@@ -1,0 +1,103 @@
+package com.kashi.grc.usermanagement.seed;
+
+import com.kashi.grc.usermanagement.domain.*;
+import com.kashi.grc.usermanagement.repository.*;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import java.time.LocalDateTime;
+import java.util.HashSet;
+import java.util.Set;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class DataInitializer implements CommandLineRunner {
+
+    private final UserRepository       userRepository;
+    private final RoleRepository       roleRepository;
+    private final PermissionRepository permissionRepository;
+    private final PasswordEncoder      passwordEncoder;
+    private final JdbcTemplate         jdbcTemplate;
+
+    private static final Long SYSTEM_TENANT_ID = 1L;
+    private static final Long SYSTEM_MODULE_ID = 1L;
+
+    @Override
+    @Transactional
+    public void run(String... args) {
+        if (userRepository.count() > 0) {
+            log.info("Data already seeded, skipping.");
+            return;
+        }
+
+        log.info("Starting seed for Kashi GRC...");
+
+        // 1. System tenant
+        jdbcTemplate.execute("""
+            INSERT INTO tenants (id, name, code, description, status)
+            VALUES (1, 'Kashi System Tenant', 'KASHI_SYS', 'Root system tenant', 'ACTIVE')
+            ON DUPLICATE KEY UPDATE name = name
+        """);
+
+        // 2. System module
+        jdbcTemplate.execute("""
+            INSERT INTO modules (id, code, name)
+            VALUES (1, 'SYS', 'System Management')
+            ON DUPLICATE KEY UPDATE name = name
+        """);
+
+        // 3. Permissions
+        Permission readAll       = createPermission("system:read",          "Read All");
+        Permission writeAll      = createPermission("system:write",         "Write All");
+        Permission manageTenants = createPermission("system:manageTenants", "Manage Tenants");
+
+        // 4. Role — save WITHOUT permissions first to get the role ID
+        Role adminRole = new Role();
+        adminRole.setName("PLATFORM_ADMIN");
+        adminRole.setSide(RoleSide.SYSTEM);
+        adminRole.setLevel(RoleLevel.L1);
+        adminRole.setTenantId(SYSTEM_TENANT_ID);
+        adminRole.setPermissions(new HashSet<>());  // empty — link manually below
+        roleRepository.save(adminRole);
+        roleRepository.flush();
+
+        // 5. Link role_permissions via JdbcTemplate so we can include tenant_id
+        for (Permission p : Set.of(readAll, writeAll, manageTenants)) {
+            jdbcTemplate.update(
+                    "INSERT IGNORE INTO role_permissions (role_id, permission_id, tenant_id) VALUES (?, ?, ?)",
+                    adminRole.getId(), p.getId(), SYSTEM_TENANT_ID
+            );
+        }
+
+        // 6. Admin user
+        User admin = new User();
+        admin.setEmail("admin@kashigrc.com");
+        admin.setFirstName("Kashi");
+        admin.setLastName("Admin");
+        admin.setPasswordHash(passwordEncoder.encode("Admin@123"));
+        admin.setStatus(UserStatus.ACTIVE);
+        admin.setTenantId(SYSTEM_TENANT_ID);
+        admin.setRoles(new HashSet<>(Set.of(adminRole)));
+        admin.setPasswordResetRequired(false);
+        admin.setLastLogin(LocalDateTime.now());
+        userRepository.save(admin);
+
+        log.info("Seed complete — admin@kashigrc.com created.");
+    }
+
+    private Permission createPermission(String code, String name) {
+        return permissionRepository.findByCode(code).orElseGet(() -> {
+            Permission p = new Permission();
+            p.setModuleId(SYSTEM_MODULE_ID);
+            p.setCode(code);
+            p.setName(name);
+            return permissionRepository.save(p);
+        });
+    }
+}

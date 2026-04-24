@@ -1,0 +1,3 @@
+1. Change email service logic, We make centralised email service like i did in GRC tool project.
+2. We will not use any Native Query (@Query) we use JPA Criteria API, we will make a common class for that and use it everywhere in the project.
+3.Whenever we returning List<T> data to the frontend So make sure we are using pagination With multiple searches filters and sorting direction.
