@@ -323,6 +323,15 @@ public class VendorController {
                             .activeWorkflowInstanceId(c.getWorkflowInstanceId())
                             .currentCycleNo(c.getCycleNo());
 
+                    // Populate workflowInstanceStatus so the frontend can distinguish
+                    // an actively-running workflow from a cancelled/completed one.
+                    // Without this, vendor.workflowInstanceStatus is always null,
+                    // causing hasWorkflow = false and the setup banner never hiding.
+                    if (c.getWorkflowInstanceId() != null) {
+                        workflowInstanceRepository.findById(c.getWorkflowInstanceId())
+                                .ifPresent(wi -> builder.workflowInstanceStatus(wi.getStatus().name()));
+                    }
+
                     // Check if template was instantiated for this cycle's assessment
                     boolean instantiated = assessmentRepository.findByCycleId(c.getId())
                             .stream()

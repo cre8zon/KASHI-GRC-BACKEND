@@ -192,6 +192,7 @@ public class ActionItem extends TenantAwareEntity {
     public enum EntityType {
         QUESTION_RESPONSE,
         ASSESSMENT,
+        VENDOR,
         TASK,
         CONTROL,
         RISK,

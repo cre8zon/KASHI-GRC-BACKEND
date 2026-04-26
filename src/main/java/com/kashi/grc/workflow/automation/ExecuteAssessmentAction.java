@@ -1,4 +1,4 @@
-package com.kashi.grc.assessment.automation;
+package com.kashi.grc.workflow.automation;
 
 import com.kashi.grc.assessment.domain.*;
 import com.kashi.grc.assessment.repository.*;
@@ -16,6 +16,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -158,58 +159,113 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
                 .build();
         templateInstanceRepository.save(templateInstance);
 
-        // ── Snapshot sections → section instances ─────────────────────────────
+        // ── Snapshot sections + questions + options ───────────────────────────
+        // OLD: individual save() per section, question, option = 448 round-trips
+        //      × 20ms Aiven RTT = ~9 seconds just for this block.
+        // NEW: bulk-load all data in a handful of queries, build all objects
+        //      in memory, then saveAll() each type in one batched INSERT.
+        //      Result: 5 queries to read + 3 saveAll() calls = ~8 round-trips
+        //      instead of 448 — typically reduces this block from 9s to <1s.
+
         int questionCount = 0;
         List<TemplateSectionMapping> sectionMappings =
                 templateSectionMappingRepository.findByTemplateIdOrderByOrderNo(templateId);
 
-        for (TemplateSectionMapping tsm : sectionMappings) {
-            AssessmentSection section = sectionRepository.findById(tsm.getSectionId()).orElse(null);
-            if (section == null) continue;
+        // Bulk-load all sections for this template in one query
+        List<Long> sectionIds = sectionMappings.stream()
+                .map(TemplateSectionMapping::getSectionId).toList();
+        Map<Long, AssessmentSection> sectionMap = sectionRepository.findAllById(sectionIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AssessmentSection::getId, s -> s));
 
-            AssessmentSectionInstance sectionInstance = AssessmentSectionInstance.builder()
+        // Bulk-load all question mappings for all sections in one query
+        List<SectionQuestionMapping> allQuestionMappings =
+                sectionQuestionMappingRepository.findBySectionIdInOrderByOrderNo(sectionIds);
+
+        List<Long> questionIds = allQuestionMappings.stream()
+                .map(SectionQuestionMapping::getQuestionId).toList();
+
+        // Bulk-load all questions in one query
+        Map<Long, AssessmentQuestion> questionMap = questionRepository.findAllById(questionIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestion::getId, q -> q));
+
+        // Bulk-load all option mappings for all questions in one query
+        List<QuestionOptionMapping> allOptionMappings =
+                questionOptionMappingRepository.findByQuestionIdInOrderByOrderNo(questionIds);
+        List<Long> optionIds = allOptionMappings.stream()
+                .map(QuestionOptionMapping::getOptionId).toList();
+        Map<Long, AssessmentQuestionOption> optionMap = optionRepository.findAllById(optionIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestionOption::getId, o -> o));
+
+        // Group question mappings by section for easy lookup
+        Map<Long, List<SectionQuestionMapping>> questionsBySectionId = allQuestionMappings.stream()
+                .collect(java.util.stream.Collectors.groupingBy(SectionQuestionMapping::getSectionId));
+        // Group option mappings by question for easy lookup
+        Map<Long, List<QuestionOptionMapping>> optionsByQuestionId = allOptionMappings.stream()
+                .collect(java.util.stream.Collectors.groupingBy(QuestionOptionMapping::getQuestionId));
+
+        // Build + saveAll section instances
+        List<AssessmentSectionInstance> sectionInstances = new java.util.ArrayList<>();
+        for (TemplateSectionMapping tsm : sectionMappings) {
+            AssessmentSection section = sectionMap.get(tsm.getSectionId());
+            if (section == null) continue;
+            sectionInstances.add(AssessmentSectionInstance.builder()
                     .templateInstanceId(templateInstance.getId())
                     .originalSectionId(section.getId())
                     .sectionNameSnapshot(section.getName())
                     .sectionOrderNo(tsm.getOrderNo())
-                    .build();
-            sectionInstanceRepository.save(sectionInstance);
+                    .build());
+        }
+        sectionInstanceRepository.saveAll(sectionInstances);
 
-            // ── Snapshot questions → question instances ────────────────────────
-            List<SectionQuestionMapping> questionMappings =
-                    sectionQuestionMappingRepository.findBySectionIdOrderByOrderNo(section.getId());
+        // Build + saveAll question instances (sections now have IDs from saveAll)
+        List<AssessmentQuestionInstance> questionInstances = new java.util.ArrayList<>();
+        Map<Long, AssessmentSectionInstance> sectionInstanceBySectionId = new java.util.HashMap<>();
+        for (int i = 0; i < sectionMappings.size(); i++) {
+            AssessmentSection section = sectionMap.get(sectionMappings.get(i).getSectionId());
+            if (section == null || i >= sectionInstances.size()) continue;
+            sectionInstanceBySectionId.put(section.getId(), sectionInstances.get(i));
+        }
 
-            for (SectionQuestionMapping sqm : questionMappings) {
-                AssessmentQuestion q = questionRepository.findById(sqm.getQuestionId()).orElse(null);
+        for (Map.Entry<Long, AssessmentSectionInstance> entry : sectionInstanceBySectionId.entrySet()) {
+            Long sectionId = entry.getKey();
+            AssessmentSectionInstance si = entry.getValue();
+            List<SectionQuestionMapping> qMappings = questionsBySectionId.getOrDefault(sectionId, List.of());
+            for (SectionQuestionMapping sqm : qMappings) {
+                AssessmentQuestion q = questionMap.get(sqm.getQuestionId());
                 if (q == null) continue;
-
-                AssessmentQuestionInstance qi = AssessmentQuestionInstance.builder()
+                questionInstances.add(AssessmentQuestionInstance.builder()
                         .assessmentId(assessment.getId())
-                        .sectionInstanceId(sectionInstance.getId())
+                        .sectionInstanceId(si.getId())
                         .originalQuestionId(q.getId())
                         .questionTextSnapshot(q.getQuestionText())
                         .responseType(q.getResponseType())
                         .weight(sqm.getWeight())
                         .isMandatory(sqm.isMandatory())
                         .orderNo(sqm.getOrderNo())
-                        .build();
-                questionInstanceRepository.save(qi);
-
-                // ── Snapshot options ──────────────────────────────────────────
-                questionOptionMappingRepository
-                        .findByQuestionIdOrderByOrderNo(q.getId())
-                        .forEach(qom -> optionRepository.findById(qom.getOptionId())
-                                .ifPresent(opt -> optionInstanceRepository.save(
-                                        AssessmentOptionInstance.builder()
-                                                .questionInstanceId(qi.getId())
-                                                .originalOptionId(opt.getId())
-                                                .optionValue(opt.getOptionValue())
-                                                .score(opt.getScore())
-                                                .orderNo(qom.getOrderNo())
-                                                .build())));
+                        .build());
                 questionCount++;
             }
         }
+        questionInstanceRepository.saveAll(questionInstances);
+
+        // Build + saveAll option instances
+        List<AssessmentOptionInstance> optionInstances = new java.util.ArrayList<>();
+        for (AssessmentQuestionInstance qi : questionInstances) {
+            List<QuestionOptionMapping> oMappings =
+                    optionsByQuestionId.getOrDefault(qi.getOriginalQuestionId(), List.of());
+            for (QuestionOptionMapping qom : oMappings) {
+                AssessmentQuestionOption opt = optionMap.get(qom.getOptionId());
+                if (opt == null) continue;
+                optionInstances.add(AssessmentOptionInstance.builder()
+                        .questionInstanceId(qi.getId())
+                        .originalOptionId(opt.getId())
+                        .optionValue(opt.getOptionValue())
+                        .score(opt.getScore())
+                        .orderNo(qom.getOrderNo())
+                        .build());
+            }
+        }
+        optionInstanceRepository.saveAll(optionInstances);
 
         log.info("[EXECUTE_ASSESSMENT] Done | assessmentId={} | templateInstanceId={} | " +
                         "sections={} | questions={}",

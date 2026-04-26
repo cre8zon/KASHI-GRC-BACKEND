@@ -31,6 +31,7 @@ public class AuthResponse {
         private Long tenantId;
         private String tenantName;
         private Long vendorId;
+        private String vendorName;
         private String status;
         private Boolean requiresPasswordReset;
         private List<RoleInfo> roles;

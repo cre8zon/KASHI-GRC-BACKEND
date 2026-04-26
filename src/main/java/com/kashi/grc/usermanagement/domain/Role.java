@@ -41,7 +41,7 @@ public class Role extends BaseEntity {
     @Builder.Default
     private Boolean isSystem = false;
 
-    @ManyToMany(fetch = FetchType.EAGER)
+    @ManyToMany(fetch = FetchType.LAZY)
     @JoinTable(
             name = "role_permissions",
             joinColumns = @JoinColumn(name = "role_id"),

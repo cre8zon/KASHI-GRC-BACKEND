@@ -113,6 +113,40 @@ public class DbRepository {
         return entityManager.createQuery(cq).getResultList();
     }
 
+    /**
+     * Vendor-scoped variant: finds users holding a role AND belonging to a specific vendor.
+     *
+     * Used for VENDOR-side workflow steps so tasks go only to users of the workflow's
+     * specific vendor (instance.entityId), not to ALL users with that role across every
+     * vendor in the tenant. Without this scope, every VRM/CISO/Responder across all vendors
+     * receives the same task — a data isolation violation.
+     *
+     * null vendorId falls back to the tenant-wide query (safe for org-side steps).
+     */
+    public List<Long> findUserIdsByRoleAndVendor(Long roleId, Long tenantId, Long vendorId) {
+        if (vendorId == null) {
+            return findUserIdsByRoleAndTenant(roleId, tenantId);
+        }
+
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<com.kashi.grc.usermanagement.domain.User> root =
+                cq.from(com.kashi.grc.usermanagement.domain.User.class);
+
+        Join<Object, Object> rolesJoin = root.join("roles", JoinType.INNER);
+
+        cq.select(root.get("id"))
+                .distinct(true)
+                .where(
+                        cb.equal(rolesJoin.get("id"), roleId),
+                        cb.equal(root.get("tenantId"), tenantId),
+                        cb.equal(root.get("vendorId"), vendorId),
+                        cb.isFalse(root.get("isDeleted"))
+                );
+
+        return entityManager.createQuery(cq).getResultList();
+    }
+
     // ── Private helpers ───────────────────────────────────────────
 
     private <E> List<Predicate> buildPredicates(
@@ -160,8 +194,8 @@ public class DbRepository {
                 Path<?> path = fields.get(nv.getName());
                 if (path != null && nv.getValue() != null) {
                     searchPreds.add(cb.like(
-                        cb.lower(path.as(String.class)),
-                        "%" + nv.getValue().toLowerCase() + "%"
+                            cb.lower(path.as(String.class)),
+                            "%" + nv.getValue().toLowerCase() + "%"
                     ));
                 }
             }

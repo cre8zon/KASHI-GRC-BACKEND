@@ -39,7 +39,8 @@ import java.util.stream.Collectors;
 public class AuthServiceImpl implements AuthService {
 
     private final UserRepository      userRepository;
-    private final TenantRepository tenantRepository;
+    private final TenantRepository    tenantRepository;
+    private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
     private final PasswordEncoder     passwordEncoder;
     private final JwtTokenProvider    tokenProvider;
     private final MailService         mailService;
@@ -291,7 +292,13 @@ public class AuthServiceImpl implements AuthService {
                         .email(user.getEmail())
                         .fullName(user.getFullName())
                         .tenantId(user.getTenantId())
+                        .tenantName(tenantRepository.findById(user.getTenantId())
+                                .map(t -> t.getName()).orElse(""))
                         .vendorId(user.getVendorId())
+                        .vendorName(user.getVendorId() != null
+                                ? vendorRepository.findById(user.getVendorId())
+                                  .map(v -> v.getName()).orElse("")
+                                : null)
                         .status(user.getStatus().name())
                         .requiresPasswordReset(user.getPasswordResetRequired())
                         .roles(roleInfos)

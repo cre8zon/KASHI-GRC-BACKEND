@@ -200,4 +200,18 @@ public class UserController {
         return ResponseEntity.ok(ApiResponse.success(
                 userService.getActivityLog(userId, startDate, endDate, actionType, limit)));
     }
+
+    /** Save per-user UI preferences (app_theme, sidebar_theme) to user_attributes */
+    @PatchMapping("/me/preferences")
+    public ResponseEntity<ApiResponse<Void>> savePreferences(
+            @RequestBody Map<String, String> prefs) {
+        userService.savePreferences(prefs);
+        return ResponseEntity.ok(ApiResponse.success(null));
+    }
+
+    /** Get per-user UI preferences from user_attributes */
+    @GetMapping("/me/preferences")
+    public ResponseEntity<ApiResponse<Map<String, String>>> getPreferences() {
+        return ResponseEntity.ok(ApiResponse.success(userService.getPreferences()));
+    }
 }
