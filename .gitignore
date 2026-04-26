@@ -1091,3 +1091,4 @@
 /target/grc-0.0.1-SNAPSHOT.jar
 /target/grc-0.0.1-SNAPSHOT.jar.original
 /target/jacoco.exec
+application.properties

@@ -1769,7 +1769,11 @@ public class WorkflowEngineService {
                     } else {
                         int assignerTaskCount = 0;
                         for (WorkflowStepAssignerRole ar : assignerRoles) {
-                            List<Long> uids = dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
+                            // For vendor-side steps scope to this workflow's specific vendor.
+                            // Org-side assigner roles (e.g. ORG_CISO) are tenant-wide — no vendorId filter.
+                            List<Long> uids = "VENDOR".equalsIgnoreCase(si.getSnapSide())
+                                    ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
+                                    : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
                             for (Long uid : uids) {
                                 TaskInstance t = createTask(si, uid, true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                                 sectionCompletionService.snapshotSectionsForTask(t, si, instance);
@@ -1830,7 +1834,13 @@ public class WorkflowEngineService {
             for (WorkflowStepRole ar : actorRoles) {
                 String roleName = roleRepository.findById(ar.getRoleId())
                         .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
-                List<Long> uids = dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
+                // CRITICAL: vendor-side steps must resolve actors ONLY from the specific vendor
+                // this workflow belongs to (instance.entityId = vendorId).
+                // Using tenant-wide lookup fans tasks out to ALL vendors' VRMs/CISOs/Responders —
+                // a serious data isolation violation. Org-side steps remain tenant-wide.
+                List<Long> uids = "VENDOR".equalsIgnoreCase(si.getSnapSide())
+                        ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
+                        : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
                 for (Long uid : uids) {
                     TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, roleName);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
@@ -1871,12 +1881,14 @@ public class WorkflowEngineService {
             String fallbackReason;
 
             if ("VENDOR".equalsIgnoreCase(si.getSnapSide())) {
-                // Vendor-side: find the first user with VENDOR_VRM role in this tenant
-                fallbackUserId = roleRepository.findAll().stream()
-                        .filter(r -> r.getName() != null &&
-                                (r.getName().equalsIgnoreCase("VENDOR_VRM") ||
-                                        r.getName().equalsIgnoreCase("VRM")))
-                        .flatMap(r -> dbRepository.findUserIdsByRoleAndTenant(r.getId(), tenantId).stream())
+                // Vendor-side fallback: find VRM user scoped to THIS specific vendor.
+                // Use targeted findByNameAndSide instead of findAll() which loads every role.
+                fallbackUserId = java.util.stream.Stream.of("VENDOR_VRM", "VRM")
+                        .map(name -> roleRepository.findByNameAndSide(name,
+                                com.kashi.grc.usermanagement.domain.RoleSide.VENDOR))
+                        .filter(java.util.Optional::isPresent)
+                        .map(java.util.Optional::get)
+                        .flatMap(r -> dbRepository.findUserIdsByRoleAndVendor(r.getId(), tenantId, instance.getEntityId()).stream())
                         .findFirst()
                         .orElse(null);
                 fallbackReason = fallbackUserId != null

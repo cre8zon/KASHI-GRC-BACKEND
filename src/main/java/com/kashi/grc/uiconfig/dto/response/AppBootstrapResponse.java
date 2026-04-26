@@ -15,6 +15,9 @@ import java.util.Map;
 @Data @Builder
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class AppBootstrapResponse {
+    private String tenantName;
+    private String vendorName;
+    private Map<String, String> userPreferences;
     private TenantBrandingResponse branding;
     private List<UiNavigationItemResponse> navigation;
     private List<DashboardWidgetResponse> dashboardWidgets;

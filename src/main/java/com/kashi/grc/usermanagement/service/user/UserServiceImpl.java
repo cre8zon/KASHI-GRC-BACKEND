@@ -505,4 +505,38 @@ public class UserServiceImpl implements UserService {
                 .passwordResetRequired(Boolean.TRUE.equals(user.getPasswordResetRequired()))
                 .build();
     }
+
+    private static final List<String> ALLOWED_PREF_KEYS =
+            java.util.Arrays.asList("ui_app_theme", "ui_sidebar_theme", "ui_sidebar_color");
+
+    @Override
+    @Transactional
+    public void savePreferences(Map<String, String> prefs) {
+        User user = utilityService.getLoggedInDataContext();
+        prefs.forEach((key, value) -> {
+            if (!ALLOWED_PREF_KEYS.contains(key)) return;
+            attributeRepository.findByUserIdAndAttributeKey(user.getId(), key)
+                    .ifPresentOrElse(
+                            attr -> attr.setAttributeValue(value),
+                            () -> attributeRepository.save(
+                                    UserAttribute.builder()
+                                            .user(user)
+                                            .attributeKey(key)
+                                            .attributeValue(value)
+                                            .build())
+                    );
+        });
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public Map<String, String> getPreferences() {
+        User user = utilityService.getLoggedInDataContext();
+        Map<String, String> result = new java.util.HashMap<>();
+        ALLOWED_PREF_KEYS.forEach(key ->
+                attributeRepository.findByUserIdAndAttributeKey(user.getId(), key)
+                        .ifPresent(attr -> result.put(key, attr.getAttributeValue()))
+        );
+        return result;
+    }
 }

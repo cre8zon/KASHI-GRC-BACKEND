@@ -12,7 +12,31 @@ import java.util.Set;
  * Core user entity. Maps to the `users` table.
  * Multi-tenant: every user belongs to exactly one tenant (via TenantAwareEntity.tenantId).
  * Vendor users have vendor_id set; org users have vendor_id = null.
+ *
+ * ── Entity Graph strategy ────────────────────────────────────────────────────
+ * roles and permissions are LAZY by default — never auto-joined on simple lookups.
+ * Use named graphs on repository queries that actually need them:
+ *
+ *   User.WITH_ROLES              — roles only (workflow access checks, sidebar)
+ *   User.WITH_ROLES_PERMISSIONS  — roles + permissions (auth/login, JWT validation)
+ *
+ * This replaces the old EAGER fetch which fired a full JOIN on every user load
+ * regardless of whether roles were needed — the primary cause of slow list/login.
  */
+@NamedEntityGraphs({
+        @NamedEntityGraph(
+                name = User.WITH_ROLES,
+                attributeNodes = @NamedAttributeNode("roles")
+        ),
+        @NamedEntityGraph(
+                name = User.WITH_ROLES_PERMISSIONS,
+                attributeNodes = @NamedAttributeNode(value = "roles", subgraph = "roles-with-permissions"),
+                subgraphs = @NamedSubgraph(
+                        name = "roles-with-permissions",
+                        attributeNodes = @NamedAttributeNode("permissions")
+                )
+        )
+})
 @Entity
 @Table(name = "users")
 @Getter
@@ -21,6 +45,10 @@ import java.util.Set;
 @NoArgsConstructor
 @AllArgsConstructor
 public class User extends AuditableEntity {
+
+    // Graph name constants — use these instead of magic strings in @EntityGraph annotations
+    public static final String WITH_ROLES             = "User.withRoles";
+    public static final String WITH_ROLES_PERMISSIONS = "User.withRolesAndPermissions";
 
     @Column(name = "vendor_id")
     private Long vendorId;
@@ -80,7 +108,7 @@ public class User extends AuditableEntity {
     private String timezone = "UTC";
 
     // ── Relationships ─────────────────────────────────────────────
-    @ManyToMany(fetch = FetchType.EAGER)
+    @ManyToMany(fetch = FetchType.LAZY)
     @JoinTable(
             name = "user_roles",
             joinColumns = @JoinColumn(name = "user_id"),

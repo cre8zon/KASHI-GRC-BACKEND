@@ -12,6 +12,10 @@ public interface QuestionOptionMappingRepository extends JpaRepository<QuestionO
 
     List<QuestionOptionMapping> findByQuestionIdOrderByOrderNo(Long questionId);
 
+    // Bulk variant — loads all option mappings for multiple questions in one query.
+    // Used by ExecuteAssessmentAction to replace N individual findByQuestionId calls.
+    List<QuestionOptionMapping> findByQuestionIdInOrderByOrderNo(java.util.Collection<Long> questionIds);
+
     List<QuestionOptionMapping> findByOptionId(Long optionId);
 
     Optional<QuestionOptionMapping> findByQuestionIdAndOptionId(Long questionId, Long optionId);

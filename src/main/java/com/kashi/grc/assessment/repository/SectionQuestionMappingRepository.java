@@ -12,6 +12,10 @@ public interface SectionQuestionMappingRepository extends JpaRepository<SectionQ
 
     List<SectionQuestionMapping> findBySectionIdOrderByOrderNo(Long sectionId);
 
+    // Bulk variant — loads all question mappings for multiple sections in one query.
+    // Used by ExecuteAssessmentAction to replace N individual findBySectionId calls.
+    List<SectionQuestionMapping> findBySectionIdInOrderByOrderNo(java.util.Collection<Long> sectionIds);
+
     List<SectionQuestionMapping> findByQuestionId(Long questionId);
 
     Optional<SectionQuestionMapping> findBySectionIdAndQuestionId(Long sectionId, Long questionId);

@@ -25,4 +25,6 @@ public interface UserService {
     Map<String, Object> changePassword(ChangePasswordRequest request);
     UserAccessSummary getAccessSummary(Long userId);
     Map<String, Object> getActivityLog(Long userId, String startDate, String endDate, String actionType, int limit);
+    void savePreferences(Map<String, String> prefs);
+    Map<String, String> getPreferences();
 }

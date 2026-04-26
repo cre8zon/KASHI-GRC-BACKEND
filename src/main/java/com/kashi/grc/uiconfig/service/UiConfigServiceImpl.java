@@ -27,15 +27,36 @@ public class UiConfigServiceImpl implements UiConfigService {
     private final UiActionRepository        actionRepository;
     private final DashboardWidgetRepository widgetRepository;
     private final FeatureFlagRepository     featureFlagRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
+    private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
     private final TenantBrandingRepository  brandingRepository;
     private final UtilityService            utilityService;
+    private final com.kashi.grc.usermanagement.service.user.UserService userService;
 
     // ── Bootstrap (single call after login) ───────────────────────
 
     @Override
     @Transactional(readOnly = true)
     public AppBootstrapResponse bootstrap() {
+        // getLoggedInDataContext() returns the User entity directly
+        com.kashi.grc.usermanagement.domain.User currentUser =
+                utilityService.getLoggedInDataContext();
+        Long tenantId = currentUser.getTenantId();
+
+        String tenantName = tenantRepository.findById(tenantId)
+                .map(t -> t.getName()).orElse("");
+
+        // For vendor users — look up vendor name from vendorId on the user entity
+        String vendorName = null;
+        if (currentUser.getVendorId() != null) {
+            vendorName = vendorRepository.findById(currentUser.getVendorId())
+                    .map(v -> v.getName()).orElse(null);
+        }
+
         return AppBootstrapResponse.builder()
+                .tenantName(tenantName)
+                .vendorName(vendorName)
+                .userPreferences(userService.getPreferences())
                 .branding(getBranding())
                 .navigation(getNavigation())
                 .dashboardWidgets(getDashboardWidgets())
