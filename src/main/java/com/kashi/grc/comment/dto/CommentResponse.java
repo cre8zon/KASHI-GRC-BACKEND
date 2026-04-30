@@ -21,6 +21,7 @@ public class CommentResponse {
     private Long                       createdBy;
     private String                     createdByName;
     private LocalDateTime              createdAt;
-    private boolean                    isInternal;   // true when visibility=INTERNAL
-    private boolean                    isCisoOnly;   // true when visibility=CISO_ONLY
+    private boolean                    isInternal;      // true when visibility=INTERNAL (org private)
+    private boolean                    isCisoOnly;      // true when visibility=CISO_ONLY
+    private boolean                    isVendorInternal;// true when visibility=VENDOR_INTERNAL (vendor private)
 }

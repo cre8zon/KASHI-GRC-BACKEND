@@ -121,6 +121,8 @@ public class CommentService {
                 .tenantId(tenantId)
                 .entityType(entityType)
                 .entityId(entityId)
+                .questionInstanceId(entityType == EntityComment.EntityType.QUESTION_RESPONSE
+                        ? entityId : null)
                 .commentText(text)
                 .commentType(EntityComment.CommentType.SYSTEM)
                 .visibility(EntityComment.Visibility.ALL)
@@ -135,18 +137,22 @@ public class CommentService {
     private List<EntityComment.Visibility> resolveAllowedVisibilities(
             String userSide, String userRole) {
         if ("ORGANIZATION".equals(userSide)) {
-            // Org side sees everything: ALL + INTERNAL + CISO_ONLY
+            // Org side sees: ALL + INTERNAL + CISO_ONLY
+            // NEVER VENDOR_INTERNAL — that is the vendor's private channel
             return List.of(EntityComment.Visibility.ALL,
                     EntityComment.Visibility.INTERNAL,
                     EntityComment.Visibility.CISO_ONLY);
         }
-        // Vendor CISO sees ALL + CISO_ONLY (not INTERNAL)
+        // Vendor CISO / VRM: ALL + VENDOR_INTERNAL + CISO_ONLY
         if ("VENDOR_CISO".equals(userRole) || "VENDOR_VRM".equals(userRole)) {
             return List.of(EntityComment.Visibility.ALL,
+                    EntityComment.Visibility.VENDOR_INTERNAL,
                     EntityComment.Visibility.CISO_ONLY);
         }
-        // Vendor responders/contributors see ALL only
-        return List.of(EntityComment.Visibility.ALL);
+        // Vendor responders and contributors: ALL + VENDOR_INTERNAL
+        // Cannot see org-internal notes, cannot see CISO_ONLY
+        return List.of(EntityComment.Visibility.ALL,
+                EntityComment.Visibility.VENDOR_INTERNAL);
     }
 
     private void pushComment(EntityComment comment, CommentResponse response) {
@@ -181,6 +187,7 @@ public class CommentService {
                 .createdAt(c.getCreatedAt())
                 .isInternal(c.getVisibility() == EntityComment.Visibility.INTERNAL)
                 .isCisoOnly(c.getVisibility() == EntityComment.Visibility.CISO_ONLY)
+                .isVendorInternal(c.getVisibility() == EntityComment.Visibility.VENDOR_INTERNAL)
                 .build();
     }
 
@@ -203,7 +210,7 @@ public class CommentService {
                 // no taskId needed in the URL when contributor's task is already APPROVED.
                 // Try to find an active task (PENDING/IN_PROGRESS) for a cleaner URL;
                 // fall back to route without taskId — revision bypass handles access.
-                Long assessmentId = comment.getEntityId();
+                Long assessmentId = qi.getAssessmentId();
                 List<com.kashi.grc.workflow.domain.TaskInstance> activeTasks =
                         new java.util.ArrayList<>();
                 activeTasks.addAll(taskInstanceRepository

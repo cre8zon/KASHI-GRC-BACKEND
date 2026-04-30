@@ -97,6 +97,9 @@ public class DocumentController {
         public Integer displayOrder;
     }
 
+    @org.springframework.beans.factory.annotation.Value("${aws.s3.kms-key-arn}")
+    private String kmsKeyArn;
+
     // ══════════════════════════════════════════════════════════════════════
     // STEP 1 of upload: Request presigned PUT URL
     // ══════════════════════════════════════════════════════════════════════
@@ -136,6 +139,7 @@ public class DocumentController {
                 .documentType(req.getDocumentType())
                 .s3Key(result.getS3Key())
                 .s3Bucket(result.getS3Bucket())
+                .storagePath(result.getS3Key())
                 .status("PENDING")
                 .version(1)
                 .fileSize(req.getFileSizeBytes())
@@ -152,8 +156,9 @@ public class DocumentController {
         response.put("mimeType",     result.getEffectiveMimeType());
         // Tell client which headers to include in the PUT request
         response.put("requiredHeaders", Map.of(
-                "Content-Type",                        result.getEffectiveMimeType(),
-                "x-amz-server-side-encryption",        "aws:kms"
+                "Content-Type",                                  result.getEffectiveMimeType()
+//                "x-amz-server-side-encryption",                  "aws:kms",
+//                "x-amz-server-side-encryption-aws-kms-key-id",  kmsKeyArn
         ));
 
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(response));
@@ -254,6 +259,7 @@ public class DocumentController {
                 .documentType("EVIDENCE")
                 .s3Key(result.getS3Key())
                 .s3Bucket(result.getS3Bucket())
+                .storagePath(result.getS3Key())
                 .status("ACTIVE")
                 .version(1)
                 .contentLength(result.getContentLength())
@@ -426,6 +432,7 @@ public class DocumentController {
                 .sourceModule(old.getSourceModule())
                 .s3Key(result.getS3Key())
                 .s3Bucket(result.getS3Bucket())
+                .storagePath(result.getS3Key())
                 .status("PENDING")
                 .version(old.getVersion() + 1)
                 .supersedesId(old.getId())
@@ -438,10 +445,17 @@ public class DocumentController {
 
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(Map.of(
                 "newDocumentId",    newDoc.getId(),
+                "documentId",       newDoc.getId(),
                 "version",          newDoc.getVersion(),
                 "supersedesId",     old.getId(),
                 "presignedUrl",     result.getPresignedUrl(),
-                "expiresAt",        result.getExpiresAt().toString())));
+                "expiresAt",        result.getExpiresAt().toString(),
+                "requiredHeaders",  Map.of(                // ← ADD THIS
+                        "Content-Type",                                 result.getEffectiveMimeType()
+//                        "x-amz-server-side-encryption",                 "aws:kms",
+//                        "x-amz-server-side-encryption-aws-kms-key-id", kmsKeyArn
+                ))));
+
     }
 
     // ══════════════════════════════════════════════════════════════════════

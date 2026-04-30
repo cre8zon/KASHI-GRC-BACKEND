@@ -100,10 +100,19 @@ public class UserController {
     @Operation(summary = "List users — paginated, filterable, searchable, sortable")
     public ResponseEntity<ApiResponse<PaginatedResponse<UserResponse>>> listUsers(
             @RequestParam Map<String, String> allParams) {
-        String side = allParams.get("side");  // ← extract before passing to pageDetails
+        String side    = allParams.get("side");  // ← extract before passing to pageDetails
         boolean noRoles = "true".equalsIgnoreCase(allParams.get("noRoles"));
+        // vendorId filter: org-admin drilling into a specific vendor's team,
+        // OR scoping override. Vendor-side users are always scoped to their own
+        // vendor by the service (via loggedInUser.getVendorId()) — this param
+        // is only honoured for org/system callers.
+        Long vendorId = null;
+        String vendorIdStr = allParams.get("vendorId");
+        if (vendorIdStr != null && !vendorIdStr.isBlank()) {
+            try { vendorId = Long.parseLong(vendorIdStr); } catch (NumberFormatException ignored) {}
+        }
         return ResponseEntity.ok(ApiResponse.success(
-                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles)));
+                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId)));
     }
 
     // ── UPDATE ────────────────────────────────────────────────────

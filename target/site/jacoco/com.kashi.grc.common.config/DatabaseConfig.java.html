@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>DatabaseConfig.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GRC</a> &gt; <a href="index.source.html" class="el_package">com.kashi.grc.common.config</a> &gt; <span class="el_source">DatabaseConfig.java</span></div><h1>DatabaseConfig.java</h1><pre class="source lang-java linenums">package com.kashi.grc.common.config;
+
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import javax.sql.DataSource;
+import java.util.List;
+
+/**
+ * DatabaseConfig — single place for all DB performance tuning.
+ *
+ * Covers:
+ *   1. HikariCP pool sized and keepalive-tuned for Aiven (remote SSL, ~15ms RTT).
+ *   2. JDBC URL parameters — prepared statement cache, batch rewrites, socket timeouts.
+ *   3. Missing indexes — created on startup via JdbcTemplate (avoids EntityManager cycle).
+ *
+ * Index strategy: MySQL does not reliably support &quot;CREATE INDEX IF NOT EXISTS&quot; across
+ * all connector/server combinations. Instead we use SHOW INDEX to check first, then
+ * CREATE only if missing. Safe and idempotent on every restart.
+ */
+<span class="fc" id="L28">@Slf4j</span>
+@Configuration
+<span class="fc" id="L30">public class DatabaseConfig {</span>
+
+    @Value(&quot;${spring.datasource.url}&quot;)
+    private String jdbcUrl;
+
+    @Value(&quot;${spring.datasource.username}&quot;)
+    private String username;
+
+    @Value(&quot;${spring.datasource.password}&quot;)
+    private String password;
+
+    // ── 1. HikariCP DataSource ────────────────────────────────────────────────
+
+    @Bean
+    @Primary
+    public DataSource dataSource() {
+<span class="fc" id="L46">        HikariConfig config = new HikariConfig();</span>
+
+<span class="pc bpc" id="L48" title="1 of 2 branches missed.">        String url = jdbcUrl.contains(&quot;cachePrepStmts&quot;)</span>
+<span class="nc" id="L49">                ? jdbcUrl</span>
+<span class="fc" id="L50">                : jdbcUrl + buildJdbcParams();</span>
+
+<span class="fc" id="L52">        config.setJdbcUrl(url);</span>
+<span class="fc" id="L53">        config.setUsername(username);</span>
+<span class="fc" id="L54">        config.setPassword(password);</span>
+<span class="fc" id="L55">        config.setDriverClassName(&quot;com.mysql.cj.jdbc.Driver&quot;);</span>
+
+<span class="fc" id="L57">        config.setPoolName(&quot;KashiGRC-Pool&quot;);</span>
+<span class="fc" id="L58">        config.setMaximumPoolSize(20);</span>
+<span class="fc" id="L59">        config.setMinimumIdle(5);</span>
+
+<span class="fc" id="L61">        config.setConnectionTimeout(8_000);</span>
+<span class="fc" id="L62">        config.setIdleTimeout(300_000);</span>
+<span class="fc" id="L63">        config.setMaxLifetime(1_800_000);</span>
+
+        // CRITICAL for Aiven: ping idle connections every 60s.
+        // Aiven drops idle MySQL connections at ~5 min. Without keepalive,
+        // Hikari hands out a dead connection → 30s hang on the next request.
+<span class="fc" id="L68">        config.setKeepaliveTime(30_000);</span>
+
+<span class="fc" id="L70">        config.setValidationTimeout(3_000);</span>
+<span class="fc" id="L71">        config.setConnectionTestQuery(&quot;SELECT 1&quot;);</span>
+
+<span class="fc" id="L73">        log.info(&quot;[DB-CONFIG] HikariCP pool ready | maxPool=20 | keepalive=60s&quot;);</span>
+<span class="fc" id="L74">        return new HikariDataSource(config);</span>
+    }
+
+    private String buildJdbcParams() {
+<span class="fc" id="L78">        return &quot;&amp;connectTimeout=5000&quot;</span>
+                + &quot;&amp;socketTimeout=120000&quot;
+                + &quot;&amp;autoReconnect=true&quot;
+                + &quot;&amp;cachePrepStmts=true&quot;
+                + &quot;&amp;prepStmtCacheSize=250&quot;
+                + &quot;&amp;prepStmtCacheSqlLimit=2048&quot;
+                + &quot;&amp;useServerPrepStmts=true&quot;
+                + &quot;&amp;rewriteBatchedStatements=true&quot;
+                + &quot;&amp;serverTimezone=UTC&quot;;
+    }
+
+    // ── 2. Performance indexes ────────────────────────────────────────────────
+
+    /**
+     * Each entry: { &quot;table_name&quot;, &quot;index_name&quot;, &quot;CREATE INDEX ... SQL&quot; }
+     *
+     * We SHOW INDEX first to check existence, then CREATE only if missing.
+     * This avoids MySQL's inconsistent &quot;IF NOT EXISTS&quot; support across connector
+     * versions — which caused &quot;bad SQL grammar&quot; on Aiven 8.0.45.
+     *
+     * Adding a new slow query = add one row here. No entity file changes needed.
+     */
+<span class="fc" id="L100">    private static final List&lt;String[]&gt; INDEXES = List.of(</span>
+
+            // task_instances — inbox fires findByAssignedUserIdAndStatus 3× per load
+            new String[]{ &quot;task_instances&quot;, &quot;idx_task_assigned_status&quot;,
+                    &quot;CREATE INDEX idx_task_assigned_status ON task_instances (assigned_user_id, status)&quot; },
+            new String[]{ &quot;task_instances&quot;, &quot;idx_task_step_instance&quot;,
+                    &quot;CREATE INDEX idx_task_step_instance ON task_instances (step_instance_id)&quot; },
+            new String[]{ &quot;task_instances&quot;, &quot;idx_task_step_status&quot;,
+                    &quot;CREATE INDEX idx_task_step_status ON task_instances (step_instance_id, status)&quot; },
+
+            // step_instances — workflow timeline load
+            new String[]{ &quot;step_instances&quot;, &quot;idx_step_workflow_instance&quot;,
+                    &quot;CREATE INDEX idx_step_workflow_instance ON step_instances (workflow_instance_id, created_at)&quot; },
+            new String[]{ &quot;step_instances&quot;, &quot;idx_step_status_sla&quot;,
+                    &quot;CREATE INDEX idx_step_status_sla ON step_instances (status, sla_due_at, completed_at)&quot; },
+
+            // workflow_instances — vendor detail, entity resolution
+            new String[]{ &quot;workflow_instances&quot;, &quot;idx_wi_tenant_entity&quot;,
+                    &quot;CREATE INDEX idx_wi_tenant_entity ON workflow_instances (tenant_id, entity_type, entity_id, status)&quot; },
+
+            // vendor_assessment_cycles — called on every vendor detail load
+            new String[]{ &quot;vendor_assessment_cycles&quot;, &quot;idx_cycle_vendor&quot;,
+                    &quot;CREATE INDEX idx_cycle_vendor ON vendor_assessment_cycles (vendor_id, status)&quot; },
+
+            // Prevents duplicate cycles per workflow instance (fixes EntityResolver NonUniqueResultException)
+            new String[]{ &quot;vendor_assessment_cycles&quot;, &quot;uk_cycle_workflow_instance&quot;,
+                    &quot;CREATE UNIQUE INDEX uk_cycle_workflow_instance ON vendor_assessment_cycles (workflow_instance_id)&quot; },
+
+            // Prevents duplicate response rows for the same (assessment, question) pair.
+            // Root cause: concurrent multi-choice clicks fire two POST /respond requests
+            // within the same DB transaction window: both SELECT empty, both INSERT.
+            // The constraint makes the second INSERT fail with DataIntegrityViolationException
+            // which AssessmentController.respondToQuestion catches and retries as UPDATE.
+            // Cleanup first: DELETE FROM assessment_responses WHERE id = 72;
+            new String[]{ &quot;assessment_responses&quot;, &quot;uk_response_assessment_question&quot;,
+                    &quot;CREATE UNIQUE INDEX uk_response_assessment_question ON assessment_responses (assessment_id, question_instance_id)&quot; },
+
+            // vendor_assessments — assessment tab, EntityResolver
+            new String[]{ &quot;vendor_assessments&quot;, &quot;idx_assessment_cycle&quot;,
+                    &quot;CREATE INDEX idx_assessment_cycle ON vendor_assessments (cycle_id)&quot; },
+
+            // users — VRM lookup by vendor, role resolution
+            new String[]{ &quot;users&quot;, &quot;idx_user_vendor&quot;,
+                    &quot;CREATE INDEX idx_user_vendor ON users (vendor_id, is_deleted)&quot; },
+            new String[]{ &quot;users&quot;, &quot;idx_user_tenant_vendor&quot;,
+                    &quot;CREATE INDEX idx_user_tenant_vendor ON users (tenant_id, vendor_id, is_deleted)&quot; },
+
+            // action_items — vendor detail action items tab
+            new String[]{ &quot;action_items&quot;, &quot;idx_ai_entity&quot;,
+                    &quot;CREATE INDEX idx_ai_entity ON action_items (entity_type, entity_id, tenant_id)&quot; },
+            new String[]{ &quot;action_items&quot;, &quot;idx_ai_assigned_status&quot;,
+                    &quot;CREATE INDEX idx_ai_assigned_status ON action_items (assigned_to, status, tenant_id)&quot; }
+    );
+
+    @Bean
+    public ApplicationRunner ensureIndexes(DataSource dataSource) {
+<span class="fc" id="L156">        return args -&gt; {</span>
+<span class="fc" id="L157">            JdbcTemplate jdbc = new JdbcTemplate(dataSource);</span>
+<span class="fc" id="L158">            log.info(&quot;[DB-CONFIG] Checking {} performance indexes...&quot;, INDEXES.size());</span>
+<span class="fc" id="L159">            int created = 0, skipped = 0;</span>
+
+<span class="fc bfc" id="L161" title="All 2 branches covered.">            for (String[] entry : INDEXES) {</span>
+<span class="fc" id="L162">                String table     = entry[0];</span>
+<span class="fc" id="L163">                String indexName = entry[1];</span>
+<span class="fc" id="L164">                String ddl       = entry[2];</span>
+
+                // Check existence via SHOW INDEX — works on all MySQL versions.
+                // queryForList avoids the ambiguous lambda overload between
+                // ResultSetExtractor and RowCallbackHandler in JdbcTemplate.query().
+<span class="fc" id="L169">                boolean exists = !jdbc.queryForList(</span>
+                        &quot;SHOW INDEX FROM `&quot; + table + &quot;` WHERE Key_name = ?&quot;,
+                        indexName
+<span class="fc bfc" id="L172" title="All 2 branches covered.">                ).isEmpty();</span>
+
+<span class="fc bfc" id="L174" title="All 2 branches covered.">                if (exists) {</span>
+<span class="fc" id="L175">                    skipped++;</span>
+                } else {
+                    try {
+<span class="nc" id="L178">                        jdbc.execute(ddl);</span>
+<span class="nc" id="L179">                        created++;</span>
+<span class="nc" id="L180">                        log.info(&quot;[DB-CONFIG] Created index: {}.{}&quot;, table, indexName);</span>
+<span class="fc" id="L181">                    } catch (Exception e) {</span>
+<span class="fc" id="L182">                        log.warn(&quot;[DB-CONFIG] Failed to create index {}.{}: {}&quot;,</span>
+<span class="fc" id="L183">                                table, indexName, e.getMessage());</span>
+<span class="nc" id="L184">                    }</span>
+                }
+<span class="fc" id="L186">            }</span>
+
+<span class="fc" id="L188">            log.info(&quot;[DB-CONFIG] Indexes done | created={} | already-existed={}&quot;, created, skipped);</span>
+<span class="fc" id="L189">        };</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

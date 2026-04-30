@@ -1,0 +1,278 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>ExecuteAssessmentAction.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GRC</a> &gt; <a href="index.source.html" class="el_package">com.kashi.grc.workflow.automation</a> &gt; <span class="el_source">ExecuteAssessmentAction.java</span></div><h1>ExecuteAssessmentAction.java</h1><pre class="source lang-java linenums">package com.kashi.grc.workflow.automation;
+
+import com.kashi.grc.assessment.domain.*;
+import com.kashi.grc.assessment.repository.*;
+import com.kashi.grc.vendor.domain.RiskTemplateMapping;
+import com.kashi.grc.vendor.domain.Vendor;
+import com.kashi.grc.vendor.repository.RiskTemplateMappingRepository;
+import com.kashi.grc.vendor.repository.VendorRepository;
+import com.kashi.grc.workflow.automation.AutomatedActionContext;
+import com.kashi.grc.workflow.automation.AutomatedActionHandler;
+import com.kashi.grc.workflow.domain.WorkflowInstance;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * AutomatedActionHandler for key &quot;EXECUTE_ASSESSMENT&quot;.
+ *
+ * Extracts the assessment instantiation logic that previously lived in
+ * AssessmentController.executeAssessment() into a proper @Component.
+ *
+ * WHY MOVED:
+ *   Business logic must not live in controllers. The old endpoint required
+ *   a taskId, a self-assigned task, and a manual frontend call — all of which
+ *   were workarounds for the lack of an automation registry. Now this fires
+ *   automatically when a SYSTEM step with automatedAction=&quot;EXECUTE_ASSESSMENT&quot;
+ *   starts, with no frontend involvement.
+ *
+ * WHAT IT DOES:
+ *   1. Loads vendor from workflowInstance.entityId
+ *   2. Finds the risk→template mapping for vendor's current risk score
+ *   3. Creates or reuses the active VendorAssessmentCycle
+ *   4. Creates VendorAssessment (status=ASSIGNED)
+ *   5. Snapshots AssessmentTemplateInstance, SectionInstances, QuestionInstances,
+ *      OptionInstances — locking the template version at trigger time
+ *
+ * After returning true, WorkflowEngineService auto-approves the SYSTEM step
+ * and advances the workflow to the next step (VRM assignment).
+ */
+<span class="fc" id="L46">@Slf4j</span>
+@Component
+@RequiredArgsConstructor
+public class ExecuteAssessmentAction implements AutomatedActionHandler {
+
+    private final VendorRepository                     vendorRepository;
+    private final RiskTemplateMappingRepository        mappingRepository;
+    private final VendorAssessmentCycleRepository      cycleRepository;
+    private final VendorAssessmentRepository           assessmentRepository;
+    private final AssessmentTemplateRepository         templateRepository;
+    private final AssessmentTemplateInstanceRepository templateInstanceRepository;
+    private final AssessmentSectionInstanceRepository  sectionInstanceRepository;
+    private final AssessmentSectionRepository          sectionRepository;
+    private final AssessmentQuestionInstanceRepository questionInstanceRepository;
+    private final AssessmentQuestionRepository         questionRepository;
+    private final AssessmentOptionInstanceRepository   optionInstanceRepository;
+    private final AssessmentQuestionOptionRepository   optionRepository;
+    private final TemplateSectionMappingRepository     templateSectionMappingRepository;
+    private final SectionQuestionMappingRepository     sectionQuestionMappingRepository;
+    private final QuestionOptionMappingRepository      questionOptionMappingRepository;
+
+    @Override
+    public String actionKey() {
+<span class="fc" id="L69">        return &quot;EXECUTE_ASSESSMENT&quot;;</span>
+    }
+
+    @Override
+    @Transactional
+    public boolean execute(AutomatedActionContext ctx) {
+<span class="nc" id="L75">        WorkflowInstance wi       = ctx.getWorkflowInstance();</span>
+<span class="nc" id="L76">        Long             tenantId = ctx.getTenantId();</span>
+<span class="nc" id="L77">        Long             userId   = ctx.getInitiatedBy();</span>
+
+<span class="nc" id="L79">        log.info(&quot;[EXECUTE_ASSESSMENT] Starting | workflowInstanceId={} | entityId={}&quot;,</span>
+<span class="nc" id="L80">                wi.getId(), wi.getEntityId());</span>
+
+        // ── Load vendor ───────────────────────────────────────────────────────
+<span class="nc" id="L83">        Vendor vendor = vendorRepository.findById(wi.getEntityId()).orElse(null);</span>
+<span class="nc bnc" id="L84" title="All 2 branches missed.">        if (vendor == null) {</span>
+<span class="nc" id="L85">            log.error(&quot;[EXECUTE_ASSESSMENT] Vendor not found | entityId={}&quot;, wi.getEntityId());</span>
+<span class="nc" id="L86">            return false;</span>
+        }
+
+        // ── Find risk→template mapping for this vendor's score ────────────────
+<span class="nc" id="L90">        Optional&lt;RiskTemplateMapping&gt; mappingOpt =</span>
+<span class="nc" id="L91">                mappingRepository.findByScore(vendor.getCurrentRiskScore());</span>
+<span class="nc bnc" id="L92" title="All 2 branches missed.">        if (mappingOpt.isEmpty()) {</span>
+<span class="nc" id="L93">            log.error(&quot;[EXECUTE_ASSESSMENT] No template mapped for risk score={} | vendorId={}&quot;,</span>
+<span class="nc" id="L94">                    vendor.getCurrentRiskScore(), vendor.getId());</span>
+<span class="nc" id="L95">            return false;</span>
+        }
+<span class="nc" id="L97">        Long templateId = mappingOpt.get().getTemplateId();</span>
+
+        // ── Create or reuse the active cycle ──────────────────────────────────
+<span class="nc" id="L100">        VendorAssessmentCycle cycle = cycleRepository</span>
+<span class="nc" id="L101">                .findByVendorIdOrderByCycleNo(vendor.getId()).stream()</span>
+<span class="nc" id="L102">                .filter(c -&gt; &quot;ACTIVE&quot;.equals(c.getStatus()))</span>
+<span class="nc" id="L103">                .reduce((a, b) -&gt; b)</span>
+<span class="nc" id="L104">                .orElse(null);</span>
+
+<span class="nc bnc" id="L106" title="All 2 branches missed.">        if (cycle == null) {</span>
+<span class="nc" id="L107">            long cycleNo = cycleRepository.countByVendorId(vendor.getId()) + 1;</span>
+<span class="nc" id="L108">            cycle = VendorAssessmentCycle.builder()</span>
+<span class="nc" id="L109">                    .tenantId(tenantId)</span>
+<span class="nc" id="L110">                    .vendorId(vendor.getId())</span>
+<span class="nc" id="L111">                    .cycleNo((int) cycleNo)</span>
+<span class="nc" id="L112">                    .triggeredAt(LocalDateTime.now())</span>
+<span class="nc" id="L113">                    .triggeredBy(userId)</span>
+<span class="nc" id="L114">                    .workflowInstanceId(wi.getId())</span>
+<span class="nc" id="L115">                    .status(&quot;ACTIVE&quot;)</span>
+<span class="nc" id="L116">                    .build();</span>
+<span class="nc" id="L117">            cycleRepository.save(cycle);</span>
+<span class="nc" id="L118">            log.info(&quot;[EXECUTE_ASSESSMENT] New cycle created | cycleId={} | cycleNo={}&quot;,</span>
+<span class="nc" id="L119">                    cycle.getId(), cycle.getCycleNo());</span>
+<span class="nc" id="L120">        } else {</span>
+<span class="nc" id="L121">            cycle.setWorkflowInstanceId(wi.getId());</span>
+<span class="nc" id="L122">            cycleRepository.save(cycle);</span>
+<span class="nc" id="L123">            log.info(&quot;[EXECUTE_ASSESSMENT] Reusing existing cycle | cycleId={}&quot;, cycle.getId());</span>
+        }
+
+        // ── Guard: prevent duplicate assessments for the same cycle ───────────
+<span class="nc bnc" id="L127" title="All 2 branches missed.">        boolean assessmentExists = !assessmentRepository.findByCycleId(cycle.getId()).isEmpty();</span>
+<span class="nc bnc" id="L128" title="All 2 branches missed.">        if (assessmentExists) {</span>
+<span class="nc" id="L129">            log.warn(&quot;[EXECUTE_ASSESSMENT] Assessment already exists for cycleId={} — skipping&quot;,</span>
+<span class="nc" id="L130">                    cycle.getId());</span>
+            // Return true so the SYSTEM step still auto-approves and workflow advances
+<span class="nc" id="L132">            return true;</span>
+        }
+
+        // ── Create VendorAssessment ───────────────────────────────────────────
+<span class="nc" id="L136">        VendorAssessment assessment = VendorAssessment.builder()</span>
+<span class="nc" id="L137">                .tenantId(tenantId)</span>
+<span class="nc" id="L138">                .cycleId(cycle.getId())</span>
+<span class="nc" id="L139">                .vendorId(vendor.getId())</span>
+<span class="nc" id="L140">                .templateId(templateId)</span>
+<span class="nc" id="L141">                .status(&quot;ASSIGNED&quot;)</span>
+<span class="nc" id="L142">                .build();</span>
+<span class="nc" id="L143">        assessmentRepository.save(assessment);</span>
+
+        // ── Snapshot AssessmentTemplateInstance ───────────────────────────────
+<span class="nc" id="L146">        AssessmentTemplate template = templateRepository.findById(templateId).orElse(null);</span>
+<span class="nc bnc" id="L147" title="All 2 branches missed.">        if (template == null) {</span>
+<span class="nc" id="L148">            log.error(&quot;[EXECUTE_ASSESSMENT] Template not found | templateId={}&quot;, templateId);</span>
+<span class="nc" id="L149">            return false;</span>
+        }
+
+<span class="nc" id="L152">        AssessmentTemplateInstance templateInstance = AssessmentTemplateInstance.builder()</span>
+<span class="nc" id="L153">                .tenantId(tenantId)</span>
+<span class="nc" id="L154">                .assessmentId(assessment.getId())</span>
+<span class="nc" id="L155">                .originalTemplateId(templateId)</span>
+<span class="nc" id="L156">                .templateNameSnapshot(template.getName())</span>
+<span class="nc" id="L157">                .templateVersionSnapshot(template.getVersion())</span>
+<span class="nc" id="L158">                .snapshottedAt(LocalDateTime.now())</span>
+<span class="nc" id="L159">                .build();</span>
+<span class="nc" id="L160">        templateInstanceRepository.save(templateInstance);</span>
+
+        // ── Snapshot sections + questions + options ───────────────────────────
+        // OLD: individual save() per section, question, option = 448 round-trips
+        //      × 20ms Aiven RTT = ~9 seconds just for this block.
+        // NEW: bulk-load all data in a handful of queries, build all objects
+        //      in memory, then saveAll() each type in one batched INSERT.
+        //      Result: 5 queries to read + 3 saveAll() calls = ~8 round-trips
+        //      instead of 448 — typically reduces this block from 9s to &lt;1s.
+
+<span class="nc" id="L170">        int questionCount = 0;</span>
+<span class="nc" id="L171">        List&lt;TemplateSectionMapping&gt; sectionMappings =</span>
+<span class="nc" id="L172">                templateSectionMappingRepository.findByTemplateIdOrderByOrderNo(templateId);</span>
+
+        // Bulk-load all sections for this template in one query
+<span class="nc" id="L175">        List&lt;Long&gt; sectionIds = sectionMappings.stream()</span>
+<span class="nc" id="L176">                .map(TemplateSectionMapping::getSectionId).toList();</span>
+<span class="nc" id="L177">        Map&lt;Long, AssessmentSection&gt; sectionMap = sectionRepository.findAllById(sectionIds)</span>
+<span class="nc" id="L178">                .stream().collect(java.util.stream.Collectors.toMap(AssessmentSection::getId, s -&gt; s));</span>
+
+        // Bulk-load all question mappings for all sections in one query
+<span class="nc" id="L181">        List&lt;SectionQuestionMapping&gt; allQuestionMappings =</span>
+<span class="nc" id="L182">                sectionQuestionMappingRepository.findBySectionIdInOrderByOrderNo(sectionIds);</span>
+
+<span class="nc" id="L184">        List&lt;Long&gt; questionIds = allQuestionMappings.stream()</span>
+<span class="nc" id="L185">                .map(SectionQuestionMapping::getQuestionId).toList();</span>
+
+        // Bulk-load all questions in one query
+<span class="nc" id="L188">        Map&lt;Long, AssessmentQuestion&gt; questionMap = questionRepository.findAllById(questionIds)</span>
+<span class="nc" id="L189">                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestion::getId, q -&gt; q));</span>
+
+        // Bulk-load all option mappings for all questions in one query
+<span class="nc" id="L192">        List&lt;QuestionOptionMapping&gt; allOptionMappings =</span>
+<span class="nc" id="L193">                questionOptionMappingRepository.findByQuestionIdInOrderByOrderNo(questionIds);</span>
+<span class="nc" id="L194">        List&lt;Long&gt; optionIds = allOptionMappings.stream()</span>
+<span class="nc" id="L195">                .map(QuestionOptionMapping::getOptionId).toList();</span>
+<span class="nc" id="L196">        Map&lt;Long, AssessmentQuestionOption&gt; optionMap = optionRepository.findAllById(optionIds)</span>
+<span class="nc" id="L197">                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestionOption::getId, o -&gt; o));</span>
+
+        // Group question mappings by section for easy lookup
+<span class="nc" id="L200">        Map&lt;Long, List&lt;SectionQuestionMapping&gt;&gt; questionsBySectionId = allQuestionMappings.stream()</span>
+<span class="nc" id="L201">                .collect(java.util.stream.Collectors.groupingBy(SectionQuestionMapping::getSectionId));</span>
+        // Group option mappings by question for easy lookup
+<span class="nc" id="L203">        Map&lt;Long, List&lt;QuestionOptionMapping&gt;&gt; optionsByQuestionId = allOptionMappings.stream()</span>
+<span class="nc" id="L204">                .collect(java.util.stream.Collectors.groupingBy(QuestionOptionMapping::getQuestionId));</span>
+
+        // Build + saveAll section instances
+<span class="nc" id="L207">        List&lt;AssessmentSectionInstance&gt; sectionInstances = new java.util.ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L208" title="All 2 branches missed.">        for (TemplateSectionMapping tsm : sectionMappings) {</span>
+<span class="nc" id="L209">            AssessmentSection section = sectionMap.get(tsm.getSectionId());</span>
+<span class="nc bnc" id="L210" title="All 2 branches missed.">            if (section == null) continue;</span>
+<span class="nc" id="L211">            sectionInstances.add(AssessmentSectionInstance.builder()</span>
+<span class="nc" id="L212">                    .templateInstanceId(templateInstance.getId())</span>
+<span class="nc" id="L213">                    .originalSectionId(section.getId())</span>
+<span class="nc" id="L214">                    .sectionNameSnapshot(section.getName())</span>
+<span class="nc" id="L215">                    .sectionOrderNo(tsm.getOrderNo())</span>
+<span class="nc" id="L216">                    .build());</span>
+<span class="nc" id="L217">        }</span>
+<span class="nc" id="L218">        sectionInstanceRepository.saveAll(sectionInstances);</span>
+
+        // Build + saveAll question instances (sections now have IDs from saveAll)
+<span class="nc" id="L221">        List&lt;AssessmentQuestionInstance&gt; questionInstances = new java.util.ArrayList&lt;&gt;();</span>
+<span class="nc" id="L222">        Map&lt;Long, AssessmentSectionInstance&gt; sectionInstanceBySectionId = new java.util.HashMap&lt;&gt;();</span>
+<span class="nc bnc" id="L223" title="All 2 branches missed.">        for (int i = 0; i &lt; sectionMappings.size(); i++) {</span>
+<span class="nc" id="L224">            AssessmentSection section = sectionMap.get(sectionMappings.get(i).getSectionId());</span>
+<span class="nc bnc" id="L225" title="All 4 branches missed.">            if (section == null || i &gt;= sectionInstances.size()) continue;</span>
+<span class="nc" id="L226">            sectionInstanceBySectionId.put(section.getId(), sectionInstances.get(i));</span>
+        }
+
+<span class="nc bnc" id="L229" title="All 2 branches missed.">        for (Map.Entry&lt;Long, AssessmentSectionInstance&gt; entry : sectionInstanceBySectionId.entrySet()) {</span>
+<span class="nc" id="L230">            Long sectionId = entry.getKey();</span>
+<span class="nc" id="L231">            AssessmentSectionInstance si = entry.getValue();</span>
+<span class="nc" id="L232">            List&lt;SectionQuestionMapping&gt; qMappings = questionsBySectionId.getOrDefault(sectionId, List.of());</span>
+<span class="nc bnc" id="L233" title="All 2 branches missed.">            for (SectionQuestionMapping sqm : qMappings) {</span>
+<span class="nc" id="L234">                AssessmentQuestion q = questionMap.get(sqm.getQuestionId());</span>
+<span class="nc bnc" id="L235" title="All 2 branches missed.">                if (q == null) continue;</span>
+<span class="nc" id="L236">                questionInstances.add(AssessmentQuestionInstance.builder()</span>
+<span class="nc" id="L237">                        .assessmentId(assessment.getId())</span>
+<span class="nc" id="L238">                        .sectionInstanceId(si.getId())</span>
+<span class="nc" id="L239">                        .originalQuestionId(q.getId())</span>
+<span class="nc" id="L240">                        .questionTextSnapshot(q.getQuestionText())</span>
+<span class="nc" id="L241">                        .responseType(q.getResponseType())</span>
+<span class="nc" id="L242">                        .weight(sqm.getWeight())</span>
+<span class="nc" id="L243">                        .isMandatory(sqm.isMandatory())</span>
+<span class="nc" id="L244">                        .orderNo(sqm.getOrderNo())</span>
+<span class="nc" id="L245">                        .build());</span>
+<span class="nc" id="L246">                questionCount++;</span>
+<span class="nc" id="L247">            }</span>
+<span class="nc" id="L248">        }</span>
+<span class="nc" id="L249">        questionInstanceRepository.saveAll(questionInstances);</span>
+
+        // Build + saveAll option instances
+<span class="nc" id="L252">        List&lt;AssessmentOptionInstance&gt; optionInstances = new java.util.ArrayList&lt;&gt;();</span>
+<span class="nc bnc" id="L253" title="All 2 branches missed.">        for (AssessmentQuestionInstance qi : questionInstances) {</span>
+<span class="nc" id="L254">            List&lt;QuestionOptionMapping&gt; oMappings =</span>
+<span class="nc" id="L255">                    optionsByQuestionId.getOrDefault(qi.getOriginalQuestionId(), List.of());</span>
+<span class="nc bnc" id="L256" title="All 2 branches missed.">            for (QuestionOptionMapping qom : oMappings) {</span>
+<span class="nc" id="L257">                AssessmentQuestionOption opt = optionMap.get(qom.getOptionId());</span>
+<span class="nc bnc" id="L258" title="All 2 branches missed.">                if (opt == null) continue;</span>
+<span class="nc" id="L259">                optionInstances.add(AssessmentOptionInstance.builder()</span>
+<span class="nc" id="L260">                        .questionInstanceId(qi.getId())</span>
+<span class="nc" id="L261">                        .originalOptionId(opt.getId())</span>
+<span class="nc" id="L262">                        .optionValue(opt.getOptionValue())</span>
+<span class="nc" id="L263">                        .score(opt.getScore())</span>
+<span class="nc" id="L264">                        .orderNo(qom.getOrderNo())</span>
+<span class="nc" id="L265">                        .build());</span>
+<span class="nc" id="L266">            }</span>
+<span class="nc" id="L267">        }</span>
+<span class="nc" id="L268">        optionInstanceRepository.saveAll(optionInstances);</span>
+
+<span class="nc" id="L270">        log.info(&quot;[EXECUTE_ASSESSMENT] Done | assessmentId={} | templateInstanceId={} | &quot; +</span>
+                        &quot;sections={} | questions={}&quot;,
+<span class="nc" id="L272">                assessment.getId(), templateInstance.getId(),</span>
+<span class="nc" id="L273">                sectionMappings.size(), questionCount);</span>
+
+<span class="nc" id="L275">        return true;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

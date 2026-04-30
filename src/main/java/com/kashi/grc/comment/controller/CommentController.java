@@ -40,14 +40,21 @@ public class CommentController {
         Long userId   = user.getId();
         Long tenantId = user.getTenantId();
 
-        // Enforce visibility rules — vendor responders cannot create INTERNAL or CISO_ONLY
+        // Enforce visibility rules — strict channel isolation between vendor and org sides
         String userSide = resolveUserSide(user);
         String userRole = resolveUserRole(user);
+        if (req.getVisibility() == EntityComment.Visibility.VENDOR_INTERNAL
+                && "ORGANIZATION".equals(userSide)) {
+            req.setVisibility(EntityComment.Visibility.ALL);
+        }
 
+        // INTERNAL: vendor side cannot post to org's private channel
         if (req.getVisibility() == EntityComment.Visibility.INTERNAL
                 && !"ORGANIZATION".equals(userSide)) {
-            req.setVisibility(EntityComment.Visibility.ALL); // downgrade silently
+            req.setVisibility(EntityComment.Visibility.ALL);
         }
+
+        // CISO_ONLY: only vendor CISO/VRM and org roles
         if (req.getVisibility() == EntityComment.Visibility.CISO_ONLY
                 && !"ORGANIZATION".equals(userSide)
                 && !"VENDOR_CISO".equals(userRole)

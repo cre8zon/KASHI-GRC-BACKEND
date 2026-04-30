@@ -195,7 +195,7 @@ public class ReviewController {
                             List<Map<String, Object>> qMaps =
                                     questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(si.getId())
                                             .stream().map(qi -> {
-                                                var r = responseRepository.findByAssessmentIdAndQuestionInstanceId(assessmentId, qi.getId());
+                                                var r = responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
                                                 Map<String, Object> m = new LinkedHashMap<>();
                                                 m.put("questionInstanceId",      qi.getId());
                                                 m.put("questionText",            qi.getQuestionTextSnapshot());

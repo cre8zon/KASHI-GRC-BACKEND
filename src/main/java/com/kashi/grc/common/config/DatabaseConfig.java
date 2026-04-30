@@ -60,12 +60,12 @@ public class DatabaseConfig {
 
         config.setConnectionTimeout(8_000);
         config.setIdleTimeout(300_000);
-        config.setMaxLifetime(600_000);
+        config.setMaxLifetime(1_800_000);
 
         // CRITICAL for Aiven: ping idle connections every 60s.
         // Aiven drops idle MySQL connections at ~5 min. Without keepalive,
         // Hikari hands out a dead connection → 30s hang on the next request.
-        config.setKeepaliveTime(60_000);
+        config.setKeepaliveTime(30_000);
 
         config.setValidationTimeout(3_000);
         config.setConnectionTestQuery("SELECT 1");
@@ -76,7 +76,7 @@ public class DatabaseConfig {
 
     private String buildJdbcParams() {
         return "&connectTimeout=5000"
-                + "&socketTimeout=30000"
+                + "&socketTimeout=120000"
                 + "&autoReconnect=true"
                 + "&cachePrepStmts=true"
                 + "&prepStmtCacheSize=250"
@@ -124,6 +124,15 @@ public class DatabaseConfig {
             // Prevents duplicate cycles per workflow instance (fixes EntityResolver NonUniqueResultException)
             new String[]{ "vendor_assessment_cycles", "uk_cycle_workflow_instance",
                     "CREATE UNIQUE INDEX uk_cycle_workflow_instance ON vendor_assessment_cycles (workflow_instance_id)" },
+
+            // Prevents duplicate response rows for the same (assessment, question) pair.
+            // Root cause: concurrent multi-choice clicks fire two POST /respond requests
+            // within the same DB transaction window: both SELECT empty, both INSERT.
+            // The constraint makes the second INSERT fail with DataIntegrityViolationException
+            // which AssessmentController.respondToQuestion catches and retries as UPDATE.
+            // Cleanup first: DELETE FROM assessment_responses WHERE id = 72;
+            new String[]{ "assessment_responses", "uk_response_assessment_question",
+                    "CREATE UNIQUE INDEX uk_response_assessment_question ON assessment_responses (assessment_id, question_instance_id)" },
 
             // vendor_assessments — assessment tab, EntityResolver
             new String[]{ "vendor_assessments", "idx_assessment_cycle",

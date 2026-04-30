@@ -1,0 +1,263 @@
+<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html xmlns="http://www.w3.org/1999/xhtml" lang="en"><head><meta http-equiv="Content-Type" content="text/html;charset=UTF-8"/><link rel="stylesheet" href="../jacoco-resources/report.css" type="text/css"/><link rel="shortcut icon" href="../jacoco-resources/report.gif" type="image/gif"/><title>VendorItemActionController.java</title><link rel="stylesheet" href="../jacoco-resources/prettify.css" type="text/css"/><script type="text/javascript" src="../jacoco-resources/prettify.js"></script></head><body onload="window['PR_TAB_WIDTH']=4;prettyPrint()"><div class="breadcrumb" id="breadcrumb"><span class="info"><a href="../jacoco-sessions.html" class="el_session">Sessions</a></span><a href="../index.html" class="el_report">GRC</a> &gt; <a href="index.source.html" class="el_package">com.kashi.grc.assessment.controller</a> &gt; <span class="el_source">VendorItemActionController.java</span></div><h1>VendorItemActionController.java</h1><pre class="source lang-java linenums">package com.kashi.grc.assessment.controller;
+
+import com.kashi.grc.actionitem.domain.ActionItem;
+import com.kashi.grc.actionitem.repository.ActionItemRepository;
+import com.kashi.grc.actionitem.specification.ActionItemSpecification;
+import com.kashi.grc.assessment.domain.AssessmentQuestionInstance;
+import com.kashi.grc.assessment.domain.AssessmentResponse;
+import com.kashi.grc.assessment.repository.AssessmentOptionInstanceRepository;
+import com.kashi.grc.assessment.repository.AssessmentQuestionInstanceRepository;
+import com.kashi.grc.assessment.repository.AssessmentResponseRepository;
+import com.kashi.grc.assessment.repository.VendorAssessmentRepository;
+import com.kashi.grc.comment.domain.EntityComment;
+import com.kashi.grc.comment.service.CommentService;
+import com.kashi.grc.comment.dto.CommentRequest;
+import com.kashi.grc.common.dto.ApiResponse;
+import com.kashi.grc.common.exception.BusinessException;
+import com.kashi.grc.common.exception.ResourceNotFoundException;
+import com.kashi.grc.common.util.UtilityService;
+import com.kashi.grc.notification.service.NotificationService;
+import com.kashi.grc.usermanagement.repository.UserRepository;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDateTime;
+import java.util.*;
+
+/**
+ * VendorItemActionController — responder→contributor command actions.
+ *
+ * ISOLATION RULE: This controller handles ONLY the two actions that cannot
+ * go through the centralized CommentController:
+ *
+ *   1. ACCEPT contributor answer   — stamps reviewerStatus = ACCEPTED
+ *   2. OVERRIDE contributor answer — saves responder's own answer, preserves
+ *                                    original as a SYSTEM comment via CommentService
+ *
+ * REVISION REQUEST deliberately goes through POST /v1/comments with
+ * commentType = REVISION_REQUEST. CommentService.handleRevisionRequest()
+ * already auto-creates the ActionItem for the contributor. Nothing new needed.
+ *
+ * System audit events (accept/override) use CommentService.addSystemComment()
+ * — same table, same WebSocket push, same visibility rules. No new tables.
+ *
+ * ── SCALABILITY NOTE ────────────────────────────────────────────────────────
+ * The Accept/Override pattern will apply identically to Controls, Risks,
+ * Policies, and Issues in future modules. When those are built:
+ *   - Add the entity-specific status update (equivalent to updateResponderStatus)
+ *   - Call commentService.addSystemComment() for audit trail
+ *   - Keep this controller focused on ASSESSMENT questions only;
+ *     create ControlItemActionController etc. for other modules.
+ * ────────────────────────────────────────────────────────────────────────────
+ */
+<span class="fc" id="L58">@Slf4j</span>
+@RestController
+@Tag(name = &quot;Vendor Item Actions&quot;, description = &quot;Responder accept/override actions on contributor answers&quot;)
+@RequiredArgsConstructor
+@RequestMapping(&quot;/v1/assessments&quot;)
+public class VendorItemActionController {
+
+    private final VendorAssessmentRepository              assessmentRepository;
+    private final AssessmentQuestionInstanceRepository    questionInstanceRepository;
+    private final AssessmentResponseRepository            responseRepository;
+    private final AssessmentOptionInstanceRepository      optionInstanceRepository;
+    private final ActionItemRepository                    actionItemRepository;
+    private final UserRepository                          userRepository;
+    private final CommentService                          commentService;
+    private final NotificationService                     notificationService;
+    private final UtilityService                          utilityService;
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 1. ACCEPT CONTRIBUTOR ANSWER
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Responder accepts contributor's submitted answer.
+     *
+     * Effects:
+     *   - Sets reviewerStatus = ACCEPTED on the response row
+     *   - Closes any open REVISION_REQUEST action items for this question
+     *   - Logs a SYSTEM comment (audit trail, visible in ItemPanel activity tab)
+     *   - Notifies contributor
+     *
+     * Idempotent: calling twice on an already-accepted answer is a no-op.
+     */
+    @PutMapping(&quot;/{assessmentId}/questions/{questionInstanceId}/accept-contributor&quot;)
+    @Transactional
+    @Operation(summary = &quot;Responder accepts contributor's submitted answer&quot;)
+    public ResponseEntity&lt;ApiResponse&lt;Map&lt;String, Object&gt;&gt;&gt; acceptContributorAnswer(
+            @PathVariable Long assessmentId,
+            @PathVariable Long questionInstanceId) {
+
+<span class="nc" id="L97">        Long userId   = utilityService.getLoggedInDataContext().getId();</span>
+<span class="nc" id="L98">        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();</span>
+
+<span class="nc" id="L100">        assessmentRepository.findById(assessmentId)</span>
+<span class="nc" id="L101">                .orElseThrow(() -&gt; new ResourceNotFoundException(&quot;VendorAssessment&quot;, assessmentId));</span>
+
+<span class="nc" id="L103">        AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)</span>
+<span class="nc" id="L104">                .orElseThrow(() -&gt; new ResourceNotFoundException(&quot;QuestionInstance&quot;, questionInstanceId));</span>
+<span class="nc bnc" id="L105" title="All 2 branches missed.">        if (!qi.getAssessmentId().equals(assessmentId))</span>
+<span class="nc" id="L106">            throw new com.kashi.grc.common.exception.ValidationException(</span>
+                    &quot;QuestionInstance does not belong to assessment &quot; + assessmentId);
+<span class="nc bnc" id="L108" title="All 2 branches missed.">        if (qi.getAssignedUserId() == null)</span>
+<span class="nc" id="L109">            throw new BusinessException(&quot;NO_CONTRIBUTOR&quot;, &quot;No contributor is assigned to this question.&quot;);</span>
+
+<span class="nc" id="L111">        responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(</span>
+                        assessmentId, questionInstanceId)
+<span class="nc" id="L113">                .orElseThrow(() -&gt; new BusinessException(&quot;NO_RESPONSE&quot;,</span>
+                        &quot;Contributor has not submitted an answer yet.&quot;));
+
+        // Already accepted — idempotent
+<span class="nc" id="L117">        responseRepository.updateResponderStatus(assessmentId, questionInstanceId, &quot;ACCEPTED&quot;);</span>
+
+        // Close any open REVISION_REQUEST action items on this question
+<span class="nc" id="L120">        actionItemRepository.findAll(</span>
+<span class="nc" id="L121">                        ActionItemSpecification.forTenant(tenantId)</span>
+<span class="nc" id="L122">                                .and(ActionItemSpecification.forEntity(</span>
+                                        ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+<span class="nc" id="L124">                                .and(ActionItemSpecification.open())</span>
+<span class="nc" id="L125">                ).stream()</span>
+<span class="nc" id="L126">                .filter(ai -&gt; &quot;REVISION_REQUEST&quot;.equals(ai.getRemediationType()))</span>
+<span class="nc" id="L127">                .forEach(ai -&gt; {</span>
+<span class="nc" id="L128">                    ai.setStatus(ActionItem.Status.RESOLVED);</span>
+<span class="nc" id="L129">                    ai.setResolvedAt(LocalDateTime.now());</span>
+<span class="nc" id="L130">                    ai.setResolvedBy(userId);</span>
+<span class="nc" id="L131">                    ai.setResolutionNote(&quot;Answer accepted by &quot; + resolveUserName(userId));</span>
+<span class="nc" id="L132">                    actionItemRepository.save(ai);</span>
+<span class="nc" id="L133">                });</span>
+
+        // Audit trail via centralized comment module — shows in ItemPanel activity tab
+<span class="nc" id="L136">        commentService.addSystemComment(</span>
+                EntityComment.EntityType.QUESTION_RESPONSE,
+                questionInstanceId,
+                tenantId,
+<span class="nc" id="L140">                &quot;Answer accepted by &quot; + resolveUserName(userId));</span>
+
+        // Notify contributor
+<span class="nc bnc" id="L143" title="All 4 branches missed.">        if (qi.getAssignedUserId() != null &amp;&amp; !qi.getAssignedUserId().equals(userId))</span>
+<span class="nc" id="L144">            notificationService.send(qi.getAssignedUserId(), &quot;ANSWER_ACCEPTED&quot;,</span>
+<span class="nc" id="L145">                    resolveUserName(userId) + &quot; accepted your answer&quot;,</span>
+                    &quot;QUESTION_RESPONSE&quot;, questionInstanceId);
+
+<span class="nc" id="L148">        log.info(&quot;[ACCEPT] qi={} | by={} | assessmentId={}&quot;, questionInstanceId, userId, assessmentId);</span>
+<span class="nc" id="L149">        return ResponseEntity.ok(ApiResponse.success(Map.of(</span>
+                &quot;questionInstanceId&quot;, questionInstanceId,
+                &quot;responderStatus&quot;,    &quot;ACCEPTED&quot;,
+<span class="nc" id="L152">                &quot;acceptedByName&quot;,     resolveUserName(userId))));</span>
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // 2. OVERRIDE CONTRIBUTOR ANSWER
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Responder overrides contributor's answer with their own.
+     *
+     * Effects:
+     *   - Preserves original answer as a SYSTEM comment before overwriting
+     *   - Calls upsertResponse with responder's text/option
+     *   - Sets reviewerStatus = OVERRIDDEN
+     *   - Logs a second SYSTEM comment noting the override + reason
+     *   - Notifies contributor
+     *
+     * Body: { responseText?, selectedOptionInstanceId?, overrideReason? }
+     *
+     * Note: revision request goes through POST /v1/comments (CommentService handles
+     * the ActionItem side effects automatically). No endpoint needed here.
+     */
+    @PostMapping(&quot;/{assessmentId}/questions/{questionInstanceId}/override-answer&quot;)
+    @Transactional
+    @Operation(summary = &quot;Responder overrides contributor's answer — original preserved in audit trail&quot;)
+    public ResponseEntity&lt;ApiResponse&lt;Map&lt;String, Object&gt;&gt;&gt; overrideContributorAnswer(
+            @PathVariable Long assessmentId,
+            @PathVariable Long questionInstanceId,
+            @RequestBody Map&lt;String, Object&gt; body) {
+
+<span class="nc" id="L182">        Long userId   = utilityService.getLoggedInDataContext().getId();</span>
+<span class="nc" id="L183">        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();</span>
+
+<span class="nc bnc" id="L185" title="All 2 branches missed.">        String overrideText   = body.get(&quot;responseText&quot;) != null ? body.get(&quot;responseText&quot;).toString() : null;</span>
+<span class="nc bnc" id="L186" title="All 2 branches missed.">        Long   selectedOptId  = body.get(&quot;selectedOptionInstanceId&quot;) != null</span>
+<span class="nc" id="L187">                ? Long.parseLong(body.get(&quot;selectedOptionInstanceId&quot;).toString()) : null;</span>
+<span class="nc" id="L188">        String overrideReason = body.getOrDefault(&quot;overrideReason&quot;, &quot;&quot;).toString().trim();</span>
+
+<span class="nc" id="L190">        assessmentRepository.findById(assessmentId)</span>
+<span class="nc" id="L191">                .orElseThrow(() -&gt; new ResourceNotFoundException(&quot;VendorAssessment&quot;, assessmentId));</span>
+<span class="nc" id="L192">        AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)</span>
+<span class="nc" id="L193">                .orElseThrow(() -&gt; new ResourceNotFoundException(&quot;QuestionInstance&quot;, questionInstanceId));</span>
+<span class="nc bnc" id="L194" title="All 2 branches missed.">        if (!qi.getAssessmentId().equals(assessmentId))</span>
+<span class="nc" id="L195">            throw new com.kashi.grc.common.exception.ValidationException(</span>
+                    &quot;QuestionInstance does not belong to assessment &quot; + assessmentId);
+
+        // Preserve original answer as SYSTEM comment before overwriting
+<span class="nc" id="L199">        responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(</span>
+                        assessmentId, questionInstanceId)
+<span class="nc" id="L201">                .ifPresent(orig -&gt; {</span>
+<span class="nc bnc" id="L202" title="All 2 branches missed.">                    String originalText = orig.getResponseText() != null</span>
+<span class="nc" id="L203">                            ? orig.getResponseText() : &quot;[choice answer — id:&quot; + orig.getSelectedOptionInstanceId() + &quot;]&quot;;</span>
+<span class="nc" id="L204">                    String originalBy   = resolveUserName(orig.getSubmittedBy());</span>
+<span class="nc" id="L205">                    commentService.addSystemComment(</span>
+                            EntityComment.EntityType.QUESTION_RESPONSE,
+                            questionInstanceId, tenantId,
+<span class="nc" id="L208">                            &quot;Original answer by &quot; + originalBy + &quot;: &quot; + truncate(originalText, 200));</span>
+<span class="nc" id="L209">                });</span>
+
+        // Calculate score for override option if a choice was selected
+<span class="nc" id="L212">        Double scoreEarned = null;</span>
+<span class="nc bnc" id="L213" title="All 2 branches missed.">        if (selectedOptId != null)</span>
+<span class="nc" id="L214">            scoreEarned = optionInstanceRepository.findById(selectedOptId)</span>
+<span class="nc" id="L215">                    .map(opt -&gt; opt.getScore()).orElse(null);</span>
+
+        // Write override via native upsert (safe, no session poisoning)
+<span class="nc" id="L218">        responseRepository.upsertResponse(</span>
+                tenantId, assessmentId, questionInstanceId,
+                overrideText, selectedOptId,
+<span class="nc" id="L221">                scoreEarned, userId, LocalDateTime.now());</span>
+
+        // Stamp OVERRIDDEN status
+<span class="nc" id="L224">        responseRepository.updateResponderStatus(assessmentId, questionInstanceId, &quot;OVERRIDDEN&quot;);</span>
+
+        // Log override event
+<span class="nc" id="L227">        String auditMsg = &quot;Answer overridden by &quot; + resolveUserName(userId)</span>
+<span class="nc bnc" id="L228" title="All 2 branches missed.">                + (overrideReason.isBlank() ? &quot;&quot; : &quot; — reason: &quot; + overrideReason);</span>
+<span class="nc" id="L229">        commentService.addSystemComment(</span>
+                EntityComment.EntityType.QUESTION_RESPONSE,
+                questionInstanceId, tenantId, auditMsg);
+
+        // Notify contributor
+<span class="nc bnc" id="L234" title="All 4 branches missed.">        if (qi.getAssignedUserId() != null &amp;&amp; !qi.getAssignedUserId().equals(userId))</span>
+<span class="nc" id="L235">            notificationService.send(qi.getAssignedUserId(), &quot;ANSWER_OVERRIDDEN&quot;,</span>
+<span class="nc" id="L236">                    resolveUserName(userId) + &quot; overrode your answer for a question&quot;,</span>
+                    &quot;QUESTION_RESPONSE&quot;, questionInstanceId);
+
+<span class="nc" id="L239">        log.info(&quot;[OVERRIDE] qi={} | by={} | assessmentId={}&quot;, questionInstanceId, userId, assessmentId);</span>
+<span class="nc" id="L240">        return ResponseEntity.ok(ApiResponse.success(Map.of(</span>
+                &quot;questionInstanceId&quot;, questionInstanceId,
+                &quot;responderStatus&quot;,    &quot;OVERRIDDEN&quot;,
+<span class="nc" id="L243">                &quot;overriddenByName&quot;,   resolveUserName(userId))));</span>
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private String resolveUserName(Long userId) {
+<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (userId == null) return &quot;Unknown&quot;;</span>
+<span class="nc" id="L250">        return userRepository.findById(userId).map(u -&gt; {</span>
+<span class="nc bnc" id="L251" title="All 2 branches missed.">            String fn = u.getFirstName() != null ? u.getFirstName() : &quot;&quot;;</span>
+<span class="nc bnc" id="L252" title="All 2 branches missed.">            String ln = u.getLastName()  != null ? u.getLastName()  : &quot;&quot;;</span>
+<span class="nc" id="L253">            String full = (fn + &quot; &quot; + ln).trim();</span>
+<span class="nc bnc" id="L254" title="All 2 branches missed.">            return full.isEmpty() ? u.getEmail() : full;</span>
+<span class="nc" id="L255">        }).orElse(&quot;Unknown&quot;);</span>
+    }
+
+    private String truncate(String s, int max) {
+<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (s == null) return &quot;&quot;;</span>
+<span class="nc bnc" id="L260" title="All 2 branches missed.">        return s.length() &lt;= max ? s : s.substring(0, max) + &quot;…&quot;;</span>
+    }
+}
+</pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>
