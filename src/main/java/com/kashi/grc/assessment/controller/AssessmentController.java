@@ -329,12 +329,24 @@ public class AssessmentController {
         long mandatory = allQs.stream().filter(AssessmentQuestionInstance::isMandatory).count();
         int  pct       = allQs.isEmpty() ? 0 : (int) (answered * 100 / allQs.size());
 
+        // Fetch cycle for cycleNo and workflowInstanceId
+        VendorAssessmentCycle cycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
+
         return ResponseEntity.ok(ApiResponse.success(VendorAssessmentResponse.builder()
                 .assessmentId(assessment.getId())
                 .vendorId(vendor.getId())
                 .vendorName(vendor.getName())
                 .templateName(templateName)
                 .status(assessment.getStatus())
+                .cycleNo(cycle != null ? cycle.getCycleNo() : null)
+                .workflowInstanceId(cycle != null ? cycle.getWorkflowInstanceId() : null)
+                .totalEarnedScore(assessment.getTotalEarnedScore())
+                .totalPossibleScore(assessment.getTotalPossibleScore())
+                .riskRating(assessment.getRiskRating())
+                .reviewFindings(assessment.getReviewFindings())
+                .submittedAt(assessment.getSubmittedAt())
+                .completedAt(assessment.getCompletedAt())
+                .reportUrl(assessment.getReportUrl())
                 .progress(Map.of(
                         "totalQuestions",     allQs.size(),
                         "answered",           answered,
@@ -442,7 +454,7 @@ public class AssessmentController {
         }
 
         AssessmentResponse response = responseRepository
-                .findByAssessmentIdAndQuestionInstanceId(assessmentId, req.getQuestionInstanceId())
+                .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, req.getQuestionInstanceId())
                 .orElse(AssessmentResponse.builder()
                         .tenantId(tenantId)
                         .assessmentId(assessmentId)
@@ -491,7 +503,28 @@ public class AssessmentController {
         }
         response.setSubmittedBy(userId);
         response.setSubmittedAt(LocalDateTime.now());
-        responseRepository.save(response);
+        // Use native INSERT ... ON DUPLICATE KEY UPDATE instead of save() + try-catch.
+        //
+        // WHY NOT try-catch: when save() throws DataIntegrityViolationException inside
+        // a @Transactional method, Hibernate marks the session "rollback-only".
+        // Any subsequent query in the same transaction (the findFirstBy... retry) then
+        // triggers a flush of the broken entity (id=null) → AssertionFailure crash.
+        //
+        // The native upsert is atomic at the DB level — no exception, no session
+        // poisoning, no race condition. If two concurrent clicks both arrive:
+        //   - First: INSERT new row
+        //   - Second: hits duplicate key → UPDATE existing row instead
+        // Both succeed. Hibernate session stays clean throughout.
+        responseRepository.upsertResponse(
+                tenantId,
+                assessmentId,
+                req.getQuestionInstanceId(),
+                response.getResponseText(),
+                response.getSelectedOptionInstanceId(),
+                response.getScoreEarned(),
+                userId,
+                response.getSubmittedAt()
+        );
 
         // KashiGuard: evaluate answer against guard rules (async, non-blocking)
         // Uses new module-agnostic signature — no AssessmentQuestionInstance import in GuardEvaluator
@@ -527,6 +560,18 @@ public class AssessmentController {
             ).forEach(ai -> {
                 if (ai.getStatus() != ActionItem.Status.OPEN
                         && ai.getStatus() != ActionItem.Status.IN_PROGRESS) return;
+
+                // CONTRIBUTOR_ASSIGNMENT: answering the question = work done.
+                // Resolve immediately — no pending review needed.
+                // REVISION_REQUEST and REMEDIATION_REQUEST still go to PENDING_REVIEW below.
+                if ("CONTRIBUTOR_ASSIGNMENT".equals(ai.getRemediationType())) {
+                    ai.setStatus(ActionItem.Status.RESOLVED);
+                    ai.setResolutionNote("Question answered by contributor");
+                    ai.setResolvedAt(LocalDateTime.now());
+                    ai.setResolvedBy(userId);
+                    actionItemRepository.save(ai);
+                    return; // skip the PENDING_REVIEW transition for this item
+                }
 
                 boolean isRemediation = "REMEDIATION_REQUEST".equals(ai.getRemediationType());
 
@@ -567,8 +612,15 @@ public class AssessmentController {
             });
         }
 
+        // upsertResponse() is a void native query — it does not update the JPA entity's ID.
+        // Re-fetch the row so we can return the real responseId to the client.
+        Long responseId = responseRepository
+                .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, req.getQuestionInstanceId())
+                .map(AssessmentResponse::getId)
+                .orElse(null);
+
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "responseId",         response.getId(),
+                "responseId",         responseId != null ? responseId : 0L,
                 "assessmentId",       assessmentId,
                 "questionInstanceId", req.getQuestionInstanceId(),
                 "scoreEarned",        response.getScoreEarned() != null ? response.getScoreEarned() : 0.0)));
@@ -732,7 +784,11 @@ public class AssessmentController {
     public ResponseEntity<ApiResponse<PaginatedResponse<VendorAssessmentResponse>>> listAssessments(
             @RequestParam Map<String, String> allParams) {
 
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        User loggedInUser   = utilityService.getLoggedInDataContext();
+        Long tenantId       = loggedInUser.getTenantId();
+        // Vendor-side users are always scoped to their own vendor.
+        // Org/System users see all vendors in the tenant.
+        Long callerVendorId = loggedInUser.getVendorId();
 
         return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
                 VendorAssessment.class,
@@ -740,6 +796,10 @@ public class AssessmentController {
                 (cb, root) -> {
                     List<Predicate> preds = new ArrayList<>();
                     preds.add(cb.equal(root.get("tenantId"), tenantId));
+                    // Vendor scoping — prevent cross-vendor data leakage
+                    if (callerVendorId != null) {
+                        preds.add(cb.equal(root.get("vendorId"), callerVendorId));
+                    }
                     String status = allParams.get("status");
                     if (status != null) {
                         // Explicit status filter — show exactly what was requested,
@@ -1009,7 +1069,7 @@ public class AssessmentController {
                             questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(si.getId())
                                     .stream().map(qi -> {
                                         var responseOpt = responseRepository
-                                                .findByAssessmentIdAndQuestionInstanceId(assessmentId, qi.getId());
+                                                .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
 
                                         List<OptionInstanceResponse> options =
                                                 optionInstanceRepository.findByQuestionInstanceIdOrderByOrderNo(qi.getId())
@@ -1028,10 +1088,23 @@ public class AssessmentController {
                                                                     .commentedBy(c.getCommentedBy())
                                                                     .createdAt(c.getCreatedAt())
                                                                     .build()).toList();
+                                            // Parse multi-choice JSON array e.g. "[4257,4259]"
+                                            // into selectedOptionInstanceIds so org-side views
+                                            // show all selected options, not just the last-toggled one.
+                                            List<Long> multiIds = new java.util.ArrayList<>();
+                                            String rt = r.getResponseText();
+                                            if (rt != null && rt.startsWith("[")) {
+                                                try {
+                                                    Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
+                                                            .readValue(rt, Long[].class);
+                                                    java.util.Collections.addAll(multiIds, arr);
+                                                } catch (Exception ignored) {}
+                                            }
                                             return AnswerResponse.builder()
                                                     .responseId(r.getId())
                                                     .responseText(r.getResponseText())
                                                     .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
+                                                    .selectedOptionInstanceIds(multiIds.isEmpty() ? null : multiIds)
                                                     .scoreEarned(r.getScoreEarned())
                                                     .reviewerStatus(r.getReviewerStatus())
                                                     .submittedAt(r.getSubmittedAt())
@@ -1170,7 +1243,23 @@ public class AssessmentController {
                             .count();
 
                     if (submittedSections >= totalSections && totalSections > 0) {
-                        // All sections with this contributor's questions are submitted → approve sub-task
+                        // All sections containing this contributor's questions are now locked.
+                        // Determine the right task closure based on whether the contributor
+                        // actually submitted their answers before the responder locked the section.
+                        //
+                        // APPROVE  — contributor called contributorSubmitSection for every
+                        //            section they had questions in → their work is complete.
+                        // REJECTED — responder locked the section before contributor finished
+                        //            → remove from their inbox so they aren't confused by a
+                        //               task they can no longer act on.
+
+                        // How many of the contributor's sections did they actually submit?
+                        long contributorSubmittedCount = contributorSectionSubmissionRepository
+                                .findByAssessmentIdAndContributorUserId(assessmentId, contributorId)
+                                .size();
+                        boolean contributorFinished = contributorSubmittedCount >= totalSections
+                                && totalSections > 0;
+
                         StepInstance fillStep = stepInstanceRepository
                                 .findByWorkflowInstanceIdOrderByCreatedAtAsc(
                                         cycleRepository.findById(
@@ -1190,16 +1279,31 @@ public class AssessmentController {
                                             || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS))
                                     .forEach(t -> {
                                         try {
-                                            com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                                                    new com.kashi.grc.workflow.dto.request.TaskActionRequest();
-                                            req.setTaskInstanceId(t.getId());
-                                            req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
-                                            req.setRemarks("All assigned sections submitted by responder — auto-approved");
-                                            workflowEngineService.performAction(req, userId);
-                                            log.info("[SECTION-SUBMIT] Contributor sub-task auto-approved | contributorId={} | taskId={}",
-                                                    contributorId, t.getId());
+                                            if (contributorFinished) {
+                                                // Contributor submitted all their sections — proper APPROVE
+                                                com.kashi.grc.workflow.dto.request.TaskActionRequest req =
+                                                        new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+                                                req.setTaskInstanceId(t.getId());
+                                                req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+                                                req.setRemarks("Contributor submitted all sections — auto-approved");
+                                                workflowEngineService.performAction(req, userId);
+                                                log.info("[SECTION-SUBMIT] Contributor sub-task APPROVED | contributorId={} | taskId={}",
+                                                        contributorId, t.getId());
+                                            } else {
+                                                // Responder locked section before contributor finished.
+                                                // Directly set task to REJECTED so it leaves their inbox.
+                                                // We do NOT use performAction(REJECT) because that would
+                                                // trigger step-level rejection logic — we only want to
+                                                // close this individual sub-task.
+                                                t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.REJECTED);
+                                                t.setActedAt(java.time.LocalDateTime.now());
+                                                t.setRemarks("Section locked by responder — contributor access revoked");
+                                                taskInstanceRepository.save(t);
+                                                log.info("[SECTION-SUBMIT] Contributor sub-task REJECTED (section locked before contributor finished) | contributorId={} | taskId={}",
+                                                        contributorId, t.getId());
+                                            }
                                         } catch (Exception e) {
-                                            log.warn("[SECTION-SUBMIT] Could not auto-approve contributor task {}: {}",
+                                            log.warn("[SECTION-SUBMIT] Could not close contributor task {}: {}",
                                                     t.getId(), e.getMessage());
                                         }
                                     });
@@ -1688,8 +1792,62 @@ public class AssessmentController {
             throw new com.kashi.grc.common.exception.ValidationException(
                     "QuestionInstance does not belong to assessment " + assessmentId);
 
+        Long prevAssistantId = qi.getReviewerAssignedUserId();
         qi.setReviewerAssignedUserId(reviewAssistantId);
         questionInstanceRepository.save(qi);
+
+        Long tenantId  = utilityService.getLoggedInDataContext().getTenantId();
+        Long assignerId = utilityService.getLoggedInDataContext().getId();
+
+        // Close previous assistant's open REVIEWER_ASSIGNMENT item for this question
+        if (prevAssistantId != null && !prevAssistantId.equals(reviewAssistantId)) {
+            actionItemRepository.findAll(
+                            ActionItemSpecification.forTenant(tenantId)
+                                    .and(ActionItemSpecification.forEntity(
+                                            ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+                                    .and(ActionItemSpecification.open())
+                    ).stream()
+                    .filter(ai -> "REVIEWER_ASSIGNMENT".equals(ai.getRemediationType())
+                            && prevAssistantId.equals(ai.getAssignedTo()))
+                    .forEach(ai -> {
+                        ai.setStatus(ActionItem.Status.RESOLVED);
+                        ai.setResolutionNote("Reassigned to another review assistant");
+                        ai.setResolvedAt(LocalDateTime.now());
+                        ai.setResolvedBy(assignerId);
+                        actionItemRepository.save(ai);
+                    });
+        }
+
+        // Create ActionItem for the review assistant — their inbox entry
+        // navContext → scrolls directly to this question on the review page
+        ActionItem item = ActionItem.builder()
+                .tenantId(tenantId)
+                .createdBy(assignerId)
+                .assignedTo(reviewAssistantId)
+                .sourceType(ActionItem.SourceType.SYSTEM)
+                .sourceId(questionInstanceId)
+                .entityType(ActionItem.EntityType.QUESTION_RESPONSE)
+                .entityId(questionInstanceId)
+                .title(qi.getQuestionTextSnapshot()
+                        .substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
+                .status(ActionItem.Status.OPEN)
+                .priority(ActionItem.Priority.MEDIUM)
+                .remediationType("REVIEWER_ASSIGNMENT")
+                .build();
+        actionItemRepository.save(item);
+
+        String navCtx = String.format(
+                "{\"assigneeRoute\":\"/assessments/%d/review?questionInstanceId=%d\"" +
+                        ",\"reviewerRoute\":\"/assessments/%d/review\"" +
+                        ",\"questionInstanceId\":%d,\"assessmentId\":%d}",
+                assessmentId, questionInstanceId,
+                assessmentId, questionInstanceId, assessmentId);
+        item.setNavContext(navCtx);
+        actionItemRepository.save(item);
+
+        notificationService.send(reviewAssistantId, "QUESTION_ASSIGNED_FOR_REVIEW",
+                "You have been assigned a question to evaluate",
+                "QUESTION_RESPONSE", questionInstanceId);
 
         String name = userRepository.findById(reviewAssistantId)
                 .map(u -> {
@@ -1699,13 +1857,13 @@ public class AssessmentController {
                     return full.isEmpty() ? u.getEmail() : full;
                 }).orElse(null);
 
-        log.info("[REVIEWER-ASSIGN] qi={} → userId={} | assessmentId={}",
-                questionInstanceId, reviewAssistantId, assessmentId);
+        log.info("[REVIEWER-ASSIGN] qi={} → userId={} | assessmentId={} | actionItemId={}",
+                questionInstanceId, reviewAssistantId, assessmentId, item.getId());
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "assessmentId",           assessmentId,
-                "questionInstanceId",     questionInstanceId,
-                "reviewerAssignedUserId", reviewAssistantId,
+                "assessmentId",             assessmentId,
+                "questionInstanceId",       questionInstanceId,
+                "reviewerAssignedUserId",   reviewAssistantId,
                 "reviewerAssignedUserName", name != null ? name : ""
         )));
     }
@@ -1729,6 +1887,27 @@ public class AssessmentController {
 
         qi.setReviewerAssignedUserId(null);
         questionInstanceRepository.save(qi);
+
+        Long tenantId   = utilityService.getLoggedInDataContext().getTenantId();
+        Long unassignerId = utilityService.getLoggedInDataContext().getId();
+
+        // Close any open REVIEWER_ASSIGNMENT items for this question
+        if (qi.getReviewerAssignedUserId() != null) {
+            actionItemRepository.findAll(
+                            ActionItemSpecification.forTenant(tenantId)
+                                    .and(ActionItemSpecification.forEntity(
+                                            ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+                                    .and(ActionItemSpecification.open())
+                    ).stream()
+                    .filter(ai -> "REVIEWER_ASSIGNMENT".equals(ai.getRemediationType()))
+                    .forEach(ai -> {
+                        ai.setStatus(ActionItem.Status.RESOLVED);
+                        ai.setResolutionNote("Review assistant assignment removed");
+                        ai.setResolvedAt(LocalDateTime.now());
+                        ai.setResolvedBy(unassignerId);
+                        actionItemRepository.save(ai);
+                    });
+        }
 
         log.info("[REVIEWER-UNASSIGN] qi={} | assessmentId={}", questionInstanceId, assessmentId);
 
@@ -1763,7 +1942,7 @@ public class AssessmentController {
         }
 
         AssessmentResponse response = responseRepository
-                .findByAssessmentIdAndQuestionInstanceId(assessmentId, questionInstanceId)
+                .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, questionInstanceId)
                 .orElseGet(() -> {
                     // Question may not have a response yet (unanswered) — create a shell record
                     Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -1777,6 +1956,26 @@ public class AssessmentController {
 
         response.setReviewerStatus(verdict.toUpperCase());
         responseRepository.save(response);
+
+        // Auto-resolve open REVIEWER_ASSIGNMENT action items for this question
+        // when the review assistant saves their evaluation verdict.
+        // Same pattern as CONTRIBUTOR_ASSIGNMENT resolution in submitAnswer.
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        actionItemRepository.findAll(
+                        ActionItemSpecification.forTenant(tenantId)
+                                .and(ActionItemSpecification.assignedTo(userId))
+                                .and(ActionItemSpecification.forEntity(
+                                        ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+                                .and(ActionItemSpecification.open())
+                ).stream()
+                .filter(ai -> "REVIEWER_ASSIGNMENT".equals(ai.getRemediationType()))
+                .forEach(ai -> {
+                    ai.setStatus(ActionItem.Status.RESOLVED);
+                    ai.setResolutionNote("Question evaluated by review assistant");
+                    ai.setResolvedAt(LocalDateTime.now());
+                    ai.setResolvedBy(userId);
+                    actionItemRepository.save(ai);
+                });
 
         log.info("[REVIEWER-EVAL] {} | assessmentId={} | qi={} | by={}",
                 verdict.toUpperCase(), assessmentId, questionInstanceId, userId);
@@ -1986,8 +2185,39 @@ public class AssessmentController {
             throw new com.kashi.grc.common.exception.ValidationException(
                     "QuestionInstance does not belong to assessment " + assessmentId);
 
+        Long prevContributorId = qi.getAssignedUserId();
         qi.setAssignedUserId(null);
         questionInstanceRepository.save(qi);
+
+        if (prevContributorId != null) {
+            Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+            Long unassignerId = utilityService.getLoggedInDataContext().getId();
+
+            // Close the contributor's open CONTRIBUTOR_ASSIGNMENT ActionItem for this question
+            actionItemRepository.findAll(
+                            ActionItemSpecification.forTenant(tenantId)
+                                    .and(ActionItemSpecification.forEntity(
+                                            ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+                                    .and(ActionItemSpecification.open())
+                    ).stream()
+                    .filter(ai -> "CONTRIBUTOR_ASSIGNMENT".equals(ai.getRemediationType())
+                            && prevContributorId.equals(ai.getAssignedTo()))
+                    .forEach(ai -> {
+                        ai.setStatus(ActionItem.Status.RESOLVED);
+                        ai.setResolutionNote("Contributor unassigned from question");
+                        ai.setResolvedAt(LocalDateTime.now());
+                        ai.setResolvedBy(unassignerId);
+                        actionItemRepository.save(ai);
+                    });
+
+            // Legacy sub-task cleanup
+            long remaining = questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId)
+                    .stream().filter(q -> prevContributorId.equals(q.getAssignedUserId())).count();
+            if (remaining == 0) {
+                closeContributorTask(assessmentId, prevContributorId,
+                        "All assigned questions removed — contributor access revoked");
+            }
+        }
 
         log.info("[UNASSIGN] Question unassigned | questionInstanceId={} | assessmentId={}",
                 questionInstanceId, assessmentId);
@@ -2076,45 +2306,90 @@ public class AssessmentController {
      */
     private void doAssignQuestion(AssessmentQuestionInstance qi, Long contributorId,
                                   Long assessmentId, Long assignerId) {
-        // Already assigned to the same user — idempotent
-        if (contributorId.equals(qi.getAssignedUserId())) return;
+        if (contributorId.equals(qi.getAssignedUserId())) return; // idempotent
 
+        Long prevContributorId = qi.getAssignedUserId();
         qi.setAssignedUserId(contributorId);
         questionInstanceRepository.save(qi);
 
-        // Ensure the contributor has a sub-task on the active FILL step instance.
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        VendorAssessment va = assessmentRepository.findById(assessmentId).orElse(null);
-        if (va == null) return;
-        VendorAssessmentCycle cycle = cycleRepository.findById(va.getCycleId()).orElse(null);
-        if (cycle == null || cycle.getWorkflowInstanceId() == null) return;
 
-        // Find active FILL step instance for this workflow
-        StepInstance fillStep = stepInstanceRepository
-                .findByWorkflowInstanceIdOrderByCreatedAtAsc(cycle.getWorkflowInstanceId())
-                .stream()
-                .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL
-                        && si.getStatus() == com.kashi.grc.workflow.enums.StepStatus.IN_PROGRESS)
-                .findFirst().orElse(null);
-        if (fillStep == null) return;
+        // ── Reassignment cleanup ──────────────────────────────────────────────────
+        if (prevContributorId != null && !prevContributorId.equals(contributorId)) {
 
-        // Check if the contributor already has a sub-task on this step
-        boolean alreadyHasTask = taskInstanceRepository.findByStepInstanceId(fillStep.getId())
-                .stream()
-                .anyMatch(t -> contributorId.equals(t.getAssignedUserId())
-                        && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
-                        || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS));
+            // Close the previous contributor's open CONTRIBUTOR_ASSIGNMENT item
+            // for this specific question
+            actionItemRepository.findAll(
+                            ActionItemSpecification.forTenant(tenantId)
+                                    .and(ActionItemSpecification.forEntity(
+                                            ActionItem.EntityType.QUESTION_RESPONSE, qi.getId()))
+                                    .and(ActionItemSpecification.open())
+                    ).stream()
+                    .filter(ai -> "CONTRIBUTOR_ASSIGNMENT".equals(ai.getRemediationType())
+                            && prevContributorId.equals(ai.getAssignedTo()))
+                    .forEach(ai -> {
+                        ai.setStatus(ActionItem.Status.RESOLVED);
+                        ai.setResolutionNote("Reassigned to another contributor");
+                        ai.setResolvedAt(LocalDateTime.now());
+                        ai.setResolvedBy(assignerId);
+                        actionItemRepository.save(ai);
+                    });
 
-        if (!alreadyHasTask) {
-            // Create sub-task — appears in contributor's inbox
-            workflowEngineService.createSubTask(
-                    fillStep, contributorId,
-                    com.kashi.grc.workflow.enums.TaskRole.ACTOR,
-                    tenantId,
-                    "Assigned questions to answer by " + assignerId);
-            log.info("[CONTRIBUTOR] Sub-task created | contributorId={} | assessmentId={} | stepInstanceId={}",
-                    contributorId, assessmentId, fillStep.getId());
+            // Legacy sub-task cleanup — close if previous contributor has no
+            // remaining questions anywhere in this assessment
+            long remaining = questionInstanceRepository
+                    .findByAssessmentIdOrderByOrderNo(assessmentId)
+                    .stream()
+                    .filter(q -> prevContributorId.equals(q.getAssignedUserId()))
+                    .count();
+            if (remaining == 0) {
+                closeContributorTask(assessmentId, prevContributorId,
+                        "All questions reassigned to another contributor");
+            }
         }
+
+        // ── Create ActionItem for the new contributor ─────────────────────────────
+        // One ActionItem per question — this is the contributor's trackable inbox item.
+        // Does NOT include openWork=1. Section lock still applies — the contributor
+        // sees read-only if the section was submitted before they answer.
+        // openWork=1 is reserved exclusively for REVISION_REQUEST (formal re-answer bypass).
+        //
+        // navContext references the ActionItem's own ID so the fill page can resolve
+        // isAssignmentEntry correctly (separate from isRevisionEntry).
+        // We save twice: first to get the generated ID, then to write navContext with it.
+
+        ActionItem item = ActionItem.builder()
+                .tenantId(tenantId)
+                .createdBy(assignerId)
+                .assignedTo(contributorId)
+                .sourceType(ActionItem.SourceType.SYSTEM)
+                .sourceId(qi.getId())
+                .entityType(ActionItem.EntityType.QUESTION_RESPONSE)
+                .entityId(qi.getId())
+                .title(qi.getQuestionTextSnapshot()
+                        .substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
+                .status(ActionItem.Status.OPEN)
+                .priority(ActionItem.Priority.MEDIUM)
+                .remediationType("CONTRIBUTOR_ASSIGNMENT")
+                .build();
+        actionItemRepository.save(item); // generates item.getId()
+
+        String navCtx = String.format(
+                "{\"assigneeRoute\":\"/vendor/assessments/%d/fill" +
+                        "?actionItemId=%d&questionInstanceId=%d\"" +
+                        ",\"reviewerRoute\":\"/vendor/assessments/%d/fill\"" +
+                        ",\"questionInstanceId\":%d,\"assessmentId\":%d}",
+                assessmentId, item.getId(), qi.getId(),
+                assessmentId, qi.getId(), assessmentId);
+        item.setNavContext(navCtx);
+        actionItemRepository.save(item);
+
+        notificationService.send(contributorId, "QUESTION_ASSIGNED",
+                "You have been assigned a question to answer",
+                "QUESTION_RESPONSE", qi.getId());
+
+        log.info("[CONTRIBUTOR] ActionItem created | itemId={} | contributorId={} | qi={} | assessmentId={}",
+                item.getId(), contributorId, qi.getId(), assessmentId);
     }
 
     @GetMapping("/v1/assessments/{assessmentId}/my-sections")
@@ -2140,7 +2415,7 @@ public class AssessmentController {
                                             .stream()
                                             .map(qi -> {
                                                 var responseOpt = responseRepository
-                                                        .findByAssessmentIdAndQuestionInstanceId(assessmentId, qi.getId());
+                                                        .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
 
                                                 List<OptionInstanceResponse> options =
                                                         optionInstanceRepository
@@ -2264,7 +2539,7 @@ public class AssessmentController {
                         .stream()
                         .map(qi -> {
                             var responseOpt = responseRepository
-                                    .findByAssessmentIdAndQuestionInstanceId(assessmentId, qi.getId());
+                                    .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
                             AnswerResponse answer = responseOpt.map(r -> {
                                 java.util.List<Long> multiIds = null;
                                 if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
@@ -2321,6 +2596,41 @@ public class AssessmentController {
     // ══════════════════════════════════════════════════════════════
     // STEP-GATED ACCESS GUARD — private helper
     // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Closes a contributor's sub-task on the active FILL step when they have no
+     * remaining questions. Used by unassign and reassign flows.
+     * Sets TaskStatus.REJECTED directly — bypasses performAction to avoid
+     * step-level rejection logic (we only want to remove this sub-task from inbox).
+     */
+    private void closeContributorTask(Long assessmentId, Long contributorId, String reason) {
+        VendorAssessment va = assessmentRepository.findById(assessmentId).orElse(null);
+        if (va == null) return;
+        VendorAssessmentCycle cycle = cycleRepository.findById(va.getCycleId()).orElse(null);
+        if (cycle == null || cycle.getWorkflowInstanceId() == null) return;
+
+        stepInstanceRepository
+                .findByWorkflowInstanceIdOrderByCreatedAtAsc(cycle.getWorkflowInstanceId())
+                .stream()
+                .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL
+                        && si.getStatus() == com.kashi.grc.workflow.enums.StepStatus.IN_PROGRESS)
+                .findFirst()
+                .ifPresent(fillStep ->
+                        taskInstanceRepository.findByStepInstanceId(fillStep.getId())
+                                .stream()
+                                .filter(t -> contributorId.equals(t.getAssignedUserId())
+                                        && (t.getStatus() == TaskStatus.PENDING
+                                        || t.getStatus() == TaskStatus.IN_PROGRESS))
+                                .forEach(t -> {
+                                    t.setStatus(TaskStatus.REJECTED);
+                                    t.setActedAt(java.time.LocalDateTime.now());
+                                    t.setRemarks(reason);
+                                    taskInstanceRepository.save(t);
+                                    log.info("[CONTRIBUTOR-TASK] Closed | contributorId={} | taskId={} | reason={}",
+                                            contributorId, t.getId(), reason);
+                                })
+                );
+    }
 
     /**
      * Asserts that the current user has an active (PENDING or IN_PROGRESS) task

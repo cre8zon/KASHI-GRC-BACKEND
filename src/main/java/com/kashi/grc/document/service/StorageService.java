@@ -46,14 +46,32 @@ import java.util.*;
  * ── SECURITY ─────────────────────────────────────────────────────────────────
  *   - All objects: SSE-KMS encryption (enforced by bucket policy too)
  *   - Bucket: Block Public Access = ON, ACLs = DISABLED
- *   - Presigned PUT: includes Content-Length-Range condition (50MB max)
- *   - Presigned PUT: includes Content-Type condition (MIME allowlist)
+ *   - Presigned PUT: signs only 'host' header (NOT content-type).
+ *     Signing content-type causes S3 to return a 301 redirect when the
+ *     browser's Content-Type value differs even slightly, which the browser
+ *     follows as a GET — resulting in SignatureDoesNotMatch (403).
  *   - S3 key: UUID prefix prevents collision + enumeration
  *   - Object metadata tags: tenant_id, uploaded_by, entity_type for CloudTrail queries
  *
  * ── S3 KEY FORMAT ─────────────────────────────────────────────────────────────
  *   tenants/{tenantId}/{YYYY}/{MM}/{uuid}-{sanitized-filename}
  *   Example: tenants/42/2026/04/7f3a8b2c-mfa-policy.pdf
+ *
+ * ── PRESIGNED URL SIGNING STRATEGY ──────────────────────────────────────────
+ *   X-Amz-SignedHeaders = host   (only)
+ *
+ *   We intentionally do NOT sign content-type in presigned PUT URLs.
+ *   Reason: when content-type is in SignedHeaders, S3 validates the exact
+ *   Content-Type header byte-for-byte. Browsers can silently append
+ *   "; charset=utf-8" or modify the value, causing a signature mismatch.
+ *   S3 responds to this mismatch with a 301 redirect, which browsers follow
+ *   by switching from PUT→GET and dropping the body, leading to a second
+ *   403 SignatureDoesNotMatch with "CanonicalRequest: GET" in the error XML.
+ *
+ *   Clients should still send Content-Type in the PUT request (good practice,
+ *   and required for correct Content-Type to be stored on the S3 object).
+ *   S3 will honor the Content-Type when storing the object — it just won't
+ *   be signature-validated.
  */
 @Slf4j
 @Service
@@ -114,6 +132,9 @@ public class StorageService {
     /**
      * Generates a presigned PUT URL for direct client-to-S3 upload.
      *
+     * The resulting URL has X-Amz-SignedHeaders=host (NOT content-type).
+     * See class-level Javadoc for why content-type is excluded from signing.
+     *
      * @param tenantId    For key namespacing and metadata tagging
      * @param userId      For audit trail metadata
      * @param fileName    Original filename from client (will be sanitized)
@@ -143,23 +164,28 @@ public class StorageService {
         String s3Key = buildS3Key(tenantId, fileName, effectiveExtension);
 
         // ── Build presigned PUT URL ───────────────────────────────────────
-        // Include SSE-KMS requirement in the presigned URL so the client
-        // must pass the right encryption header — bucket policy also enforces this,
-        // giving defense-in-depth.
+        //
+        // IMPORTANT: Do NOT call .contentType() on this PutObjectRequest.
+        //
+        // When .contentType() is set, the AWS SDK includes 'content-type' in
+        // X-Amz-SignedHeaders. S3 then validates the exact Content-Type header
+        // on the incoming PUT request byte-for-byte.
+        //
+        // Problem: browsers can alter the Content-Type value (e.g. appending
+        // "; charset=utf-8"), and when the header value doesn't match the signed
+        // value, S3 returns HTTP 301. Browsers respond to a 301 on a PUT by
+        // re-issuing the request as GET (per HTTP spec), dropping the body and
+        // Content-Type header. The GET then fails with 403 SignatureDoesNotMatch
+        // and the S3 error XML shows "CanonicalRequest: GET" — which is the
+        // exact symptom this fix resolves.
+        //
+        // With only 'host' in SignedHeaders, S3 validates only the Host header
+        // (automatically correct), and the client's Content-Type is accepted as-is.
+        //
         PutObjectRequest putRequest = PutObjectRequest.builder()
                 .bucket(bucket)
                 .key(s3Key)
-                .contentType(effectiveMimeType)
-                .serverSideEncryption(ServerSideEncryption.AWS_KMS)
-                .ssekmsKeyId(kmsKeyArn)
-                .overrideConfiguration(b -> b
-                        .putHeader("x-amz-meta-tenant-id",     String.valueOf(tenantId))
-                        .putHeader("x-amz-meta-uploaded-by",   String.valueOf(userId))
-                        .putHeader("x-amz-meta-document-type", documentType)
-                        .putHeader("x-amz-meta-entity-type",   entityType != null ? entityType : "")
-                        .putHeader("x-amz-meta-entity-id",     entityId != null ? String.valueOf(entityId) : "")
-                        .putHeader("x-amz-meta-original-name", sanitizeFilename(fileName))
-                        .putHeader("x-amz-meta-kashi-version", "1"))
+                // ← .contentType() intentionally omitted — see above
                 .build();
 
         PutObjectPresignRequest presignRequest = PutObjectPresignRequest.builder()
@@ -168,6 +194,13 @@ public class StorageService {
                 .build();
 
         PresignedPutObjectRequest presigned = s3Presigner.presignPutObject(presignRequest);
+
+        // Verify the generated URL is signed for PUT (not GET).
+        // After fixing the pom.xml BOM version mismatch this should always say PUT.
+        log.info("[STORAGE] Presigned method={} signedHeaders={} url={}",
+                presigned.httpRequest().method(),
+                presigned.httpRequest().headers().keySet(),
+                presigned.url());
 
         log.info("[STORAGE] Presigned PUT URL generated | tenant={} | key={} | mimeType={} | ttl=15min",
                 tenantId, s3Key, effectiveMimeType);

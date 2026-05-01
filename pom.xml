@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project xmlns="http://maven.apache.org/POM/4.0.0"
-		 xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-		 xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
 	<modelVersion>4.0.0</modelVersion>
 	<parent>
 		<groupId>org.springframework.boot</groupId>
@@ -30,16 +30,16 @@
 
 	<dependencyManagement>
 
-	  <dependencies>
-	    <dependency>
-	      <groupId>software.amazon.awssdk</groupId>
+		<dependencies>
+			<dependency>
+				<groupId>software.amazon.awssdk</groupId>
 
-	      <artifactId>bom</artifactId>
-	      <version>2.26.29</version>
-	      <type>pom</type>
-	     <scope>import</scope>
-	    </dependency>
-	  </dependencies>
+				<artifactId>bom</artifactId>
+				<version>2.27.21</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
+		</dependencies>
 	</dependencyManagement>
 
 	<dependencies>
@@ -168,28 +168,27 @@
 		<dependency>
 			<groupId>software.amazon.awssdk</groupId>
 			<artifactId>s3</artifactId>
-			<version>${aws.sdk.version}</version>
 		</dependency>
 		<!-- TwelveMonkeys ImageIO for JPEG/TIFF/HEIC read support -->
 		<dependency>
-		  <groupId>com.twelvemonkeys.imageio</groupId>
-		  <artifactId>imageio-core</artifactId>
-		  <version>3.10.1</version>
+			<groupId>com.twelvemonkeys.imageio</groupId>
+			<artifactId>imageio-core</artifactId>
+			<version>3.10.1</version>
 		</dependency>
 		<dependency>
-		  <groupId>com.twelvemonkeys.imageio</groupId>
-		  <artifactId>imageio-jpeg</artifactId>
-		  <version>3.10.1</version>
+			<groupId>com.twelvemonkeys.imageio</groupId>
+			<artifactId>imageio-jpeg</artifactId>
+			<version>3.10.1</version>
 		</dependency>
 		<dependency>
-		  <groupId>com.twelvemonkeys.imageio</groupId>
-		  <artifactId>imageio-tiff</artifactId>
-		  <version>3.10.1</version>
+			<groupId>com.twelvemonkeys.imageio</groupId>
+			<artifactId>imageio-tiff</artifactId>
+			<version>3.10.1</version>
 		</dependency>
 		<dependency>
-		  <groupId>com.twelvemonkeys.imageio</groupId>
-		  <artifactId>imageio-webp</artifactId>
-		  <version>3.10.1</version>
+			<groupId>com.twelvemonkeys.imageio</groupId>
+			<artifactId>imageio-webp</artifactId>
+			<version>3.10.1</version>
 		</dependency>
 		<dependency>
 			<groupId>io.minio</groupId>

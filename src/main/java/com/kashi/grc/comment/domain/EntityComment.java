@@ -88,8 +88,10 @@ public class EntityComment extends TenantAwareEntity {
     }
 
     public enum Visibility {
-        ALL,        // all workflow participants
-        INTERNAL,   // org side only
-        CISO_ONLY   // vendor CISO + org side (not responders/contributors)
+        ALL,             // all workflow participants (both sides see this)
+        INTERNAL,        // org side only — never visible to vendor
+        CISO_ONLY,       // vendor CISO + org side (not responders/contributors)
+        VENDOR_INTERNAL  // vendor side only — NEVER visible to org reviewers
+        // used for responder↔contributor internal discussion
     }
 }

@@ -161,7 +161,7 @@ public class UserServiceImpl implements UserService {
 
     @Override
     @Transactional(readOnly = true)
-    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles) {
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -169,6 +169,16 @@ public class UserServiceImpl implements UserService {
         boolean isSystemUser = loggedInUser.getRoles().stream()
                 .anyMatch(r -> r.getSide() != null &&
                         r.getSide().name().equals("SYSTEM"));
+
+        // Determine the effective vendorId for scoping:
+        //   1. Vendor-side users are ALWAYS scoped to their own vendor (security gate).
+        //      Their loggedInUser.getVendorId() is the authoritative value — ignore any
+        //      client-supplied param so a malicious actor can't request another vendor's users.
+        //   2. Org/System callers may pass vendorId to drill into a specific vendor's team.
+        boolean isVendorUser = loggedInUser.getVendorId() != null;
+        final Long effectiveVendorId = isVendorUser
+                ? loggedInUser.getVendorId()   // always enforce their own vendor
+                : vendorIdParam;               // org/system: use supplied param (may be null)
 
         // Parse RoleSide enum safely
         com.kashi.grc.usermanagement.domain.RoleSide roleSide = null;
@@ -193,8 +203,17 @@ public class UserServiceImpl implements UserService {
                     // Filter by role side — only users who have at least one role with this side
                     if (finalRoleSide != null) {
                         if (finalRoleSide == com.kashi.grc.usermanagement.domain.RoleSide.VENDOR) {
-                            // VENDOR side — primary gate is vendor_id
+                            // VENDOR side — must have a vendor_id (i.e. be a vendor user)
                             predicates.add(cb.isNotNull(root.get("vendorId")));
+                            // ── VENDOR SCOPING FIX ──────────────────────────────────────────
+                            // Scope to a specific vendor:
+                            //   • Vendor-side callers: always their own vendorId (enforced above).
+                            //   • Org/System callers: only when vendorId param was supplied
+                            //     (e.g. org-admin viewing a vendor's team tab).
+                            // Without this, ANY vendor user could see all vendors' users.
+                            if (effectiveVendorId != null) {
+                                predicates.add(cb.equal(root.get("vendorId"), effectiveVendorId));
+                            }
                         } else {
                             // ORG/SYSTEM/AUDITOR/AUDITEE — no vendor_id
                             predicates.add(cb.isNull(root.get("vendorId")));
@@ -210,6 +229,9 @@ public class UserServiceImpl implements UserService {
                                 predicates.add(cb.exists(sub));
                             }
                         }
+                    } else if (effectiveVendorId != null) {
+                        // No side filter but vendorId given — scope to that vendor regardless
+                        predicates.add(cb.equal(root.get("vendorId"), effectiveVendorId));
                     }
                     return predicates;
                 },

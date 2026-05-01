@@ -15,14 +15,29 @@ public class VendorAssessmentResponse {
     private Long templateInstanceId;
     private Long vendorId;
     private String vendorName;
-    private String templateName; // still populated from snapshot
+    private String templateName;
     private String status;
+    private Integer cycleNo;
+    private Long workflowInstanceId;
+
+    // Scoring
+    private Double totalEarnedScore;
+    private Double totalPossibleScore;
+
+    // Risk
+    private String riskRating;
+    private String reviewFindings;
+
+    // Timestamps
     private LocalDateTime submittedAt;
+    private LocalDateTime completedAt;
+
+    // Report
+    private String reportUrl;
+
     private Map<String, Object> progress;
     private List<SectionInstanceResponse> sections;
 
-    // Report summary fields — populated by /review endpoint so CISO can see
-    // risk rating and open remediations in the report panel before sign-off
-    private String  riskRating;
+    // Report summary fields
     private Integer openRemediationCount;
 }
