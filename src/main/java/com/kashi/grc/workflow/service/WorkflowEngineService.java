@@ -683,9 +683,28 @@ public class WorkflowEngineService {
     }
 
     // ── SEND_BACK — supports N steps back via targetStepId ───────────────────
+    // IMPORTANT: Send Back is a nuclear operation — it rolls back the ENTIRE step,
+    // cancels all other actors' tasks, and restarts from a previous step.
+    // This is restricted to ORG_ADMIN / ORG_OWNER only.
+    // All other roles should use Action Items (Revision Request / Remediation Request / Reopen Section).
 
     private WorkflowInstanceResponse handleSendBack(TaskInstance task, StepInstance stepInstance,
                                                     WorkflowInstance instance, TaskActionRequest req, Long performedBy) {
+
+        // Role guard — only ORG_ADMIN / ORG_OWNER may roll back a workflow step.
+        // Use roleRepository.findByNameAndSide to avoid lazy-loading User.roles.
+        Long tenantId = instance.getTenantId();
+        boolean isAdmin = java.util.stream.Stream.of("ORG_ADMIN", "ORG_OWNER")
+                .map(name -> roleRepository.findByNameAndSide(name, com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION))
+                .filter(java.util.Optional::isPresent)
+                .map(java.util.Optional::get)
+                .anyMatch(r -> dbRepository.findUserIdsByRoleAndTenant(r.getId(), tenantId).contains(performedBy));
+        if (!isAdmin) {
+            throw new BusinessException("SEND_BACK_NOT_AUTHORIZED",
+                    "Only ORG_ADMIN or ORG_OWNER can roll back a workflow step. " +
+                            "Use Revision Request, Reopen Section, or Remediation Request for content-level corrections.",
+                    HttpStatus.FORBIDDEN);
+        }
 
         log.info("[WORKFLOW-ACTION] SEND_BACK | instanceId={} | from='{}' | targetStepId={}",
                 instance.getId(), stepInstance.getSnapName(), req.getTargetStepId());

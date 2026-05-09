@@ -125,6 +125,7 @@ public class AssessmentController {
     private final ActionItemRepository                   actionItemRepository;
     private final NotificationService                    notificationService;
     private final com.kashi.grc.document.repository.DocumentLinkRepository documentLinkRepository;
+    private final com.kashi.grc.comment.repository.EntityCommentRepository entityCommentRepository;
 
     // ── 9.1 Execute Assessment (logic unchanged) ───────────────────────────────
 
@@ -1289,16 +1290,17 @@ public class AssessmentController {
         Long userId = utilityService.getLoggedInDataContext().getId();
         User currentUser = utilityService.getLoggedInDataContext();
 
-        // Only CISO/VRM/ORG_ADMIN can reopen
-        boolean canReopen = currentUser.getRoles().stream().anyMatch(r ->
-                r.getSide() == com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION
-                        || "VENDOR_CISO".equals(r.getName())
-                        || "VENDOR_VRM".equals(r.getName())
-                        || r.getSide() == com.kashi.grc.usermanagement.domain.RoleSide.SYSTEM);
+        // Only VENDOR_CISO and VENDOR_VRM can reopen a submitted section.
+        // Org-side users should raise a Revision Request instead — that keeps the
+        // audit trail clean and avoids giving the org unilateral access to the vendor's submission.
+        boolean canReopen = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "VENDOR_CISO".equals(name) || "VENDOR_VRM".equals(name);
+        });
 
         if (!canReopen) {
             throw new BusinessException("ACCESS_DENIED",
-                    "Only CISO, VRM or Org Admin can reopen a submitted section.",
+                    "Only VENDOR_CISO or VENDOR_VRM can reopen a submitted section.",
                     HttpStatus.FORBIDDEN);
         }
 
@@ -1323,6 +1325,88 @@ public class AssessmentController {
 
         log.info("[SECTION-REOPEN] Section reopened | sectionInstanceId={} | assessmentId={} | by={}",
                 sectionInstanceId, assessmentId, userId);
+
+        // Revert the responder's FILL-step task from APPROVED back to IN_PROGRESS
+        // so they can access the fill page again through their task inbox.
+        // Without this, their task stays APPROVED and they have no way to navigate
+        // back to the fill page from their inbox.
+        if (section.getAssignedUserId() != null) {
+            try {
+                VendorAssessment assessment = assessmentRepository.findById(assessmentId).orElse(null);
+                if (assessment != null && assessment.getCycleId() != null) {
+                    cycleRepository.findById(assessment.getCycleId()).ifPresent(cycle -> {
+                        if (cycle.getWorkflowInstanceId() != null) {
+                            stepInstanceRepository.findByWorkflowInstanceIdOrderByCreatedAtAsc(
+                                            cycle.getWorkflowInstanceId())
+                                    .stream()
+                                    .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL)
+                                    .findFirst()
+                                    .ifPresent(fillStep -> {
+                                        taskInstanceRepository.findByStepInstanceId(fillStep.getId())
+                                                .stream()
+                                                .filter(t -> section.getAssignedUserId().equals(t.getAssignedUserId())
+                                                        && t.getTaskRole() == com.kashi.grc.workflow.enums.TaskRole.ACTOR
+                                                        && t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.APPROVED)
+                                                .forEach(t -> {
+                                                    t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS);
+                                                    t.setActedAt(null);
+                                                    t.setRemarks("Section reopened — responder needs to resubmit");
+                                                    taskInstanceRepository.save(t);
+                                                    log.info("[SECTION-REOPEN] Responder task reverted to IN_PROGRESS | taskId={} | responderUserId={}",
+                                                            t.getId(), section.getAssignedUserId());
+                                                });
+                                    });
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                log.warn("[SECTION-REOPEN] Could not revert task status: {}", e.getMessage());
+            }
+        }
+
+        // Notify the responder and post an activity comment
+        if (section.getAssignedUserId() != null && !section.getAssignedUserId().equals(userId)) {
+            // Resolve reopener name from userRepository (resolveUserName is in CommentService, not here)
+            String reopenerName = userRepository.findById(userId).map(u -> {
+                String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                String full = (fn + " " + ln).trim();
+                return full.isEmpty() ? u.getEmail() : full;
+            }).orElse("Someone");
+
+            String sectionName = section.getSectionNameSnapshot() != null
+                    ? section.getSectionNameSnapshot() : "a section";
+
+            notificationService.send(
+                    section.getAssignedUserId(),
+                    "SECTION_REOPENED",
+                    reopenerName + " has unlocked \"" + sectionName + "\" — please review and resubmit.",
+                    "SECTION_INSTANCE", sectionInstanceId
+            );
+
+            // Post a VENDOR_INTERNAL system comment on the section's first question
+            // so the activity tab shows who unlocked it and when
+            questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sectionInstanceId)
+                    .stream().findFirst().ifPresent(qi -> {
+                        try {
+                            Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+                            com.kashi.grc.comment.domain.EntityComment note =
+                                    com.kashi.grc.comment.domain.EntityComment.builder()
+                                            .tenantId(tenantId)
+                                            .entityType(com.kashi.grc.comment.domain.EntityComment.EntityType.QUESTION_RESPONSE)
+                                            .entityId(qi.getId())
+                                            .questionInstanceId(qi.getId())
+                                            .createdBy(userId)
+                                            .commentText("Section unlocked by " + reopenerName + " — please update your answers and resubmit.")
+                                            .commentType(com.kashi.grc.comment.domain.EntityComment.CommentType.SYSTEM)
+                                            .visibility(com.kashi.grc.comment.domain.EntityComment.Visibility.VENDOR_INTERNAL)
+                                            .build();
+                            entityCommentRepository.save(note);
+                        } catch (Exception e) {
+                            log.warn("[SECTION-REOPEN] Could not post system comment: {}", e.getMessage());
+                        }
+                    });
+        }
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "sectionInstanceId", sectionInstanceId,
