@@ -13,6 +13,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -33,20 +34,27 @@ public class VendorRiskService {
         vendor.setCurrentRiskScore(score);
         vendorRepository.save(vendor);
 
-        Optional<RiskTemplateMapping> mapping = mappingRepository.findByScore(score);
-        Map<String, Object> recommendedTier = null;
+        // Derive tier label from the DB mapping rows — single source of truth.
+        // findAllByScore returns all rows whose range covers this score;
+        // they all share the same tierLabel so grabbing the first is sufficient.
+        List<RiskTemplateMapping> matches = mappingRepository.findAllByScore(score);
+        String tierLabel = matches.isEmpty() ? null : matches.get(0).getTierLabel();
+
+        Map<String, Object> recommendedTier     = null;
         Map<String, Object> recommendedTemplate = null;
-        if (mapping.isPresent()) {
-            var m = mapping.get();
+        if (!matches.isEmpty()) {
+            var m = matches.get(0);
             recommendedTier = Map.of(
-                "tierId",    m.getTierId() != null ? m.getTierId() : 0,
-                "tierLabel", m.getTierLabel() != null ? m.getTierLabel() : "");
+                    "tierId",    m.getTierId() != null ? m.getTierId() : 0,
+                    "tierLabel", tierLabel != null ? tierLabel : "");
             recommendedTemplate = Map.of("templateId", m.getTemplateId());
         }
+
         return RiskScoreResponse.builder()
                 .vendorId(vendor.getId()).vendorName(vendor.getName())
                 .previousRiskScore(previous).newRiskScore(score)
-                .riskClassification(classifyScore(score))
+                // Tier label comes from DB — no hardcoded boundaries here
+                .riskClassification(tierLabel != null ? tierLabel : classifyScoreFallback(score))
                 .scoreBreakdown(breakdown(vendor.getDataAccessLevel(),
                         vendor.getRiskClassification(), vendor.getCriticality(), vendor.getIndustry()))
                 .recommendedTier(recommendedTier).recommendedTemplate(recommendedTemplate)
@@ -82,11 +90,19 @@ public class VendorRiskService {
         return BigDecimal.valueOf(score).setScale(2, RoundingMode.HALF_UP);
     }
 
-    private String classifyScore(BigDecimal score) {
+    /**
+     * Fallback classification used only when no risk_template_mapping rows exist yet
+     * (e.g. fresh install before the platform admin has saved any mappings).
+     * This should never be called in a configured system — the DB rows are the
+     * source of truth for tier boundaries.
+     */
+    private String classifyScoreFallback(BigDecimal score) {
+        log.warn("[RISK] No mapping rows found for score={} — using fallback classification. " +
+                "Configure risk-template-mappings to remove this warning.", score);
         double v = score.doubleValue();
-        if (v >= 85) return "CRITICAL";
-        if (v >= 60) return "HIGH";
-        if (v >= 25) return "MEDIUM";
+        if (v > 75) return "CRITICAL";
+        if (v > 50) return "HIGH";
+        if (v > 25) return "MEDIUM";
         return "LOW";
     }
 

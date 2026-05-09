@@ -4,8 +4,10 @@ import com.kashi.grc.assessment.domain.*;
 import com.kashi.grc.assessment.repository.*;
 import com.kashi.grc.vendor.domain.RiskTemplateMapping;
 import com.kashi.grc.vendor.domain.Vendor;
+import com.kashi.grc.vendor.domain.VendorTemplateSelection;
 import com.kashi.grc.vendor.repository.RiskTemplateMappingRepository;
 import com.kashi.grc.vendor.repository.VendorRepository;
+import com.kashi.grc.vendor.repository.VendorTemplateSelectionRepository;
 import com.kashi.grc.workflow.automation.AutomatedActionContext;
 import com.kashi.grc.workflow.automation.AutomatedActionHandler;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
@@ -50,6 +52,7 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
 
     private final VendorRepository                     vendorRepository;
     private final RiskTemplateMappingRepository        mappingRepository;
+    private final VendorTemplateSelectionRepository    templateSelectionRepository;
     private final VendorAssessmentCycleRepository      cycleRepository;
     private final VendorAssessmentRepository           assessmentRepository;
     private final AssessmentTemplateRepository         templateRepository;
@@ -86,15 +89,40 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
             return false;
         }
 
-        // ── Find risk→template mapping for this vendor's score ────────────────
-        Optional<RiskTemplateMapping> mappingOpt =
-                mappingRepository.findByScore(vendor.getCurrentRiskScore());
-        if (mappingOpt.isEmpty()) {
-            log.error("[EXECUTE_ASSESSMENT] No template mapped for risk score={} | vendorId={}",
-                    vendor.getCurrentRiskScore(), vendor.getId());
-            return false;
+        // ── Resolve templateId ────────────────────────────────────────────────
+        // Primary path: QUEUE_ASSESSMENT_CANDIDATES ran before this step and an
+        // ORG_ADMIN / ORG_OWNER made their selection on the manual step.
+        // Fallback path: blueprint uses the old single-step style — find the one
+        // mapped template directly from the risk score (backward compatible).
+        Long templateId;
+        java.util.Optional<VendorTemplateSelection> selectionOpt =
+                templateSelectionRepository.findByWorkflowInstanceId(wi.getId());
+
+        if (selectionOpt.isPresent()) {
+            VendorTemplateSelection sel = selectionOpt.get();
+            if (sel.getSelectedTemplateId() == null) {
+                log.error("[EXECUTE_ASSESSMENT] Template selection exists but no template chosen yet " +
+                                "| workflowInstanceId={} — SELECT step must complete before EXECUTE_ASSESSMENT",
+                        wi.getId());
+                return false;
+            }
+            templateId = sel.getSelectedTemplateId();
+            log.info("[EXECUTE_ASSESSMENT] Using human-selected templateId={} (tier={}) | workflowInstanceId={}",
+                    templateId, sel.getRiskTierLabel(), wi.getId());
+        } else {
+            // Backward-compatible fallback: no QUEUE step in this blueprint,
+            // pick the single template mapped for this score.
+            Optional<RiskTemplateMapping> mappingOpt =
+                    mappingRepository.findByScore(vendor.getCurrentRiskScore());
+            if (mappingOpt.isEmpty()) {
+                log.error("[EXECUTE_ASSESSMENT] No template mapped for risk score={} | vendorId={}",
+                        vendor.getCurrentRiskScore(), vendor.getId());
+                return false;
+            }
+            templateId = mappingOpt.get().getTemplateId();
+            log.info("[EXECUTE_ASSESSMENT] Using score-mapped templateId={} (fallback, no selection row) | vendorId={}",
+                    templateId, vendor.getId());
         }
-        Long templateId = mappingOpt.get().getTemplateId();
 
         // ── Create or reuse the active cycle ──────────────────────────────────
         VendorAssessmentCycle cycle = cycleRepository

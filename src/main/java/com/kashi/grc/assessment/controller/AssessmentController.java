@@ -18,8 +18,10 @@ import com.kashi.grc.assessment.dto.request.*;
 import com.kashi.grc.assessment.dto.response.*;
 import com.kashi.grc.assessment.repository.*;
 import com.kashi.grc.vendor.domain.Vendor;
+import com.kashi.grc.vendor.domain.VendorTemplateSelection;
 import com.kashi.grc.vendor.repository.VendorRepository;
 import com.kashi.grc.vendor.repository.RiskTemplateMappingRepository;
+import com.kashi.grc.vendor.repository.VendorTemplateSelectionRepository;
 import com.kashi.grc.workflow.domain.*;
 import com.kashi.grc.workflow.dto.request.TaskActionRequest;
 import com.kashi.grc.workflow.dto.response.TaskInstanceResponse;
@@ -109,6 +111,7 @@ public class AssessmentController {
     private final QuestionOptionMappingRepository      questionOptionMappingRepository;
     private final VendorRepository                     vendorRepository;
     private final RiskTemplateMappingRepository        mappingRepository;
+    private final VendorTemplateSelectionRepository    templateSelectionRepository;
     private final WorkflowInstanceRepository           workflowInstanceRepository;
     private final WorkflowStepRepository               stepRepository;
     private final StepInstanceRepository               stepInstanceRepository;
@@ -3101,5 +3104,154 @@ public class AssessmentController {
 
         log.debug("[ASSESSMENT-GUARD] Read access granted | userId={} | assessmentId={}",
                 userId, assessment.getId());
+    }
+
+    // ── Template Selection — GET candidates ───────────────────────────────────
+
+    /**
+     * Returns the pending template selection for a workflow instance.
+     * Called by the "Select Assessment Template" task page on load.
+     *
+     * Access: ORG_ADMIN and ORG_OWNER only — vendor-side users never see this step.
+     *
+     * Response includes:
+     *   - riskTierLabel   — LOW / MEDIUM / HIGH / CRITICAL
+     *   - alreadySelected — true if QUEUE step pre-filled a single candidate
+     *   - candidates      — [{templateId, name, version, status}]
+     *   - selectedTemplateId — null until selection made (or pre-filled for single candidate)
+     */
+    @GetMapping("/v1/assessments/template-selection")
+    @Operation(summary = "ORG_ADMIN/ORG_OWNER: get pending template candidates for a workflow instance")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getTemplateSelection(
+            @RequestParam Long workflowInstanceId) {
+
+        User currentUser = utilityService.getLoggedInDataContext();
+
+        // ── Role guard: only ORG_ADMIN / ORG_OWNER ───────────────────────────
+        boolean isOrgAdmin = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "ORG_ADMIN".equals(name) || "ORG_OWNER".equals(name);
+        });
+        if (!isOrgAdmin) {
+            throw new BusinessException("ACCESS_DENIED",
+                    "Only ORG_ADMIN or ORG_OWNER can access the template selection.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        VendorTemplateSelection selection = templateSelectionRepository
+                .findByWorkflowInstanceId(workflowInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "TemplateSelection (workflowInstanceId)", workflowInstanceId));
+
+        // Parse candidate IDs and hydrate template names
+        List<Long> candidateIds;
+        try {
+            candidateIds = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(selection.getCandidateTemplateIds(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<Long>>() {});
+        } catch (Exception e) {
+            throw new BusinessException("INTERNAL_ERROR",
+                    "Could not parse candidate template IDs", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+
+        List<Map<String, Object>> candidates = candidateIds.stream().map(tid -> {
+            var tpl = templateRepository.findById(tid).orElse(null);
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("templateId", tid);
+            m.put("name",       tpl != null ? tpl.getName()    : "Unknown");
+            m.put("version",    tpl != null ? tpl.getVersion() : 1);
+            m.put("status",     tpl != null ? tpl.getStatus()  : "UNKNOWN");
+            return m;
+        }).toList();
+
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("workflowInstanceId",  workflowInstanceId);
+        body.put("riskTierLabel",       selection.getRiskTierLabel());
+        body.put("alreadySelected",     selection.getSelectedTemplateId() != null);
+        body.put("selectedTemplateId",  selection.getSelectedTemplateId());
+        body.put("candidates",          candidates);
+
+        return ResponseEntity.ok(ApiResponse.success(body));
+    }
+
+    // ── Template Selection — POST selection ───────────────────────────────────
+
+    /**
+     * ORG_ADMIN / ORG_OWNER submits their template choice.
+     * Saves the selection, then completes the QUEUE_ASSESSMENT_CANDIDATES SYSTEM step
+     * and advances the workflow — EXECUTE_ASSESSMENT fires on the next step.
+     *
+     * Body: { workflowInstanceId, selectedTemplateId }
+     *
+     * Access: ORG_ADMIN and ORG_OWNER only.
+     */
+    @PostMapping("/v1/assessments/template-selection/select")
+    @Transactional
+    @Operation(summary = "ORG_ADMIN/ORG_OWNER: submit the chosen assessment template")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> selectTemplate(
+            @RequestBody Map<String, Object> req) {
+
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        User currentUser = utilityService.getLoggedInDataContext();
+
+        // ── Role guard: only ORG_ADMIN / ORG_OWNER ───────────────────────────
+        boolean isOrgAdmin = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "ORG_ADMIN".equals(name) || "ORG_OWNER".equals(name);
+        });
+        if (!isOrgAdmin) {
+            throw new BusinessException("ACCESS_DENIED",
+                    "Only ORG_ADMIN or ORG_OWNER can select the assessment template.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        Long workflowInstanceId = Long.parseLong(req.get("workflowInstanceId").toString());
+        Long selectedTemplateId = Long.parseLong(req.get("selectedTemplateId").toString());
+
+        VendorTemplateSelection selection = templateSelectionRepository
+                .findByWorkflowInstanceId(workflowInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "TemplateSelection (workflowInstanceId)", workflowInstanceId));
+
+        // ── Validate chosen templateId is one of the candidates ───────────────
+        List<Long> candidateIds;
+        try {
+            candidateIds = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(selection.getCandidateTemplateIds(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<Long>>() {});
+        } catch (Exception e) {
+            throw new BusinessException("INTERNAL_ERROR",
+                    "Could not parse candidate template IDs", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+        if (!candidateIds.contains(selectedTemplateId)) {
+            throw new BusinessException("INVALID_SELECTION",
+                    "The chosen templateId is not in the candidate list for this workflow.",
+                    HttpStatus.BAD_REQUEST);
+        }
+
+        // ── Persist selection ─────────────────────────────────────────────────
+        selection.setSelectedTemplateId(selectedTemplateId);
+        selection.setSelectedByUserId(userId);
+        selection.setSelectedAt(java.time.LocalDateTime.now());
+        templateSelectionRepository.save(selection);
+
+        // ── Complete the QUEUE_ASSESSMENT_CANDIDATES SYSTEM step and advance ──
+        // The step stayed IN_PROGRESS (returned false) while waiting for this choice.
+        // Now that selectedTemplateId is set, completing it triggers EXECUTE_ASSESSMENT
+        // on the next step, which reads selectedTemplateId and instantiates the snapshot.
+        workflowEngineService.completeSystemStepAndAdvance(
+                selection.getStepInstanceId(),
+                userId,
+                "Template selected by ORG_ADMIN/ORG_OWNER: templateId=" + selectedTemplateId
+        );
+
+        log.info("[TEMPLATE-SELECTION] Selected templateId={} | workflowInstanceId={} | by userId={}",
+                selectedTemplateId, workflowInstanceId, userId);
+
+        Map<String, Object> responseBody = new java.util.LinkedHashMap<>();
+        responseBody.put("selectedTemplateId", selectedTemplateId);
+        responseBody.put("workflowInstanceId", workflowInstanceId);
+        responseBody.put("message", "Template selected — workflow advancing to assessment execution");
+        return ResponseEntity.ok(ApiResponse.success(responseBody));
     }
 }

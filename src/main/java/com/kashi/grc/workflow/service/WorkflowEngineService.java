@@ -1125,6 +1125,60 @@ public class WorkflowEngineService {
                 .orElseThrow(() -> new ResourceNotFoundException("Workflow", id));
     }
 
+    /**
+     * Completes a SYSTEM step that is stuck IN_PROGRESS (its automated action
+     * returned false while waiting for human input) and advances the workflow to
+     * the next step.
+     *
+     * Used by the template-selection endpoint: after the ORG_ADMIN/ORG_OWNER picks
+     * a template, the QUEUE_ASSESSMENT_CANDIDATES step can be approved so
+     * EXECUTE_ASSESSMENT fires automatically on the next step.
+     *
+     * Mirrors the auto-advance block inside createStepInstance() but is exposed
+     * publicly so non-engine code can drive the advance without duplicating the logic.
+     */
+    @org.springframework.transaction.annotation.Transactional
+    public void completeSystemStepAndAdvance(Long stepInstanceId, Long performedBy, String remarks) {
+        StepInstance si = stepInstanceRepository.findById(stepInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", stepInstanceId));
+        WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));
+        WorkflowStep step = stepRepository.findById(si.getStepId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowStep", si.getStepId()));
+
+        completeStep(si, StepStatus.APPROVED, remarks);
+        recordHistory(instance, si, null, "STEP_MANUALLY_ADVANCED",
+                StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
+                performedBy, remarks);
+
+        stepRepository.findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                        step.getWorkflowId(), step.getStepOrder())
+                .ifPresentOrElse(
+                        nextStep -> {
+                            StepInstance nextSI = createStepInstance(instance, nextStep);
+                            instance.setCurrentStepId(nextSI.getId());
+                            instanceRepository.save(instance);
+                            assignTasksForStep(nextSI, nextStep, instance);
+                            recordHistory(instance, nextSI, null, "STEP_STARTED",
+                                    null, nextSI.getStatus().name(), performedBy,
+                                    "Moved to: " + nextStep.getName());
+                            log.info("[WORKFLOW] System step manually advanced | instanceId={} | nextStep='{}'",
+                                    instance.getId(), nextStep.getName());
+                        },
+                        () -> {
+                            instance.setStatus(WorkflowStatus.COMPLETED);
+                            instance.setCurrentStepId(null);
+                            instance.setCompletedAt(java.time.LocalDateTime.now());
+                            instanceRepository.save(instance);
+                            recordHistory(instance, si, null, "WORKFLOW_COMPLETED",
+                                    WorkflowStatus.IN_PROGRESS.name(), WorkflowStatus.COMPLETED.name(),
+                                    performedBy, "All steps completed");
+                            log.info("[WORKFLOW] Workflow COMPLETED after manual advance | instanceId={}", instance.getId());
+                        }
+                );
+    }
+
+
     public List<WorkflowHistoryResponse> getHistoryByUser(Long userId, Long tenantId) {
         return historyRepository.findByPerformedByAndTenantId(userId, tenantId)
                 .stream().map(this::toHistoryResponse).toList();

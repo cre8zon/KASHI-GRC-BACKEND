@@ -320,6 +320,7 @@ public class AssessmentTemplateController {
                                         .questionId(q.getId())
                                         .questionText(q.getQuestionText())
                                         .responseType(q.getResponseType())
+                                        .questionTag(q.getQuestionTag())
                                         .weight(sqm.getWeight())
                                         .isMandatory(sqm.isMandatory())
                                         .orderNo(sqm.getOrderNo())

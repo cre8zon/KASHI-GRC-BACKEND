@@ -25,4 +25,7 @@ public interface TemplateSectionMappingRepository extends JpaRepository<Template
     long countByTemplateId(Long templateId);
 
     void deleteBySectionId(Long sectionId);
+
+    /** Bulk variant — removes template mappings for multiple sections in one DELETE WHERE IN query. */
+    void deleteBySectionIdIn(java.util.Collection<Long> sectionIds);
 }

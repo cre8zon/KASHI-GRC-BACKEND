@@ -38,7 +38,7 @@ public class ActionItemController {
         User user = utilityService.getLoggedInDataContext();
         List<String> roles = resolveRoleNames(user);
         List<ActionItemResponse> items = actionItemService.getMyOpenItems(
-            user.getId(), roles, user.getTenantId());
+                user.getId(), roles, user.getTenantId(), user.getVendorId());
         return ResponseEntity.ok(ApiResponse.success(items));
     }
 
@@ -65,7 +65,7 @@ public class ActionItemController {
             @RequestParam Long entityId) {
         User user = utilityService.getLoggedInDataContext();
         List<ActionItemResponse> items = actionItemService.getForEntity(
-            entityType, entityId, user.getId(), resolveRoleNames(user), user.getTenantId());
+                entityType, entityId, user.getId(), resolveRoleNames(user), user.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(items));
     }
 
@@ -80,7 +80,7 @@ public class ActionItemController {
             @Valid @RequestBody ActionItemRequest req) {
         User user = utilityService.getLoggedInDataContext();
         ActionItemResponse response = actionItemService.create(
-            req, user.getId(), user.getTenantId());
+                req, user.getId(), user.getTenantId());
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(response));
     }
 
@@ -96,7 +96,7 @@ public class ActionItemController {
             @Valid @RequestBody ActionItemStatusUpdate update) {
         User user = utilityService.getLoggedInDataContext();
         ActionItemResponse response = actionItemService.updateStatus(
-            id, update, user.getId(), resolveRoleNames(user), user.getTenantId());
+                id, update, user.getId(), resolveRoleNames(user), user.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(response));
     }
 
@@ -105,8 +105,8 @@ public class ActionItemController {
     private List<String> resolveRoleNames(User user) {
         if (user.getRoles() == null) return List.of();
         return user.getRoles().stream()
-            .map(r -> r.getName() != null ? r.getName() : "")
-            .filter(s -> !s.isEmpty())
-            .toList();
+                .map(r -> r.getName() != null ? r.getName() : "")
+                .filter(s -> !s.isEmpty())
+                .toList();
     }
 }
