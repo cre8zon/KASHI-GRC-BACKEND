@@ -68,13 +68,25 @@ public record ModuleSubmitEvent(
      * This is what the ANSWER_MISSING condition type checks for.
      */
     public record QuestionContext(
-            String  questionTagSnapshot, // tag from instance — guard rule lookup key
-            Long    questionInstanceId,  // instance ID — action item entity + idempotency
-            String  responseText,        // null if never answered
-            boolean fileUploaded,        // true if a file was attached
-            Double  score,               // numeric score, null if not applicable
-            String  navContext           // JSON: { assigneeRoute, reviewerRoute, questionInstanceId, ... }
+            String       questionTagSnapshot,    // tag from instance — guard rule lookup key
+            Long         questionInstanceId,     // instance ID — action item entity + idempotency
+            String       responseText,           // null if never answered (TEXT / NUMERIC / DATE)
+            boolean      fileUploaded,           // true if a DocumentLink exists (FILE_UPLOAD questions)
+            Double       score,                  // numeric score, null if not applicable
+            String       navContext,             // JSON: { assigneeRoute, reviewerRoute, questionInstanceId, ... }
+            List<String> selectedOptionValues    // resolved option text(s) for SINGLE/MULTI_CHOICE questions
     ) {
+        /**
+         * Backwards-compatible constructor for callers that don't resolve option values.
+         * selectedOptionValues defaults to null → OPTION_SELECTED falls back to responseText.
+         */
+        public QuestionContext(String questionTagSnapshot, Long questionInstanceId,
+                               String responseText, boolean fileUploaded,
+                               Double score, String navContext) {
+            this(questionTagSnapshot, questionInstanceId, responseText,
+                    fileUploaded, score, navContext, null);
+        }
+
         /**
          * Convenience for a completely unanswered question.
          * ANSWER_MISSING condition fires for these.
@@ -83,7 +95,7 @@ public record ModuleSubmitEvent(
                                                  Long questionInstanceId,
                                                  String navContext) {
             return new QuestionContext(questionTagSnapshot, questionInstanceId,
-                    null, false, null, navContext);
+                    null, false, null, navContext, null);
         }
     }
 }

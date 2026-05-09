@@ -111,51 +111,115 @@ public class GuardEvaluator {
                          String navContext,
                          Long tenantId) {
         evaluate(new QuestionContext(questionTagSnapshot, questionInstanceId,
-                responseText, fileUploaded, score, navContext), tenantId);
+                responseText, fileUploaded, score, navContext, null), tenantId);
+    }
+
+    /**
+     * Overload with resolved option values — use this for SINGLE/MULTI_CHOICE questions
+     * so OPTION_SELECTED rules match against actual option text, not raw IDs.
+     */
+    @Async
+    @Transactional
+    public void evaluate(String questionTagSnapshot,
+                         Long questionInstanceId,
+                         String responseText,
+                         boolean fileUploaded,
+                         Double score,
+                         String navContext,
+                         java.util.List<String> selectedOptionValues,
+                         Long tenantId) {
+        evaluate(new QuestionContext(questionTagSnapshot, questionInstanceId,
+                responseText, fileUploaded, score, navContext, selectedOptionValues), tenantId);
     }
 
     // ── Condition evaluation ──────────────────────────────────────────────────
 
     private boolean evaluateCondition(GuardRule rule, QuestionContext ctx) {
         return switch (rule.getConditionType()) {
-            case OPTION_SELECTED     -> ctx.responseText() != null
-                    && ctx.responseText().equalsIgnoreCase(rule.getConditionValue());
 
-            case OPTION_NOT_SELECTED -> ctx.responseText() == null
-                    || !ctx.responseText().equalsIgnoreCase(rule.getConditionValue());
+            // ── OPTION_SELECTED ───────────────────────────────────────────────
+            // For SINGLE_CHOICE / MULTI_CHOICE questions, the answer is stored as
+            // option IDs — not text. selectedOptionValues contains the resolved text
+            // for all selected options. For MULTI_CHOICE, fires if ANY selected
+            // option matches conditionValue (e.g. "No" in a multi-select question).
+            // Falls back to responseText for TEXT questions using option-like answers.
+            case OPTION_SELECTED -> {
+                if (ctx.selectedOptionValues() != null && !ctx.selectedOptionValues().isEmpty()) {
+                    String cv = rule.getConditionValue();
+                    yield cv != null && ctx.selectedOptionValues().stream()
+                            .anyMatch(v -> v != null && v.equalsIgnoreCase(cv));
+                }
+                // Fallback — TEXT question with option-like responseText
+                yield ctx.responseText() != null
+                        && rule.getConditionValue() != null
+                        && ctx.responseText().equalsIgnoreCase(rule.getConditionValue());
+            }
 
-            case TEXT_CONTAINS       -> ctx.responseText() != null
+            // ── OPTION_NOT_SELECTED ───────────────────────────────────────────
+            // Fires when the given option value is NOT among the selected options.
+            // For unanswered questions (no selection) this also fires — absence of
+            // a required selection is itself a finding.
+            case OPTION_NOT_SELECTED -> {
+                if (ctx.selectedOptionValues() != null && !ctx.selectedOptionValues().isEmpty()) {
+                    String cv = rule.getConditionValue();
+                    yield cv == null || ctx.selectedOptionValues().stream()
+                            .noneMatch(v -> v != null && v.equalsIgnoreCase(cv));
+                }
+                // Fallback — TEXT question
+                yield ctx.responseText() == null
+                        || rule.getConditionValue() == null
+                        || !ctx.responseText().equalsIgnoreCase(rule.getConditionValue());
+            }
+
+            // ── TEXT_CONTAINS ─────────────────────────────────────────────────
+            case TEXT_CONTAINS -> ctx.responseText() != null
                     && !ctx.responseText().isBlank()
                     && rule.getConditionValue() != null
                     && ctx.responseText().toLowerCase()
                     .contains(rule.getConditionValue().toLowerCase());
 
-            case TEXT_EMPTY          -> ctx.responseText() == null
-                    || ctx.responseText().isBlank();
+            // ── TEXT_EMPTY ────────────────────────────────────────────────────
+            // Fires when no text response was provided.
+            // For FILE_UPLOAD questions: responseText is always null — use
+            // FILE_NOT_UPLOADED rule instead to avoid double-firing.
+            // For SINGLE/MULTI_CHOICE: also fires when no option selected
+            // (selectedOptionValues empty AND responseText null).
+            case TEXT_EMPTY -> {
+                boolean noText = ctx.responseText() == null || ctx.responseText().isBlank();
+                boolean noOption = ctx.selectedOptionValues() == null
+                        || ctx.selectedOptionValues().isEmpty();
+                yield noText && noOption;
+            }
 
-            case FILE_NOT_UPLOADED   -> !ctx.fileUploaded();
+            // ── FILE_NOT_UPLOADED ─────────────────────────────────────────────
+            case FILE_NOT_UPLOADED -> !ctx.fileUploaded();
 
-            case SCORE_BELOW         -> {
+            // ── SCORE_BELOW / SCORE_ABOVE ─────────────────────────────────────
+            case SCORE_BELOW -> {
                 try { yield ctx.score() != null
                         && ctx.score() < Double.parseDouble(rule.getConditionValue()); }
                 catch (NumberFormatException e) { yield false; }
             }
 
-            case SCORE_ABOVE         -> {
+            case SCORE_ABOVE -> {
                 try { yield ctx.score() != null
                         && ctx.score() > Double.parseDouble(rule.getConditionValue()); }
                 catch (NumberFormatException e) { yield false; }
             }
 
-            case ANY_ANSWER          -> true;
+            // ── ANY_ANSWER ────────────────────────────────────────────────────
+            case ANY_ANSWER -> true;
 
-            case ANSWER_MISSING      ->
-                // Completely skipped: no text, no file, no score
-                    ctx.responseText() == null && !ctx.fileUploaded() && ctx.score() == null;
+            // ── ANSWER_MISSING ────────────────────────────────────────────────
+            // Completely unanswered: no text, no file, no score, no option selected.
+            case ANSWER_MISSING ->
+                    (ctx.responseText() == null || ctx.responseText().isBlank())
+                            && !ctx.fileUploaded()
+                            && ctx.score() == null
+                            && (ctx.selectedOptionValues() == null || ctx.selectedOptionValues().isEmpty());
 
-            case SCORE_NOT_SET       ->
-                // Scored question but score was left null
-                    ctx.score() == null;
+            // ── SCORE_NOT_SET ─────────────────────────────────────────────────
+            case SCORE_NOT_SET -> ctx.score() == null;
         };
     }
 

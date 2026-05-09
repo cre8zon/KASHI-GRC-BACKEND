@@ -1960,6 +1960,7 @@ public class AssessmentController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> saveReviewerEval(
             @PathVariable Long assessmentId,
             @PathVariable Long questionInstanceId,
+            @RequestParam(required = false) Long taskId,
             @RequestBody Map<String, String> body) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
@@ -2007,6 +2008,51 @@ public class AssessmentController {
 
         log.info("[REVIEWER-EVAL] {} | assessmentId={} | qi={} | by={}",
                 verdict.toUpperCase(), assessmentId, questionInstanceId, userId);
+
+        // ── Fire SCORE_ANSWERS when all assigned questions are evaluated ──────
+        // SCORE_ANSWERS is a required compound task section gate on the reviewer's
+        // task. Without this firing, the task never auto-approves even after the
+        // reviewer submits all their sections (SECTION_REVIEW_COMPLETE fires but
+        // SCORE_ANSWERS never does → 1/2 sections always stuck → task stays open).
+        if (taskId != null) {
+            try {
+                AssessmentTemplateInstance ti = templateInstanceRepository
+                        .findByAssessmentId(assessmentId).orElse(null);
+                if (ti != null) {
+                    // All questions across this reviewer's assigned sections
+                    List<AssessmentQuestionInstance> myQuestions =
+                            sectionInstanceRepository
+                                    .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
+                                            ti.getId(), userId)
+                                    .stream()
+                                    .flatMap(s -> questionInstanceRepository
+                                            .findBySectionInstanceIdOrderByOrderNo(s.getId()).stream())
+                                    .toList();
+
+                    // All evaluated = every question has a non-null, non-PENDING reviewerStatus
+                    boolean allEvaluated = !myQuestions.isEmpty() && myQuestions.stream()
+                            .allMatch(qi -> {
+                                String rs = responseRepository
+                                        .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(
+                                                assessmentId, qi.getId())
+                                        .map(AssessmentResponse::getReviewerStatus)
+                                        .orElse(null);
+                                return rs != null && !rs.equals("PENDING");
+                            });
+
+                    if (allEvaluated) {
+                        log.info("[REVIEWER-EVAL] All questions evaluated — firing SCORE_ANSWERS | taskId={} | assessmentId={}",
+                                taskId, assessmentId);
+                        eventPublisher.publishEvent(
+                                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
+                                        "SCORE_ANSWERS", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("[REVIEWER-EVAL] SCORE_ANSWERS check failed — non-blocking | taskId={} | reason={}",
+                        taskId, e.getMessage());
+            }
+        }
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "questionInstanceId", questionInstanceId,
@@ -2795,14 +2841,6 @@ public class AssessmentController {
             StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
             return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
         });
-
-        // Contributors have no workflow TaskInstance — they access the assessment
-        // via ActionItems (CONTRIBUTOR_ASSIGNMENT) created when a question is assigned.
-        // Fall back to open obligation check before denying read access.
-        if (!hasParticipated) {
-            hasParticipated = hasOpenActionItemForAssessment(userId, assessment.getId(),
-                    assessment.getTenantId());
-        }
 
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",
