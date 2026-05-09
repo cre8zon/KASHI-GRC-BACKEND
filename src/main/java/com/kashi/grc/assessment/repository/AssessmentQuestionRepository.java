@@ -2,8 +2,12 @@ package com.kashi.grc.assessment.repository;
 
 import com.kashi.grc.assessment.domain.AssessmentQuestion;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 @Repository
@@ -23,4 +27,12 @@ public interface AssessmentQuestionRepository
      * Null-safe: if tag is null, returns 0 (Spring Data handles IS NULL correctly).
      */
     long countByQuestionTag(String questionTag);
+
+    /**
+     * Bulk fetch by IDs — single IN query replacing N individual findById calls.
+     * Used by AssessmentTemplateController.getFull() to load all questions for a
+     * template in one round-trip instead of one query per question.
+     */
+    @Query("SELECT q FROM AssessmentQuestion q WHERE q.id IN :ids")
+    List<AssessmentQuestion> findAllByIdIn(@Param("ids") Collection<Long> ids);
 }

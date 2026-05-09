@@ -84,7 +84,21 @@ public interface AssessmentResponseRepositoryCustom {
      * Returns 0.0 when no scored responses exist for the assessment.
      * Called at step 10 (consolidateScores), step 11 (assignRiskRating),
      * and final report generation. Pre-review paths (step 5 vendor submit)
-     * continue to use the raw sumScoreByAssessmentId default method.
+     * continue to use the raw sumScoreEarnedByAssessmentId method.
      */
     Double sumReviewerAdjustedScoreByAssessmentId(Long assessmentId);
+
+    /**
+     * Raw SUM of scoreEarned — no reviewer verdict adjustment.
+     *
+     * Replaces the former Java default method in AssessmentResponseRepository:
+     *   findByAssessmentId(id).stream().mapToDouble(...).sum()
+     * That method loaded ALL response rows into Java heap just to sum one column.
+     *
+     * This declaration routes to a Criteria-API implementation in
+     * AssessmentResponseRepositoryImpl — a single SQL SUM query.
+     * Used at step 5 (vendor submit) before any reviewer has set verdicts.
+     * Returns 0.0 when no scored responses exist.
+     */
+    Double sumScoreEarnedByAssessmentId(Long assessmentId);
 }

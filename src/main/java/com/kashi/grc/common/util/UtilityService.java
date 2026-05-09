@@ -30,6 +30,16 @@ import java.util.Map;
  *
  * Tenant ID is ALWAYS read from the JWT via SecurityContextHolder.
  * Controllers must NEVER receive tenantId as a request param or header.
+ *
+ * ── Request-scoped user cache ─────────────────────────────────────────────────
+ * getLoggedInDataContext() runs a criteria JOIN FETCH query (user → roles → permissions).
+ * Without caching, bootstrap alone calls it 6–8 times per request: once in getNavigation(),
+ * once more for tenantId in the same method, once in getDashboardWidgets(), once in
+ * getBranding(), once in getEnabledFeatureFlags(), etc.
+ *
+ * The ThreadLocal cache ensures the DB is hit exactly once per HTTP request lifecycle.
+ * RequestUserCacheFilter clears it after every request so the cache never leaks between
+ * requests on the same thread (critical for Tomcat thread pool reuse).
  */
 @Service
 @Transactional
@@ -40,6 +50,20 @@ public class UtilityService {
     private final AuthenticationManager   authenticationManager;
     private final EmailTemplateRepository emailTemplateRepository;
     private final EntityManager entityManager;
+
+    // ── Per-request user cache ────────────────────────────────────────────────
+    // ThreadLocal because Tomcat reuses threads across requests. The cache is only
+    // valid for the duration of a single HTTP request; RequestUserCacheFilter clears
+    // it in the finally block after every request completes.
+    private static final ThreadLocal<User> REQUEST_USER_CACHE = new ThreadLocal<>();
+
+    /**
+     * Called by RequestUserCacheFilter after every request to prevent thread-pool
+     * cache leakage. Must be public so the filter can reach it.
+     */
+    public static void clearRequestCache() {
+        REQUEST_USER_CACHE.remove();
+    }
 
     public PageDetails getpageDetails(Map<String, String> allParams) {
         PageDetails pageDetails = new PageDetails();
@@ -94,8 +118,16 @@ public class UtilityService {
     /**
      * Returns the fully-loaded User entity for the currently authenticated request.
      * The JWT filter stores the userId as the principal name — we never receive it from frontend.
+     *
+     * Result is cached in a ThreadLocal for the duration of the current HTTP request.
+     * The DB is hit at most once per request regardless of how many times this is called.
+     * Cache is cleared by RequestUserCacheFilter after every request.
      */
     public User getLoggedInDataContext() {
+        // Return cached user if already loaded during this request
+        User cached = REQUEST_USER_CACHE.get();
+        if (cached != null) return cached;
+
         var auth = SecurityContextHolder.getContext().getAuthentication();
         if (auth == null || auth.getPrincipal() == null) {
             throw new com.kashi.grc.common.exception.BusinessException(
@@ -124,8 +156,12 @@ public class UtilityService {
         cq.select(root).distinct(true)
                 .where(cb.equal(root.get("id"), userId));
 
-        return em.createQuery(cq).getResultStream().findFirst()
+        User user = em.createQuery(cq).getResultStream().findFirst()
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
+
+        // Cache for the remainder of this request
+        REQUEST_USER_CACHE.set(user);
+        return user;
     }
 
     private jakarta.persistence.EntityManager getEntityManager() {

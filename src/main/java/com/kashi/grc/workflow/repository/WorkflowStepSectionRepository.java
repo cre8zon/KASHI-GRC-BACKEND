@@ -4,6 +4,7 @@ import com.kashi.grc.workflow.domain.WorkflowStepSection;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 
 /**
@@ -20,6 +21,13 @@ public interface WorkflowStepSectionRepository extends JpaRepository<WorkflowSte
 
     /** Called once per step activation to build the snapshot. */
     List<WorkflowStepSection> findByStepIdOrderBySectionOrderAsc(Long stepId);
+
+    /**
+     * Bulk fetch sections for multiple step IDs in one IN query, ordered by section order.
+     * Used by WorkflowEngineService.buildWorkflowResponse() to replace
+     * the per-step findByStepIdOrderBySectionOrderAsc pattern (N queries → 1 query).
+     */
+    List<WorkflowStepSection> findByStepIdInOrderBySectionOrderAsc(Collection<Long> stepIds);
 
     /** Called during workflow activation validation only. */
     boolean existsByStepId(Long stepId);

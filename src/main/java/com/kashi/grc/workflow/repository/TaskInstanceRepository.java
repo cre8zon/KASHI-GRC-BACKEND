@@ -4,8 +4,11 @@ import com.kashi.grc.workflow.domain.TaskInstance;
 import com.kashi.grc.workflow.enums.TaskRole;
 import com.kashi.grc.workflow.enums.TaskStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -60,4 +63,45 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
      */
     boolean existsByStepInstanceIdAndAssignedUserIdAndStatus(
             Long stepInstanceId, Long assignedUserId, TaskStatus status);
+
+    /**
+     * Check if the user has an active task on a specific workflow instance — single JOIN query.
+     *
+     * Replaces the N+1 pattern in AssessmentController.assertUserHasActiveTask():
+     *   findByAssignedUserIdAndStatus(PENDING) + findByAssignedUserIdAndStatus(IN_PROGRESS)
+     *   + N × stepInstanceRepository.findById(task.getStepInstanceId())
+     *
+     * All that is now a single EXISTS subquery — O(1) regardless of task count.
+     * The statuses collection is typically [PENDING, IN_PROGRESS].
+     */
+    @Query("""
+        SELECT COUNT(t) > 0 FROM TaskInstance t
+        JOIN StepInstance s ON s.id = t.stepInstanceId
+        WHERE t.assignedUserId      = :userId
+          AND s.workflowInstanceId  = :workflowInstanceId
+          AND t.status              IN :statuses
+        """)
+    boolean existsByUserIdAndWorkflowInstanceIdAndStatusIn(
+            @Param("userId")             Long userId,
+            @Param("workflowInstanceId") Long workflowInstanceId,
+            @Param("statuses")           Collection<TaskStatus> statuses);
+
+    /**
+     * Check if the user has EVER had any task on a specific workflow instance — single JOIN query.
+     *
+     * Replaces the N+1 pattern in AssessmentController.assertUserHasParticipated():
+     *   findByAssignedUserId(userId) + N × stepInstanceRepository.findById(task.getStepInstanceId())
+     *
+     * Used for read-only access guard on COMPLETED assessments — any historical participant
+     * (regardless of task status) can view the completed data.
+     */
+    @Query("""
+        SELECT COUNT(t) > 0 FROM TaskInstance t
+        JOIN StepInstance s ON s.id = t.stepInstanceId
+        WHERE t.assignedUserId     = :userId
+          AND s.workflowInstanceId = :workflowInstanceId
+        """)
+    boolean existsByUserIdAndWorkflowInstanceId(
+            @Param("userId")             Long userId,
+            @Param("workflowInstanceId") Long workflowInstanceId);
 }

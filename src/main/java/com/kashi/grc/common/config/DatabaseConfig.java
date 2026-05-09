@@ -148,7 +148,38 @@ public class DatabaseConfig {
             new String[]{ "action_items", "idx_ai_entity",
                     "CREATE INDEX idx_ai_entity ON action_items (entity_type, entity_id, tenant_id)" },
             new String[]{ "action_items", "idx_ai_assigned_status",
-                    "CREATE INDEX idx_ai_assigned_status ON action_items (assigned_to, status, tenant_id)" }
+                    "CREATE INDEX idx_ai_assigned_status ON action_items (assigned_to, status, tenant_id)" },
+
+            // ── Assessment template structure — /full endpoint ────────────────────────
+            // template_section_mappings — scanned on every getFull() and publishTemplate().
+            // Without these, MySQL does a filesort on template_id even with the unique
+            // constraint, because composite (template_id, order_no) is needed for ORDER BY.
+            new String[]{ "template_section_mappings", "idx_tsm_template_order",
+                    "CREATE INDEX idx_tsm_template_order ON template_section_mappings (template_id, order_no)" },
+            new String[]{ "template_section_mappings", "idx_tsm_section",
+                    "CREATE INDEX idx_tsm_section ON template_section_mappings (section_id)" },
+
+            // section_question_mappings — hot path: IN query over many section IDs in getFull()
+            new String[]{ "section_question_mappings", "idx_sqm_section_order",
+                    "CREATE INDEX idx_sqm_section_order ON section_question_mappings (section_id, order_no)" },
+            new String[]{ "section_question_mappings", "idx_sqm_question",
+                    "CREATE INDEX idx_sqm_question ON section_question_mappings (question_id)" },
+
+            // question_option_mappings — hot path: IN query over many question IDs in getFull()
+            new String[]{ "question_option_mappings", "idx_qom_question_order",
+                    "CREATE INDEX idx_qom_question_order ON question_option_mappings (question_id, order_no)" },
+
+            // assessment_questions — library list queries filtered by tenant
+            new String[]{ "assessment_questions", "idx_aq_tenant",
+                    "CREATE INDEX idx_aq_tenant ON assessment_questions (tenant_id)" },
+
+            // assessment_sections — library list queries filtered by tenant
+            new String[]{ "assessment_sections", "idx_as_tenant",
+                    "CREATE INDEX idx_as_tenant ON assessment_sections (tenant_id)" },
+
+            // notifications — unread count query fires on every page load via TopNav badge
+            new String[]{ "notifications", "idx_notif_user_read",
+                    "CREATE INDEX idx_notif_user_read ON notifications (user_id, read_at)" }
     );
 
     @Bean

@@ -72,19 +72,23 @@ public interface AssessmentResponseRepository
 
     long countByAssessmentId(Long assessmentId);
 
-    // ── Java-level aggregate (no query annotation needed) ─────────────────
-
-    /**
-     * Raw sum of scoreEarned — used at step 5 (vendor submit) before any
-     * reviewer has set verdicts. All reviewerStatus values are PENDING at
-     * that point, so both this and sumReviewerAdjustedScoreByAssessmentId
-     * would return the same number, but this is semantically correct for the
-     * pre-review phase.
-     */
+    // ── sumScoreByAssessmentId ─────────────────────────────────────────────
+    //
+    // NOTE: This method delegates to sumScoreEarnedByAssessmentId() which is
+    // implemented via Criteria API in AssessmentResponseRepositoryImpl.
+    //
+    // WHY CHANGED: The previous implementation was a Java default method:
+    //   findByAssessmentId(assessmentId).stream()
+    //           .filter(r -> r.getScoreEarned() != null)
+    //           .mapToDouble(AssessmentResponse::getScoreEarned).sum()
+    //
+    // This loaded every response row for the assessment into Java heap just
+    // to sum one double column. With 500 questions that could be 500 rows.
+    // sumScoreEarnedByAssessmentId() does the same in a single SQL SUM query.
+    //
+    // The method name sumScoreByAssessmentId is kept for backward compatibility
+    // with all existing callers (submitAssessment, etc.).
     default Double sumScoreByAssessmentId(Long assessmentId) {
-        return findByAssessmentId(assessmentId).stream()
-                .filter(r -> r.getScoreEarned() != null)
-                .mapToDouble(AssessmentResponse::getScoreEarned)
-                .sum();
+        return sumScoreEarnedByAssessmentId(assessmentId);
     }
 }

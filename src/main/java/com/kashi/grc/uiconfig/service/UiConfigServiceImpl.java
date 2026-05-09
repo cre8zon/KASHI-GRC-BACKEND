@@ -38,7 +38,9 @@ public class UiConfigServiceImpl implements UiConfigService {
     @Override
     @Transactional(readOnly = true)
     public AppBootstrapResponse bootstrap() {
-        // getLoggedInDataContext() returns the User entity directly
+        // getLoggedInDataContext() returns the User entity directly.
+        // Called once here — all sub-methods (getNavigation, getDashboardWidgets, etc.)
+        // reuse the same cached result via UtilityService.REQUEST_USER_CACHE.
         com.kashi.grc.usermanagement.domain.User currentUser =
                 utilityService.getLoggedInDataContext();
         Long tenantId = currentUser.getTenantId();
@@ -69,7 +71,9 @@ public class UiConfigServiceImpl implements UiConfigService {
     @Override
     @Transactional(readOnly = true)
     public ScreenConfigResponse getScreenConfig(String screenKey) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        // Single call — result cached in ThreadLocal for this request
+        User currentUser = utilityService.getLoggedInDataContext();
+        Long tenantId    = currentUser.getTenantId();
 
         // Components — global first, then tenant overrides
         List<UiComponent> components = componentRepository
@@ -106,18 +110,21 @@ public class UiConfigServiceImpl implements UiConfigService {
     @Override
     @Transactional(readOnly = true)
     public List<UiNavigationItemResponse> getNavigation() {
-        Long tenantId  = utilityService.getLoggedInDataContext().getTenantId();
-        User user      = utilityService.getLoggedInDataContext();
+        // Single call — result cached in ThreadLocal for this request.
+        // Previously this called getLoggedInDataContext() twice (once for tenantId,
+        // once for user), causing two full criteria JOIN FETCH queries per nav load.
+        User user     = utilityService.getLoggedInDataContext();
+        Long tenantId = user.getTenantId();
         Set<String> userSides       = extractSides(user);
         Set<String> userPermissions = extractPermissions(user);
 
-        log.info("=== NAV DEBUG ===");
-        log.info("UserId: {}, TenantId: {}", user.getId(), tenantId);
-        log.info("User sides: {}", userSides);
-        log.info("User permissions: {}", userPermissions);
+        log.debug("=== NAV DEBUG ===");
+        log.debug("UserId: {}, TenantId: {}", user.getId(), tenantId);
+        log.debug("User sides: {}", userSides);
+        log.debug("User permissions: {}", userPermissions);
 
         List<UiNavigation> all = navigationRepository.findAllForTenant(tenantId);
-        log.info("Total nav items from DB: {}", all.size());
+        log.info("[NAV] userId={} tenantId={} total={}", user.getId(), tenantId, all.size());
 
         // Filter by side/permission only — NOT by isActive.
         // isActive is returned in the response so the frontend can decide
@@ -134,8 +141,8 @@ public class UiConfigServiceImpl implements UiConfigService {
                 })
                 .toList();
 
-        log.info("Visible items: {}", visible.stream().map(UiNavigation::getNavKey).toList());
-        log.info("=== NAV DEBUG END ===");
+        log.debug("Visible items: {}", visible.stream().map(UiNavigation::getNavKey).toList());
+        log.debug("=== NAV DEBUG END ===");
 
         return buildNavTree(visible, null);
     }
@@ -168,10 +175,12 @@ public class UiConfigServiceImpl implements UiConfigService {
     @Override
     @Transactional(readOnly = true)
     public List<UiActionResponse> getActions(String screenKey, String entityStatus) {
-        Long tenantId       = utilityService.getLoggedInDataContext().getTenantId();
-        User user           = utilityService.getLoggedInDataContext();
-        Set<String> sides   = extractSides(user);
-        Set<String> perms   = extractPermissions(user);
+        // Single call — result cached in ThreadLocal for this request.
+        // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).
+        User user         = utilityService.getLoggedInDataContext();
+        Long tenantId     = user.getTenantId();
+        Set<String> sides = extractSides(user);
+        Set<String> perms = extractPermissions(user);
 
         return actionRepository.findByScreenAndTenant(screenKey, tenantId).stream()
                 .filter(a -> isActionVisible(a, sides, perms, entityStatus))
@@ -184,8 +193,10 @@ public class UiConfigServiceImpl implements UiConfigService {
     @Override
     @Transactional(readOnly = true)
     public List<DashboardWidgetResponse> getDashboardWidgets() {
-        Long tenantId     = utilityService.getLoggedInDataContext().getTenantId();
+        // Single call — result cached in ThreadLocal for this request.
+        // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).
         User user         = utilityService.getLoggedInDataContext();
+        Long tenantId     = user.getTenantId();
         Set<String> sides = extractSides(user);
         Set<String> perms = extractPermissions(user);
 

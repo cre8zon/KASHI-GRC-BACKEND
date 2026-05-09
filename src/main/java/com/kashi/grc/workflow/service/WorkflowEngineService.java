@@ -2241,36 +2241,80 @@ public class WorkflowEngineService {
     /** Builds full workflow blueprint response with all steps. Logic unchanged. */
     public WorkflowResponse buildWorkflowResponse(Workflow w) {
         List<WorkflowStep> steps = stepRepository.findByWorkflowIdOrderByStepOrderAsc(w.getId());
-        List<WorkflowStepResponse> stepResponses = steps.stream().map(s -> WorkflowStepResponse.builder()
-                        .id(s.getId()).workflowId(w.getId()).stepOrder(s.getStepOrder())
-                        .name(s.getName()).side(s.getSide()).description(s.getDescription())
-                        .approvalType(s.getApprovalType()).minApprovalsRequired(s.getMinApprovalsRequired())
-                        .isParallel(s.isParallel()).isOptional(s.isOptional()).slaHours(s.getSlaHours())
-                        .automatedAction(s.getAutomatedAction())
-                        .roleIds(stepRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepRole::getRoleId).toList())
-                        .userIds(stepUserRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepUser::getUserId).toList())
-                        .assignerRoleIds(stepAssignerRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepAssignerRole::getRoleId).toList())
-                        .observerRoleIds(stepObserverRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepObserverRole::getRoleId).toList())
-                        .assignerResolution(s.getAssignerResolution())
-                        .allowOverride(s.isAllowOverride())
-                        .stepAction(s.getStepAction())
-                        .navKey(s.getNavKey())
-                        .assignerNavKey(s.getAssignerNavKey())
-                        // Gap 1+2: return sections so admin UI can read them back
-                        .sections(stepSectionRepository.findByStepIdOrderBySectionOrderAsc(s.getId())
-                                .stream().map(sec -> com.kashi.grc.workflow.dto.response.StepSectionResponse.builder()
-                                        .id(sec.getId()).sectionKey(sec.getSectionKey())
-                                        .sectionOrder(sec.getSectionOrder()).label(sec.getLabel())
-                                        .description(sec.getDescription()).required(sec.isRequired())
-                                        .completionEvent(sec.getCompletionEvent())
-                                        .requiresAssignment(sec.isRequiresAssignment())
-                                        .tracksItems(sec.isTracksItems())
-                                        .build()).toList())
-                        .build())
+
+        if (steps.isEmpty()) {
+            return WorkflowResponse.builder()
+                    .id(w.getId()).name(w.getName()).entityType(w.getEntityType())
+                    .description(w.getDescription()).version(w.getVersion()).isActive(w.isActive())
+                    .createdAt(w.getCreatedAt()).steps(List.of()).build();
+        }
+
+        // ── Bulk-load all step associations in 5 queries instead of 5×N ──────
+        // Previously: stepRoleRepository.findByStepId(s.getId()) was called once
+        // per step for 5 different tables → 5×N queries for a workflow with N steps.
+        // A 12-step workflow fired 60 queries just to render a single list row.
+        // Now: one IN query per table, results grouped in memory — always 5 queries.
+        List<Long> stepIds = steps.stream().map(WorkflowStep::getId).toList();
+
+        Map<Long, List<Long>> roleIdsByStepId = stepRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> userIdsByStepId = stepUserRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepUser::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepUser::getUserId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> assignerRoleIdsByStepId = stepAssignerRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepAssignerRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepAssignerRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> observerRoleIdsByStepId = stepObserverRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepObserverRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepObserverRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        // Gap 1+2: return sections so admin UI can read them back
+        Map<Long, List<com.kashi.grc.workflow.dto.response.StepSectionResponse>> sectionsByStepId =
+                stepSectionRepository.findByStepIdInOrderBySectionOrderAsc(stepIds)
+                        .stream().collect(java.util.stream.Collectors.groupingBy(
+                                com.kashi.grc.workflow.domain.WorkflowStepSection::getStepId,
+                                java.util.stream.Collectors.mapping(
+                                        sec -> com.kashi.grc.workflow.dto.response.StepSectionResponse.builder()
+                                                .id(sec.getId()).sectionKey(sec.getSectionKey())
+                                                .sectionOrder(sec.getSectionOrder()).label(sec.getLabel())
+                                                .description(sec.getDescription()).required(sec.isRequired())
+                                                .completionEvent(sec.getCompletionEvent())
+                                                .requiresAssignment(sec.isRequiresAssignment())
+                                                .tracksItems(sec.isTracksItems())
+                                                .build(),
+                                        java.util.stream.Collectors.toList())));
+
+        // ── Assemble responses from pre-loaded maps (zero additional DB hits) ─
+        List<WorkflowStepResponse> stepResponses = steps.stream().map(s ->
+                        WorkflowStepResponse.builder()
+                                .id(s.getId()).workflowId(w.getId()).stepOrder(s.getStepOrder())
+                                .name(s.getName()).side(s.getSide()).description(s.getDescription())
+                                .approvalType(s.getApprovalType()).minApprovalsRequired(s.getMinApprovalsRequired())
+                                .isParallel(s.isParallel()).isOptional(s.isOptional()).slaHours(s.getSlaHours())
+                                .automatedAction(s.getAutomatedAction())
+                                .roleIds(roleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .userIds(userIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .assignerRoleIds(assignerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .observerRoleIds(observerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .assignerResolution(s.getAssignerResolution())
+                                .allowOverride(s.isAllowOverride())
+                                .stepAction(s.getStepAction())
+                                .navKey(s.getNavKey())
+                                .assignerNavKey(s.getAssignerNavKey())
+                                .sections(sectionsByStepId.getOrDefault(s.getId(), List.of()))
+                                .build())
                 .collect(java.util.stream.Collectors.toList());
 
         return WorkflowResponse.builder()

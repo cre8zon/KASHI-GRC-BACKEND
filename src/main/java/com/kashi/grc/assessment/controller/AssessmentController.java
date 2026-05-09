@@ -328,9 +328,21 @@ public class AssessmentController {
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
         long answeredViaResponse = responseRepository.countAnsweredByAssessmentId(assessmentId);
+
+        // FIX: bulk-count all FILE_UPLOAD attachments in one GROUP BY query instead of
+        // calling countActiveAttachments() once per FILE_UPLOAD question (N round-trips).
+        List<Long> fileUploadQiIds = allQs.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId)
+                .toList();
+        Map<Long, Long> fileAttachCounts = new java.util.HashMap<>();
+        if (!fileUploadQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileUploadQiIds)
+                    .forEach(row -> fileAttachCounts.put((Long) row[0], (Long) row[1]));
+        }
         long answeredViaFile = allQs.stream()
                 .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
-                .filter(qi -> documentLinkRepository.countActiveAttachments("QUESTION_RESPONSE", qi.getId()) > 0)
+                .filter(qi -> fileAttachCounts.getOrDefault(qi.getId(), 0L) > 0)
                 .count();
         long answered  = answeredViaResponse + answeredViaFile;
         long mandatory = allQs.stream().filter(AssessmentQuestionInstance::isMandatory).count();
@@ -912,13 +924,11 @@ public class AssessmentController {
                     // With normalised scoring, scoreEarned is (optScore/maxOptScore)×weight,
                     // so SUM(scoreEarned)/SUM(weight) is always bounded 0–100%.
                     // Use persisted value if available (post step-12), else compute live.
+                    // FIX: sumWeightByAssessmentId() does a single DB SUM instead of
+                    // loading all question instances into memory to stream-sum weight.
                     double totalPossible = a.getTotalPossibleScore() != null
                             ? a.getTotalPossibleScore()
-                            : questionInstanceRepository
-                              .findByAssessmentIdOrderByOrderNo(a.getId())
-                              .stream()
-                              .mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0)
-                              .sum();
+                            : questionInstanceRepository.sumWeightByAssessmentId(a.getId());
                     double totalEarned = a.getTotalEarnedScore() != null
                             ? a.getTotalEarnedScore()
                             : responseRepository.sumReviewerAdjustedScoreByAssessmentId(a.getId());
@@ -2669,135 +2679,148 @@ public class AssessmentController {
                 .findByAssessmentId(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance for assessment", assessmentId));
 
-        List<SectionInstanceResponse> sections =
-                sectionInstanceRepository
-                        .findByTemplateInstanceIdAndAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId)
-                        .stream()
-                        .map(si -> {
-                            List<QuestionInstanceResponse> questions =
-                                    questionInstanceRepository
-                                            .findBySectionInstanceIdOrderByOrderNo(si.getId())
-                                            .stream()
-                                            .map(qi -> {
-                                                var responseOpt = responseRepository
-                                                        .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
+        List<AssessmentSectionInstance> rawSections =
+                sectionInstanceRepository.findByTemplateInstanceIdAndAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId);
 
-                                                List<OptionInstanceResponse> options =
-                                                        optionInstanceRepository
-                                                                .findByQuestionInstanceIdOrderByOrderNo(qi.getId())
-                                                                .stream()
-                                                                .map(o -> OptionInstanceResponse.builder()
-                                                                        .optionInstanceId(o.getId())
-                                                                        .optionValue(o.getOptionValue())
-                                                                        .score(o.getScore())
-                                                                        .build())
-                                                                .toList();
+        // ── Bulk-load all data upfront to eliminate N+1 queries ──────────────
+        // FIX: all userRepository.findById, responseRepository.findFirst, and
+        // documentLinkRepository.countActiveAttachments calls inside the per-question
+        // loop were each firing a separate DB query — O(N) per question.
+        // Pre-loading everything here reduces it to a fixed number of bulk queries.
 
-                                                AnswerResponse answer = responseOpt.map(r -> {
-                                                    java.util.List<Long> multiIds = null;
-                                                    if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
-                                                        try {
-                                                            Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
-                                                                    .readValue(r.getResponseText(), Long[].class);
-                                                            multiIds = java.util.Arrays.asList(arr);
-                                                        } catch (Exception ignored) {}
-                                                    }
-                                                    String answeredByName = null;
-                                                    if (r.getSubmittedBy() != null) {
-                                                        answeredByName = userRepository.findById(r.getSubmittedBy())
-                                                                .map(u -> {
-                                                                    String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                    String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                    String full = (fn + " " + ln).trim();
-                                                                    return full.isEmpty() ? u.getEmail() : full;
-                                                                }).orElse(null);
-                                                    }
-                                                    return AnswerResponse.builder()
-                                                            .responseId(r.getId())
-                                                            .responseText(multiIds != null ? null : r.getResponseText())
-                                                            .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
-                                                            .selectedOptionInstanceIds(multiIds)
-                                                            .scoreEarned(r.getScoreEarned())
-                                                            .reviewerStatus(r.getReviewerStatus())
-                                                            .submittedAt(r.getSubmittedAt())
-                                                            .answeredBy(r.getSubmittedBy())
-                                                            .answeredByName(answeredByName)
-                                                            .build();
-                                                }).orElse(null);
+        // Bulk-load all questions for all sections at once (1 query)
+        Set<Long> sectionInstanceIds = rawSections.stream()
+                .map(AssessmentSectionInstance::getId).collect(java.util.stream.Collectors.toSet());
+        List<AssessmentQuestionInstance> allQuestions = sectionInstanceIds.isEmpty()
+                ? List.of()
+                : questionInstanceRepository.findBySectionInstanceIdInOrderByOrderNo(sectionInstanceIds);
 
-                                                // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
-                                                if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
-                                                    long docCount = documentLinkRepository.countActiveAttachments(
-                                                            "QUESTION_RESPONSE", qi.getId());
-                                                    if (docCount > 0) {
-                                                        answer = AnswerResponse.builder()
-                                                                .responseText("[FILE_UPLOADED:" + docCount + "]")
-                                                                .build();
-                                                    }
-                                                }
+        // Bulk-load all responses for this assessment (1 query)
+        Map<Long, AssessmentResponse> responseByQiId = responseRepository.findByAssessmentId(assessmentId)
+                .stream().collect(java.util.stream.Collectors.toMap(
+                        AssessmentResponse::getQuestionInstanceId, r -> r, (a, b) -> b));
 
-                                                String assignedName = null;
-                                                if (qi.getAssignedUserId() != null) {
-                                                    assignedName = userRepository.findById(qi.getAssignedUserId())
-                                                            .map(u -> {
-                                                                String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                String full = (fn + " " + ln).trim();
-                                                                return full.isEmpty() ? u.getEmail() : full;
-                                                            }).orElse(null);
-                                                }
-                                                // Resolve review assistant name separately —
-                                                // reviewerAssignedUserId is the org-side assignment (step 9)
-                                                String reviewerAssignedName = null;
-                                                if (qi.getReviewerAssignedUserId() != null) {
-                                                    reviewerAssignedName = userRepository.findById(qi.getReviewerAssignedUserId())
-                                                            .map(u -> {
-                                                                String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                String full = (fn + " " + ln).trim();
-                                                                return full.isEmpty() ? u.getEmail() : full;
-                                                            }).orElse(null);
-                                                }
-                                                return QuestionInstanceResponse.builder()
-                                                        .questionInstanceId(qi.getId())
-                                                        .questionText(qi.getQuestionTextSnapshot())
-                                                        .responseType(qi.getResponseType())
-                                                        .weight(qi.getWeight())
-                                                        .mandatory(qi.isMandatory())
-                                                        .orderNo(qi.getOrderNo())
-                                                        .options(options)
-                                                        .currentResponse(answer)
-                                                        .assignedUserId(qi.getAssignedUserId())
-                                                        .assignedUserName(assignedName)
-                                                        .reviewerAssignedUserId(qi.getReviewerAssignedUserId())
-                                                        .reviewerAssignedUserName(reviewerAssignedName)
+        // Collect all user IDs we'll need for name resolution
+        Set<Long> allUserIds = new java.util.HashSet<>();
+        rawSections.forEach(s -> {
+            if (s.getAssignedUserId() != null) allUserIds.add(s.getAssignedUserId());
+            if (s.getSubmittedBy()    != null) allUserIds.add(s.getSubmittedBy());
+        });
+        allQuestions.forEach(qi -> {
+            if (qi.getAssignedUserId()         != null) allUserIds.add(qi.getAssignedUserId());
+            if (qi.getReviewerAssignedUserId()  != null) allUserIds.add(qi.getReviewerAssignedUserId());
+        });
+        responseByQiId.values().forEach(r -> {
+            if (r.getSubmittedBy() != null) allUserIds.add(r.getSubmittedBy());
+        });
+
+        // Bulk-load all user names (1 query)
+        Map<Long, String> nameMap = allUserIds.isEmpty() ? Map.of()
+                : userRepository.findAllById(allUserIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(
+                          com.kashi.grc.usermanagement.domain.User::getId,
+                          u -> {
+                              String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                              String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                              String full = (fn + " " + ln).trim();
+                              return full.isEmpty() ? u.getEmail() : full;
+                          }));
+
+        // Bulk-load FILE_UPLOAD attachment counts (1 query)
+        List<Long> fileQiIds = allQuestions.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId).toList();
+        Map<Long, Long> attachCounts = new java.util.HashMap<>();
+        if (!fileQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileQiIds)
+                    .forEach(row -> attachCounts.put((Long) row[0], (Long) row[1]));
+        }
+
+        // Group questions by sectionInstanceId for the mapper
+        Map<Long, List<AssessmentQuestionInstance>> questionsBySectionId = allQuestions.stream()
+                .collect(java.util.stream.Collectors.groupingBy(AssessmentQuestionInstance::getSectionInstanceId));
+
+        List<SectionInstanceResponse> sections = rawSections.stream()
+                .map(si -> {
+                    List<QuestionInstanceResponse> questions =
+                            questionsBySectionId.getOrDefault(si.getId(), List.of()).stream()
+                                    .map(qi -> {
+                                        AssessmentResponse r = responseByQiId.get(qi.getId());
+
+                                        List<OptionInstanceResponse> options =
+                                                optionInstanceRepository
+                                                        .findByQuestionInstanceIdOrderByOrderNo(qi.getId())
+                                                        .stream()
+                                                        .map(o -> OptionInstanceResponse.builder()
+                                                                .optionInstanceId(o.getId())
+                                                                .optionValue(o.getOptionValue())
+                                                                .score(o.getScore())
+                                                                .build())
+                                                        .toList();
+
+                                        AnswerResponse answer = null;
+                                        if (r != null) {
+                                            java.util.List<Long> multiIds = null;
+                                            if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
+                                                try {
+                                                    Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
+                                                            .readValue(r.getResponseText(), Long[].class);
+                                                    multiIds = java.util.Arrays.asList(arr);
+                                                } catch (Exception ignored) {}
+                                            }
+                                            answer = AnswerResponse.builder()
+                                                    .responseId(r.getId())
+                                                    .responseText(multiIds != null ? null : r.getResponseText())
+                                                    .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
+                                                    .selectedOptionInstanceIds(multiIds)
+                                                    .scoreEarned(r.getScoreEarned())
+                                                    .reviewerStatus(r.getReviewerStatus())
+                                                    .submittedAt(r.getSubmittedAt())
+                                                    .answeredBy(r.getSubmittedBy())
+                                                    .answeredByName(nameMap.get(r.getSubmittedBy())) // bulk name map
+                                                    .build();
+                                        }
+
+                                        // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
+                                        if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                            long docCount = attachCounts.getOrDefault(qi.getId(), 0L); // bulk count map
+                                            if (docCount > 0) {
+                                                answer = AnswerResponse.builder()
+                                                        .responseText("[FILE_UPLOADED:" + docCount + "]")
                                                         .build();
-                                            })
-                                            .toList();
+                                            }
+                                        }
 
-                            String submittedByName = null;
-                            if (si.getSubmittedBy() != null) {
-                                submittedByName = userRepository.findById(si.getSubmittedBy())
-                                        .map(u -> {
-                                            String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                            String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                            String full = (fn + " " + ln).trim();
-                                            return full.isEmpty() ? u.getEmail() : full;
-                                        }).orElse(null);
-                            }
-                            return SectionInstanceResponse.builder()
-                                    .sectionInstanceId(si.getId())
-                                    .sectionName(si.getSectionNameSnapshot())
-                                    .sectionOrderNo(si.getSectionOrderNo())
-                                    .assignedUserId(si.getAssignedUserId())
-                                    .submittedAt(si.getSubmittedAt())
-                                    .submittedBy(si.getSubmittedBy())
-                                    .submittedByName(submittedByName)
-                                    .reopenedAt(si.getReopenedAt())
-                                    .questions(questions)
-                                    .build();
-                        })
-                        .toList();
+                                        return QuestionInstanceResponse.builder()
+                                                .questionInstanceId(qi.getId())
+                                                .questionText(qi.getQuestionTextSnapshot())
+                                                .responseType(qi.getResponseType())
+                                                .weight(qi.getWeight())
+                                                .mandatory(qi.isMandatory())
+                                                .orderNo(qi.getOrderNo())
+                                                .options(options)
+                                                .currentResponse(answer)
+                                                .assignedUserId(qi.getAssignedUserId())
+                                                .assignedUserName(nameMap.get(qi.getAssignedUserId())) // bulk name map
+                                                .reviewerAssignedUserId(qi.getReviewerAssignedUserId())
+                                                .reviewerAssignedUserName(nameMap.get(qi.getReviewerAssignedUserId())) // bulk name map
+                                                .build();
+                                    })
+                                    .toList();
+
+                    return SectionInstanceResponse.builder()
+                            .sectionInstanceId(si.getId())
+                            .sectionName(si.getSectionNameSnapshot())
+                            .sectionOrderNo(si.getSectionOrderNo())
+                            .assignedUserId(si.getAssignedUserId())
+                            .submittedAt(si.getSubmittedAt())
+                            .submittedBy(si.getSubmittedBy())
+                            .submittedByName(nameMap.get(si.getSubmittedBy())) // bulk name map
+                            .reopenedAt(si.getReopenedAt())
+                            .questions(questions)
+                            .build();
+                })
+                .toList();
 
         return ResponseEntity.ok(ApiResponse.success(sections));
     }
@@ -2810,13 +2833,62 @@ public class AssessmentController {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
 
+        List<AssessmentQuestionInstance> allMyQuestions =
+                questionInstanceRepository.findByAssessmentIdAndAssignedUserIdOrderByOrderNo(assessmentId, userId);
+
+        // ── Bulk-load all data upfront to eliminate N+1 queries ──────────────
+        // FIX: userRepository.findById, sectionInstanceRepository.findById, and
+        // documentLinkRepository.countActiveAttachments were each called once per
+        // question inside the stream — O(N) per question. Pre-loading in bulk here.
+
+        // Bulk-load all responses for the assessment (1 query)
+        Map<Long, AssessmentResponse> myResponseByQiId = responseRepository.findByAssessmentId(assessmentId)
+                .stream().collect(java.util.stream.Collectors.toMap(
+                        AssessmentResponse::getQuestionInstanceId, r -> r, (a, b) -> b));
+
+        // Collect section instance IDs and user IDs
+        Set<Long> mySectionIds = allMyQuestions.stream()
+                .filter(qi -> qi.getSectionInstanceId() != null)
+                .map(AssessmentQuestionInstance::getSectionInstanceId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // Bulk-load section instances (1 query)
+        Map<Long, AssessmentSectionInstance> mySectionMap = mySectionIds.isEmpty() ? Map.of()
+                : sectionInstanceRepository.findAllById(mySectionIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(AssessmentSectionInstance::getId, s -> s));
+
+        // Collect all user IDs for name resolution
+        Set<Long> myUserIds = new java.util.HashSet<>();
+        myResponseByQiId.values().forEach(r -> { if (r.getSubmittedBy() != null) myUserIds.add(r.getSubmittedBy()); });
+
+        // Bulk-load user names (1 query)
+        Map<Long, String> myNameMap = myUserIds.isEmpty() ? Map.of()
+                : userRepository.findAllById(myUserIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(
+                          com.kashi.grc.usermanagement.domain.User::getId,
+                          u -> {
+                              String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                              String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                              String full = (fn + " " + ln).trim();
+                              return full.isEmpty() ? u.getEmail() : full;
+                          }));
+
+        // Bulk FILE_UPLOAD attachment counts (1 query)
+        List<Long> myFileQiIds = allMyQuestions.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId).toList();
+        Map<Long, Long> myAttachCounts = new java.util.HashMap<>();
+        if (!myFileQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", myFileQiIds)
+                    .forEach(row -> myAttachCounts.put((Long) row[0], (Long) row[1]));
+        }
+
         List<QuestionInstanceResponse> questions =
-                questionInstanceRepository.findByAssessmentIdAndAssignedUserIdOrderByOrderNo(assessmentId, userId)
-                        .stream()
+                allMyQuestions.stream()
                         .map(qi -> {
-                            var responseOpt = responseRepository
-                                    .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
-                            AnswerResponse answer = responseOpt.map(r -> {
+                            AssessmentResponse r = myResponseByQiId.get(qi.getId());
+                            AnswerResponse answer = null;
+                            if (r != null) {
                                 java.util.List<Long> multiIds = null;
                                 if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
                                     try {
@@ -2825,7 +2897,7 @@ public class AssessmentController {
                                         multiIds = java.util.Arrays.asList(arr);
                                     } catch (Exception ignored) {}
                                 }
-                                return AnswerResponse.builder()
+                                answer = AnswerResponse.builder()
                                         .responseId(r.getId())
                                         .responseText(multiIds != null ? null : r.getResponseText())
                                         .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
@@ -2833,23 +2905,14 @@ public class AssessmentController {
                                         .scoreEarned(r.getScoreEarned())
                                         .reviewerStatus(r.getReviewerStatus())
                                         .answeredBy(r.getSubmittedBy())
-                                        .answeredByName(r.getSubmittedBy() != null
-                                                ? userRepository.findById(r.getSubmittedBy())
-                                                  .map(u -> {
-                                                      String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                      String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                      String full = (fn + " " + ln).trim();
-                                                      return full.isEmpty() ? u.getEmail() : full;
-                                                  }).orElse(null)
-                                                : null)
+                                        .answeredByName(myNameMap.get(r.getSubmittedBy())) // bulk name map
                                         .submittedAt(r.getSubmittedAt())
                                         .build();
-                            }).orElse(null);
+                            }
 
                             // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
                             if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
-                                long docCount = documentLinkRepository.countActiveAttachments(
-                                        "QUESTION_RESPONSE", qi.getId());
+                                long docCount = myAttachCounts.getOrDefault(qi.getId(), 0L); // bulk count map
                                 if (docCount > 0) {
                                     answer = AnswerResponse.builder()
                                             .responseText("[FILE_UPLOADED:" + docCount + "]")
@@ -2857,13 +2920,12 @@ public class AssessmentController {
                                 }
                             }
 
-                            var sectionInst = qi.getSectionInstanceId() != null
-                                    ? sectionInstanceRepository.findById(qi.getSectionInstanceId()).orElse(null)
+                            AssessmentSectionInstance sectionInst = qi.getSectionInstanceId() != null
+                                    ? mySectionMap.get(qi.getSectionInstanceId()) // bulk section map
                                     : null;
-                            String sectionName = sectionInst != null
-                                    ? sectionInst.getSectionNameSnapshot() : null;
-                            java.time.LocalDateTime sectionSubmittedAt = sectionInst != null
-                                    ? sectionInst.getSubmittedAt() : null;
+                            String sectionName = sectionInst != null ? sectionInst.getSectionNameSnapshot() : null;
+                            java.time.LocalDateTime sectionSubmittedAt = sectionInst != null ? sectionInst.getSubmittedAt() : null;
+
                             return QuestionInstanceResponse.builder()
                                     .questionInstanceId(qi.getId())
                                     .questionText(qi.getQuestionTextSnapshot())
@@ -2954,14 +3016,11 @@ public class AssessmentController {
 
         Long workflowInstanceId = cycle.getWorkflowInstanceId();
 
-        List<TaskInstance> activeTasks = new ArrayList<>();
-        activeTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.PENDING));
-        activeTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.IN_PROGRESS));
-
-        boolean hasActiveTask = activeTasks.stream().anyMatch(task -> {
-            StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
-            return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
-        });
+        // FIX: single JOIN query replaces 2 findByStatus calls + N stepInstance.findById calls.
+        // taskInstanceRepository.existsByUserIdAndWorkflowInstanceIdAndStatusIn() does one
+        // EXISTS subquery with a JOIN on step_instances — O(1) regardless of task count.
+        boolean hasActiveTask = taskInstanceRepository.existsByUserIdAndWorkflowInstanceIdAndStatusIn(
+                userId, workflowInstanceId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS));
 
         if (!hasActiveTask) {
             if (hasOpenActionItemForAssessment(userId, assessment.getId(), assessment.getTenantId())) {
@@ -3027,11 +3086,10 @@ public class AssessmentController {
 
         Long workflowInstanceId = cycle.getWorkflowInstanceId();
 
-        List<TaskInstance> allUserTasks = taskInstanceRepository.findByAssignedUserId(userId);
-        boolean hasParticipated = allUserTasks.stream().anyMatch(task -> {
-            StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
-            return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
-        });
+        // FIX: single JOIN query replaces findByAssignedUserId + N stepInstance.findById calls.
+        // existsByUserIdAndWorkflowInstanceId does one EXISTS subquery — O(1).
+        boolean hasParticipated = taskInstanceRepository.existsByUserIdAndWorkflowInstanceId(
+                userId, workflowInstanceId);
 
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",

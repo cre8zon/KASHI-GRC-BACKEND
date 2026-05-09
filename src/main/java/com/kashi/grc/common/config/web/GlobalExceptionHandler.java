@@ -14,6 +14,8 @@ import org.springframework.validation.FieldError;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.NoHandlerFoundException;
 
 import java.util.HashMap;
@@ -83,6 +85,29 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleNotFound(NoHandlerFoundException ex) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.error("ENDPOINT_NOT_FOUND", "Endpoint not found: " + ex.getRequestURL()));
+    }
+
+    // ── Browser disconnect / client abort ─────────────────────────
+    // Fired when the browser cancels a slow request (tab close, navigation away,
+    // or timeout) while the server is still writing the response. This is normal
+    // user behavior — not a server error. Logging it as ERROR with a full stack
+    // trace flooded the logs and buried real errors. Now logged at WARN, no trace.
+    @ExceptionHandler(AsyncRequestNotUsableException.class)
+    public void handleClientAbort(AsyncRequestNotUsableException ex) {
+        log.warn("[CLIENT-ABORT] Browser disconnected mid-response: {}", ex.getMessage());
+        // No response — the connection is already gone.
+    }
+
+    // ── Path variable type mismatch ───────────────────────────────
+    // Happens when a URL segment that should be a Long ID contains a string
+    // (e.g. /v1/assessments/vendor — "vendor" routed to an {assessmentId} Long param).
+    // Was previously caught by the catch-all and logged as a full ERROR stack trace.
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    public ResponseEntity<ApiResponse<Void>> handleTypeMismatch(MethodArgumentTypeMismatchException ex) {
+        log.warn("[TYPE-MISMATCH] param='{}' value='{}'", ex.getName(), ex.getValue());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error("INVALID_PARAMETER",
+                        "Invalid value '" + ex.getValue() + "' for parameter '" + ex.getName() + "'"));
     }
 
     // ── Catch-all ─────────────────────────────────────────────────

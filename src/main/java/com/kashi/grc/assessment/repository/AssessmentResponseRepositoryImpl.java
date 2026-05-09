@@ -229,4 +229,36 @@ public class AssessmentResponseRepositoryImpl
         Double result = em.createQuery(cq).getSingleResult();
         return result != null ? result : 0.0;
     }
+
+    // ── 6. sumScoreEarnedByAssessmentId ──────────────────────────────────────
+
+    /**
+     * Raw SUM of scoreEarned — no reviewer verdict adjustment.
+     *
+     * Replaces the former Java default method in AssessmentResponseRepository:
+     *   findByAssessmentId(id).stream()
+     *           .filter(r -> r.getScoreEarned() != null)
+     *           .mapToDouble(AssessmentResponse::getScoreEarned).sum()
+     *
+     * That method loaded ALL response rows into Java heap just to aggregate
+     * one double column. This implementation does it in a single SQL SUM query.
+     *
+     * Used at step 5 (vendor submit) before any reviewer has set verdicts.
+     * Returns 0.0 when no scored responses exist for the assessment.
+     */
+    @Override
+    public Double sumScoreEarnedByAssessmentId(Long assessmentId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Double> cq = cb.createQuery(Double.class);
+        Root<AssessmentResponse> root = cq.from(AssessmentResponse.class);
+
+        cq.select(cb.sum(root.<Double>get("scoreEarned")))
+                .where(
+                        cb.equal(root.get("assessmentId"), assessmentId),
+                        cb.isNotNull(root.get("scoreEarned"))
+                );
+
+        Double result = em.createQuery(cq).getSingleResult();
+        return result != null ? result : 0.0;
+    }
 }
