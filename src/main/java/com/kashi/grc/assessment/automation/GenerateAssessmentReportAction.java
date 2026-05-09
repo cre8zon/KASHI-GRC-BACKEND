@@ -123,7 +123,10 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
                 .mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0)
                 .sum();
 
-        double totalEarned = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Reviewer-adjusted score: PASS → full credit, PARTIAL → 50%, FAIL → 0.
+        // PENDING (not yet reviewed) keeps full credit — same as raw score.
+        // This is the final authoritative value that goes into the compliance report.
+        double totalEarned = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         double compliancePct = totalPossible > 0
                 ? Math.round((totalEarned / totalPossible) * 10000.0) / 100.0
                 : 0.0;

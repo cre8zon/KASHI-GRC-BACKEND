@@ -776,7 +776,8 @@ public class ReviewController {
 
         double possible = questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId)
                 .stream().mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0).sum();
-        double earned   = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Use reviewer-adjusted score: PASS → full, PARTIAL → 50%, FAIL → 0, PENDING → full.
+        double earned   = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         double pct      = possible > 0 ? Math.round((earned / possible) * 10000.0) / 100.0 : 0.0;
 
         int openRemed = countOpenItemsByType(assessmentId, tenantId, "REMEDIATION_REQUEST");

@@ -802,8 +802,10 @@ public class AssessmentController {
                 .progress(Map.of(
                         "totalQuestions",   allQs.size(),
                         "answered",         responseRepository.countByAssessmentId(assessmentId),
-                        // Always recalculate live — DB value may be stale from vendor submission
-                        "totalEarnedScore", responseRepository.sumScoreByAssessmentId(assessmentId)))
+                        // Show reviewer-adjusted score so the reviewer sees the live
+                        // impact of their PASS/PARTIAL/FAIL verdicts as they evaluate.
+                        // PENDING questions (not yet reviewed) still contribute full credit.
+                        "totalEarnedScore", responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId)))
                 .sections(buildSectionInstances(assessmentId))
                 .build()));
     }
@@ -2166,12 +2168,13 @@ public class AssessmentController {
         VendorAssessment assessment = assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
 
-        // Recalculate total earned score from live response data
-        // This corrects any stale/zero value from vendor submission time
-        double liveScore = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Recalculate total earned score applying reviewer verdicts:
+        // PASS → full credit, PARTIAL → 50% credit, FAIL → 0, PENDING → full credit.
+        // This is the authoritative score that gets persisted and flows into all reports.
+        double liveScore = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         assessment.setTotalEarnedScore(liveScore);
         assessmentRepository.save(assessment);
-        log.info("[CONSOLIDATE] totalEarnedScore={} | assessmentId={}", liveScore, assessmentId);
+        log.info("[CONSOLIDATE] reviewer-adjusted totalEarnedScore={} | assessmentId={}", liveScore, assessmentId);
 
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -2238,7 +2241,9 @@ public class AssessmentController {
                     "riskRating must be one of: LOW, MEDIUM, HIGH, CRITICAL");
         }
         assessment.setRiskRating(riskRating.toUpperCase());
-        assessment.setTotalEarnedScore(responseRepository.sumScoreByAssessmentId(assessmentId));
+        // Persist reviewer-adjusted score alongside the rating so totalEarnedScore
+        // on the assessment record is always consistent with the final risk decision.
+        assessment.setTotalEarnedScore(responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId));
         assessmentRepository.save(assessment);
         log.info("[RISK-RATING] {} | assessmentId={} | by={}", riskRating.toUpperCase(), assessmentId, userId);
         eventPublisher.publishEvent(
