@@ -468,21 +468,39 @@ public class AssessmentController {
                         .questionInstanceId(req.getQuestionInstanceId())
                         .build());
 
-        // Multi-choice: store all selected option IDs as JSON in responseText.
-        // Single-choice: store the single selectedOptionInstanceId as before.
+        // ── INDUSTRY-STANDARD SCORING ──────────────────────────────────────
+        //
+        // scoreEarned stores the NORMALISED WEIGHTED CONTRIBUTION, not the raw
+        // option score. This keeps compliance % bounded to 0–100% regardless of
+        // how option scores are configured in the template.
+        //
+        // Formula (same as ServiceNow GRC / OneTrust / Archer):
+        //   SINGLE_CHOICE: scoreEarned = (selectedScore / maxOptionScore) × weight
+        //   MULTI_CHOICE:  scoreEarned = (sumSelectedScores / sumAllOptionScores) × weight
+        //   TEXT / DATE / NUMERIC / FILE: binary — answered = weight, not answered = 0
+        //
+        // totalPossible = SUM(weight) — already correct, weight is the ceiling
+        // totalEarned   = SUM(scoreEarned) — always ≤ totalPossible
+        // compliance %  = totalEarned / totalPossible × 100 — always 0–100%
+        //
+        // Raw option scores are still visible in option display (for the reviewer
+        // to see "3/5 pts" per question) — they are NOT used in aggregation.
+
+        AssessmentQuestionInstance qi = questionInstanceRepository
+                .findById(req.getQuestionInstanceId())
+                .orElse(null);
+        double weight = (qi != null && qi.getWeight() != null) ? qi.getWeight() : 1.0;
+
         if (req.getSelectedOptionInstanceIds() != null && !req.getSelectedOptionInstanceIds().isEmpty()) {
-            // MULTI_CHOICE — accumulate selections:
-            // Merge with any previously stored selections so toggling one option
-            // doesn't wipe the others.
+            // ── MULTI_CHOICE ──────────────────────────────────────────────────
             java.util.Set<Long> existing = new java.util.HashSet<>();
             if (response.getResponseText() != null && response.getResponseText().startsWith("[")) {
                 try {
-                    com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
-                    Long[] arr = om.readValue(response.getResponseText(), Long[].class);
+                    Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(response.getResponseText(), Long[].class);
                     existing.addAll(java.util.Arrays.asList(arr));
                 } catch (Exception ignored) {}
             }
-            // Toggle: if already selected → remove, else → add
             for (Long optId : req.getSelectedOptionInstanceIds()) {
                 if (existing.contains(optId)) existing.remove(optId);
                 else existing.add(optId);
@@ -493,20 +511,49 @@ public class AssessmentController {
             } catch (Exception e) {
                 response.setResponseText(existing.toString());
             }
-            // Store last-toggled for scoring compatibility
             response.setSelectedOptionInstanceId(req.getSelectedOptionInstanceIds().get(0));
-            // Score = sum of all selected option scores
-            double totalScore = existing.stream()
-                    .mapToDouble(id -> optionInstanceRepository.findById(id)
-                            .map(o -> o.getScore() != null ? o.getScore() : 0.0).orElse(0.0))
-                    .sum();
-            response.setScoreEarned(totalScore);
+
+            // Normalised multi-choice score: sumSelected / sumAll × weight
+            double sumAll = optionInstanceRepository.sumScoreByQuestionInstanceId(req.getQuestionInstanceId());
+            if (sumAll > 0) {
+                double sumSelected = existing.stream()
+                        .mapToDouble(id -> optionInstanceRepository.findById(id)
+                                .map(o -> o.getScore() != null ? o.getScore() : 0.0)
+                                .orElse(0.0))
+                        .sum();
+                response.setScoreEarned((sumSelected / sumAll) * weight);
+            } else {
+                // No option scores configured — fall back to binary (any selection = full weight)
+                response.setScoreEarned(existing.isEmpty() ? 0.0 : weight);
+            }
+
         } else {
+            // ── SINGLE_CHOICE, TEXT, NUMERIC, DATE, FILE ─────────────────────
             response.setSelectedOptionInstanceId(req.getSelectedOptionInstanceId());
             response.setResponseText(req.getResponseText());
-            if (req.getSelectedOptionInstanceId() != null)
-                optionInstanceRepository.findById(req.getSelectedOptionInstanceId())
-                        .ifPresent(o -> response.setScoreEarned(o.getScore()));
+
+            if (req.getSelectedOptionInstanceId() != null) {
+                // SINGLE_CHOICE: normalised = (selectedScore / maxScore) × weight
+                AssessmentOptionInstance selectedOpt = optionInstanceRepository
+                        .findById(req.getSelectedOptionInstanceId()).orElse(null);
+                if (selectedOpt != null && selectedOpt.getScore() != null) {
+                    double maxScore = optionInstanceRepository
+                            .maxScoreByQuestionInstanceId(req.getQuestionInstanceId());
+                    if (maxScore > 0) {
+                        response.setScoreEarned((selectedOpt.getScore() / maxScore) * weight);
+                    } else {
+                        // Options exist but no scores configured — full weight for answering
+                        response.setScoreEarned(weight);
+                    }
+                } else {
+                    // Option has no score — full weight for answering (participation credit)
+                    response.setScoreEarned(weight);
+                }
+            } else if (req.getResponseText() != null && !req.getResponseText().isBlank()) {
+                // TEXT / NUMERIC / DATE — binary: answered = full weight
+                response.setScoreEarned(weight);
+            }
+            // FILE_UPLOAD: scored separately via DocumentLink; leave scoreEarned null here
         }
         response.setSubmittedBy(userId);
         response.setSubmittedAt(LocalDateTime.now());
@@ -534,8 +581,8 @@ public class AssessmentController {
         );
 
         // KashiGuard: evaluate answer against guard rules (async, non-blocking)
-        // Uses new module-agnostic signature — no AssessmentQuestionInstance import in GuardEvaluator
-        questionInstanceRepository.findById(req.getQuestionInstanceId()).ifPresent(qi -> {
+        // Uses the outer `qi` already fetched above for scoring — no second DB lookup.
+        if (qi != null) {
             String navCtx = String.format(
                     "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1\","
                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
@@ -572,7 +619,7 @@ public class AssessmentController {
                     selectedOptionValues.isEmpty() ? null : selectedOptionValues,
                     tenantId
             );
-        });
+        }
 
         // ── Re-answer: transition action items to PENDING_REVIEW ────────────
         // When contributor re-answers, signal "ball is in reviewer's court".
@@ -788,22 +835,29 @@ public class AssessmentController {
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
 
+        // Fetch cycle for workflowInstanceId — needed by report page audit trail
+        VendorAssessmentCycle reviewCycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
+
         return ResponseEntity.ok(ApiResponse.success(VendorAssessmentResponse.builder()
                 .assessmentId(assessment.getId())
                 .vendorId(vendor.getId())
                 .vendorName(vendor.getName())
                 .templateName(templateName)
                 .status(assessment.getStatus())
+                .cycleNo(reviewCycle != null ? reviewCycle.getCycleNo() : null)
+                .workflowInstanceId(reviewCycle != null ? reviewCycle.getWorkflowInstanceId() : null)
                 .riskRating(assessment.getRiskRating())
+                .reviewFindings(assessment.getReviewFindings())
+                .totalEarnedScore(assessment.getTotalEarnedScore())
+                .totalPossibleScore(assessment.getTotalPossibleScore())
                 .openRemediationCount(assessment.getOpenRemediationCount() != null
                         ? assessment.getOpenRemediationCount().intValue() : 0)
+                .submittedAt(assessment.getSubmittedAt())
+                .completedAt(assessment.getCompletedAt())
                 .progress(Map.of(
-                        "totalQuestions",   allQs.size(),
-                        "answered",         responseRepository.countAnsweredByAssessmentId(assessmentId),
-                        // Show reviewer-adjusted score so the reviewer sees the live
-                        // impact of their PASS/PARTIAL/FAIL verdicts as they evaluate.
-                        // PENDING questions (not yet reviewed) still contribute full credit.
-                        "totalEarnedScore", responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId)))
+                        "totalQuestions",    allQs.size(),
+                        "answered",          responseRepository.countAnsweredByAssessmentId(assessmentId),
+                        "totalEarnedScore",  responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId)))
                 .sections(buildSectionInstances(assessmentId))
                 .build()));
     }
@@ -853,6 +907,25 @@ public class AssessmentController {
                     long answered = responseRepository.countAnsweredByAssessmentId(a.getId());
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int) (answered * 100 / total) : 0;
+
+                    // totalPossibleScore = SUM(weight) across all questions.
+                    // With normalised scoring, scoreEarned is (optScore/maxOptScore)×weight,
+                    // so SUM(scoreEarned)/SUM(weight) is always bounded 0–100%.
+                    // Use persisted value if available (post step-12), else compute live.
+                    double totalPossible = a.getTotalPossibleScore() != null
+                            ? a.getTotalPossibleScore()
+                            : questionInstanceRepository
+                              .findByAssessmentIdOrderByOrderNo(a.getId())
+                              .stream()
+                              .mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0)
+                              .sum();
+                    double totalEarned = a.getTotalEarnedScore() != null
+                            ? a.getTotalEarnedScore()
+                            : responseRepository.sumReviewerAdjustedScoreByAssessmentId(a.getId());
+                    int compliancePct = totalPossible > 0
+                            ? (int) Math.round(totalEarned / totalPossible * 100)
+                            : 0;
+
                     return VendorAssessmentResponse.builder()
                             .assessmentId(a.getId())
                             .vendorId(a.getVendorId())
@@ -861,14 +934,17 @@ public class AssessmentController {
                             .status(a.getStatus())
                             .submittedAt(a.getSubmittedAt())
                             .riskRating(a.getRiskRating())
+                            .totalEarnedScore(totalEarned)
+                            .totalPossibleScore(totalPossible)
                             .openRemediationCount(a.getOpenRemediationCount() != null
                                     ? a.getOpenRemediationCount().intValue() : 0)
                             .progress(Map.of(
-                                    "totalQuestions",   total,
-                                    "answered",         answered,
-                                    "percentComplete",  pct,
-                                    "totalEarnedScore", a.getTotalEarnedScore() != null
-                                            ? a.getTotalEarnedScore() : 0.0))
+                                    "totalQuestions",    total,
+                                    "answered",          answered,
+                                    "percentComplete",   pct,
+                                    "compliancePct",     compliancePct,
+                                    "totalEarnedScore",  totalEarned,
+                                    "totalPossibleScore", totalPossible))
                             .build();
                 })));
     }
@@ -2118,6 +2194,59 @@ public class AssessmentController {
      *   tasks are approved. That is correct — the step advances to step 10 when the last
      *   reviewer submits. This mirrors how vendor contributor tasks work in step 4.
      */
+    /**
+     * POST /v1/assessments/{assessmentId}/reset-reviewer-sections
+     *
+     * Admin: clear reviewer_submitted_at on all sections assigned to a specific
+     * reviewer so they can re-submit their sections after a task reset.
+     *
+     * Called AFTER POST /v1/workflow-instances/{id}/tasks/{taskId}/reset.
+     * Together they give the reviewer a clean slate without touching answers
+     * or evaluations already saved.
+     *
+     * @param assignedUserId the reviewer whose section submissions to clear.
+     *                       If omitted, clears ALL reviewer submissions for this assessment.
+     */
+    @PostMapping("/v1/assessments/{assessmentId}/reset-reviewer-sections")
+    @Transactional
+    @Operation(summary = "Admin: clear reviewer section submissions so the reviewer can re-submit")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resetReviewerSections(
+            @PathVariable Long assessmentId,
+            @RequestParam(required = false) Long assignedUserId) {
+
+        AssessmentTemplateInstance ti = templateInstanceRepository
+                .findByAssessmentId(assessmentId)
+                .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance", assessmentId));
+
+        List<AssessmentSectionInstance> sections = assignedUserId != null
+                ? sectionInstanceRepository
+                  .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
+                          ti.getId(), assignedUserId)
+                : sectionInstanceRepository
+                  .findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+
+        int cleared = 0;
+        for (AssessmentSectionInstance sec : sections) {
+            if (sec.getReviewerSubmittedAt() != null) {
+                sec.setReviewerSubmittedAt(null);
+                sec.setReviewerSubmittedBy(null);
+                sec.setReviewerReopenedAt(java.time.LocalDateTime.now());
+                sec.setReviewerReopenedBy(utilityService.getLoggedInDataContext().getId());
+                cleared++;
+            }
+        }
+        sectionInstanceRepository.saveAll(sections);
+
+        log.info("[ADMIN] reset-reviewer-sections | assessmentId={} | assignedUserId={} | cleared={}",
+                assessmentId, assignedUserId, cleared);
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "assessmentId",  assessmentId,
+                "assignedUserId", assignedUserId,
+                "sectionsCleared", cleared
+        )));
+    }
+
     @PostMapping("/v1/assessments/{assessmentId}/complete-reviewer-evaluation")
     @Transactional
     @Operation(summary = "Step 9: mark reviewer evaluation complete — closes individual reviewer task")

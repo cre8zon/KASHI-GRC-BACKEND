@@ -348,6 +348,35 @@ public class WorkflowInstanceController {
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    /**
+     * POST /v1/workflow-instances/{id}/tasks/{taskId}/reset
+     *
+     * Admin: reset a task back to IN_PROGRESS so the assignee can re-work it.
+     *
+     * Resets:
+     *   1. task_instances.status       → IN_PROGRESS
+     *   2. task_instances.acted_at     → NULL
+     *   3. task_section_completions    → completed=false, completedAt=NULL for all rows
+     *   4. Writes a workflow history audit entry
+     *
+     * Does NOT touch assessment domain state (answers, evaluations, section submits).
+     * Pair with POST /v1/assessments/{id}/reset-reviewer-sections if the reviewer's
+     * section submissions also need to be cleared so they can re-submit.
+     *
+     * Idempotent — safe to call on an already-IN_PROGRESS task.
+     */
+    @PostMapping("/{id}/tasks/{taskId}/reset")
+    @org.springframework.transaction.annotation.Transactional
+    @Operation(summary = "Admin: reset a task to IN_PROGRESS and re-arm its section gates")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
+            @PathVariable Long id,
+            @PathVariable Long taskId) {
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        log.info("[WF-ADMIN] RESET-TASK | instanceId={} | taskId={} | by={}", id, taskId, userId);
+        Map<String, Object> result = service.resetTask(id, taskId, userId);
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
     // ══════════════════════════════════════════════════════════════
     // HISTORY / AUDIT TRAIL
     // ══════════════════════════════════════════════════════════════

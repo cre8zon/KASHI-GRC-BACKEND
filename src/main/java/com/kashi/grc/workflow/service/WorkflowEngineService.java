@@ -118,6 +118,7 @@ public class WorkflowEngineService {
     private final ApplicationEventPublisher eventPublisher;
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
+    private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
 
     // ══════════════════════════════════════════════════════════════
     // BLUEPRINT MANAGEMENT — Platform Admin only (logic unchanged)
@@ -2743,4 +2744,76 @@ public class WorkflowEngineService {
             return Map.of("advanced", true, "nextStep", "WORKFLOW_COMPLETED");
         }
     }
+
+
+    /**
+     * Reset a task back to IN_PROGRESS so the assignee can re-work it.
+     *
+     * Workflow-layer half of the admin "reopen task" feature. Resets task status
+     * and re-arms compound section gates. Assessment-domain state (reviewer
+     * submitted sections, evaluations) is handled by AssessmentController separately.
+     *
+     *   1. Reset task status to IN_PROGRESS, clear acted_at
+     *   2. Reset all TaskSectionCompletion rows (completed=false, re-arms gates)
+     *   3. If step was APPROVED, revert to IN_PROGRESS so engine knows it's not done
+     *   4. Write audit history
+     */
+    @Transactional
+    public Map<String, Object> resetTask(Long instanceId, Long taskId, Long performedBy) {
+        WorkflowInstance instance = instanceRepository.findById(instanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
+
+        TaskInstance task = taskInstanceRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskId));
+
+        StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", task.getStepInstanceId()));
+
+        if (!si.getWorkflowInstanceId().equals(instanceId)) {
+            throw new BusinessException("MISMATCH", "Task does not belong to this workflow instance");
+        }
+
+        String previousStatus = task.getStatus().name();
+
+        // 1. Reset task
+        task.setStatus(TaskStatus.IN_PROGRESS);
+        task.setActedAt(null);
+        task.setRemarks("Reset by admin (was " + previousStatus + ") — re-work in progress");
+        taskInstanceRepository.save(task);
+        log.info("[WF-ADMIN] RESET-TASK | taskId={} | {} -> IN_PROGRESS", taskId, previousStatus);
+
+        // 2. Re-arm all section completion gates
+        List<TaskSectionCompletion> sections =
+                taskSectionCompletionRepository
+                        .findByTaskInstanceIdOrderBySnapSectionOrderAsc(taskId);
+        for (TaskSectionCompletion sc : sections) {
+            sc.setCompleted(false);
+            sc.setCompletedAt(null);
+            sc.setCompletedBy(null);
+            sc.setRemarks("Reset by admin");
+        }
+        taskSectionCompletionRepository.saveAll(sections);
+        log.info("[WF-ADMIN] RESET-TASK | {} section gate(s) re-armed for taskId={}", sections.size(), taskId);
+
+        // 3. Revert step to IN_PROGRESS if it was already APPROVED
+        if (si.getStatus() == StepStatus.APPROVED) {
+            si.setStatus(StepStatus.IN_PROGRESS);
+            si.setCompletedAt(null);
+            stepInstanceRepository.save(si);
+            log.info("[WF-ADMIN] RESET-TASK | stepInstance={} APPROVED -> IN_PROGRESS", si.getId());
+        }
+
+        // 4. Audit trail
+        recordHistory(instance, si, task, "TASK_RESET",
+                previousStatus, TaskStatus.IN_PROGRESS.name(), performedBy,
+                "Task reset by admin — assignee can re-work");
+
+        return Map.of(
+                "reset",          true,
+                "taskId",         taskId,
+                "previousStatus", previousStatus,
+                "sectionsReset",  sections.size()
+        );
+    }
+
 }
