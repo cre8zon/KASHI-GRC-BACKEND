@@ -2313,7 +2313,7 @@ public class AssessmentController {
     /** Step 10: Reviewer saves consolidated findings text */
     @PostMapping("/v1/assessments/{assessmentId}/document-findings")
     @Transactional
-    @Operation(summary = "Step 10: save findings text and fire FINDINGS_DOCUMENTED event")
+    @Operation(summary = "Step 10: append reviewer findings (all reviewers' findings are preserved)")
     public ResponseEntity<ApiResponse<Void>> documentFindings(
             @PathVariable Long assessmentId,
             @RequestParam Long taskId,
@@ -2323,9 +2323,29 @@ public class AssessmentController {
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
         String findings = body != null ? body.getOrDefault("findings", "") : "";
         if (!findings.isBlank()) {
-            assessment.setReviewFindings(findings);
+            // Resolve reviewer name for the findings header
+            String reviewerName = userRepository.findById(userId).map(u -> {
+                String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                String full = (fn + " " + ln).trim();
+                return full.isEmpty() ? u.getEmail() : full;
+            }).orElse("Reviewer #" + userId);
+
+            String datestamp = java.time.LocalDate.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy"));
+
+            // Build the new section header and content
+            String section = "--- " + reviewerName + " · " + datestamp + " ---\n" + findings.trim();
+
+            // Append to existing findings (preserve all previous reviewers' contributions)
+            String existing = assessment.getReviewFindings();
+            String combined = (existing != null && !existing.isBlank())
+                    ? existing.trim() + "\n\n" + section
+                    : section;
+
+            assessment.setReviewFindings(combined);
             assessmentRepository.save(assessment);
-            log.info("[FINDINGS] Saved {} chars of findings | assessmentId={}", findings.length(), assessmentId);
+            log.info("[FINDINGS] Appended {} chars | assessmentId={} | reviewer={}", findings.length(), assessmentId, reviewerName);
         }
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
