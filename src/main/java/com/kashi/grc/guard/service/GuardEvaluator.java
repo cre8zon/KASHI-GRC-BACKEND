@@ -257,8 +257,24 @@ public class GuardEvaluator {
         req.setSourceId(rule.getId());
         req.setEntityType(ActionItem.EntityType.QUESTION_RESPONSE);
         req.setEntityId(qi);
-        req.setAssignedGroupRole(rule.getAssignedRole() != null
-                ? rule.getAssignedRole() : blueprint.getResolutionRole());
+
+        // ── Direct assignment: section responder / contributor takes priority ──
+        // If the publishing module resolved a specific user (section assignedUserId
+        // or question contributor), assign the action item directly to them.
+        // This avoids inbox noise for the whole VENDOR_RESPONDER group when the
+        // responsible person is already known.
+        // Falls back to assignedGroupRole from the rule / blueprint when no specific
+        // user is set (e.g. question was never assigned to a contributor).
+        if (ctx.assignedUserId() != null) {
+            req.setAssignedTo(ctx.assignedUserId());
+            log.debug("[KASHI-GUARD] Direct assignment → userId={} | qi={}", ctx.assignedUserId(), qi);
+        } else {
+            req.setAssignedGroupRole(rule.getAssignedRole() != null
+                    ? rule.getAssignedRole() : blueprint.getResolutionRole());
+            log.debug("[KASHI-GUARD] Group assignment → role={} | qi={}",
+                    rule.getAssignedRole() != null ? rule.getAssignedRole() : blueprint.getResolutionRole(), qi);
+        }
+
         req.setResolutionRole(blueprint.getResolutionRole());
         req.setTitle(blueprint.getTitleTemplate());
         req.setDescription(blueprint.getDescriptionTemplate());

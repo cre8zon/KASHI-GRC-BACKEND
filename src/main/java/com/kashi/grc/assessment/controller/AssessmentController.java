@@ -1693,6 +1693,10 @@ public class AssessmentController {
      * 2. WORKFLOW EVENTS — fires CISO_REVIEW_COMPLETE + ASSESSMENT_SUBMITTED.
      */
     @PostMapping("/v1/assessments/{assessmentId}/ciso-submit")
+    @Transactional  // REQUIRED: GuardEvaluationListener uses @TransactionalEventListener(AFTER_COMMIT).
+    // Without an enclosing transaction, ModuleSubmitEvent is silently dropped
+    // (fallbackExecution=false is Spring's default) → guard sweep never runs
+    // → no action items created for unanswered/flagged questions.
     @Operation(summary = "Step 6: guard sweep + fire CISO_REVIEW_COMPLETE + ASSESSMENT_SUBMITTED")
     public ResponseEntity<ApiResponse<Void>> cisoSubmit(
             @PathVariable Long assessmentId,
@@ -1751,6 +1755,19 @@ public class AssessmentController {
                                 }
                             }
 
+                            // ── Direct assignment: section responder → contributor → null ──
+                            // Priority: contributor (question-level) → section responder → null (group fallback).
+                            // GuardEvaluator assigns the action item directly to this user,
+                            // avoiding inbox noise for the entire VENDOR_RESPONDER group.
+                            Long assignedUserId = qi.getAssignedUserId(); // contributor if assigned
+                            if (assignedUserId == null && qi.getSectionInstanceId() != null) {
+                                // Fall back to section-level responder assignment
+                                assignedUserId = sectionInstanceRepository
+                                        .findById(qi.getSectionInstanceId())
+                                        .map(com.kashi.grc.assessment.domain.AssessmentSectionInstance::getAssignedUserId)
+                                        .orElse(null);
+                            }
+
                             String navCtx = String.format(
                                     "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1\","
                                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
@@ -1764,7 +1781,8 @@ public class AssessmentController {
                                     fileUploaded,
                                     r != null ? r.getScoreEarned() : null,
                                     navCtx,
-                                    selectedOptionValues.isEmpty() ? null : selectedOptionValues
+                                    selectedOptionValues.isEmpty() ? null : selectedOptionValues,
+                                    assignedUserId  // direct assignee — section responder or contributor
                             );
                         })
                         .toList();
@@ -2067,50 +2085,13 @@ public class AssessmentController {
         log.info("[REVIEWER-EVAL] {} | assessmentId={} | qi={} | by={}",
                 verdict.toUpperCase(), assessmentId, questionInstanceId, userId);
 
-        // ── Fire SCORE_ANSWERS when all assigned questions are evaluated ──────
-        // SCORE_ANSWERS is a required compound task section gate on the reviewer's
-        // task. Without this firing, the task never auto-approves even after the
-        // reviewer submits all their sections (SECTION_REVIEW_COMPLETE fires but
-        // SCORE_ANSWERS never does → 1/2 sections always stuck → task stays open).
-        if (taskId != null) {
-            try {
-                AssessmentTemplateInstance ti = templateInstanceRepository
-                        .findByAssessmentId(assessmentId).orElse(null);
-                if (ti != null) {
-                    // All questions across this reviewer's assigned sections
-                    List<AssessmentQuestionInstance> myQuestions =
-                            sectionInstanceRepository
-                                    .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
-                                            ti.getId(), userId)
-                                    .stream()
-                                    .flatMap(s -> questionInstanceRepository
-                                            .findBySectionInstanceIdOrderByOrderNo(s.getId()).stream())
-                                    .toList();
-
-                    // All evaluated = every question has a non-null, non-PENDING reviewerStatus
-                    boolean allEvaluated = !myQuestions.isEmpty() && myQuestions.stream()
-                            .allMatch(qi -> {
-                                String rs = responseRepository
-                                        .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(
-                                                assessmentId, qi.getId())
-                                        .map(AssessmentResponse::getReviewerStatus)
-                                        .orElse(null);
-                                return rs != null && !rs.equals("PENDING");
-                            });
-
-                    if (allEvaluated) {
-                        log.info("[REVIEWER-EVAL] All questions evaluated — firing SCORE_ANSWERS | taskId={} | assessmentId={}",
-                                taskId, assessmentId);
-                        eventPublisher.publishEvent(
-                                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
-                                        "SCORE_ANSWERS", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
-                    }
-                }
-            } catch (Exception e) {
-                log.warn("[REVIEWER-EVAL] SCORE_ANSWERS check failed — non-blocking | taskId={} | reason={}",
-                        taskId, e.getMessage());
-            }
-        }
+        // NOTE: SCORE_ANSWERS compound-task section gate is no longer fired here.
+        // Step 9 task completion is now handled entirely in reviewerSubmitSection:
+        // when the reviewer submits their last section, markAllSectionsCompleteForTask()
+        // marks ALL snapshotted sections (including SCORE_ANSWERS) complete atomically
+        // and auto-approves the task — the same proven pattern used by vendor responders
+        // at step 4. Keeping SCORE_ANSWERS here would race against that call and cause
+        // double-approval attempts. The verdict saved above is still readable for scoring.
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "questionInstanceId", questionInstanceId,
