@@ -560,10 +560,19 @@ public class ReviewController {
             try { dueAt = LocalDateTime.parse(dueDateStr); } catch (Exception ignored) {}
         }
 
+        // Resolve the responder: section's assigned user (VENDOR_RESPONDER).
+        // Remediation ownership always goes to the responder, never to the contributor directly.
+        Long responderUserId = null;
+        if (qi.getSectionInstanceId() != null) {
+            responderUserId = sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                    .map(si -> si.getAssignedUserId())
+                    .orElse(null);
+        }
+
         ActionItem item = ActionItem.builder()
                 .tenantId(tenantId).createdBy(userId)
-                .assignedTo(qi.getAssignedUserId())
-                .assignedGroupRole("VENDOR_CISO")
+                .assignedTo(responderUserId)
+                .assignedGroupRole("VENDOR_RESPONDER")
                 .sourceType(ActionItem.SourceType.COMMENT).sourceId(questionInstanceId)
                 .entityType(ActionItem.EntityType.QUESTION_RESPONSE).entityId(questionInstanceId)
                 .title("Remediation required: " + qi.getQuestionTextSnapshot().substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
@@ -583,7 +592,9 @@ public class ReviewController {
         assessmentRepository.save(assessment);
 
         String msg = resolveUserName(userId) + " flagged a question for remediation [" + severity + "]";
-        if (qi.getAssignedUserId() != null)
+        if (responderUserId != null)
+            notificationService.send(responderUserId, "REMEDIATION_REQUESTED", msg, "QUESTION_RESPONSE", questionInstanceId);
+        if (qi.getAssignedUserId() != null && !qi.getAssignedUserId().equals(responderUserId))
             notificationService.send(qi.getAssignedUserId(), "REMEDIATION_REQUESTED", msg, "QUESTION_RESPONSE", questionInstanceId);
         notifyCiso(assessment, msg, questionInstanceId);
 

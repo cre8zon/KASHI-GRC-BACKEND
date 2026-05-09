@@ -326,6 +326,28 @@ public class WorkflowInstanceController {
         return ResponseEntity.ok(ApiResponse.success(service.getStuckSteps()));
     }
 
+    /**
+     * POST /v1/workflow-instances/{id}/steps/{stepInstanceId}/re-evaluate
+     *
+     * Re-runs isStepApprovalSatisfied() on a specific step and advances the workflow
+     * if the gate now passes. Useful for steps that got stuck because REJECTED sub-tasks
+     * were inflating the total ACTOR count and preventing advancement (now fixed in
+     * isStepApprovalSatisfied to exclude REJECTED tasks).
+     *
+     * Called by org admin from the workflow timeline when a step shows all actor tasks
+     * complete but the step hasn't advanced.
+     */
+    @PostMapping("/{id}/steps/{stepInstanceId}/re-evaluate")
+    @Operation(summary = "Admin: re-evaluate step approval gate and advance workflow if satisfied")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reEvaluateStep(
+            @PathVariable Long id,
+            @PathVariable Long stepInstanceId) {
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        log.info("[WF-ADMIN] RE-EVALUATE | instanceId={} | stepInstanceId={} | by={}", id, stepInstanceId, userId);
+        Map<String, Object> result = service.reEvaluateStep(id, stepInstanceId, userId);
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
     // ══════════════════════════════════════════════════════════════
     // HISTORY / AUDIT TRAIL
     // ══════════════════════════════════════════════════════════════

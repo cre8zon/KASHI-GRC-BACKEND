@@ -59,9 +59,20 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     }
 
     private String extractToken(HttpServletRequest request) {
+        // Primary: Authorization header (all normal API calls)
         String bearer = request.getHeader("Authorization");
-        if (StringUtils.hasText(bearer) && bearer.startsWith("Bearer ")) {
+        if (org.springframework.util.StringUtils.hasText(bearer) && bearer.startsWith("Bearer ")) {
             return bearer.substring(7);
+        }
+        // Fallback: ?token= query param — used by iframe-based preview endpoints
+        // (/v1/documents/{id}/stream and /v1/documents/{id}/preview-content) where
+        // the browser cannot set custom headers. Only accepted for these specific paths.
+        String path = request.getRequestURI();
+        if (path.contains("/v1/documents/") && (path.endsWith("/stream") || path.endsWith("/preview-content"))) {
+            String qpToken = request.getParameter("token");
+            if (org.springframework.util.StringUtils.hasText(qpToken)) {
+                return qpToken;
+            }
         }
         return null;
     }

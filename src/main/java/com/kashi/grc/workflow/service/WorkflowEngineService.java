@@ -2082,11 +2082,17 @@ public class WorkflowEngineService {
      * same StepInstance) are evaluated correctly.
      */
     private boolean isStepApprovalSatisfied(StepInstance si) {
-        long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRole(si.getId(), TaskRole.ACTOR);
+        // REJECTED tasks are intentionally excluded from both counts.
+        // A REJECTED contributor task means the responder closed it (section locked before
+        // contributor finished) — it is a terminal "done" state that should not block
+        // the step from advancing once the real ACTOR tasks (responders) are all approved.
+        // Including REJECTED in total but not approved would permanently stall the step.
+        long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatusNot(
+                si.getId(), TaskRole.ACTOR, TaskStatus.REJECTED);
         long approved = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatus(
                 si.getId(), TaskRole.ACTOR, TaskStatus.APPROVED);
 
-        // No actor tasks exist yet (step still AWAITING_ASSIGNMENT) → not satisfied
+        // No non-rejected actor tasks exist yet (step still AWAITING_ASSIGNMENT) → not satisfied
         if (total == 0) return false;
 
         ApprovalType approvalType = si.getSnapApprovalType() != null
@@ -2627,5 +2633,73 @@ public class WorkflowEngineService {
 
         log.info("[WF-ADMIN] getStuckSteps — found {} stuck step(s)", stuck.size());
         return stuck;
+    }
+
+    /**
+     * Re-evaluates the approval gate on a specific step and advances the workflow
+     * if isStepApprovalSatisfied() now returns true.
+     *
+     * Use case: step 4 got stuck because legacy contributor REJECTED tasks were
+     * being counted in the approval denominator (now fixed). Call this endpoint
+     * on affected instances to immediately unblock them without data migration.
+     */
+    @Transactional
+    public Map<String, Object> reEvaluateStep(Long instanceId, Long stepInstanceId, Long performedBy) {
+        WorkflowInstance instance = instanceRepository.findById(instanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
+        StepInstance si = stepInstanceRepository.findById(stepInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", stepInstanceId));
+
+        if (!si.getWorkflowInstanceId().equals(instanceId)) {
+            throw new BusinessException("MISMATCH", "StepInstance does not belong to this workflow instance");
+        }
+        if (si.getStatus() != StepStatus.IN_PROGRESS) {
+            return Map.of("advanced", false, "reason",
+                    "Step is not IN_PROGRESS (status=" + si.getStatus() + ")");
+        }
+
+        boolean satisfied = isStepApprovalSatisfied(si);
+        log.info("[WF-ADMIN] re-evaluate | stepInstanceId={} | satisfied={}", stepInstanceId, satisfied);
+
+        if (!satisfied) {
+            long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatusNot(
+                    si.getId(), TaskRole.ACTOR, TaskStatus.REJECTED);
+            long approved = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatus(
+                    si.getId(), TaskRole.ACTOR, TaskStatus.APPROVED);
+            return Map.of("advanced", false, "reason",
+                    "Gate not satisfied — approved=" + approved + " / total(excl.rejected)=" + total);
+        }
+
+        // Gate passes — complete step and advance
+        completeStep(si, StepStatus.APPROVED, "Re-evaluated and auto-advanced by admin");
+        expirePendingTasks(si, null);
+        recordHistory(instance, si, null, "STEP_APPROVED",
+                StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(), performedBy,
+                "Re-evaluated by admin — step gate satisfied");
+        eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                instance.getId(), si.getId(), si.getSnapName(), "APPROVED", performedBy));
+
+        Optional<WorkflowStep> nextStep = stepRepository
+                .findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                        instance.getWorkflowId(), si.getSnapStepOrder());
+
+        if (nextStep.isPresent()) {
+            StepInstance newSI = createStepInstance(instance, nextStep.get());
+            instance.setCurrentStepId(newSI.getId());
+            instanceRepository.save(instance);
+            assignTasksForStep(newSI, nextStep.get(), instance);
+            recordHistory(instance, newSI, null, "STEP_STARTED", null, newSI.getStatus().name(),
+                    performedBy, "Moved to: " + nextStep.get().getName());
+            eventPublisher.publishEvent(new WorkflowEvent.StepAdvanced(
+                    instance.getId(), newSI.getId(), nextStep.get().getName(),
+                    nextStep.get().getStepOrder(), newSI.getStatus().name(), performedBy));
+            log.info("[WF-ADMIN] Step advanced | from='{}' | to='{}'", si.getSnapName(), nextStep.get().getName());
+            return Map.of("advanced", true, "nextStep", nextStep.get().getName(),
+                    "nextStepInstanceId", newSI.getId());
+        } else {
+            instance.setStatus(WorkflowStatus.COMPLETED);
+            instanceRepository.save(instance);
+            return Map.of("advanced", true, "nextStep", "WORKFLOW_COMPLETED");
+        }
     }
 }

@@ -46,6 +46,15 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
     long countByStepInstanceIdAndTaskRoleAndStatus(Long stepInstanceId, TaskRole taskRole, TaskStatus status);
 
     /**
+     * Count ACTOR tasks EXCLUDING a specific status.
+     * Used by isStepApprovalSatisfied to exclude REJECTED sub-tasks (e.g. contributor
+     * tasks closed by the responder when locking a section) from the approval denominator.
+     * Without this, REJECTED contributor tasks inflate `total` and permanently stall
+     * the ALL-approval gate even when all real responder tasks are approved.
+     */
+    long countByStepInstanceIdAndTaskRoleAndStatusNot(Long stepInstanceId, TaskRole taskRole, TaskStatus status);
+
+    /**
      * Check if a specific user already has a PENDING task on a step instance.
      * Used by manual-assign to prevent duplicate tasks for the same user on the same step.
      */

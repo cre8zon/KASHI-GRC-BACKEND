@@ -124,6 +124,7 @@ public class AssessmentController {
     private final GuardEvaluator                        guardEvaluator;
     private final ActionItemRepository                   actionItemRepository;
     private final NotificationService                    notificationService;
+    private final com.kashi.grc.document.repository.DocumentLinkRepository documentLinkRepository;
 
     // ── 9.1 Execute Assessment (logic unchanged) ───────────────────────────────
 
@@ -325,7 +326,14 @@ public class AssessmentController {
 
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
-        long answered  = responseRepository.countByAssessmentId(assessmentId);
+        long answeredViaResponse = responseRepository.countByAssessmentId(assessmentId);
+        // FILE_UPLOAD questions are answered via DocumentLink, not AssessmentResponse.
+        // Count them separately and add to get the true answered total.
+        long answeredViaFile = allQs.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .filter(qi -> documentLinkRepository.countActiveAttachments("QUESTION_RESPONSE", qi.getId()) > 0)
+                .count();
+        long answered  = answeredViaResponse + answeredViaFile;
         long mandatory = allQs.stream().filter(AssessmentQuestionInstance::isMandatory).count();
         int  pct       = allQs.isEmpty() ? 0 : (int) (answered * 100 / allQs.size());
 
@@ -1112,6 +1120,20 @@ public class AssessmentController {
                                                     .build();
                                         }).orElse(null);
 
+                                        // FILE_UPLOAD: answered = at least one active DocumentLink exists.
+                                        // No AssessmentResponse row is written for file uploads — the document
+                                        // itself IS the answer. Build a sentinel response so currentResponse
+                                        // is non-null and the question counts as answered everywhere.
+                                        if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                            long docCount = documentLinkRepository.countActiveAttachments(
+                                                    "QUESTION_RESPONSE", qi.getId());
+                                            if (docCount > 0) {
+                                                answer = AnswerResponse.builder()
+                                                        .responseText("[FILE_UPLOADED:" + docCount + "]")
+                                                        .build();
+                                            }
+                                        }
+
                                         return QuestionInstanceResponse.builder()
                                                 .questionInstanceId(qi.getId())
                                                 .questionText(qi.getQuestionTextSnapshot())
@@ -1128,6 +1150,9 @@ public class AssessmentController {
                             .sectionInstanceId(si.getId())
                             .sectionName(si.getSectionNameSnapshot())
                             .sectionOrderNo(si.getSectionOrderNo())
+                            .assignedUserId(si.getAssignedUserId())
+                            .submittedAt(si.getSubmittedAt())
+                            .submittedBy(si.getSubmittedBy())
                             .questions(questions)
                             .build();
                 }).toList();
@@ -1216,102 +1241,8 @@ public class AssessmentController {
         log.info("[SECTION-SUBMIT] Section locked | sectionInstanceId={} | assessmentId={} | userId={}",
                 sectionInstanceId, assessmentId, userId);
 
-        // Auto-approve contributor sub-tasks for contributors whose ALL sections are now submitted
-        // A contributor may have questions in multiple sections — only close their task
-        // when the LAST section containing their questions is submitted.
-        java.util.Set<Long> contributorIds = questions.stream()
-                .filter(q -> q.getAssignedUserId() != null)
-                .map(AssessmentQuestionInstance::getAssignedUserId)
-                .collect(java.util.stream.Collectors.toSet());
-
-        if (!contributorIds.isEmpty()) {
-            AssessmentTemplateInstance tiForCheck = templateInstanceRepository
-                    .findByAssessmentId(assessmentId).orElse(null);
-            if (tiForCheck != null) {
-                for (Long contributorId : contributorIds) {
-                    // Count total sections that have at least one question assigned to this contributor
-                    long totalSections = contributorSectionSubmissionRepository
-                            .countDistinctSectionsWithAssignments(assessmentId, contributorId);
-                    // Count sections already submitted (including this one we just submitted)
-                    long submittedSections = sectionInstanceRepository
-                            .findByTemplateInstanceIdOrderBySectionOrderNo(tiForCheck.getId())
-                            .stream()
-                            .filter(s -> s.getSubmittedAt() != null)
-                            .filter(s -> questionInstanceRepository
-                                    .findBySectionInstanceIdOrderByOrderNo(s.getId())
-                                    .stream().anyMatch(q -> contributorId.equals(q.getAssignedUserId())))
-                            .count();
-
-                    if (submittedSections >= totalSections && totalSections > 0) {
-                        // All sections containing this contributor's questions are now locked.
-                        // Determine the right task closure based on whether the contributor
-                        // actually submitted their answers before the responder locked the section.
-                        //
-                        // APPROVE  — contributor called contributorSubmitSection for every
-                        //            section they had questions in → their work is complete.
-                        // REJECTED — responder locked the section before contributor finished
-                        //            → remove from their inbox so they aren't confused by a
-                        //               task they can no longer act on.
-
-                        // How many of the contributor's sections did they actually submit?
-                        long contributorSubmittedCount = contributorSectionSubmissionRepository
-                                .findByAssessmentIdAndContributorUserId(assessmentId, contributorId)
-                                .size();
-                        boolean contributorFinished = contributorSubmittedCount >= totalSections
-                                && totalSections > 0;
-
-                        StepInstance fillStep = stepInstanceRepository
-                                .findByWorkflowInstanceIdOrderByCreatedAtAsc(
-                                        cycleRepository.findById(
-                                                        assessmentRepository.findById(assessmentId)
-                                                                .map(va -> va.getCycleId()).orElse(0L))
-                                                .map(c -> c.getWorkflowInstanceId()).orElse(0L))
-                                .stream()
-                                .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL
-                                        && si.getStatus() == com.kashi.grc.workflow.enums.StepStatus.IN_PROGRESS)
-                                .findFirst().orElse(null);
-
-                        if (fillStep != null) {
-                            taskInstanceRepository.findByStepInstanceId(fillStep.getId())
-                                    .stream()
-                                    .filter(t -> contributorId.equals(t.getAssignedUserId())
-                                            && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
-                                            || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS))
-                                    .forEach(t -> {
-                                        try {
-                                            if (contributorFinished) {
-                                                // Contributor submitted all their sections — proper APPROVE
-                                                com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                                                        new com.kashi.grc.workflow.dto.request.TaskActionRequest();
-                                                req.setTaskInstanceId(t.getId());
-                                                req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
-                                                req.setRemarks("Contributor submitted all sections — auto-approved");
-                                                workflowEngineService.performAction(req, userId);
-                                                log.info("[SECTION-SUBMIT] Contributor sub-task APPROVED | contributorId={} | taskId={}",
-                                                        contributorId, t.getId());
-                                            } else {
-                                                // Responder locked section before contributor finished.
-                                                // Directly set task to REJECTED so it leaves their inbox.
-                                                // We do NOT use performAction(REJECT) because that would
-                                                // trigger step-level rejection logic — we only want to
-                                                // close this individual sub-task.
-                                                t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.REJECTED);
-                                                t.setActedAt(java.time.LocalDateTime.now());
-                                                t.setRemarks("Section locked by responder — contributor access revoked");
-                                                taskInstanceRepository.save(t);
-                                                log.info("[SECTION-SUBMIT] Contributor sub-task REJECTED (section locked before contributor finished) | contributorId={} | taskId={}",
-                                                        contributorId, t.getId());
-                                            }
-                                        } catch (Exception e) {
-                                            log.warn("[SECTION-SUBMIT] Could not close contributor task {}: {}",
-                                                    t.getId(), e.getMessage());
-                                        }
-                                    });
-                        }
-                    }
-                }
-            }
-        }
+        // Contributor tracking is via CONTRIBUTOR_ASSIGNMENT ActionItems (created in doAssignQuestion).
+        // No contributor TaskInstances exist — the sub-task close/reject block was removed.
 
         // Check if ALL sections assigned to this responder are now submitted
         // If so, fire the compound task gate → task auto-approves
@@ -2460,6 +2391,17 @@ public class AssessmentController {
                                                             .build();
                                                 }).orElse(null);
 
+                                                // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
+                                                if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                                    long docCount = documentLinkRepository.countActiveAttachments(
+                                                            "QUESTION_RESPONSE", qi.getId());
+                                                    if (docCount > 0) {
+                                                        answer = AnswerResponse.builder()
+                                                                .responseText("[FILE_UPLOADED:" + docCount + "]")
+                                                                .build();
+                                                    }
+                                                }
+
                                                 String assignedName = null;
                                                 if (qi.getAssignedUserId() != null) {
                                                     assignedName = userRepository.findById(qi.getAssignedUserId())
@@ -2555,9 +2497,32 @@ public class AssessmentController {
                                         .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
                                         .selectedOptionInstanceIds(multiIds)
                                         .scoreEarned(r.getScoreEarned())
+                                        .reviewerStatus(r.getReviewerStatus())
+                                        .answeredBy(r.getSubmittedBy())
+                                        .answeredByName(r.getSubmittedBy() != null
+                                                ? userRepository.findById(r.getSubmittedBy())
+                                                  .map(u -> {
+                                                      String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                                                      String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                                                      String full = (fn + " " + ln).trim();
+                                                      return full.isEmpty() ? u.getEmail() : full;
+                                                  }).orElse(null)
+                                                : null)
                                         .submittedAt(r.getSubmittedAt())
                                         .build();
                             }).orElse(null);
+
+                            // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
+                            if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                long docCount = documentLinkRepository.countActiveAttachments(
+                                        "QUESTION_RESPONSE", qi.getId());
+                                if (docCount > 0) {
+                                    answer = AnswerResponse.builder()
+                                            .responseText("[FILE_UPLOADED:" + docCount + "]")
+                                            .build();
+                                }
+                            }
+
                             var sectionInst = qi.getSectionInstanceId() != null
                                     ? sectionInstanceRepository.findById(qi.getSectionInstanceId()).orElse(null)
                                     : null;
