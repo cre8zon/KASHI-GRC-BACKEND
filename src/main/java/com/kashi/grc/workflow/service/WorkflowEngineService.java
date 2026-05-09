@@ -528,7 +528,14 @@ public class WorkflowEngineService {
             throw new BusinessException("TASK_TERMINAL",
                     "Task is already in terminal state: " + task.getStatus());
 
-        StepInstance stepInstance = stepInstanceRepository.findById(task.getStepInstanceId())
+        // Pessimistic write lock — serialises concurrent approvals on the same step.
+        // Without this, two actors approving within milliseconds of each other both
+        // read status=IN_PROGRESS, both satisfy isStepApprovalSatisfied(), and both
+        // call createStepInstance for the next step → duplicate step instances → false
+        // "+N revisits" badge on every subsequent workflow instance.
+        // With this lock the second transaction blocks until the first commits; by then
+        // the step is already APPROVED and the guard in handleApprove() exits early.
+        StepInstance stepInstance = stepInstanceRepository.findByIdForUpdate(task.getStepInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("StepInstance", task.getStepInstanceId()));
         WorkflowInstance instance = instanceRepository.findById(stepInstance.getWorkflowInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance",
@@ -601,6 +608,21 @@ public class WorkflowEngineService {
                 stepInstance.getId(), stepInstance.getSnapApprovalType(), stepComplete);
 
         if (stepComplete) {
+            // ── Concurrent-advance guard ──────────────────────────────────────
+            // Re-read the step status from the DB after acquiring the lock.
+            // If another transaction already completed this step (status != IN_PROGRESS),
+            // skip the advance entirely — creating a second next-step instance would
+            // produce the duplicate "+N revisits" bug on all future workflow instances.
+            StepStatus freshStatus = stepInstanceRepository.findById(stepInstance.getId())
+                    .map(StepInstance::getStatus)
+                    .orElse(StepStatus.IN_PROGRESS);
+            if (freshStatus != StepStatus.IN_PROGRESS) {
+                log.warn("[WORKFLOW-ACTION] Step already advanced by concurrent approval — skipping duplicate advance | stepInstanceId={} | freshStatus={}",
+                        stepInstance.getId(), freshStatus);
+                return buildInstanceResponse(instance);
+            }
+            // ── End concurrent-advance guard ──────────────────────────────────
+
             completeStep(stepInstance, StepStatus.APPROVED, req.getRemarks());
             expirePendingTasks(stepInstance, task.getId());
 

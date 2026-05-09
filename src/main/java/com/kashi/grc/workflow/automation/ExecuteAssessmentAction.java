@@ -242,6 +242,13 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
                         .weight(sqm.getWeight())
                         .isMandatory(sqm.isMandatory())
                         .orderNo(sqm.getOrderNo())
+                        // Snapshot the tag at instantiation time — full isolation from future
+                        // tag changes on the library question. GuardEvaluator reads this
+                        // snapshot, never joins back to assessment_questions.
+                        // Was accidentally omitted during the bulk-save refactor — caused
+                        // all question_tag_snapshot values to be NULL on new assessments,
+                        // silently skipping the entire guard sweep on ciso-submit.
+                        .questionTagSnapshot(q.getQuestionTag())
                         .build());
                 questionCount++;
             }

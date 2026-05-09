@@ -579,9 +579,9 @@ public class ReviewController {
                 .description(description).status(ActionItem.Status.OPEN).priority(priority).dueAt(dueAt)
                 .resolutionReservedFor(userId)
                 .navContext(String.format(
-                        "{\"assigneeRoute\":\"/vendor/assessments/%d/responder-review\"," +
+                        "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1&questionInstanceId=%d\"," +
                                 "\"reviewerRoute\":\"/assessments/%d/review\",\"questionInstanceId\":%d}",
-                        assessmentId, assessmentId, questionInstanceId))
+                        assessmentId, questionInstanceId, assessmentId, questionInstanceId))
                 .remediationType("REMEDIATION_REQUEST").severity(severity)
                 .expectedEvidence(expectedEvidence.isBlank() ? null : expectedEvidence)
                 .build();

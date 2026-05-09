@@ -1737,17 +1737,30 @@ public class AssessmentController {
      * Called after the org admin selects a CISO and confirms the delegation.
      */
     @PostMapping("/v1/assessments/{assessmentId}/assign-org-ciso")
-    @Operation(summary = "Step 7: fire ORG_CISO_ASSIGNED section event")
+    @Transactional
+    @Operation(summary = "Step 7: Org Admin confirms CISO selection — directly approves task to advance workflow")
     public ResponseEntity<ApiResponse<Void>> assignOrgCiso(
             @PathVariable Long assessmentId,
-            @RequestParam Long taskId) {
+            @RequestParam Long taskId,
+            @RequestParam(required = false) Long cisoUserId) {
+
         Long userId = utilityService.getLoggedInDataContext().getId();
         assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
-        eventPublisher.publishEvent(
-                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
-                        "ORG_CISO_ASSIGNED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
-        log.info("[SECTION-EVENT] ORG_CISO_ASSIGNED | assessmentId={} | taskId={}", assessmentId, taskId);
+
+        // Directly approve the task — advances step 7 and triggers step 8 task creation.
+        // Step 8 uses PUSH_TO_ROLES with ORG_CISO actor role, so it automatically fans
+        // out to all ORG_CISO users without any hardcoded reassignment here.
+        com.kashi.grc.workflow.dto.request.TaskActionRequest approveReq =
+                new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+        approveReq.setTaskInstanceId(taskId);
+        approveReq.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+        approveReq.setRemarks("Org CISO assignment confirmed" +
+                (cisoUserId != null ? " — cisoUserId=" + cisoUserId : ""));
+        workflowEngineService.performAction(approveReq, userId);
+
+        log.info("[ASSIGN-CISO] Step 7 approved | assessmentId={} | taskId={} | cisoUserId={} | by={}",
+                assessmentId, taskId, cisoUserId, userId);
         return ResponseEntity.ok(ApiResponse.success(null));
     }
 
@@ -2782,6 +2795,14 @@ public class AssessmentController {
             StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
             return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
         });
+
+        // Contributors have no workflow TaskInstance — they access the assessment
+        // via ActionItems (CONTRIBUTOR_ASSIGNMENT) created when a question is assigned.
+        // Fall back to open obligation check before denying read access.
+        if (!hasParticipated) {
+            hasParticipated = hasOpenActionItemForAssessment(userId, assessment.getId(),
+                    assessment.getTenantId());
+        }
 
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",

@@ -2,13 +2,16 @@ package com.kashi.grc.workflow.repository;
 
 import com.kashi.grc.workflow.domain.StepInstance;
 import com.kashi.grc.workflow.enums.StepStatus;
+import jakarta.persistence.LockModeType;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Lock;
 import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Repository for StepInstance entities.
@@ -51,6 +54,22 @@ public interface StepInstanceRepository extends JpaRepository<StepInstance, Long
      * Used to count how many times a step has been visited (send-back loop detection).
      */
     List<StepInstance> findByWorkflowInstanceIdAndStepId(Long workflowInstanceId, Long stepId);
+
+    /**
+     * Fetches a StepInstance with a pessimistic write lock.
+     *
+     * Used in performAction() to serialize concurrent task approvals on the same step.
+     * Without this lock, two actors approving simultaneously both read status=IN_PROGRESS,
+     * both satisfy isStepApprovalSatisfied(), and both call createStepInstance for the
+     * next step — producing duplicate step instances (the "+2 revisits" bug).
+     *
+     * With this lock, the second transaction blocks at the DB row level until the first
+     * commits. By the time it acquires the lock, the step status is already APPROVED
+     * and the early-exit guard in handleApprove() returns without creating a duplicate.
+     */
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("SELECT s FROM StepInstance s WHERE s.id = :id")
+    Optional<StepInstance> findByIdForUpdate(@Param("id") Long id);
 
     // ── New: UNASSIGNED steps ─────────────────────────────────────────────────
 
