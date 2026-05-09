@@ -185,4 +185,40 @@ public class AssessmentAdminController {
                 "compliancePct",     compliancePct
         )));
     }
+
+    /**
+     * PUT /v1/assessments/{assessmentId}/findings
+     *
+     * Admin: directly set the combined findings text.
+     * Use when reviewer findings were lost due to the old overwrite bug,
+     * or to manually combine/edit findings before report finalization.
+     * Overwrites whatever is currently stored — admin takes responsibility.
+     *
+     * Format tip: use "--- Reviewer Name · Date ---" headers to separate
+     * multiple reviewers' findings for display in the report page.
+     */
+    @PutMapping("/v1/assessments/{assessmentId}/findings")
+    @Transactional
+    @Operation(summary = "Admin: directly set consolidated findings text (overwrites)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> updateFindings(
+            @PathVariable Long assessmentId,
+            @RequestBody Map<String, String> body) {
+
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
+                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+
+        String findings = body.getOrDefault("findings", "");
+        assessment.setReviewFindings(findings.isBlank() ? null : findings.trim());
+        assessmentRepository.save(assessment);
+
+        log.info("[FINDINGS-ADMIN] Updated | assessmentId={} | by={} | chars={}",
+                assessmentId, userId, findings.length());
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "assessmentId", assessmentId,
+                "updated",      true,
+                "chars",        findings.length()
+        )));
+    }
 }
