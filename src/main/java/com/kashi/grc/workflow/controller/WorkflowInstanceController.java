@@ -370,10 +370,14 @@ public class WorkflowInstanceController {
     @Operation(summary = "Admin: reset a task to IN_PROGRESS and re-arm its section gates")
     public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
             @PathVariable Long id,
-            @PathVariable Long taskId) {
+            @PathVariable Long taskId,
+            @RequestBody(required = false) java.util.Map<String, Object> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        log.info("[WF-ADMIN] RESET-TASK | instanceId={} | taskId={} | by={}", id, taskId, userId);
-        Map<String, Object> result = service.resetTask(id, taskId, userId);
+        boolean rollbackDownstream = body != null
+                && Boolean.TRUE.equals(body.get("rollbackDownstream"));
+        log.info("[WF-ADMIN] RESET-TASK | instanceId={} | taskId={} | by={} | rollbackDownstream={}",
+                id, taskId, userId, rollbackDownstream);
+        Map<String, Object> result = service.resetTask(id, taskId, userId, rollbackDownstream);
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 

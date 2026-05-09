@@ -507,19 +507,14 @@ public class AssessmentController {
         double weight = (qi != null && qi.getWeight() != null) ? qi.getWeight() : 1.0;
 
         if (req.getSelectedOptionInstanceIds() != null && !req.getSelectedOptionInstanceIds().isEmpty()) {
-            // ── MULTI_CHOICE ──────────────────────────────────────────────────
-            java.util.Set<Long> existing = new java.util.HashSet<>();
-            if (response.getResponseText() != null && response.getResponseText().startsWith("[")) {
-                try {
-                    Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
-                            .readValue(response.getResponseText(), Long[].class);
-                    existing.addAll(java.util.Arrays.asList(arr));
-                } catch (Exception ignored) {}
-            }
-            for (Long optId : req.getSelectedOptionInstanceIds()) {
-                if (existing.contains(optId)) existing.remove(optId);
-                else existing.add(optId);
-            }
+            // ── MULTI_CHOICE — REPLACE semantics ────────────────────────────
+            // The frontend sends the COMPLETE set of selected options on every
+            // toggle. We replace the stored set entirely rather than toggling
+            // individual IDs, which eliminates the read-modify-write race that
+            // caused "always 2 selected" when rapid clicks produced concurrent
+            // requests each reading stale state and overwriting each other.
+            java.util.Set<Long> existing = new java.util.LinkedHashSet<>(
+                    req.getSelectedOptionInstanceIds());
             try {
                 response.setResponseText(new com.fasterxml.jackson.databind.ObjectMapper()
                         .writeValueAsString(existing.stream().sorted().toList()));

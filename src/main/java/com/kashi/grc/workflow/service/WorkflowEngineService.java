@@ -2857,7 +2857,7 @@ public class WorkflowEngineService {
      *   4. Write audit history
      */
     @Transactional
-    public Map<String, Object> resetTask(Long instanceId, Long taskId, Long performedBy) {
+    public Map<String, Object> resetTask(Long instanceId, Long taskId, Long performedBy, boolean rollbackDownstream) {
         WorkflowInstance instance = instanceRepository.findById(instanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
 
@@ -2893,15 +2893,105 @@ public class WorkflowEngineService {
         taskSectionCompletionRepository.saveAll(sections);
         log.info("[WF-ADMIN] RESET-TASK | {} section gate(s) re-armed for taskId={}", sections.size(), taskId);
 
-        // 3. Revert step to IN_PROGRESS if it was already APPROVED
-        if (si.getStatus() == StepStatus.APPROVED) {
+        // 3. Revert step to IN_PROGRESS if it was already APPROVED.
+        // Capture whether the step was reverted — used in step 4 to decide
+        // whether downstream steps need to be rolled back.
+        boolean stepReverted = si.getStatus() == StepStatus.APPROVED;
+        if (stepReverted) {
             si.setStatus(StepStatus.IN_PROGRESS);
             si.setCompletedAt(null);
             stepInstanceRepository.save(si);
             log.info("[WF-ADMIN] RESET-TASK | stepInstance={} APPROVED -> IN_PROGRESS", si.getId());
         }
 
-        // 4. Audit trail
+        // 4. Roll back all subsequent steps and expire their tasks —
+        //    BUT ONLY when the step itself was reverted (was APPROVED → IN_PROGRESS).
+        //
+        // If the step is already IN_PROGRESS with multiple tasks and only ONE task is
+        // being reset (e.g. reopening Rohan's task while Karan's is still PENDING),
+        // the step stays IN_PROGRESS, downstream steps are unaffected, and other
+        // responders keep their work. Rollback only makes sense when the entire step
+        // was completed and is being pulled back — that's when downstream is invalid.
+        //
+        // Example A — rollback NEEDED:
+        //   Step 5 was APPROVED (CISO confirmed all sections). Step 6 has active tasks.
+        //   Reset step 5 → downstream must be rolled back so CISO can reassign fresh.
+        //
+        // Example B — rollback NOT needed:
+        //   Step 6 is IN_PROGRESS. Rohan's task is reset. Karan's task is still PENDING.
+        //   Step 6 stays IN_PROGRESS. Steps 7+ are untouched. Only Rohan re-does his work.
+        if (rollbackDownstream) {
+            // Determine the current step's order. snapStepOrder may be null on older
+            // step instances created before the field was added — fall back to looking
+            // it up from the blueprint step via stepId.
+            Integer currentOrder = si.getSnapStepOrder();
+            if (currentOrder == null && si.getStepId() != null) {
+                currentOrder = stepRepository.findById(si.getStepId())
+                        .map(WorkflowStep::getStepOrder).orElse(null);
+            }
+            log.info("[WF-ADMIN] RESET-TASK rollback | currentStepInstanceId={} snapStepOrder={} resolved={}",
+                    si.getId(), si.getSnapStepOrder(), currentOrder);
+
+            final Integer resolvedOrder = currentOrder;
+            List<StepInstance> allSteps = stepInstanceRepository.findByWorkflowInstanceId(instanceId);
+            log.info("[WF-ADMIN] RESET-TASK rollback | total step instances in workflow={} orders={}",
+                    allSteps.size(),
+                    allSteps.stream().map(s -> s.getId() + ":" + s.getSnapStepOrder()).toList());
+
+            List<StepInstance> subsequentSteps = allSteps.stream()
+                    .filter(s -> !s.getId().equals(si.getId()))
+                    .filter(s -> {
+                        // If we have order info, filter by order
+                        if (resolvedOrder != null && s.getSnapStepOrder() != null) {
+                            return s.getSnapStepOrder() > resolvedOrder;
+                        }
+                        // If snapStepOrder is missing on downstream steps, include ALL
+                        // other non-terminal step instances as a safe fallback
+                        return s.getStatus() == StepStatus.IN_PROGRESS
+                                || s.getStatus() == StepStatus.AWAITING_ASSIGNMENT;
+                    })
+                    .toList();
+
+            if (!subsequentSteps.isEmpty()) {
+                List<Long> subsequentStepIds = subsequentSteps.stream()
+                        .map(StepInstance::getId).toList();
+
+                // Expire all non-terminal tasks on those steps
+                List<TaskInstance> downstreamTasks =
+                        taskInstanceRepository.findByStepInstanceIdIn(subsequentStepIds);
+                int expiredCount = 0;
+                for (TaskInstance dt : downstreamTasks) {
+                    if (dt.getStatus() != TaskStatus.EXPIRED
+                            && dt.getStatus() != TaskStatus.APPROVED) {
+                        dt.setStatus(TaskStatus.EXPIRED);
+                        dt.setRemarks("Expired — upstream step was reset for rework");
+                        taskInstanceRepository.save(dt);
+                        expiredCount++;
+                    }
+                }
+
+                // Delete child task_section_completions FIRST to satisfy the FK
+                // constraint (fk_tsc_step_i: task_section_completions.step_instance_id
+                // → step_instances.id). Deleting step instances without clearing
+                // their children throws a DataIntegrityViolationException.
+                for (StepInstance ds : subsequentSteps) {
+                    List<TaskSectionCompletion> tsc =
+                            taskSectionCompletionRepository.findByStepInstanceId(ds.getId());
+                    if (!tsc.isEmpty()) {
+                        taskSectionCompletionRepository.deleteAll(tsc);
+                        log.info("[WF-ADMIN] RESET-TASK rollback | deleted {} task_section_completion(s) for stepInstanceId={}",
+                                tsc.size(), ds.getId());
+                    }
+                }
+                // Now safe to delete the step instances
+                stepInstanceRepository.deleteAll(subsequentSteps);
+
+                log.info("[WF-ADMIN] RESET-TASK | rolled back {} downstream step(s), expired {} task(s) | instanceId={} | requestedRollback=true",
+                        subsequentSteps.size(), expiredCount, instanceId);
+            }
+        }
+
+        // 5. Audit trail
         recordHistory(instance, si, task, "TASK_RESET",
                 previousStatus, TaskStatus.IN_PROGRESS.name(), performedBy,
                 "Task reset by admin — assignee can re-work");
