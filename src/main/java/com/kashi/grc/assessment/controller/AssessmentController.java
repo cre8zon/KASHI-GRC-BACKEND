@@ -327,9 +327,7 @@ public class AssessmentController {
 
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
-        long answeredViaResponse = responseRepository.countByAssessmentId(assessmentId);
-        // FILE_UPLOAD questions are answered via DocumentLink, not AssessmentResponse.
-        // Count them separately and add to get the true answered total.
+        long answeredViaResponse = responseRepository.countAnsweredByAssessmentId(assessmentId);
         long answeredViaFile = allQs.stream()
                 .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
                 .filter(qi -> documentLinkRepository.countActiveAttachments("QUESTION_RESPONSE", qi.getId()) > 0)
@@ -385,7 +383,7 @@ public class AssessmentController {
                             .map(AssessmentTemplateInstance::getTemplateNameSnapshot)
                             .orElseGet(() -> templateRepository.findById(a.getTemplateId())
                                     .map(AssessmentTemplate::getName).orElse(null));
-                    long answered = responseRepository.countByAssessmentId(a.getId());
+                    long answered = responseRepository.countAnsweredByAssessmentId(a.getId());
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int)(answered * 100 / total) : 0;
                     return VendorAssessmentResponse.builder()
@@ -801,7 +799,7 @@ public class AssessmentController {
                         ? assessment.getOpenRemediationCount().intValue() : 0)
                 .progress(Map.of(
                         "totalQuestions",   allQs.size(),
-                        "answered",         responseRepository.countByAssessmentId(assessmentId),
+                        "answered",         responseRepository.countAnsweredByAssessmentId(assessmentId),
                         // Show reviewer-adjusted score so the reviewer sees the live
                         // impact of their PASS/PARTIAL/FAIL verdicts as they evaluate.
                         // PENDING questions (not yet reviewed) still contribute full credit.
@@ -852,7 +850,7 @@ public class AssessmentController {
                             .map(AssessmentTemplateInstance::getTemplateNameSnapshot)
                             .orElseGet(() -> templateRepository.findById(a.getTemplateId())
                                     .map(AssessmentTemplate::getName).orElse(null));
-                    long answered = responseRepository.countByAssessmentId(a.getId());
+                    long answered = responseRepository.countAnsweredByAssessmentId(a.getId());
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int) (answered * 100 / total) : 0;
                     return VendorAssessmentResponse.builder()

@@ -29,7 +29,6 @@ import java.util.List;
 public class AssessmentResponseRepositoryImpl
         implements AssessmentResponseRepositoryCustom {
 
-    /** Multiplier applied to scoreEarned when reviewer marks PARTIAL. */
     private static final double PARTIAL_SCORE_MULTIPLIER = 0.5;
 
     @PersistenceContext
@@ -38,13 +37,45 @@ public class AssessmentResponseRepositoryImpl
     // ── 1. updateResponderStatus ──────────────────────────────────────────
 
     /**
-     * Bulk UPDATE using CriteriaUpdate.
+     * Count only rows where the vendor actually submitted an answer.
      *
-     * Equivalent JPQL (removed):
-     *   UPDATE AssessmentResponse r SET r.reviewerStatus = :status
-     *   WHERE r.assessmentId = :assessmentId
-     *   AND   r.questionInstanceId = :questionInstanceId
+     * saveReviewerEval creates stub rows (responseText=NULL,
+     * selectedOptionInstanceId=NULL, scoreEarned=NULL) for questions the vendor
+     * never answered so the reviewer verdict can be stored. Those stubs must
+     * NOT count as "answered" for the completion % — otherwise every question
+     * the reviewer auto-FAILs shows up as answered and completion hits 100%
+     * even when the vendor answered nothing.
+     *
+     * A row is genuine if ANY of these fields is non-null:
+     *   responseText           → TEXT / NUMERIC / DATE answers
+     *   selectedOptionInstanceId → SINGLE_CHOICE / MULTI_CHOICE answers
+     *   scoreEarned            → any scored answer
+     *
+     * FILE_UPLOAD questions are handled separately (via DocumentLink) and
+     * added on top of this count by the caller — they never produce a row.
      */
+    @Override
+    public long countAnsweredByAssessmentId(Long assessmentId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<AssessmentResponse> root = cq.from(AssessmentResponse.class);
+
+        Predicate hasText   = cb.isNotNull(root.get("responseText"));
+        Predicate hasOption = cb.isNotNull(root.get("selectedOptionInstanceId"));
+        Predicate hasScore  = cb.isNotNull(root.get("scoreEarned"));
+
+        cq.select(cb.count(root))
+                .where(
+                        cb.equal(root.get("assessmentId"), assessmentId),
+                        cb.or(hasText, hasOption, hasScore)
+                );
+
+        Long result = em.createQuery(cq).getSingleResult();
+        return result != null ? result : 0L;
+    }
+
+    // ── 2. updateResponderStatus ──────────────────────────────────────────────
+
     @Override
     public void updateResponderStatus(Long assessmentId, Long questionInstanceId, String status) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
@@ -78,12 +109,12 @@ public class AssessmentResponseRepositoryImpl
     public long countByAssessmentIdAndSectionInstanceId(Long assessmentId, Long sectionInstanceId) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);
-        Root<AssessmentResponse>        r = cq.from(AssessmentResponse.class);
+        Root<AssessmentResponse>         r = cq.from(AssessmentResponse.class);
         Root<AssessmentQuestionInstance> q = cq.from(AssessmentQuestionInstance.class);
 
         cq.select(cb.count(r))
                 .where(
-                        cb.equal(r.get("questionInstanceId"), q.get("id")),   // join condition
+                        cb.equal(r.get("questionInstanceId"), q.get("id")),
                         cb.equal(r.get("assessmentId"),        assessmentId),
                         cb.equal(q.get("sectionInstanceId"),   sectionInstanceId)
                 );
@@ -114,12 +145,12 @@ public class AssessmentResponseRepositoryImpl
 
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);
-        Root<AssessmentResponse>        r = cq.from(AssessmentResponse.class);
+        Root<AssessmentResponse>         r = cq.from(AssessmentResponse.class);
         Root<AssessmentQuestionInstance> q = cq.from(AssessmentQuestionInstance.class);
 
         cq.select(cb.count(r))
                 .where(
-                        cb.equal(r.get("questionInstanceId"), q.get("id")),       // join condition
+                        cb.equal(r.get("questionInstanceId"), q.get("id")),
                         cb.equal(r.get("assessmentId"),        assessmentId),
                         q.get("sectionInstanceId").in(sectionInstanceIds),
                         cb.isNotNull(r.get("reviewerStatus")),

@@ -7,7 +7,7 @@ import java.util.List;
  *
  * Declares every operation that requires JPA Criteria API — either because
  * it involves conditional aggregation, cross-entity joins without a mapped
- * relationship, or bulk updates.
+ * relationship, bulk updates, or filtering on nullable fields.
  *
  * Spring Data wires this automatically via the "Impl" suffix convention:
  * AssessmentResponseRepositoryImpl satisfies this interface and Spring
@@ -20,6 +20,30 @@ import java.util.List;
  *            sumScoreByAssessmentId (plain Java default method)
  */
 public interface AssessmentResponseRepositoryCustom {
+
+    /**
+     * Count only genuine vendor answers — excludes shell rows created by
+     * saveReviewerEval for unanswered questions.
+     *
+     * WHY THIS EXISTS:
+     * saveReviewerEval creates a stub AssessmentResponse row when the reviewer
+     * evaluates a question the vendor never answered (so the verdict can be
+     * persisted). These stub rows have responseText=NULL, selectedOptionInstanceId=NULL,
+     * and scoreEarned=NULL. Counting them in percentComplete makes the assessment
+     * show 100% completion even when many questions were never answered by the vendor.
+     *
+     * A row is a genuine vendor answer if ANY of these fields is non-null:
+     *   responseText           (TEXT / NUMERIC / DATE answers)
+     *   selectedOptionInstanceId (SINGLE_CHOICE / MULTI_CHOICE answers)
+     *   scoreEarned            (any answered question that has a score assigned)
+     *
+     * FILE_UPLOAD questions are counted separately via documentLinkRepository
+     * and added on top of this count — they never produce a response row.
+     *
+     * Used by: vendor GET, vendor list, org review GET, org list — all
+     * endpoints that return percentComplete or answered count.
+     */
+    long countAnsweredByAssessmentId(Long assessmentId);
 
     /**
      * Bulk-update reviewer_status for all responses matching the given
@@ -37,19 +61,15 @@ public interface AssessmentResponseRepositoryCustom {
     long countByAssessmentIdAndSectionInstanceId(Long assessmentId, Long sectionInstanceId);
 
     /**
-     * Count responses for a given assessment whose question belongs to
-     * any of the supplied sections AND whose reviewerStatus has been
-     * explicitly set (not null, not PENDING).
+     * Count responses that have been explicitly evaluated (reviewerStatus not
+     * null and not PENDING) across a set of sections.
      * Returns 0 immediately when sectionInstanceIds is empty.
-     * Replaces the former JPQL @Query with JOIN + IN + IS NOT NULL.
      */
     long countEvaluatedInSections(Long assessmentId, List<Long> sectionInstanceIds);
 
     /**
      * Count all question instances belonging to any of the supplied sections.
-     * Queries AssessmentQuestionInstance directly (no AssessmentResponse join).
      * Returns 0 immediately when sectionInstanceIds is empty.
-     * Replaces the former JPQL @Query on AssessmentQuestionInstance.
      */
     long countTotalInSections(List<Long> sectionInstanceIds);
 
