@@ -543,13 +543,35 @@ public class AssessmentController {
                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
                             + "\"questionInstanceId\":%d}",
                     assessment.getId(), assessment.getId(), qi.getId());
+            // Resolve selected option text for SINGLE/MULTI_CHOICE so OPTION_SELECTED rules
+            // match against "No"/"Never" etc — not raw option IDs.
+            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+            if ("SINGLE_CHOICE".equals(qi.getResponseType())
+                    && response.getSelectedOptionInstanceId() != null) {
+                optionInstanceRepository.findById(response.getSelectedOptionInstanceId())
+                        .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                        .ifPresent(selectedOptionValues::add);
+            } else if ("MULTI_CHOICE".equals(qi.getResponseType())
+                    && response.getResponseText() != null
+                    && response.getResponseText().startsWith("[")) {
+                try {
+                    Long[] ids = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(response.getResponseText(), Long[].class);
+                    for (Long optId : ids) {
+                        optionInstanceRepository.findById(optId)
+                                .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                .ifPresent(selectedOptionValues::add);
+                    }
+                } catch (Exception ignored) {}
+            }
             guardEvaluator.evaluate(
-                    qi.getQuestionTagSnapshot(),   // tag snapshot — guard lookup key
+                    qi.getQuestionTagSnapshot(),
                     qi.getId(),
                     response.getResponseText(),
-                    false,                         // file upload — extend when evidence upload built
+                    false,  // real-time: file uploads handled separately via DocumentLink
                     response.getScoreEarned(),
                     navCtx,
+                    selectedOptionValues.isEmpty() ? null : selectedOptionValues,
                     tenantId
             );
         });
@@ -1695,18 +1717,54 @@ public class AssessmentController {
                         .map(qi -> {
                             com.kashi.grc.assessment.domain.AssessmentResponse r =
                                     responseMap.get(qi.getId());
+
+                            // ── FILE_UPLOAD: check DocumentLink not responseText ──────────
+                            boolean fileUploaded = "FILE_UPLOAD".equals(qi.getResponseType())
+                                    && documentLinkRepository.countActiveAttachments(
+                                    "QUESTION_RESPONSE", qi.getId()) > 0;
+
+                            // ── SINGLE/MULTI_CHOICE: resolve option text for OPTION_SELECTED ──
+                            // responseText stores option IDs (null or "[4257,4259]") — not text.
+                            // GuardEvaluator needs the actual option value strings to match
+                            // conditionValue like "No", "Never", "Partially" etc.
+                            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+                            if (r != null) {
+                                if ("SINGLE_CHOICE".equals(qi.getResponseType())
+                                        && r.getSelectedOptionInstanceId() != null) {
+                                    // Single choice — one option ID
+                                    optionInstanceRepository.findById(r.getSelectedOptionInstanceId())
+                                            .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                            .ifPresent(selectedOptionValues::add);
+                                } else if ("MULTI_CHOICE".equals(qi.getResponseType())
+                                        && r.getResponseText() != null
+                                        && r.getResponseText().startsWith("[")) {
+                                    // Multi choice — JSON array of option IDs e.g. "[4257,4259]"
+                                    try {
+                                        Long[] ids = new com.fasterxml.jackson.databind.ObjectMapper()
+                                                .readValue(r.getResponseText(), Long[].class);
+                                        for (Long optId : ids) {
+                                            optionInstanceRepository.findById(optId)
+                                                    .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                                    .ifPresent(selectedOptionValues::add);
+                                        }
+                                    } catch (Exception ignored) {}
+                                }
+                            }
+
                             String navCtx = String.format(
                                     "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1\","
                                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
                                             + "\"questionInstanceId\":%d}",
                                     assessmentId, assessmentId, qi.getId());
+
                             return new ModuleSubmitEvent.QuestionContext(
                                     qi.getQuestionTagSnapshot(),
                                     qi.getId(),
                                     r != null ? r.getResponseText() : null,
-                                    false,  // file upload check — extend when evidence upload built
+                                    fileUploaded,
                                     r != null ? r.getScoreEarned() : null,
-                                    navCtx
+                                    navCtx,
+                                    selectedOptionValues.isEmpty() ? null : selectedOptionValues
                             );
                         })
                         .toList();
