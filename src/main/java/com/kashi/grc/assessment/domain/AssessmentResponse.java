@@ -6,7 +6,10 @@ import lombok.*;
 import java.time.LocalDateTime;
 
 @Entity
-@Table(name = "assessment_responses")
+@Table(name = "assessment_responses",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uk_response_question",
+                columnNames = {"assessment_id", "question_instance_id"}))
 @Getter
 @Setter
 @lombok.experimental.SuperBuilder

@@ -326,6 +326,61 @@ public class WorkflowInstanceController {
         return ResponseEntity.ok(ApiResponse.success(service.getStuckSteps()));
     }
 
+    /**
+     * POST /v1/workflow-instances/{id}/steps/{stepInstanceId}/re-evaluate
+     *
+     * Re-runs isStepApprovalSatisfied() on a specific step and advances the workflow
+     * if the gate now passes. Useful for steps that got stuck because REJECTED sub-tasks
+     * were inflating the total ACTOR count and preventing advancement (now fixed in
+     * isStepApprovalSatisfied to exclude REJECTED tasks).
+     *
+     * Called by org admin from the workflow timeline when a step shows all actor tasks
+     * complete but the step hasn't advanced.
+     */
+    @PostMapping("/{id}/steps/{stepInstanceId}/re-evaluate")
+    @Operation(summary = "Admin: re-evaluate step approval gate and advance workflow if satisfied")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reEvaluateStep(
+            @PathVariable Long id,
+            @PathVariable Long stepInstanceId) {
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        log.info("[WF-ADMIN] RE-EVALUATE | instanceId={} | stepInstanceId={} | by={}", id, stepInstanceId, userId);
+        Map<String, Object> result = service.reEvaluateStep(id, stepInstanceId, userId);
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
+    /**
+     * POST /v1/workflow-instances/{id}/tasks/{taskId}/reset
+     *
+     * Admin: reset a task back to IN_PROGRESS so the assignee can re-work it.
+     *
+     * Resets:
+     *   1. task_instances.status       → IN_PROGRESS
+     *   2. task_instances.acted_at     → NULL
+     *   3. task_section_completions    → completed=false, completedAt=NULL for all rows
+     *   4. Writes a workflow history audit entry
+     *
+     * Does NOT touch assessment domain state (answers, evaluations, section submits).
+     * Pair with POST /v1/assessments/{id}/reset-reviewer-sections if the reviewer's
+     * section submissions also need to be cleared so they can re-submit.
+     *
+     * Idempotent — safe to call on an already-IN_PROGRESS task.
+     */
+    @PostMapping("/{id}/tasks/{taskId}/reset")
+    @org.springframework.transaction.annotation.Transactional
+    @Operation(summary = "Admin: reset a task to IN_PROGRESS and re-arm its section gates")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
+            @PathVariable Long id,
+            @PathVariable Long taskId,
+            @RequestBody(required = false) java.util.Map<String, Object> body) {
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        boolean rollbackDownstream = body != null
+                && Boolean.TRUE.equals(body.get("rollbackDownstream"));
+        log.info("[WF-ADMIN] RESET-TASK | instanceId={} | taskId={} | by={} | rollbackDownstream={}",
+                id, taskId, userId, rollbackDownstream);
+        Map<String, Object> result = service.resetTask(id, taskId, userId, rollbackDownstream);
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
     // ══════════════════════════════════════════════════════════════
     // HISTORY / AUDIT TRAIL
     // ══════════════════════════════════════════════════════════════

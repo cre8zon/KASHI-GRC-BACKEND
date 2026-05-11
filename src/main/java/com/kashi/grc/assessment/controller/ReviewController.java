@@ -20,7 +20,6 @@ import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.usermanagement.repository.UserRepository;
 import com.kashi.grc.workflow.domain.*;
 import com.kashi.grc.workflow.enums.*;
-import com.kashi.grc.workflow.event.TaskSectionEvent;
 import com.kashi.grc.workflow.repository.*;
 import com.kashi.grc.workflow.service.TaskSectionCompletionService;
 import com.kashi.grc.workflow.service.WorkflowEngineService;
@@ -28,7 +27,6 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
@@ -85,7 +83,6 @@ public class ReviewController {
     private final UserRepository                       userRepository;
     private final NotificationService                  notificationService;
     private final UtilityService                       utilityService;
-    private final ApplicationEventPublisher            eventPublisher;
 
     // ══════════════════════════════════════════════════════════════════════
     // 1. REVIEWER SECTION MANAGEMENT  (mirrors Responder patterns)
@@ -292,44 +289,50 @@ public class ReviewController {
         log.info("[REVIEWER-SUBMIT] si={} | assessmentId={} | openRemediation={} | userId={}",
                 sectionInstanceId, assessmentId, openRemediations, userId);
 
-        // Check if all of this reviewer's assigned sections are now submitted
+        // Check if all of this reviewer's assigned sections are now submitted.
+        // Uses the same pattern as the vendor-side submitSection (Step 4):
+        // when all sections are done, call markAllSectionsCompleteForTask() which
+        // marks ALL snapshotted compound-task sections complete atomically and
+        // auto-approves the task. This avoids the fragile named-event approach
+        // (SCORE_ANSWERS + SECTION_REVIEW_COMPLETE) that requires exact blueprint
+        // key matching and is vulnerable to REQUIRES_NEW transaction rollbacks.
         if (taskId != null) {
             AssessmentTemplateInstance ti = templateInstanceRepository.findByAssessmentId(assessmentId).orElse(null);
             if (ti != null) {
-                boolean allDone = sectionInstanceRepository
-                        .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId)
-                        .stream().allMatch(s -> s.getReviewerSubmittedAt() != null);
+                // Primary: sections explicitly assigned to this reviewer.
+                List<AssessmentSectionInstance> reviewerSections =
+                        sectionInstanceRepository
+                                .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
+                                        ti.getId(), userId);
+
+                // Fallback: if no explicit assignment exists (Org CISO skipped per-section
+                // assignment and reviewer is using the "active EVALUATE task" fallback path),
+                // check ALL sections in the template. This mirrors getMyReviewerSections().
+                // Without this, allDone is vacuously true on an empty stream, causing
+                // SECTION_REVIEW_COMPLETE to fire prematurely on the first submit call.
+                if (reviewerSections.isEmpty()) {
+                    log.info("[REVIEWER-SUBMIT] No explicit section assignments — falling back to all sections | taskId={} | userId={}", taskId, userId);
+                    reviewerSections = sectionInstanceRepository
+                            .findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+                }
+
+                boolean allDone = !reviewerSections.isEmpty() &&
+                        reviewerSections.stream().allMatch(s -> s.getReviewerSubmittedAt() != null);
+
+                log.info("[REVIEWER-SUBMIT] Gate check | taskId={} | sections={} | allDone={}",
+                        taskId, reviewerSections.size(), allDone);
 
                 if (allDone) {
-                    // All reviewer sections submitted — fire SECTION_REVIEW_COMPLETE event.
-                    // This marks the SECTION_REVIEW_COMPLETE compound task section done.
-                    // Combined with SCORE_ANSWERS (auto-fired by saveReviewerEval when all
-                    // questions are evaluated), this satisfies all required sections and
-                    // triggers autoApproveTask → performAction(APPROVE) on the reviewer's task.
-                    log.info("[REVIEWER-SUBMIT] All sections submitted — firing SECTION_REVIEW_COMPLETE | taskId={}", taskId);
-                    try {
-                        eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                                "SECTION_REVIEW_COMPLETE", taskId, userId,
-                                "VENDOR_ASSESSMENT", assessmentId));
-                    } catch (Exception e) {
-                        log.warn("[REVIEWER-SUBMIT] SECTION_REVIEW_COMPLETE event failed | taskId={} | {}", taskId, e.getMessage());
-                    }
-
-                    // Fallback: if step has no sections configured, approve directly
-                    if (!sectionCompletionService.hasSections(taskId)) {
-                        log.warn("[REVIEWER-SUBMIT] No sections config — fallback APPROVE | taskId={}", taskId);
-                        try {
-                            var req = new com.kashi.grc.workflow.dto.request.TaskActionRequest();
-                            req.setTaskInstanceId(taskId);
-                            req.setActionType(ActionType.APPROVE);
-                            req.setRemarks("All reviewer sections submitted");
-                            workflowEngineService.performAction(req, userId);
-                        } catch (BusinessException e) {
-                            if (!"TASK_TERMINAL".equals(e.getErrorCode())) throw e;
-                        }
-                    }
-
-                    log.info("[REVIEWER-SUBMIT] Gate fired | taskId={}", taskId);
+                    // ── DEFINITIVE APPROACH (mirrors vendor Step 4 exactly) ──────────
+                    // markAllSectionsCompleteForTask marks ALL snapshotted task sections
+                    // (SCORE_ANSWERS, SECTION_REVIEW_COMPLETE, FLAG_ISSUES, etc.) complete
+                    // in a single transaction, then auto-approves the task.
+                    // No named events → no blueprint key mismatches.
+                    // No separate SCORE_ANSWERS gate → no per-question eval dependency.
+                    // This is the same proven path used by vendor responders at step 4.
+                    log.info("[REVIEWER-SUBMIT] All sections submitted — calling markAllSectionsCompleteForTask | taskId={}", taskId);
+                    sectionCompletionService.markAllSectionsCompleteForTask(taskId, userId);
+                    log.info("[REVIEWER-SUBMIT] Task gate satisfied | taskId={}", taskId);
                 }
             }
         }
@@ -560,19 +563,28 @@ public class ReviewController {
             try { dueAt = LocalDateTime.parse(dueDateStr); } catch (Exception ignored) {}
         }
 
+        // Resolve the responder: section's assigned user (VENDOR_RESPONDER).
+        // Remediation ownership always goes to the responder, never to the contributor directly.
+        Long responderUserId = null;
+        if (qi.getSectionInstanceId() != null) {
+            responderUserId = sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                    .map(si -> si.getAssignedUserId())
+                    .orElse(null);
+        }
+
         ActionItem item = ActionItem.builder()
                 .tenantId(tenantId).createdBy(userId)
-                .assignedTo(qi.getAssignedUserId())
-                .assignedGroupRole("VENDOR_CISO")
+                .assignedTo(responderUserId)
+                .assignedGroupRole("VENDOR_RESPONDER")
                 .sourceType(ActionItem.SourceType.COMMENT).sourceId(questionInstanceId)
                 .entityType(ActionItem.EntityType.QUESTION_RESPONSE).entityId(questionInstanceId)
                 .title("Remediation required: " + qi.getQuestionTextSnapshot().substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
                 .description(description).status(ActionItem.Status.OPEN).priority(priority).dueAt(dueAt)
                 .resolutionReservedFor(userId)
                 .navContext(String.format(
-                        "{\"assigneeRoute\":\"/vendor/assessments/%d/responder-review\"," +
+                        "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1&questionInstanceId=%d\"," +
                                 "\"reviewerRoute\":\"/assessments/%d/review\",\"questionInstanceId\":%d}",
-                        assessmentId, assessmentId, questionInstanceId))
+                        assessmentId, questionInstanceId, assessmentId, questionInstanceId))
                 .remediationType("REMEDIATION_REQUEST").severity(severity)
                 .expectedEvidence(expectedEvidence.isBlank() ? null : expectedEvidence)
                 .build();
@@ -583,7 +595,9 @@ public class ReviewController {
         assessmentRepository.save(assessment);
 
         String msg = resolveUserName(userId) + " flagged a question for remediation [" + severity + "]";
-        if (qi.getAssignedUserId() != null)
+        if (responderUserId != null)
+            notificationService.send(responderUserId, "REMEDIATION_REQUESTED", msg, "QUESTION_RESPONSE", questionInstanceId);
+        if (qi.getAssignedUserId() != null && !qi.getAssignedUserId().equals(responderUserId))
             notificationService.send(qi.getAssignedUserId(), "REMEDIATION_REQUESTED", msg, "QUESTION_RESPONSE", questionInstanceId);
         notifyCiso(assessment, msg, questionInstanceId);
 
@@ -762,7 +776,8 @@ public class ReviewController {
 
         double possible = questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId)
                 .stream().mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0).sum();
-        double earned   = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Use reviewer-adjusted score: PASS → full, PARTIAL → 50%, FAIL → 0, PENDING → full.
+        double earned   = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         double pct      = possible > 0 ? Math.round((earned / possible) * 10000.0) / 100.0 : 0.0;
 
         int openRemed = countOpenItemsByType(assessmentId, tenantId, "REMEDIATION_REQUEST");

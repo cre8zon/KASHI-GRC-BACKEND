@@ -70,6 +70,7 @@ public class ActionItemService {
                         ? blueprint.getDefaultPriority() : (req.getPriority() != null
                                                             ? req.getPriority() : ActionItem.Priority.MEDIUM))
                 .navContext(req.getNavContext())
+                .vendorId(req.getVendorId())
                 .status(ActionItem.Status.OPEN)
                 .build();
 
@@ -92,7 +93,8 @@ public class ActionItemService {
                                                 Long assignedTo,
                                                 String resolutionRole,
                                                 String navContextJson,
-                                                Long tenantId) {
+                                                Long tenantId,
+                                                Long vendorId) {
         // Idempotency — don't create duplicate for same comment
         if (actionItemRepository.existsOpenForSource(ActionItem.SourceType.COMMENT, comment.getId())) {
             log.debug("[ACTION-ITEM] Skipping duplicate for comment={}", comment.getId());
@@ -105,6 +107,7 @@ public class ActionItemService {
         req.setEntityType(ActionItem.EntityType.QUESTION_RESPONSE);
         req.setEntityId(comment.getEntityId()); // questionInstanceId
         req.setAssignedTo(assignedTo);
+        req.setVendorId(vendorId); // scope role-based assignment to this vendor
         req.setResolutionReservedFor(comment.getCreatedBy()); // only the requester can resolve
         req.setResolutionRole(resolutionRole);
         req.setTitle("Revision requested: " + truncate(comment.getCommentText(), 80));
@@ -236,11 +239,13 @@ public class ActionItemService {
      */
     @Transactional(readOnly = true)
     public List<ActionItemResponse> getMyOpenItems(Long userId, List<String> userRoles,
-                                                   Long tenantId) {
-        // Assignee view: items I need to work on
+                                                   Long tenantId, Long userVendorId) {
+        // Assignee view: items I need to work on.
+        // userVendorId scopes role-based matches to this vendor only —
+        // prevents VENDOR_RESPONDER from seeing items of other vendors in the same tenant.
         Specification<ActionItem> assigneeSpec =
                 ActionItemSpecification.forTenant(tenantId)
-                        .and(ActionItemSpecification.assignedToUserOrRole(userId, userRoles))
+                        .and(ActionItemSpecification.assignedToUserOrRole(userId, userRoles, userVendorId))
                         .and(ActionItemSpecification.open());
 
         // Reviewer view: items awaiting my review/resolution (PENDING_REVIEW)

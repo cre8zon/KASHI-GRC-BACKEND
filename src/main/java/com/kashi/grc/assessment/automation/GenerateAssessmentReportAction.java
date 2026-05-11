@@ -123,7 +123,9 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
                 .mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0)
                 .sum();
 
-        double totalEarned = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Reviewer-adjusted: PASS=full weight, PARTIAL=50%, FAIL=0, PENDING=full
+        // scoreEarned is (optionScore/maxOptionScore)*weight — bounded by weight.
+        double totalEarned = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         double compliancePct = totalPossible > 0
                 ? Math.round((totalEarned / totalPossible) * 10000.0) / 100.0
                 : 0.0;
@@ -212,6 +214,7 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
         // ── 8. Mark assessment + cycle COMPLETED ──────────────────────────
         assessment.setStatus("COMPLETED");
         assessment.setTotalEarnedScore(totalEarned);
+        assessment.setTotalPossibleScore(totalPossible);  // persists the ceiling — was always null
         assessmentRepository.save(assessment);
 
         cycle.setStatus("COMPLETED");

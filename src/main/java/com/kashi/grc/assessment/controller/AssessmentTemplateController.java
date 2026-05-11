@@ -25,9 +25,8 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 /**
  * Template management: create/edit/delete templates, map sections into templates,
@@ -151,11 +150,9 @@ public class AssessmentTemplateController {
             throw new BusinessException("ALREADY_PUBLISHED", "Template is already published");
         }
 
-        long sectionCount   = templateSectionMappingRepository.countByTemplateId(templateId);
-        long questionCount  = templateSectionMappingRepository.findByTemplateIdOrderByOrderNo(templateId)
-                .stream()
-                .mapToLong(tsm -> sectionQuestionMappingRepository.countBySectionId(tsm.getSectionId()))
-                .sum();
+        long sectionCount  = templateSectionMappingRepository.countByTemplateId(templateId);
+        // FIX: single subquery instead of N countBySectionId calls (one per section)
+        long questionCount = sectionQuestionMappingRepository.countQuestionsForTemplate(templateId);
 
         if (sectionCount == 0) {
             throw new BusinessException("TEMPLATE_EMPTY", "Cannot publish a template with no sections");
@@ -245,45 +242,99 @@ public class AssessmentTemplateController {
 
         AssessmentTemplate t = findTemplate(templateId, isSystem, tenantId);
 
-        List<SectionResponse> sections = templateSectionMappingRepository
-                .findByTemplateIdOrderByOrderNo(templateId).stream()
+        // ── Query 1: All section mappings for this template ──────────────────
+        List<TemplateSectionMapping> sectionMappings =
+                templateSectionMappingRepository.findByTemplateIdOrderByOrderNo(templateId);
+
+        if (sectionMappings.isEmpty()) {
+            TemplateResponse empty = TemplateResponse.builder()
+                    .templateId(t.getId()).name(t.getName()).version(t.getVersion())
+                    .status(t.getStatus()).publishedAt(t.getPublishedAt())
+                    .createdAt(t.getCreatedAt()).sections(List.of()).build();
+            return ResponseEntity.ok(ApiResponse.success(empty));
+        }
+
+        Set<Long> sectionIds = sectionMappings.stream()
+                .map(TemplateSectionMapping::getSectionId)
+                .collect(Collectors.toSet());
+
+        // ── Query 2: All sections by ID in one IN clause ─────────────────────
+        Map<Long, AssessmentSection> sectionMap = sectionRepository.findAllByIdIn(sectionIds)
+                .stream().collect(Collectors.toMap(AssessmentSection::getId, s -> s));
+
+        // ── Query 3: All question mappings for all sections at once ──────────
+        List<SectionQuestionMapping> allQuestionMappings =
+                sectionQuestionMappingRepository.findBySectionIdInOrderByOrderNo(sectionIds);
+
+        Set<Long> questionIds = allQuestionMappings.stream()
+                .map(SectionQuestionMapping::getQuestionId)
+                .collect(Collectors.toSet());
+
+        Map<Long, AssessmentQuestion> questionMap = questionRepository.findAllByIdIn(questionIds)
+                .stream().collect(Collectors.toMap(AssessmentQuestion::getId, q -> q));
+
+        // ── Query 4: All option mappings for all questions at once ───────────
+        List<QuestionOptionMapping> allOptionMappings = questionIds.isEmpty()
+                ? List.of()
+                : questionOptionMappingRepository.findByQuestionIdInOrderByOrderNo(questionIds);
+
+        Set<Long> optionIds = allOptionMappings.stream()
+                .map(QuestionOptionMapping::getOptionId)
+                .collect(Collectors.toSet());
+
+        Map<Long, AssessmentQuestionOption> optionMap = optionRepository.findAllByIdIn(optionIds)
+                .stream().collect(Collectors.toMap(AssessmentQuestionOption::getId, o -> o));
+
+        // ── Group question mappings by sectionId ─────────────────────────────
+        Map<Long, List<SectionQuestionMapping>> qMappingsBySectionId = allQuestionMappings.stream()
+                .collect(Collectors.groupingBy(SectionQuestionMapping::getSectionId));
+
+        // ── Group option mappings by questionId ──────────────────────────────
+        Map<Long, List<QuestionOptionMapping>> oMappingsByQuestionId = allOptionMappings.stream()
+                .collect(Collectors.groupingBy(QuestionOptionMapping::getQuestionId));
+
+        // ── Assemble response (pure Java, zero additional DB hits) ───────────
+        List<SectionResponse> sections = sectionMappings.stream()
                 .map(tsm -> {
-                    AssessmentSection section = sectionRepository.findById(tsm.getSectionId())
-                            .orElseThrow(() -> new ResourceNotFoundException("Section", tsm.getSectionId()));
+                    AssessmentSection section = sectionMap.get(tsm.getSectionId());
+                    if (section == null) return null;
 
-                    List<QuestionResponse> questions = sectionQuestionMappingRepository
-                            .findBySectionIdOrderByOrderNo(tsm.getSectionId()).stream()
+                    List<QuestionResponse> questions = qMappingsBySectionId
+                            .getOrDefault(tsm.getSectionId(), List.of()).stream()
                             .map(sqm -> {
-                                AssessmentQuestion q = questionRepository.findById(sqm.getQuestionId())
-                                        .orElseThrow(() -> new ResourceNotFoundException("Question", sqm.getQuestionId()));
+                                AssessmentQuestion q = questionMap.get(sqm.getQuestionId());
+                                if (q == null) return null;
 
-                                List<OptionResponse> options = questionOptionMappingRepository
-                                        .findByQuestionIdOrderByOrderNo(sqm.getQuestionId()).stream()
-                                        .map(qom -> optionRepository.findById(qom.getOptionId())
-                                                .map(o -> OptionResponse.builder()
-                                                        .optionId(o.getId())
-                                                        .optionValue(o.getOptionValue())
-                                                        .score(o.getScore()).build())
-                                                .orElse(null))
-                                        .filter(o -> o != null)
-                                        .toList();
+                                List<OptionResponse> options = oMappingsByQuestionId
+                                        .getOrDefault(sqm.getQuestionId(), List.of()).stream()
+                                        .map(qom -> {
+                                            AssessmentQuestionOption o = optionMap.get(qom.getOptionId());
+                                            return o == null ? null : OptionResponse.builder()
+                                                                      .optionId(o.getId())
+                                                                      .optionValue(o.getOptionValue())
+                                                                      .score(o.getScore()).build();
+                                        })
+                                        .filter(Objects::nonNull).toList();
 
                                 return QuestionResponse.builder()
                                         .questionId(q.getId())
                                         .questionText(q.getQuestionText())
                                         .responseType(q.getResponseType())
+                                        .questionTag(q.getQuestionTag())
                                         .weight(sqm.getWeight())
                                         .isMandatory(sqm.isMandatory())
                                         .orderNo(sqm.getOrderNo())
                                         .options(options).build();
-                            }).toList();
+                            })
+                            .filter(Objects::nonNull).toList();
 
                     return SectionResponse.builder()
                             .sectionId(section.getId())
                             .name(section.getName())
                             .orderNo(tsm.getOrderNo())
                             .questions(questions).build();
-                }).toList();
+                })
+                .filter(Objects::nonNull).toList();
 
         TemplateResponse response = TemplateResponse.builder()
                 .templateId(t.getId()).name(t.getName()).version(t.getVersion())

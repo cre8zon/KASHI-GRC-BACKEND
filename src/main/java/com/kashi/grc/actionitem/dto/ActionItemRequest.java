@@ -37,5 +37,6 @@ public class ActionItemRequest {
     private String dueAt;
 
     // Navigation
-    private String navContext; // JSON string
+    private String navContext;
+    private Long   vendorId;   // scope role-based assignment to a specific vendor // JSON string
 }

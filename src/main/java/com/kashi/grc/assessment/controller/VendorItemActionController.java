@@ -223,6 +223,24 @@ public class VendorItemActionController {
         // Stamp OVERRIDDEN status
         responseRepository.updateResponderStatus(assessmentId, questionInstanceId, "OVERRIDDEN");
 
+        // Close any open REVISION_REQUEST action items for this question — override is a resolution.
+        // Same behaviour as accept: the responder has resolved the contribution question.
+        actionItemRepository.findAll(
+                        ActionItemSpecification.forTenant(tenantId)
+                                .and(ActionItemSpecification.forEntity(
+                                        ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+                                .and(ActionItemSpecification.open())
+                ).stream()
+                .filter(ai -> "REVISION_REQUEST".equals(ai.getRemediationType())
+                        || (ai.getRemediationType() == null && ai.getSourceType() == ActionItem.SourceType.COMMENT))
+                .forEach(ai -> {
+                    ai.setStatus(ActionItem.Status.RESOLVED);
+                    ai.setResolvedAt(LocalDateTime.now());
+                    ai.setResolvedBy(userId);
+                    ai.setResolutionNote("Answer overridden by " + resolveUserName(userId));
+                    actionItemRepository.save(ai);
+                });
+
         // Log override event
         String auditMsg = "Answer overridden by " + resolveUserName(userId)
                 + (overrideReason.isBlank() ? "" : " — reason: " + overrideReason);

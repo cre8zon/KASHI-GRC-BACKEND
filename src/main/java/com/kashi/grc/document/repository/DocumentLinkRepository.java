@@ -6,6 +6,7 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
@@ -87,4 +88,35 @@ public interface DocumentLinkRepository extends JpaRepository<DocumentLink, Long
     long countActiveAttachments(
             @Param("entityType") String entityType,
             @Param("entityId")   Long entityId);
+
+    /**
+     * Bulk count active attachments for many entity IDs in one query.
+     *
+     * Replaces the N+1 pattern in AssessmentController where:
+     *   documentLinkRepository.countActiveAttachments("QUESTION_RESPONSE", qi.getId())
+     * was called inside a per-question stream — firing one COUNT query per question.
+     * For a 500-question assessment this was 500 round-trips.
+     *
+     * Returns List<Object[]> where each row is [entityId (Long), count (Long)].
+     * Entities with no attachments are absent from the result — use getOrDefault(id, 0L).
+     *
+     * Usage:
+     *   Map<Long, Long> attachmentCounts = new HashMap<>();
+     *   documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", qiIds)
+     *           .forEach(row -> attachmentCounts.put((Long) row[0], (Long) row[1]));
+     *   long count = attachmentCounts.getOrDefault(qi.getId(), 0L);
+     */
+    @Query("""
+        SELECT dl.entityId, COUNT(dl)
+        FROM DocumentLink dl
+        JOIN Document d ON d.id = dl.documentId
+        WHERE dl.entityType = :entityType
+          AND dl.entityId   IN :entityIds
+          AND dl.linkType   = 'ATTACHMENT'
+          AND d.status      = 'ACTIVE'
+        GROUP BY dl.entityId
+    """)
+    List<Object[]> countActiveAttachmentsBulk(
+            @Param("entityType") String entityType,
+            @Param("entityIds")  Collection<Long> entityIds);
 }

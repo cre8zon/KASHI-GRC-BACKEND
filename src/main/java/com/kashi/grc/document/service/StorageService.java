@@ -596,4 +596,22 @@ public class StorageService {
         private Long contentLength;
         private String serverSideEncryption;
     }
+
+    /**
+     * Stream raw S3 object bytes through the app server — used by the preview endpoint
+     * so the browser never gets a direct S3 URL.  Caller is responsible for setting
+     * Content-Type and Content-Disposition response headers.
+     */
+    public byte[] streamFileBytes(String s3Key) {
+        try {
+            software.amazon.awssdk.services.s3.model.GetObjectRequest req =
+                    software.amazon.awssdk.services.s3.model.GetObjectRequest.builder()
+                            .bucket(bucket)
+                            .key(s3Key)
+                            .build();
+            return s3Client.getObjectAsBytes(req).asByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to fetch S3 object: " + s3Key, e);
+        }
+    }
 }

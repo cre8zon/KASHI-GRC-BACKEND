@@ -7,6 +7,8 @@ import com.kashi.grc.comment.repository.EntityCommentRepository;
 import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.actionitem.service.ActionItemService;
 import com.kashi.grc.assessment.repository.AssessmentQuestionInstanceRepository;
+import com.kashi.grc.assessment.repository.VendorAssessmentRepository;
+import com.kashi.grc.notification.service.NotificationService;
 import com.kashi.grc.usermanagement.repository.UserRepository;
 import com.kashi.grc.workflow.repository.TaskInstanceRepository;
 import com.kashi.grc.workflow.enums.TaskStatus;
@@ -31,7 +33,9 @@ public class CommentService {
     private final SimpMessagingTemplate     messagingTemplate;
     private final ActionItemService          actionItemService;
     private final AssessmentQuestionInstanceRepository questionInstanceRepository;
+    private final VendorAssessmentRepository               vendorAssessmentRepository;
     private final TaskInstanceRepository               taskInstanceRepository;
+    private final NotificationService                  notificationService;
 
     /**
      * Add a comment and push to WebSocket subscribers.
@@ -60,6 +64,41 @@ public class CommentService {
 
         // Push via WebSocket to the entity's topic room
         pushComment(comment, response);
+
+        // ── @mention notifications ───────────────────────────────────────────
+        if (req.getMentionedUserIds() != null && !req.getMentionedUserIds().isEmpty()) {
+            try {
+                String mentionJson = "[" + req.getMentionedUserIds().stream()
+                        .map(String::valueOf).reduce((a, b) -> a + "," + b).orElse("") + "]";
+                comment.setMentionedUserIds(mentionJson);
+                commentRepository.save(comment);
+            } catch (Exception ignored) {}
+            for (Long mentionedId : req.getMentionedUserIds()) {
+                if (!mentionedId.equals(userId)) {
+                    notificationService.send(mentionedId, "MENTIONED_IN_COMMENT",
+                            createdByName + " mentioned you: \"" + truncate(req.getCommentText(), 80) + "\"",
+                            req.getEntityType().name(), req.getEntityId());
+                }
+            }
+        }
+
+        // ── New-comment notification to question participants ────────────────
+        // Notify the assigned contributor when responder comments and vice versa.
+        if (comment.getEntityType() == EntityComment.EntityType.QUESTION_RESPONSE
+                && comment.getQuestionInstanceId() != null
+                && comment.getCommentType() != EntityComment.CommentType.SYSTEM) {
+            try {
+                questionInstanceRepository.findById(comment.getQuestionInstanceId()).ifPresent(qi -> {
+                    String preview = createdByName + " commented: \"" + truncate(req.getCommentText(), 80) + "\"";
+                    if (qi.getAssignedUserId() != null && !qi.getAssignedUserId().equals(userId)) {
+                        notificationService.send(qi.getAssignedUserId(), "NEW_COMMENT",
+                                preview, "QUESTION_RESPONSE", qi.getId());
+                    }
+                });
+            } catch (Exception e) {
+                log.warn("[COMMENT] Participant notification failed: {}", e.getMessage());
+            }
+        }
 
         // ── Action item side effects ─────────────────────────────────────
         if (comment.getCommentType() == EntityComment.CommentType.REVISION_REQUEST
@@ -244,8 +283,10 @@ public class CommentService {
                         qi.getSectionInstanceId() != null ? qi.getSectionInstanceId() : "null",
                         assessmentId
                 );
+                Long vendorId = vendorAssessmentRepository.findById(assessmentId)
+                        .map(a -> a.getVendorId()).orElse(null);
                 actionItemService.createFromComment(
-                        comment, contributorId, "VENDOR_RESPONDER", navCtx, tenantId
+                        comment, contributorId, "VENDOR_RESPONDER", navCtx, tenantId, vendorId
                 );
             });
         } catch (Exception e) {
@@ -261,5 +302,10 @@ public class CommentService {
             String full = (fn + " " + ln).trim();
             return full.isEmpty() ? u.getEmail() : full;
         }).orElse("Unknown");
+    }
+
+    private String truncate(String s, int max) {
+        if (s == null) return "";
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 }

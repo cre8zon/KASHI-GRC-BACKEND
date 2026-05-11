@@ -12,6 +12,7 @@ import com.kashi.grc.document.service.StorageService;
 import com.kashi.grc.document.service.StorageService.PresignedUploadResult;
 import com.kashi.grc.document.service.StorageService.S3ObjectMeta;
 import com.kashi.grc.document.service.StorageService.ServerUploadResult;
+import com.kashi.grc.document.service.DocumentPreviewService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.constraints.NotBlank;
@@ -99,6 +100,8 @@ public class DocumentController {
 
     @org.springframework.beans.factory.annotation.Value("${aws.s3.kms-key-arn}")
     private String kmsKeyArn;
+
+    private final DocumentPreviewService previewService;
 
     // ══════════════════════════════════════════════════════════════════════
     // STEP 1 of upload: Request presigned PUT URL
@@ -545,6 +548,126 @@ public class DocumentController {
         log.info("[DOC-LINK] Created | docId={} | entity={}/{} | type={}",
                 doc.getId(), entityType, entityId, linkType);
         return link;
+    }
+
+    // ══════════════════════════════════════════════════════════════════════
+    // IN-APP PREVIEW — streams file through app server (no S3 URL exposed)
+    // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * GET /v1/documents/{id}/stream
+     *
+     * Streams the raw file bytes through the application server.
+     * Used for PDF.js and image preview — browser renders inline.
+     *
+     * Content-Disposition: inline (not attachment) so the browser renders it.
+     * The JWT is checked by Spring Security. S3 URL is never exposed to client.
+     */
+    @GetMapping("/v1/documents/{documentId}/stream")
+    @Operation(summary = "Stream raw file bytes through app server for in-app preview")
+    public ResponseEntity<byte[]> streamDocument(@PathVariable Long documentId) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        Document doc = documentRepository.findByIdAndTenantId(documentId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("Document", documentId));
+        if (!"ACTIVE".equals(doc.getStatus()))
+            throw new BusinessException("DOCUMENT_NOT_ACTIVE", "Document is not active.", HttpStatus.CONFLICT);
+
+        byte[] bytes = storageService.streamFileBytes(doc.getS3Key());
+
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentType(org.springframework.http.MediaType.parseMediaType(
+                doc.getMimeType() != null ? doc.getMimeType() : "application/octet-stream"));
+        headers.setContentDisposition(
+                org.springframework.http.ContentDisposition.inline()
+                        .filename(doc.getFileName() != null ? doc.getFileName() : "document")
+                        .build());
+        headers.setCacheControl("private, max-age=300"); // 5 min — same as preview-url TTL
+        return ResponseEntity.ok().headers(headers).body(bytes);
+    }
+
+    /**
+     * GET /v1/documents/{id}/preview-content
+     *
+     * Returns a browser-renderable representation of the document:
+     *   - PDF/image  → same as /stream (raw bytes, correct Content-Type)
+     *   - DOCX       → converted to HTML by DocumentPreviewService (Apache POI)
+     *   - XLSX/XLS   → converted to HTML table (Apache POI)
+     *   - CSV/TXT    → converted to HTML (plain Java)
+     *   - Other      → 415 Unsupported; client falls back to download-only
+     *
+     * Always served with Content-Disposition: inline.
+     * Always goes through the app server — no S3 URLs, no CORS issues.
+     */
+    @GetMapping("/v1/documents/{documentId}/preview-content")
+    @Operation(summary = "Return browser-renderable content for in-app preview (converts office docs to HTML)")
+    public ResponseEntity<byte[]> previewContent(@PathVariable Long documentId) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        Document doc = documentRepository.findByIdAndTenantId(documentId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("Document", documentId));
+        if (!"ACTIVE".equals(doc.getStatus()))
+            throw new BusinessException("DOCUMENT_NOT_ACTIVE", "Document is not active.", HttpStatus.CONFLICT);
+
+        String mime  = doc.getMimeType() != null ? doc.getMimeType().toLowerCase() : "";
+        String fname = doc.getFileName() != null ? doc.getFileName().toLowerCase() : "";
+
+        org.springframework.http.HttpHeaders headers = new org.springframework.http.HttpHeaders();
+        headers.setContentDisposition(
+                org.springframework.http.ContentDisposition.inline()
+                        .filename(doc.getFileName() != null ? doc.getFileName() : "document")
+                        .build());
+        headers.setCacheControl("private, max-age=300");
+
+        try {
+            byte[] rawBytes = storageService.streamFileBytes(doc.getS3Key());
+
+            // PDF — pass through, rendered by PDF.js
+            if (mime.equals("application/pdf") || fname.endsWith(".pdf")) {
+                headers.setContentType(org.springframework.http.MediaType.APPLICATION_PDF);
+                return ResponseEntity.ok().headers(headers).body(rawBytes);
+            }
+
+            // Images — pass through, rendered by <img>
+            if (mime.startsWith("image/")) {
+                headers.setContentType(org.springframework.http.MediaType.parseMediaType(mime));
+                return ResponseEntity.ok().headers(headers).body(rawBytes);
+            }
+
+            // DOCX → HTML
+            if (mime.contains("wordprocessingml") || fname.endsWith(".docx") || mime.equals("application/msword")) {
+                byte[] html = previewService.docxToHtml(rawBytes);
+                headers.setContentType(org.springframework.http.MediaType.TEXT_HTML);
+                return ResponseEntity.ok().headers(headers).body(html);
+            }
+
+            // XLSX / XLS → HTML table
+            if (mime.contains("spreadsheetml") || mime.equals("application/vnd.ms-excel")
+                    || fname.endsWith(".xlsx") || fname.endsWith(".xls")) {
+                byte[] html = previewService.xlsxToHtml(rawBytes, mime);
+                headers.setContentType(org.springframework.http.MediaType.TEXT_HTML);
+                return ResponseEntity.ok().headers(headers).body(html);
+            }
+
+            // CSV → HTML table
+            if (mime.equals("text/csv") || fname.endsWith(".csv")) {
+                byte[] html = previewService.csvToHtml(rawBytes);
+                headers.setContentType(org.springframework.http.MediaType.TEXT_HTML);
+                return ResponseEntity.ok().headers(headers).body(html);
+            }
+
+            // Plain text → HTML pre block
+            if (mime.startsWith("text/") || fname.endsWith(".txt") || fname.endsWith(".log")) {
+                byte[] html = previewService.txtToHtml(rawBytes);
+                headers.setContentType(org.springframework.http.MediaType.TEXT_HTML);
+                return ResponseEntity.ok().headers(headers).body(html);
+            }
+
+            // Unsupported type — tell client to show download-only fallback
+            return ResponseEntity.status(HttpStatus.UNSUPPORTED_MEDIA_TYPE).build();
+
+        } catch (Exception e) {
+            log.error("[PREVIEW] Failed to generate preview for documentId={}: {}", documentId, e.getMessage());
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).build();
+        }
     }
 
     private ResponseEntity<ApiResponse<Map<String, Object>>> generatePresignedGetUrl(

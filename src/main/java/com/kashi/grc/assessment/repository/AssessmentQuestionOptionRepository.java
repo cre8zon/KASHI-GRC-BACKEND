@@ -2,8 +2,12 @@ package com.kashi.grc.assessment.repository;
 
 import com.kashi.grc.assessment.domain.AssessmentQuestionOption;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 
 @Repository
@@ -26,4 +30,12 @@ public interface AssessmentQuestionOptionRepository
      */
     Optional<AssessmentQuestionOption> findByOptionValueAndScoreIsNullAndTenantIdIsNull(
             String optionValue);
+
+    /**
+     * Bulk fetch by IDs — single IN query replacing N individual findById calls.
+     * Used by AssessmentTemplateController.getFull() to load all options for a
+     * template in one round-trip instead of one query per option.
+     */
+    @Query("SELECT o FROM AssessmentQuestionOption o WHERE o.id IN :ids")
+    List<AssessmentQuestionOption> findAllByIdIn(@Param("ids") Collection<Long> ids);
 }

@@ -18,8 +18,10 @@ import com.kashi.grc.assessment.dto.request.*;
 import com.kashi.grc.assessment.dto.response.*;
 import com.kashi.grc.assessment.repository.*;
 import com.kashi.grc.vendor.domain.Vendor;
+import com.kashi.grc.vendor.domain.VendorTemplateSelection;
 import com.kashi.grc.vendor.repository.VendorRepository;
 import com.kashi.grc.vendor.repository.RiskTemplateMappingRepository;
+import com.kashi.grc.vendor.repository.VendorTemplateSelectionRepository;
 import com.kashi.grc.workflow.domain.*;
 import com.kashi.grc.workflow.dto.request.TaskActionRequest;
 import com.kashi.grc.workflow.dto.response.TaskInstanceResponse;
@@ -109,6 +111,7 @@ public class AssessmentController {
     private final QuestionOptionMappingRepository      questionOptionMappingRepository;
     private final VendorRepository                     vendorRepository;
     private final RiskTemplateMappingRepository        mappingRepository;
+    private final VendorTemplateSelectionRepository    templateSelectionRepository;
     private final WorkflowInstanceRepository           workflowInstanceRepository;
     private final WorkflowStepRepository               stepRepository;
     private final StepInstanceRepository               stepInstanceRepository;
@@ -124,6 +127,8 @@ public class AssessmentController {
     private final GuardEvaluator                        guardEvaluator;
     private final ActionItemRepository                   actionItemRepository;
     private final NotificationService                    notificationService;
+    private final com.kashi.grc.document.repository.DocumentLinkRepository documentLinkRepository;
+    private final com.kashi.grc.comment.repository.EntityCommentRepository entityCommentRepository;
 
     // ── 9.1 Execute Assessment (logic unchanged) ───────────────────────────────
 
@@ -325,7 +330,24 @@ public class AssessmentController {
 
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
-        long answered  = responseRepository.countByAssessmentId(assessmentId);
+        long answeredViaResponse = responseRepository.countAnsweredByAssessmentId(assessmentId);
+
+        // FIX: bulk-count all FILE_UPLOAD attachments in one GROUP BY query instead of
+        // calling countActiveAttachments() once per FILE_UPLOAD question (N round-trips).
+        List<Long> fileUploadQiIds = allQs.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId)
+                .toList();
+        Map<Long, Long> fileAttachCounts = new java.util.HashMap<>();
+        if (!fileUploadQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileUploadQiIds)
+                    .forEach(row -> fileAttachCounts.put((Long) row[0], (Long) row[1]));
+        }
+        long answeredViaFile = allQs.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .filter(qi -> fileAttachCounts.getOrDefault(qi.getId(), 0L) > 0)
+                .count();
+        long answered  = answeredViaResponse + answeredViaFile;
         long mandatory = allQs.stream().filter(AssessmentQuestionInstance::isMandatory).count();
         int  pct       = allQs.isEmpty() ? 0 : (int) (answered * 100 / allQs.size());
 
@@ -376,7 +398,7 @@ public class AssessmentController {
                             .map(AssessmentTemplateInstance::getTemplateNameSnapshot)
                             .orElseGet(() -> templateRepository.findById(a.getTemplateId())
                                     .map(AssessmentTemplate::getName).orElse(null));
-                    long answered = responseRepository.countByAssessmentId(a.getId());
+                    long answered = responseRepository.countAnsweredByAssessmentId(a.getId());
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int)(answered * 100 / total) : 0;
                     return VendorAssessmentResponse.builder()
@@ -461,45 +483,87 @@ public class AssessmentController {
                         .questionInstanceId(req.getQuestionInstanceId())
                         .build());
 
-        // Multi-choice: store all selected option IDs as JSON in responseText.
-        // Single-choice: store the single selectedOptionInstanceId as before.
+        // ── INDUSTRY-STANDARD SCORING ──────────────────────────────────────
+        //
+        // scoreEarned stores the NORMALISED WEIGHTED CONTRIBUTION, not the raw
+        // option score. This keeps compliance % bounded to 0–100% regardless of
+        // how option scores are configured in the template.
+        //
+        // Formula (same as ServiceNow GRC / OneTrust / Archer):
+        //   SINGLE_CHOICE: scoreEarned = (selectedScore / maxOptionScore) × weight
+        //   MULTI_CHOICE:  scoreEarned = (sumSelectedScores / sumAllOptionScores) × weight
+        //   TEXT / DATE / NUMERIC / FILE: binary — answered = weight, not answered = 0
+        //
+        // totalPossible = SUM(weight) — already correct, weight is the ceiling
+        // totalEarned   = SUM(scoreEarned) — always ≤ totalPossible
+        // compliance %  = totalEarned / totalPossible × 100 — always 0–100%
+        //
+        // Raw option scores are still visible in option display (for the reviewer
+        // to see "3/5 pts" per question) — they are NOT used in aggregation.
+
+        AssessmentQuestionInstance qi = questionInstanceRepository
+                .findById(req.getQuestionInstanceId())
+                .orElse(null);
+        double weight = (qi != null && qi.getWeight() != null) ? qi.getWeight() : 1.0;
+
         if (req.getSelectedOptionInstanceIds() != null && !req.getSelectedOptionInstanceIds().isEmpty()) {
-            // MULTI_CHOICE — accumulate selections:
-            // Merge with any previously stored selections so toggling one option
-            // doesn't wipe the others.
-            java.util.Set<Long> existing = new java.util.HashSet<>();
-            if (response.getResponseText() != null && response.getResponseText().startsWith("[")) {
-                try {
-                    com.fasterxml.jackson.databind.ObjectMapper om = new com.fasterxml.jackson.databind.ObjectMapper();
-                    Long[] arr = om.readValue(response.getResponseText(), Long[].class);
-                    existing.addAll(java.util.Arrays.asList(arr));
-                } catch (Exception ignored) {}
-            }
-            // Toggle: if already selected → remove, else → add
-            for (Long optId : req.getSelectedOptionInstanceIds()) {
-                if (existing.contains(optId)) existing.remove(optId);
-                else existing.add(optId);
-            }
+            // ── MULTI_CHOICE — REPLACE semantics ────────────────────────────
+            // The frontend sends the COMPLETE set of selected options on every
+            // toggle. We replace the stored set entirely rather than toggling
+            // individual IDs, which eliminates the read-modify-write race that
+            // caused "always 2 selected" when rapid clicks produced concurrent
+            // requests each reading stale state and overwriting each other.
+            java.util.Set<Long> existing = new java.util.LinkedHashSet<>(
+                    req.getSelectedOptionInstanceIds());
             try {
                 response.setResponseText(new com.fasterxml.jackson.databind.ObjectMapper()
                         .writeValueAsString(existing.stream().sorted().toList()));
             } catch (Exception e) {
                 response.setResponseText(existing.toString());
             }
-            // Store last-toggled for scoring compatibility
             response.setSelectedOptionInstanceId(req.getSelectedOptionInstanceIds().get(0));
-            // Score = sum of all selected option scores
-            double totalScore = existing.stream()
-                    .mapToDouble(id -> optionInstanceRepository.findById(id)
-                            .map(o -> o.getScore() != null ? o.getScore() : 0.0).orElse(0.0))
-                    .sum();
-            response.setScoreEarned(totalScore);
+
+            // Normalised multi-choice score: sumSelected / sumAll × weight
+            double sumAll = optionInstanceRepository.sumScoreByQuestionInstanceId(req.getQuestionInstanceId());
+            if (sumAll > 0) {
+                double sumSelected = existing.stream()
+                        .mapToDouble(id -> optionInstanceRepository.findById(id)
+                                .map(o -> o.getScore() != null ? o.getScore() : 0.0)
+                                .orElse(0.0))
+                        .sum();
+                response.setScoreEarned((sumSelected / sumAll) * weight);
+            } else {
+                // No option scores configured — fall back to binary (any selection = full weight)
+                response.setScoreEarned(existing.isEmpty() ? 0.0 : weight);
+            }
+
         } else {
+            // ── SINGLE_CHOICE, TEXT, NUMERIC, DATE, FILE ─────────────────────
             response.setSelectedOptionInstanceId(req.getSelectedOptionInstanceId());
             response.setResponseText(req.getResponseText());
-            if (req.getSelectedOptionInstanceId() != null)
-                optionInstanceRepository.findById(req.getSelectedOptionInstanceId())
-                        .ifPresent(o -> response.setScoreEarned(o.getScore()));
+
+            if (req.getSelectedOptionInstanceId() != null) {
+                // SINGLE_CHOICE: normalised = (selectedScore / maxScore) × weight
+                AssessmentOptionInstance selectedOpt = optionInstanceRepository
+                        .findById(req.getSelectedOptionInstanceId()).orElse(null);
+                if (selectedOpt != null && selectedOpt.getScore() != null) {
+                    double maxScore = optionInstanceRepository
+                            .maxScoreByQuestionInstanceId(req.getQuestionInstanceId());
+                    if (maxScore > 0) {
+                        response.setScoreEarned((selectedOpt.getScore() / maxScore) * weight);
+                    } else {
+                        // Options exist but no scores configured — full weight for answering
+                        response.setScoreEarned(weight);
+                    }
+                } else {
+                    // Option has no score — full weight for answering (participation credit)
+                    response.setScoreEarned(weight);
+                }
+            } else if (req.getResponseText() != null && !req.getResponseText().isBlank()) {
+                // TEXT / NUMERIC / DATE — binary: answered = full weight
+                response.setScoreEarned(weight);
+            }
+            // FILE_UPLOAD: scored separately via DocumentLink; leave scoreEarned null here
         }
         response.setSubmittedBy(userId);
         response.setSubmittedAt(LocalDateTime.now());
@@ -527,23 +591,45 @@ public class AssessmentController {
         );
 
         // KashiGuard: evaluate answer against guard rules (async, non-blocking)
-        // Uses new module-agnostic signature — no AssessmentQuestionInstance import in GuardEvaluator
-        questionInstanceRepository.findById(req.getQuestionInstanceId()).ifPresent(qi -> {
+        // Uses the outer `qi` already fetched above for scoring — no second DB lookup.
+        if (qi != null) {
             String navCtx = String.format(
                     "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1\","
                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
                             + "\"questionInstanceId\":%d}",
                     assessment.getId(), assessment.getId(), qi.getId());
+            // Resolve selected option text for SINGLE/MULTI_CHOICE so OPTION_SELECTED rules
+            // match against "No"/"Never" etc — not raw option IDs.
+            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+            if ("SINGLE_CHOICE".equals(qi.getResponseType())
+                    && response.getSelectedOptionInstanceId() != null) {
+                optionInstanceRepository.findById(response.getSelectedOptionInstanceId())
+                        .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                        .ifPresent(selectedOptionValues::add);
+            } else if ("MULTI_CHOICE".equals(qi.getResponseType())
+                    && response.getResponseText() != null
+                    && response.getResponseText().startsWith("[")) {
+                try {
+                    Long[] ids = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readValue(response.getResponseText(), Long[].class);
+                    for (Long optId : ids) {
+                        optionInstanceRepository.findById(optId)
+                                .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                .ifPresent(selectedOptionValues::add);
+                    }
+                } catch (Exception ignored) {}
+            }
             guardEvaluator.evaluate(
-                    qi.getQuestionTagSnapshot(),   // tag snapshot — guard lookup key
+                    qi.getQuestionTagSnapshot(),
                     qi.getId(),
                     response.getResponseText(),
-                    false,                         // file upload — extend when evidence upload built
+                    false,  // real-time: file uploads handled separately via DocumentLink
                     response.getScoreEarned(),
                     navCtx,
+                    selectedOptionValues.isEmpty() ? null : selectedOptionValues,
                     tenantId
             );
-        });
+        }
 
         // ── Re-answer: transition action items to PENDING_REVIEW ────────────
         // When contributor re-answers, signal "ball is in reviewer's court".
@@ -759,20 +845,29 @@ public class AssessmentController {
         List<AssessmentQuestionInstance> allQs =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId);
 
+        // Fetch cycle for workflowInstanceId — needed by report page audit trail
+        VendorAssessmentCycle reviewCycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
+
         return ResponseEntity.ok(ApiResponse.success(VendorAssessmentResponse.builder()
                 .assessmentId(assessment.getId())
                 .vendorId(vendor.getId())
                 .vendorName(vendor.getName())
                 .templateName(templateName)
                 .status(assessment.getStatus())
+                .cycleNo(reviewCycle != null ? reviewCycle.getCycleNo() : null)
+                .workflowInstanceId(reviewCycle != null ? reviewCycle.getWorkflowInstanceId() : null)
                 .riskRating(assessment.getRiskRating())
+                .reviewFindings(assessment.getReviewFindings())
+                .totalEarnedScore(assessment.getTotalEarnedScore())
+                .totalPossibleScore(assessment.getTotalPossibleScore())
                 .openRemediationCount(assessment.getOpenRemediationCount() != null
                         ? assessment.getOpenRemediationCount().intValue() : 0)
+                .submittedAt(assessment.getSubmittedAt())
+                .completedAt(assessment.getCompletedAt())
                 .progress(Map.of(
-                        "totalQuestions",   allQs.size(),
-                        "answered",         responseRepository.countByAssessmentId(assessmentId),
-                        // Always recalculate live — DB value may be stale from vendor submission
-                        "totalEarnedScore", responseRepository.sumScoreByAssessmentId(assessmentId)))
+                        "totalQuestions",    allQs.size(),
+                        "answered",          responseRepository.countAnsweredByAssessmentId(assessmentId),
+                        "totalEarnedScore",  responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId)))
                 .sections(buildSectionInstances(assessmentId))
                 .build()));
     }
@@ -819,9 +914,26 @@ public class AssessmentController {
                             .map(AssessmentTemplateInstance::getTemplateNameSnapshot)
                             .orElseGet(() -> templateRepository.findById(a.getTemplateId())
                                     .map(AssessmentTemplate::getName).orElse(null));
-                    long answered = responseRepository.countByAssessmentId(a.getId());
+                    long answered = responseRepository.countAnsweredByAssessmentId(a.getId());
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int) (answered * 100 / total) : 0;
+
+                    // totalPossibleScore = SUM(weight) across all questions.
+                    // With normalised scoring, scoreEarned is (optScore/maxOptScore)×weight,
+                    // so SUM(scoreEarned)/SUM(weight) is always bounded 0–100%.
+                    // Use persisted value if available (post step-12), else compute live.
+                    // FIX: sumWeightByAssessmentId() does a single DB SUM instead of
+                    // loading all question instances into memory to stream-sum weight.
+                    double totalPossible = a.getTotalPossibleScore() != null
+                            ? a.getTotalPossibleScore()
+                            : questionInstanceRepository.sumWeightByAssessmentId(a.getId());
+                    double totalEarned = a.getTotalEarnedScore() != null
+                            ? a.getTotalEarnedScore()
+                            : responseRepository.sumReviewerAdjustedScoreByAssessmentId(a.getId());
+                    int compliancePct = totalPossible > 0
+                            ? (int) Math.round(totalEarned / totalPossible * 100)
+                            : 0;
+
                     return VendorAssessmentResponse.builder()
                             .assessmentId(a.getId())
                             .vendorId(a.getVendorId())
@@ -830,14 +942,17 @@ public class AssessmentController {
                             .status(a.getStatus())
                             .submittedAt(a.getSubmittedAt())
                             .riskRating(a.getRiskRating())
+                            .totalEarnedScore(totalEarned)
+                            .totalPossibleScore(totalPossible)
                             .openRemediationCount(a.getOpenRemediationCount() != null
                                     ? a.getOpenRemediationCount().intValue() : 0)
                             .progress(Map.of(
-                                    "totalQuestions",   total,
-                                    "answered",         answered,
-                                    "percentComplete",  pct,
-                                    "totalEarnedScore", a.getTotalEarnedScore() != null
-                                            ? a.getTotalEarnedScore() : 0.0))
+                                    "totalQuestions",    total,
+                                    "answered",          answered,
+                                    "percentComplete",   pct,
+                                    "compliancePct",     compliancePct,
+                                    "totalEarnedScore",  totalEarned,
+                                    "totalPossibleScore", totalPossible))
                             .build();
                 })));
     }
@@ -1112,6 +1227,20 @@ public class AssessmentController {
                                                     .build();
                                         }).orElse(null);
 
+                                        // FILE_UPLOAD: answered = at least one active DocumentLink exists.
+                                        // No AssessmentResponse row is written for file uploads — the document
+                                        // itself IS the answer. Build a sentinel response so currentResponse
+                                        // is non-null and the question counts as answered everywhere.
+                                        if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                            long docCount = documentLinkRepository.countActiveAttachments(
+                                                    "QUESTION_RESPONSE", qi.getId());
+                                            if (docCount > 0) {
+                                                answer = AnswerResponse.builder()
+                                                        .responseText("[FILE_UPLOADED:" + docCount + "]")
+                                                        .build();
+                                            }
+                                        }
+
                                         return QuestionInstanceResponse.builder()
                                                 .questionInstanceId(qi.getId())
                                                 .questionText(qi.getQuestionTextSnapshot())
@@ -1128,6 +1257,9 @@ public class AssessmentController {
                             .sectionInstanceId(si.getId())
                             .sectionName(si.getSectionNameSnapshot())
                             .sectionOrderNo(si.getSectionOrderNo())
+                            .assignedUserId(si.getAssignedUserId())
+                            .submittedAt(si.getSubmittedAt())
+                            .submittedBy(si.getSubmittedBy())
                             .questions(questions)
                             .build();
                 }).toList();
@@ -1216,102 +1348,8 @@ public class AssessmentController {
         log.info("[SECTION-SUBMIT] Section locked | sectionInstanceId={} | assessmentId={} | userId={}",
                 sectionInstanceId, assessmentId, userId);
 
-        // Auto-approve contributor sub-tasks for contributors whose ALL sections are now submitted
-        // A contributor may have questions in multiple sections — only close their task
-        // when the LAST section containing their questions is submitted.
-        java.util.Set<Long> contributorIds = questions.stream()
-                .filter(q -> q.getAssignedUserId() != null)
-                .map(AssessmentQuestionInstance::getAssignedUserId)
-                .collect(java.util.stream.Collectors.toSet());
-
-        if (!contributorIds.isEmpty()) {
-            AssessmentTemplateInstance tiForCheck = templateInstanceRepository
-                    .findByAssessmentId(assessmentId).orElse(null);
-            if (tiForCheck != null) {
-                for (Long contributorId : contributorIds) {
-                    // Count total sections that have at least one question assigned to this contributor
-                    long totalSections = contributorSectionSubmissionRepository
-                            .countDistinctSectionsWithAssignments(assessmentId, contributorId);
-                    // Count sections already submitted (including this one we just submitted)
-                    long submittedSections = sectionInstanceRepository
-                            .findByTemplateInstanceIdOrderBySectionOrderNo(tiForCheck.getId())
-                            .stream()
-                            .filter(s -> s.getSubmittedAt() != null)
-                            .filter(s -> questionInstanceRepository
-                                    .findBySectionInstanceIdOrderByOrderNo(s.getId())
-                                    .stream().anyMatch(q -> contributorId.equals(q.getAssignedUserId())))
-                            .count();
-
-                    if (submittedSections >= totalSections && totalSections > 0) {
-                        // All sections containing this contributor's questions are now locked.
-                        // Determine the right task closure based on whether the contributor
-                        // actually submitted their answers before the responder locked the section.
-                        //
-                        // APPROVE  — contributor called contributorSubmitSection for every
-                        //            section they had questions in → their work is complete.
-                        // REJECTED — responder locked the section before contributor finished
-                        //            → remove from their inbox so they aren't confused by a
-                        //               task they can no longer act on.
-
-                        // How many of the contributor's sections did they actually submit?
-                        long contributorSubmittedCount = contributorSectionSubmissionRepository
-                                .findByAssessmentIdAndContributorUserId(assessmentId, contributorId)
-                                .size();
-                        boolean contributorFinished = contributorSubmittedCount >= totalSections
-                                && totalSections > 0;
-
-                        StepInstance fillStep = stepInstanceRepository
-                                .findByWorkflowInstanceIdOrderByCreatedAtAsc(
-                                        cycleRepository.findById(
-                                                        assessmentRepository.findById(assessmentId)
-                                                                .map(va -> va.getCycleId()).orElse(0L))
-                                                .map(c -> c.getWorkflowInstanceId()).orElse(0L))
-                                .stream()
-                                .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL
-                                        && si.getStatus() == com.kashi.grc.workflow.enums.StepStatus.IN_PROGRESS)
-                                .findFirst().orElse(null);
-
-                        if (fillStep != null) {
-                            taskInstanceRepository.findByStepInstanceId(fillStep.getId())
-                                    .stream()
-                                    .filter(t -> contributorId.equals(t.getAssignedUserId())
-                                            && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
-                                            || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS))
-                                    .forEach(t -> {
-                                        try {
-                                            if (contributorFinished) {
-                                                // Contributor submitted all their sections — proper APPROVE
-                                                com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                                                        new com.kashi.grc.workflow.dto.request.TaskActionRequest();
-                                                req.setTaskInstanceId(t.getId());
-                                                req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
-                                                req.setRemarks("Contributor submitted all sections — auto-approved");
-                                                workflowEngineService.performAction(req, userId);
-                                                log.info("[SECTION-SUBMIT] Contributor sub-task APPROVED | contributorId={} | taskId={}",
-                                                        contributorId, t.getId());
-                                            } else {
-                                                // Responder locked section before contributor finished.
-                                                // Directly set task to REJECTED so it leaves their inbox.
-                                                // We do NOT use performAction(REJECT) because that would
-                                                // trigger step-level rejection logic — we only want to
-                                                // close this individual sub-task.
-                                                t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.REJECTED);
-                                                t.setActedAt(java.time.LocalDateTime.now());
-                                                t.setRemarks("Section locked by responder — contributor access revoked");
-                                                taskInstanceRepository.save(t);
-                                                log.info("[SECTION-SUBMIT] Contributor sub-task REJECTED (section locked before contributor finished) | contributorId={} | taskId={}",
-                                                        contributorId, t.getId());
-                                            }
-                                        } catch (Exception e) {
-                                            log.warn("[SECTION-SUBMIT] Could not close contributor task {}: {}",
-                                                    t.getId(), e.getMessage());
-                                        }
-                                    });
-                        }
-                    }
-                }
-            }
-        }
+        // Contributor tracking is via CONTRIBUTOR_ASSIGNMENT ActionItems (created in doAssignQuestion).
+        // No contributor TaskInstances exist — the sub-task close/reject block was removed.
 
         // Check if ALL sections assigned to this responder are now submitted
         // If so, fire the compound task gate → task auto-approves
@@ -1358,16 +1396,17 @@ public class AssessmentController {
         Long userId = utilityService.getLoggedInDataContext().getId();
         User currentUser = utilityService.getLoggedInDataContext();
 
-        // Only CISO/VRM/ORG_ADMIN can reopen
-        boolean canReopen = currentUser.getRoles().stream().anyMatch(r ->
-                r.getSide() == com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION
-                        || "VENDOR_CISO".equals(r.getName())
-                        || "VENDOR_VRM".equals(r.getName())
-                        || r.getSide() == com.kashi.grc.usermanagement.domain.RoleSide.SYSTEM);
+        // Only VENDOR_CISO and VENDOR_VRM can reopen a submitted section.
+        // Org-side users should raise a Revision Request instead — that keeps the
+        // audit trail clean and avoids giving the org unilateral access to the vendor's submission.
+        boolean canReopen = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "VENDOR_CISO".equals(name) || "VENDOR_VRM".equals(name);
+        });
 
         if (!canReopen) {
             throw new BusinessException("ACCESS_DENIED",
-                    "Only CISO, VRM or Org Admin can reopen a submitted section.",
+                    "Only VENDOR_CISO or VENDOR_VRM can reopen a submitted section.",
                     HttpStatus.FORBIDDEN);
         }
 
@@ -1392,6 +1431,88 @@ public class AssessmentController {
 
         log.info("[SECTION-REOPEN] Section reopened | sectionInstanceId={} | assessmentId={} | by={}",
                 sectionInstanceId, assessmentId, userId);
+
+        // Revert the responder's FILL-step task from APPROVED back to IN_PROGRESS
+        // so they can access the fill page again through their task inbox.
+        // Without this, their task stays APPROVED and they have no way to navigate
+        // back to the fill page from their inbox.
+        if (section.getAssignedUserId() != null) {
+            try {
+                VendorAssessment assessment = assessmentRepository.findById(assessmentId).orElse(null);
+                if (assessment != null && assessment.getCycleId() != null) {
+                    cycleRepository.findById(assessment.getCycleId()).ifPresent(cycle -> {
+                        if (cycle.getWorkflowInstanceId() != null) {
+                            stepInstanceRepository.findByWorkflowInstanceIdOrderByCreatedAtAsc(
+                                            cycle.getWorkflowInstanceId())
+                                    .stream()
+                                    .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL)
+                                    .findFirst()
+                                    .ifPresent(fillStep -> {
+                                        taskInstanceRepository.findByStepInstanceId(fillStep.getId())
+                                                .stream()
+                                                .filter(t -> section.getAssignedUserId().equals(t.getAssignedUserId())
+                                                        && t.getTaskRole() == com.kashi.grc.workflow.enums.TaskRole.ACTOR
+                                                        && t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.APPROVED)
+                                                .forEach(t -> {
+                                                    t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS);
+                                                    t.setActedAt(null);
+                                                    t.setRemarks("Section reopened — responder needs to resubmit");
+                                                    taskInstanceRepository.save(t);
+                                                    log.info("[SECTION-REOPEN] Responder task reverted to IN_PROGRESS | taskId={} | responderUserId={}",
+                                                            t.getId(), section.getAssignedUserId());
+                                                });
+                                    });
+                        }
+                    });
+                }
+            } catch (Exception e) {
+                log.warn("[SECTION-REOPEN] Could not revert task status: {}", e.getMessage());
+            }
+        }
+
+        // Notify the responder and post an activity comment
+        if (section.getAssignedUserId() != null && !section.getAssignedUserId().equals(userId)) {
+            // Resolve reopener name from userRepository (resolveUserName is in CommentService, not here)
+            String reopenerName = userRepository.findById(userId).map(u -> {
+                String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                String full = (fn + " " + ln).trim();
+                return full.isEmpty() ? u.getEmail() : full;
+            }).orElse("Someone");
+
+            String sectionName = section.getSectionNameSnapshot() != null
+                    ? section.getSectionNameSnapshot() : "a section";
+
+            notificationService.send(
+                    section.getAssignedUserId(),
+                    "SECTION_REOPENED",
+                    reopenerName + " has unlocked \"" + sectionName + "\" — please review and resubmit.",
+                    "SECTION_INSTANCE", sectionInstanceId
+            );
+
+            // Post a VENDOR_INTERNAL system comment on the section's first question
+            // so the activity tab shows who unlocked it and when
+            questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sectionInstanceId)
+                    .stream().findFirst().ifPresent(qi -> {
+                        try {
+                            Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+                            com.kashi.grc.comment.domain.EntityComment note =
+                                    com.kashi.grc.comment.domain.EntityComment.builder()
+                                            .tenantId(tenantId)
+                                            .entityType(com.kashi.grc.comment.domain.EntityComment.EntityType.QUESTION_RESPONSE)
+                                            .entityId(qi.getId())
+                                            .questionInstanceId(qi.getId())
+                                            .createdBy(userId)
+                                            .commentText("Section unlocked by " + reopenerName + " — please update your answers and resubmit.")
+                                            .commentType(com.kashi.grc.comment.domain.EntityComment.CommentType.SYSTEM)
+                                            .visibility(com.kashi.grc.comment.domain.EntityComment.Visibility.VENDOR_INTERNAL)
+                                            .build();
+                            entityCommentRepository.save(note);
+                        } catch (Exception e) {
+                            log.warn("[SECTION-REOPEN] Could not post system comment: {}", e.getMessage());
+                        }
+                    });
+        }
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "sectionInstanceId", sectionInstanceId,
@@ -1656,6 +1777,10 @@ public class AssessmentController {
      * 2. WORKFLOW EVENTS — fires CISO_REVIEW_COMPLETE + ASSESSMENT_SUBMITTED.
      */
     @PostMapping("/v1/assessments/{assessmentId}/ciso-submit")
+    @Transactional  // REQUIRED: GuardEvaluationListener uses @TransactionalEventListener(AFTER_COMMIT).
+    // Without an enclosing transaction, ModuleSubmitEvent is silently dropped
+    // (fallbackExecution=false is Spring's default) → guard sweep never runs
+    // → no action items created for unanswered/flagged questions.
     @Operation(summary = "Step 6: guard sweep + fire CISO_REVIEW_COMPLETE + ASSESSMENT_SUBMITTED")
     public ResponseEntity<ApiResponse<Void>> cisoSubmit(
             @PathVariable Long assessmentId,
@@ -1680,18 +1805,68 @@ public class AssessmentController {
                         .map(qi -> {
                             com.kashi.grc.assessment.domain.AssessmentResponse r =
                                     responseMap.get(qi.getId());
+
+                            // ── FILE_UPLOAD: check DocumentLink not responseText ──────────
+                            boolean fileUploaded = "FILE_UPLOAD".equals(qi.getResponseType())
+                                    && documentLinkRepository.countActiveAttachments(
+                                    "QUESTION_RESPONSE", qi.getId()) > 0;
+
+                            // ── SINGLE/MULTI_CHOICE: resolve option text for OPTION_SELECTED ──
+                            // responseText stores option IDs (null or "[4257,4259]") — not text.
+                            // GuardEvaluator needs the actual option value strings to match
+                            // conditionValue like "No", "Never", "Partially" etc.
+                            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+                            if (r != null) {
+                                if ("SINGLE_CHOICE".equals(qi.getResponseType())
+                                        && r.getSelectedOptionInstanceId() != null) {
+                                    // Single choice — one option ID
+                                    optionInstanceRepository.findById(r.getSelectedOptionInstanceId())
+                                            .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                            .ifPresent(selectedOptionValues::add);
+                                } else if ("MULTI_CHOICE".equals(qi.getResponseType())
+                                        && r.getResponseText() != null
+                                        && r.getResponseText().startsWith("[")) {
+                                    // Multi choice — JSON array of option IDs e.g. "[4257,4259]"
+                                    try {
+                                        Long[] ids = new com.fasterxml.jackson.databind.ObjectMapper()
+                                                .readValue(r.getResponseText(), Long[].class);
+                                        for (Long optId : ids) {
+                                            optionInstanceRepository.findById(optId)
+                                                    .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                                    .ifPresent(selectedOptionValues::add);
+                                        }
+                                    } catch (Exception ignored) {}
+                                }
+                            }
+
+                            // ── Direct assignment: section responder → contributor → null ──
+                            // Priority: contributor (question-level) → section responder → null (group fallback).
+                            // GuardEvaluator assigns the action item directly to this user,
+                            // avoiding inbox noise for the entire VENDOR_RESPONDER group.
+                            Long assignedUserId = qi.getAssignedUserId(); // contributor if assigned
+                            if (assignedUserId == null && qi.getSectionInstanceId() != null) {
+                                // Fall back to section-level responder assignment
+                                assignedUserId = sectionInstanceRepository
+                                        .findById(qi.getSectionInstanceId())
+                                        .map(com.kashi.grc.assessment.domain.AssessmentSectionInstance::getAssignedUserId)
+                                        .orElse(null);
+                            }
+
                             String navCtx = String.format(
                                     "{\"assigneeRoute\":\"/vendor/assessments/%d/fill?openWork=1\","
                                             + "\"reviewerRoute\":\"/vendor/assessments/%d/responder-review\","
                                             + "\"questionInstanceId\":%d}",
                                     assessmentId, assessmentId, qi.getId());
+
                             return new ModuleSubmitEvent.QuestionContext(
                                     qi.getQuestionTagSnapshot(),
                                     qi.getId(),
                                     r != null ? r.getResponseText() : null,
-                                    false,  // file upload check — extend when evidence upload built
+                                    fileUploaded,
                                     r != null ? r.getScoreEarned() : null,
-                                    navCtx
+                                    navCtx,
+                                    selectedOptionValues.isEmpty() ? null : selectedOptionValues,
+                                    assignedUserId  // direct assignee — section responder or contributor
                             );
                         })
                         .toList();
@@ -1722,17 +1897,30 @@ public class AssessmentController {
      * Called after the org admin selects a CISO and confirms the delegation.
      */
     @PostMapping("/v1/assessments/{assessmentId}/assign-org-ciso")
-    @Operation(summary = "Step 7: fire ORG_CISO_ASSIGNED section event")
+    @Transactional
+    @Operation(summary = "Step 7: Org Admin confirms CISO selection — directly approves task to advance workflow")
     public ResponseEntity<ApiResponse<Void>> assignOrgCiso(
             @PathVariable Long assessmentId,
-            @RequestParam Long taskId) {
+            @RequestParam Long taskId,
+            @RequestParam(required = false) Long cisoUserId) {
+
         Long userId = utilityService.getLoggedInDataContext().getId();
         assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
-        eventPublisher.publishEvent(
-                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
-                        "ORG_CISO_ASSIGNED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
-        log.info("[SECTION-EVENT] ORG_CISO_ASSIGNED | assessmentId={} | taskId={}", assessmentId, taskId);
+
+        // Directly approve the task — advances step 7 and triggers step 8 task creation.
+        // Step 8 uses PUSH_TO_ROLES with ORG_CISO actor role, so it automatically fans
+        // out to all ORG_CISO users without any hardcoded reassignment here.
+        com.kashi.grc.workflow.dto.request.TaskActionRequest approveReq =
+                new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+        approveReq.setTaskInstanceId(taskId);
+        approveReq.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+        approveReq.setRemarks("Org CISO assignment confirmed" +
+                (cisoUserId != null ? " — cisoUserId=" + cisoUserId : ""));
+        workflowEngineService.performAction(approveReq, userId);
+
+        log.info("[ASSIGN-CISO] Step 7 approved | assessmentId={} | taskId={} | cisoUserId={} | by={}",
+                assessmentId, taskId, cisoUserId, userId);
         return ResponseEntity.ok(ApiResponse.success(null));
     }
 
@@ -1932,6 +2120,7 @@ public class AssessmentController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> saveReviewerEval(
             @PathVariable Long assessmentId,
             @PathVariable Long questionInstanceId,
+            @RequestParam(required = false) Long taskId,
             @RequestBody Map<String, String> body) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
@@ -1980,6 +2169,14 @@ public class AssessmentController {
         log.info("[REVIEWER-EVAL] {} | assessmentId={} | qi={} | by={}",
                 verdict.toUpperCase(), assessmentId, questionInstanceId, userId);
 
+        // NOTE: SCORE_ANSWERS compound-task section gate is no longer fired here.
+        // Step 9 task completion is now handled entirely in reviewerSubmitSection:
+        // when the reviewer submits their last section, markAllSectionsCompleteForTask()
+        // marks ALL snapshotted sections (including SCORE_ANSWERS) complete atomically
+        // and auto-approves the task — the same proven pattern used by vendor responders
+        // at step 4. Keeping SCORE_ANSWERS here would race against that call and cause
+        // double-approval attempts. The verdict saved above is still readable for scoring.
+
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "questionInstanceId", questionInstanceId,
                 "reviewerStatus",     verdict.toUpperCase()
@@ -2005,6 +2202,59 @@ public class AssessmentController {
      *   tasks are approved. That is correct — the step advances to step 10 when the last
      *   reviewer submits. This mirrors how vendor contributor tasks work in step 4.
      */
+    /**
+     * POST /v1/assessments/{assessmentId}/reset-reviewer-sections
+     *
+     * Admin: clear reviewer_submitted_at on all sections assigned to a specific
+     * reviewer so they can re-submit their sections after a task reset.
+     *
+     * Called AFTER POST /v1/workflow-instances/{id}/tasks/{taskId}/reset.
+     * Together they give the reviewer a clean slate without touching answers
+     * or evaluations already saved.
+     *
+     * @param assignedUserId the reviewer whose section submissions to clear.
+     *                       If omitted, clears ALL reviewer submissions for this assessment.
+     */
+    @PostMapping("/v1/assessments/{assessmentId}/reset-reviewer-sections")
+    @Transactional
+    @Operation(summary = "Admin: clear reviewer section submissions so the reviewer can re-submit")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> resetReviewerSections(
+            @PathVariable Long assessmentId,
+            @RequestParam(required = false) Long assignedUserId) {
+
+        AssessmentTemplateInstance ti = templateInstanceRepository
+                .findByAssessmentId(assessmentId)
+                .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance", assessmentId));
+
+        List<AssessmentSectionInstance> sections = assignedUserId != null
+                ? sectionInstanceRepository
+                  .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
+                          ti.getId(), assignedUserId)
+                : sectionInstanceRepository
+                  .findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+
+        int cleared = 0;
+        for (AssessmentSectionInstance sec : sections) {
+            if (sec.getReviewerSubmittedAt() != null) {
+                sec.setReviewerSubmittedAt(null);
+                sec.setReviewerSubmittedBy(null);
+                sec.setReviewerReopenedAt(java.time.LocalDateTime.now());
+                sec.setReviewerReopenedBy(utilityService.getLoggedInDataContext().getId());
+                cleared++;
+            }
+        }
+        sectionInstanceRepository.saveAll(sections);
+
+        log.info("[ADMIN] reset-reviewer-sections | assessmentId={} | assignedUserId={} | cleared={}",
+                assessmentId, assignedUserId, cleared);
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "assessmentId",  assessmentId,
+                "assignedUserId", assignedUserId,
+                "sectionsCleared", cleared
+        )));
+    }
+
     @PostMapping("/v1/assessments/{assessmentId}/complete-reviewer-evaluation")
     @Transactional
     @Operation(summary = "Step 9: mark reviewer evaluation complete — closes individual reviewer task")
@@ -2053,12 +2303,13 @@ public class AssessmentController {
         VendorAssessment assessment = assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
 
-        // Recalculate total earned score from live response data
-        // This corrects any stale/zero value from vendor submission time
-        double liveScore = responseRepository.sumScoreByAssessmentId(assessmentId);
+        // Recalculate total earned score applying reviewer verdicts:
+        // PASS → full credit, PARTIAL → 50% credit, FAIL → 0, PENDING → full credit.
+        // This is the authoritative score that gets persisted and flows into all reports.
+        double liveScore = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
         assessment.setTotalEarnedScore(liveScore);
         assessmentRepository.save(assessment);
-        log.info("[CONSOLIDATE] totalEarnedScore={} | assessmentId={}", liveScore, assessmentId);
+        log.info("[CONSOLIDATE] reviewer-adjusted totalEarnedScore={} | assessmentId={}", liveScore, assessmentId);
 
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -2070,7 +2321,7 @@ public class AssessmentController {
     /** Step 10: Reviewer saves consolidated findings text */
     @PostMapping("/v1/assessments/{assessmentId}/document-findings")
     @Transactional
-    @Operation(summary = "Step 10: save findings text and fire FINDINGS_DOCUMENTED event")
+    @Operation(summary = "Step 10: append reviewer findings (all reviewers' findings are preserved)")
     public ResponseEntity<ApiResponse<Void>> documentFindings(
             @PathVariable Long assessmentId,
             @RequestParam Long taskId,
@@ -2080,9 +2331,29 @@ public class AssessmentController {
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
         String findings = body != null ? body.getOrDefault("findings", "") : "";
         if (!findings.isBlank()) {
-            assessment.setReviewFindings(findings);
+            // Resolve reviewer name for the findings header
+            String reviewerName = userRepository.findById(userId).map(u -> {
+                String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                String full = (fn + " " + ln).trim();
+                return full.isEmpty() ? u.getEmail() : full;
+            }).orElse("Reviewer #" + userId);
+
+            String datestamp = java.time.LocalDate.now()
+                    .format(java.time.format.DateTimeFormatter.ofPattern("dd MMM yyyy"));
+
+            // Build the new section header and content
+            String section = "--- " + reviewerName + " · " + datestamp + " ---\n" + findings.trim();
+
+            // Append to existing findings (preserve all previous reviewers' contributions)
+            String existing = assessment.getReviewFindings();
+            String combined = (existing != null && !existing.isBlank())
+                    ? existing.trim() + "\n\n" + section
+                    : section;
+
+            assessment.setReviewFindings(combined);
             assessmentRepository.save(assessment);
-            log.info("[FINDINGS] Saved {} chars of findings | assessmentId={}", findings.length(), assessmentId);
+            log.info("[FINDINGS] Appended {} chars | assessmentId={} | reviewer={}", findings.length(), assessmentId, reviewerName);
         }
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -2125,7 +2396,9 @@ public class AssessmentController {
                     "riskRating must be one of: LOW, MEDIUM, HIGH, CRITICAL");
         }
         assessment.setRiskRating(riskRating.toUpperCase());
-        assessment.setTotalEarnedScore(responseRepository.sumScoreByAssessmentId(assessmentId));
+        // Persist reviewer-adjusted score alongside the rating so totalEarnedScore
+        // on the assessment record is always consistent with the final risk decision.
+        assessment.setTotalEarnedScore(responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId));
         assessmentRepository.save(assessment);
         log.info("[RISK-RATING] {} | assessmentId={} | by={}", riskRating.toUpperCase(), assessmentId, userId);
         eventPublisher.publishEvent(
@@ -2404,124 +2677,148 @@ public class AssessmentController {
                 .findByAssessmentId(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance for assessment", assessmentId));
 
-        List<SectionInstanceResponse> sections =
-                sectionInstanceRepository
-                        .findByTemplateInstanceIdAndAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId)
-                        .stream()
-                        .map(si -> {
-                            List<QuestionInstanceResponse> questions =
-                                    questionInstanceRepository
-                                            .findBySectionInstanceIdOrderByOrderNo(si.getId())
-                                            .stream()
-                                            .map(qi -> {
-                                                var responseOpt = responseRepository
-                                                        .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
+        List<AssessmentSectionInstance> rawSections =
+                sectionInstanceRepository.findByTemplateInstanceIdAndAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId);
 
-                                                List<OptionInstanceResponse> options =
-                                                        optionInstanceRepository
-                                                                .findByQuestionInstanceIdOrderByOrderNo(qi.getId())
-                                                                .stream()
-                                                                .map(o -> OptionInstanceResponse.builder()
-                                                                        .optionInstanceId(o.getId())
-                                                                        .optionValue(o.getOptionValue())
-                                                                        .score(o.getScore())
-                                                                        .build())
-                                                                .toList();
+        // ── Bulk-load all data upfront to eliminate N+1 queries ──────────────
+        // FIX: all userRepository.findById, responseRepository.findFirst, and
+        // documentLinkRepository.countActiveAttachments calls inside the per-question
+        // loop were each firing a separate DB query — O(N) per question.
+        // Pre-loading everything here reduces it to a fixed number of bulk queries.
 
-                                                AnswerResponse answer = responseOpt.map(r -> {
-                                                    java.util.List<Long> multiIds = null;
-                                                    if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
-                                                        try {
-                                                            Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
-                                                                    .readValue(r.getResponseText(), Long[].class);
-                                                            multiIds = java.util.Arrays.asList(arr);
-                                                        } catch (Exception ignored) {}
-                                                    }
-                                                    String answeredByName = null;
-                                                    if (r.getSubmittedBy() != null) {
-                                                        answeredByName = userRepository.findById(r.getSubmittedBy())
-                                                                .map(u -> {
-                                                                    String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                    String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                    String full = (fn + " " + ln).trim();
-                                                                    return full.isEmpty() ? u.getEmail() : full;
-                                                                }).orElse(null);
-                                                    }
-                                                    return AnswerResponse.builder()
-                                                            .responseId(r.getId())
-                                                            .responseText(multiIds != null ? null : r.getResponseText())
-                                                            .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
-                                                            .selectedOptionInstanceIds(multiIds)
-                                                            .scoreEarned(r.getScoreEarned())
-                                                            .reviewerStatus(r.getReviewerStatus())
-                                                            .submittedAt(r.getSubmittedAt())
-                                                            .answeredBy(r.getSubmittedBy())
-                                                            .answeredByName(answeredByName)
-                                                            .build();
-                                                }).orElse(null);
+        // Bulk-load all questions for all sections at once (1 query)
+        Set<Long> sectionInstanceIds = rawSections.stream()
+                .map(AssessmentSectionInstance::getId).collect(java.util.stream.Collectors.toSet());
+        List<AssessmentQuestionInstance> allQuestions = sectionInstanceIds.isEmpty()
+                ? List.of()
+                : questionInstanceRepository.findBySectionInstanceIdInOrderByOrderNo(sectionInstanceIds);
 
-                                                String assignedName = null;
-                                                if (qi.getAssignedUserId() != null) {
-                                                    assignedName = userRepository.findById(qi.getAssignedUserId())
-                                                            .map(u -> {
-                                                                String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                String full = (fn + " " + ln).trim();
-                                                                return full.isEmpty() ? u.getEmail() : full;
-                                                            }).orElse(null);
-                                                }
-                                                // Resolve review assistant name separately —
-                                                // reviewerAssignedUserId is the org-side assignment (step 9)
-                                                String reviewerAssignedName = null;
-                                                if (qi.getReviewerAssignedUserId() != null) {
-                                                    reviewerAssignedName = userRepository.findById(qi.getReviewerAssignedUserId())
-                                                            .map(u -> {
-                                                                String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                                                String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                                                String full = (fn + " " + ln).trim();
-                                                                return full.isEmpty() ? u.getEmail() : full;
-                                                            }).orElse(null);
-                                                }
-                                                return QuestionInstanceResponse.builder()
-                                                        .questionInstanceId(qi.getId())
-                                                        .questionText(qi.getQuestionTextSnapshot())
-                                                        .responseType(qi.getResponseType())
-                                                        .weight(qi.getWeight())
-                                                        .mandatory(qi.isMandatory())
-                                                        .orderNo(qi.getOrderNo())
-                                                        .options(options)
-                                                        .currentResponse(answer)
-                                                        .assignedUserId(qi.getAssignedUserId())
-                                                        .assignedUserName(assignedName)
-                                                        .reviewerAssignedUserId(qi.getReviewerAssignedUserId())
-                                                        .reviewerAssignedUserName(reviewerAssignedName)
+        // Bulk-load all responses for this assessment (1 query)
+        Map<Long, AssessmentResponse> responseByQiId = responseRepository.findByAssessmentId(assessmentId)
+                .stream().collect(java.util.stream.Collectors.toMap(
+                        AssessmentResponse::getQuestionInstanceId, r -> r, (a, b) -> b));
+
+        // Collect all user IDs we'll need for name resolution
+        Set<Long> allUserIds = new java.util.HashSet<>();
+        rawSections.forEach(s -> {
+            if (s.getAssignedUserId() != null) allUserIds.add(s.getAssignedUserId());
+            if (s.getSubmittedBy()    != null) allUserIds.add(s.getSubmittedBy());
+        });
+        allQuestions.forEach(qi -> {
+            if (qi.getAssignedUserId()         != null) allUserIds.add(qi.getAssignedUserId());
+            if (qi.getReviewerAssignedUserId()  != null) allUserIds.add(qi.getReviewerAssignedUserId());
+        });
+        responseByQiId.values().forEach(r -> {
+            if (r.getSubmittedBy() != null) allUserIds.add(r.getSubmittedBy());
+        });
+
+        // Bulk-load all user names (1 query)
+        Map<Long, String> nameMap = allUserIds.isEmpty() ? Map.of()
+                : userRepository.findAllById(allUserIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(
+                          com.kashi.grc.usermanagement.domain.User::getId,
+                          u -> {
+                              String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                              String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                              String full = (fn + " " + ln).trim();
+                              return full.isEmpty() ? u.getEmail() : full;
+                          }));
+
+        // Bulk-load FILE_UPLOAD attachment counts (1 query)
+        List<Long> fileQiIds = allQuestions.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId).toList();
+        Map<Long, Long> attachCounts = new java.util.HashMap<>();
+        if (!fileQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileQiIds)
+                    .forEach(row -> attachCounts.put((Long) row[0], (Long) row[1]));
+        }
+
+        // Group questions by sectionInstanceId for the mapper
+        Map<Long, List<AssessmentQuestionInstance>> questionsBySectionId = allQuestions.stream()
+                .collect(java.util.stream.Collectors.groupingBy(AssessmentQuestionInstance::getSectionInstanceId));
+
+        List<SectionInstanceResponse> sections = rawSections.stream()
+                .map(si -> {
+                    List<QuestionInstanceResponse> questions =
+                            questionsBySectionId.getOrDefault(si.getId(), List.of()).stream()
+                                    .map(qi -> {
+                                        AssessmentResponse r = responseByQiId.get(qi.getId());
+
+                                        List<OptionInstanceResponse> options =
+                                                optionInstanceRepository
+                                                        .findByQuestionInstanceIdOrderByOrderNo(qi.getId())
+                                                        .stream()
+                                                        .map(o -> OptionInstanceResponse.builder()
+                                                                .optionInstanceId(o.getId())
+                                                                .optionValue(o.getOptionValue())
+                                                                .score(o.getScore())
+                                                                .build())
+                                                        .toList();
+
+                                        AnswerResponse answer = null;
+                                        if (r != null) {
+                                            java.util.List<Long> multiIds = null;
+                                            if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
+                                                try {
+                                                    Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
+                                                            .readValue(r.getResponseText(), Long[].class);
+                                                    multiIds = java.util.Arrays.asList(arr);
+                                                } catch (Exception ignored) {}
+                                            }
+                                            answer = AnswerResponse.builder()
+                                                    .responseId(r.getId())
+                                                    .responseText(multiIds != null ? null : r.getResponseText())
+                                                    .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
+                                                    .selectedOptionInstanceIds(multiIds)
+                                                    .scoreEarned(r.getScoreEarned())
+                                                    .reviewerStatus(r.getReviewerStatus())
+                                                    .submittedAt(r.getSubmittedAt())
+                                                    .answeredBy(r.getSubmittedBy())
+                                                    .answeredByName(nameMap.get(r.getSubmittedBy())) // bulk name map
+                                                    .build();
+                                        }
+
+                                        // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
+                                        if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                            long docCount = attachCounts.getOrDefault(qi.getId(), 0L); // bulk count map
+                                            if (docCount > 0) {
+                                                answer = AnswerResponse.builder()
+                                                        .responseText("[FILE_UPLOADED:" + docCount + "]")
                                                         .build();
-                                            })
-                                            .toList();
+                                            }
+                                        }
 
-                            String submittedByName = null;
-                            if (si.getSubmittedBy() != null) {
-                                submittedByName = userRepository.findById(si.getSubmittedBy())
-                                        .map(u -> {
-                                            String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                            String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                            String full = (fn + " " + ln).trim();
-                                            return full.isEmpty() ? u.getEmail() : full;
-                                        }).orElse(null);
-                            }
-                            return SectionInstanceResponse.builder()
-                                    .sectionInstanceId(si.getId())
-                                    .sectionName(si.getSectionNameSnapshot())
-                                    .sectionOrderNo(si.getSectionOrderNo())
-                                    .assignedUserId(si.getAssignedUserId())
-                                    .submittedAt(si.getSubmittedAt())
-                                    .submittedBy(si.getSubmittedBy())
-                                    .submittedByName(submittedByName)
-                                    .reopenedAt(si.getReopenedAt())
-                                    .questions(questions)
-                                    .build();
-                        })
-                        .toList();
+                                        return QuestionInstanceResponse.builder()
+                                                .questionInstanceId(qi.getId())
+                                                .questionText(qi.getQuestionTextSnapshot())
+                                                .responseType(qi.getResponseType())
+                                                .weight(qi.getWeight())
+                                                .mandatory(qi.isMandatory())
+                                                .orderNo(qi.getOrderNo())
+                                                .options(options)
+                                                .currentResponse(answer)
+                                                .assignedUserId(qi.getAssignedUserId())
+                                                .assignedUserName(nameMap.get(qi.getAssignedUserId())) // bulk name map
+                                                .reviewerAssignedUserId(qi.getReviewerAssignedUserId())
+                                                .reviewerAssignedUserName(nameMap.get(qi.getReviewerAssignedUserId())) // bulk name map
+                                                .build();
+                                    })
+                                    .toList();
+
+                    return SectionInstanceResponse.builder()
+                            .sectionInstanceId(si.getId())
+                            .sectionName(si.getSectionNameSnapshot())
+                            .sectionOrderNo(si.getSectionOrderNo())
+                            .assignedUserId(si.getAssignedUserId())
+                            .submittedAt(si.getSubmittedAt())
+                            .submittedBy(si.getSubmittedBy())
+                            .submittedByName(nameMap.get(si.getSubmittedBy())) // bulk name map
+                            .reopenedAt(si.getReopenedAt())
+                            .questions(questions)
+                            .build();
+                })
+                .toList();
 
         return ResponseEntity.ok(ApiResponse.success(sections));
     }
@@ -2534,13 +2831,62 @@ public class AssessmentController {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
 
+        List<AssessmentQuestionInstance> allMyQuestions =
+                questionInstanceRepository.findByAssessmentIdAndAssignedUserIdOrderByOrderNo(assessmentId, userId);
+
+        // ── Bulk-load all data upfront to eliminate N+1 queries ──────────────
+        // FIX: userRepository.findById, sectionInstanceRepository.findById, and
+        // documentLinkRepository.countActiveAttachments were each called once per
+        // question inside the stream — O(N) per question. Pre-loading in bulk here.
+
+        // Bulk-load all responses for the assessment (1 query)
+        Map<Long, AssessmentResponse> myResponseByQiId = responseRepository.findByAssessmentId(assessmentId)
+                .stream().collect(java.util.stream.Collectors.toMap(
+                        AssessmentResponse::getQuestionInstanceId, r -> r, (a, b) -> b));
+
+        // Collect section instance IDs and user IDs
+        Set<Long> mySectionIds = allMyQuestions.stream()
+                .filter(qi -> qi.getSectionInstanceId() != null)
+                .map(AssessmentQuestionInstance::getSectionInstanceId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        // Bulk-load section instances (1 query)
+        Map<Long, AssessmentSectionInstance> mySectionMap = mySectionIds.isEmpty() ? Map.of()
+                : sectionInstanceRepository.findAllById(mySectionIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(AssessmentSectionInstance::getId, s -> s));
+
+        // Collect all user IDs for name resolution
+        Set<Long> myUserIds = new java.util.HashSet<>();
+        myResponseByQiId.values().forEach(r -> { if (r.getSubmittedBy() != null) myUserIds.add(r.getSubmittedBy()); });
+
+        // Bulk-load user names (1 query)
+        Map<Long, String> myNameMap = myUserIds.isEmpty() ? Map.of()
+                : userRepository.findAllById(myUserIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(
+                          com.kashi.grc.usermanagement.domain.User::getId,
+                          u -> {
+                              String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                              String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                              String full = (fn + " " + ln).trim();
+                              return full.isEmpty() ? u.getEmail() : full;
+                          }));
+
+        // Bulk FILE_UPLOAD attachment counts (1 query)
+        List<Long> myFileQiIds = allMyQuestions.stream()
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .map(AssessmentQuestionInstance::getId).toList();
+        Map<Long, Long> myAttachCounts = new java.util.HashMap<>();
+        if (!myFileQiIds.isEmpty()) {
+            documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", myFileQiIds)
+                    .forEach(row -> myAttachCounts.put((Long) row[0], (Long) row[1]));
+        }
+
         List<QuestionInstanceResponse> questions =
-                questionInstanceRepository.findByAssessmentIdAndAssignedUserIdOrderByOrderNo(assessmentId, userId)
-                        .stream()
+                allMyQuestions.stream()
                         .map(qi -> {
-                            var responseOpt = responseRepository
-                                    .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
-                            AnswerResponse answer = responseOpt.map(r -> {
+                            AssessmentResponse r = myResponseByQiId.get(qi.getId());
+                            AnswerResponse answer = null;
+                            if (r != null) {
                                 java.util.List<Long> multiIds = null;
                                 if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
                                     try {
@@ -2549,22 +2895,35 @@ public class AssessmentController {
                                         multiIds = java.util.Arrays.asList(arr);
                                     } catch (Exception ignored) {}
                                 }
-                                return AnswerResponse.builder()
+                                answer = AnswerResponse.builder()
                                         .responseId(r.getId())
                                         .responseText(multiIds != null ? null : r.getResponseText())
                                         .selectedOptionInstanceId(r.getSelectedOptionInstanceId())
                                         .selectedOptionInstanceIds(multiIds)
                                         .scoreEarned(r.getScoreEarned())
+                                        .reviewerStatus(r.getReviewerStatus())
+                                        .answeredBy(r.getSubmittedBy())
+                                        .answeredByName(myNameMap.get(r.getSubmittedBy())) // bulk name map
                                         .submittedAt(r.getSubmittedAt())
                                         .build();
-                            }).orElse(null);
-                            var sectionInst = qi.getSectionInstanceId() != null
-                                    ? sectionInstanceRepository.findById(qi.getSectionInstanceId()).orElse(null)
+                            }
+
+                            // FILE_UPLOAD: a DocumentLink IS the answer — no AssessmentResponse row is written.
+                            if (answer == null && "FILE_UPLOAD".equals(qi.getResponseType())) {
+                                long docCount = myAttachCounts.getOrDefault(qi.getId(), 0L); // bulk count map
+                                if (docCount > 0) {
+                                    answer = AnswerResponse.builder()
+                                            .responseText("[FILE_UPLOADED:" + docCount + "]")
+                                            .build();
+                                }
+                            }
+
+                            AssessmentSectionInstance sectionInst = qi.getSectionInstanceId() != null
+                                    ? mySectionMap.get(qi.getSectionInstanceId()) // bulk section map
                                     : null;
-                            String sectionName = sectionInst != null
-                                    ? sectionInst.getSectionNameSnapshot() : null;
-                            java.time.LocalDateTime sectionSubmittedAt = sectionInst != null
-                                    ? sectionInst.getSubmittedAt() : null;
+                            String sectionName = sectionInst != null ? sectionInst.getSectionNameSnapshot() : null;
+                            java.time.LocalDateTime sectionSubmittedAt = sectionInst != null ? sectionInst.getSubmittedAt() : null;
+
                             return QuestionInstanceResponse.builder()
                                     .questionInstanceId(qi.getId())
                                     .questionText(qi.getQuestionTextSnapshot())
@@ -2655,14 +3014,11 @@ public class AssessmentController {
 
         Long workflowInstanceId = cycle.getWorkflowInstanceId();
 
-        List<TaskInstance> activeTasks = new ArrayList<>();
-        activeTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.PENDING));
-        activeTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.IN_PROGRESS));
-
-        boolean hasActiveTask = activeTasks.stream().anyMatch(task -> {
-            StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
-            return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
-        });
+        // FIX: single JOIN query replaces 2 findByStatus calls + N stepInstance.findById calls.
+        // taskInstanceRepository.existsByUserIdAndWorkflowInstanceIdAndStatusIn() does one
+        // EXISTS subquery with a JOIN on step_instances — O(1) regardless of task count.
+        boolean hasActiveTask = taskInstanceRepository.existsByUserIdAndWorkflowInstanceIdAndStatusIn(
+                userId, workflowInstanceId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS));
 
         if (!hasActiveTask) {
             if (hasOpenActionItemForAssessment(userId, assessment.getId(), assessment.getTenantId())) {
@@ -2728,11 +3084,10 @@ public class AssessmentController {
 
         Long workflowInstanceId = cycle.getWorkflowInstanceId();
 
-        List<TaskInstance> allUserTasks = taskInstanceRepository.findByAssignedUserId(userId);
-        boolean hasParticipated = allUserTasks.stream().anyMatch(task -> {
-            StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId()).orElse(null);
-            return si != null && workflowInstanceId.equals(si.getWorkflowInstanceId());
-        });
+        // FIX: single JOIN query replaces findByAssignedUserId + N stepInstance.findById calls.
+        // existsByUserIdAndWorkflowInstanceId does one EXISTS subquery — O(1).
+        boolean hasParticipated = taskInstanceRepository.existsByUserIdAndWorkflowInstanceId(
+                userId, workflowInstanceId);
 
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",
@@ -2744,5 +3099,154 @@ public class AssessmentController {
 
         log.debug("[ASSESSMENT-GUARD] Read access granted | userId={} | assessmentId={}",
                 userId, assessment.getId());
+    }
+
+    // ── Template Selection — GET candidates ───────────────────────────────────
+
+    /**
+     * Returns the pending template selection for a workflow instance.
+     * Called by the "Select Assessment Template" task page on load.
+     *
+     * Access: ORG_ADMIN and ORG_OWNER only — vendor-side users never see this step.
+     *
+     * Response includes:
+     *   - riskTierLabel   — LOW / MEDIUM / HIGH / CRITICAL
+     *   - alreadySelected — true if QUEUE step pre-filled a single candidate
+     *   - candidates      — [{templateId, name, version, status}]
+     *   - selectedTemplateId — null until selection made (or pre-filled for single candidate)
+     */
+    @GetMapping("/v1/assessments/template-selection")
+    @Operation(summary = "ORG_ADMIN/ORG_OWNER: get pending template candidates for a workflow instance")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getTemplateSelection(
+            @RequestParam Long workflowInstanceId) {
+
+        User currentUser = utilityService.getLoggedInDataContext();
+
+        // ── Role guard: only ORG_ADMIN / ORG_OWNER ───────────────────────────
+        boolean isOrgAdmin = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "ORG_ADMIN".equals(name) || "ORG_OWNER".equals(name);
+        });
+        if (!isOrgAdmin) {
+            throw new BusinessException("ACCESS_DENIED",
+                    "Only ORG_ADMIN or ORG_OWNER can access the template selection.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        VendorTemplateSelection selection = templateSelectionRepository
+                .findByWorkflowInstanceId(workflowInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "TemplateSelection (workflowInstanceId)", workflowInstanceId));
+
+        // Parse candidate IDs and hydrate template names
+        List<Long> candidateIds;
+        try {
+            candidateIds = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(selection.getCandidateTemplateIds(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<Long>>() {});
+        } catch (Exception e) {
+            throw new BusinessException("INTERNAL_ERROR",
+                    "Could not parse candidate template IDs", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+
+        List<Map<String, Object>> candidates = candidateIds.stream().map(tid -> {
+            var tpl = templateRepository.findById(tid).orElse(null);
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("templateId", tid);
+            m.put("name",       tpl != null ? tpl.getName()    : "Unknown");
+            m.put("version",    tpl != null ? tpl.getVersion() : 1);
+            m.put("status",     tpl != null ? tpl.getStatus()  : "UNKNOWN");
+            return m;
+        }).toList();
+
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("workflowInstanceId",  workflowInstanceId);
+        body.put("riskTierLabel",       selection.getRiskTierLabel());
+        body.put("alreadySelected",     selection.getSelectedTemplateId() != null);
+        body.put("selectedTemplateId",  selection.getSelectedTemplateId());
+        body.put("candidates",          candidates);
+
+        return ResponseEntity.ok(ApiResponse.success(body));
+    }
+
+    // ── Template Selection — POST selection ───────────────────────────────────
+
+    /**
+     * ORG_ADMIN / ORG_OWNER submits their template choice.
+     * Saves the selection, then completes the QUEUE_ASSESSMENT_CANDIDATES SYSTEM step
+     * and advances the workflow — EXECUTE_ASSESSMENT fires on the next step.
+     *
+     * Body: { workflowInstanceId, selectedTemplateId }
+     *
+     * Access: ORG_ADMIN and ORG_OWNER only.
+     */
+    @PostMapping("/v1/assessments/template-selection/select")
+    @Transactional
+    @Operation(summary = "ORG_ADMIN/ORG_OWNER: submit the chosen assessment template")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> selectTemplate(
+            @RequestBody Map<String, Object> req) {
+
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        User currentUser = utilityService.getLoggedInDataContext();
+
+        // ── Role guard: only ORG_ADMIN / ORG_OWNER ───────────────────────────
+        boolean isOrgAdmin = currentUser.getRoles().stream().anyMatch(r -> {
+            String name = r.getName() != null ? r.getName() : "";
+            return "ORG_ADMIN".equals(name) || "ORG_OWNER".equals(name);
+        });
+        if (!isOrgAdmin) {
+            throw new BusinessException("ACCESS_DENIED",
+                    "Only ORG_ADMIN or ORG_OWNER can select the assessment template.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        Long workflowInstanceId = Long.parseLong(req.get("workflowInstanceId").toString());
+        Long selectedTemplateId = Long.parseLong(req.get("selectedTemplateId").toString());
+
+        VendorTemplateSelection selection = templateSelectionRepository
+                .findByWorkflowInstanceId(workflowInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException(
+                        "TemplateSelection (workflowInstanceId)", workflowInstanceId));
+
+        // ── Validate chosen templateId is one of the candidates ───────────────
+        List<Long> candidateIds;
+        try {
+            candidateIds = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readValue(selection.getCandidateTemplateIds(),
+                            new com.fasterxml.jackson.core.type.TypeReference<List<Long>>() {});
+        } catch (Exception e) {
+            throw new BusinessException("INTERNAL_ERROR",
+                    "Could not parse candidate template IDs", HttpStatus.INTERNAL_SERVER_ERROR);
+        }
+        if (!candidateIds.contains(selectedTemplateId)) {
+            throw new BusinessException("INVALID_SELECTION",
+                    "The chosen templateId is not in the candidate list for this workflow.",
+                    HttpStatus.BAD_REQUEST);
+        }
+
+        // ── Persist selection ─────────────────────────────────────────────────
+        selection.setSelectedTemplateId(selectedTemplateId);
+        selection.setSelectedByUserId(userId);
+        selection.setSelectedAt(java.time.LocalDateTime.now());
+        templateSelectionRepository.save(selection);
+
+        // ── Complete the QUEUE_ASSESSMENT_CANDIDATES SYSTEM step and advance ──
+        // The step stayed IN_PROGRESS (returned false) while waiting for this choice.
+        // Now that selectedTemplateId is set, completing it triggers EXECUTE_ASSESSMENT
+        // on the next step, which reads selectedTemplateId and instantiates the snapshot.
+        workflowEngineService.completeSystemStepAndAdvance(
+                selection.getStepInstanceId(),
+                userId,
+                "Template selected by ORG_ADMIN/ORG_OWNER: templateId=" + selectedTemplateId
+        );
+
+        log.info("[TEMPLATE-SELECTION] Selected templateId={} | workflowInstanceId={} | by userId={}",
+                selectedTemplateId, workflowInstanceId, userId);
+
+        Map<String, Object> responseBody = new java.util.LinkedHashMap<>();
+        responseBody.put("selectedTemplateId", selectedTemplateId);
+        responseBody.put("workflowInstanceId", workflowInstanceId);
+        responseBody.put("message", "Template selected — workflow advancing to assessment execution");
+        return ResponseEntity.ok(ApiResponse.success(responseBody));
     }
 }

@@ -20,6 +20,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -190,7 +191,12 @@ public class AssessmentLibraryController {
         questionRepository.save(q);
 
         int linked = questionOptionMappingRepository.findByQuestionIdOrderByOrderNo(questionId).size();
-        if (req.getOptionIds() != null) {
+        if (req.getOptionIds() != null && !req.getOptionIds().isEmpty()) {
+            // Only clear and re-link when a non-empty list is explicitly provided.
+            // null  → caller didn't touch options — leave them as-is.
+            // []    → empty list is treated the same as null (no-op) to prevent
+            //         accidental option loss when the frontend sends before the
+            //         linked-options query has resolved.
             log.info("[LIBRARY] Re-linking options for question id={}", questionId);
             questionOptionMappingRepository.deleteByQuestionId(questionId);
             linked = linkOptionsToQuestion(questionId, req.getOptionIds());
@@ -280,28 +286,28 @@ public class AssessmentLibraryController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteQuestions(
             @RequestBody List<Long> questionIds) {
 
-        log.info("[LIBRARY] Bulk deleting {} questions | ids={}", questionIds.size(), questionIds);
-        int deleted = 0, skipped = 0;
+        if (questionIds == null || questionIds.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
+        }
+        log.info("[LIBRARY] Bulk deleting {} questions", questionIds.size());
 
-        for (Long questionId : questionIds) {
-            if (!questionRepository.existsById(questionId)) {
-                log.warn("[LIBRARY] Question id={} not found — skipping", questionId);
-                skipped++;
-                continue;
-            }
-            int optMappings = questionOptionMappingRepository.findByQuestionIdOrderByOrderNo(questionId).size();
-            int secMappings = sectionQuestionMappingRepository.findByQuestionId(questionId).size();
-            questionOptionMappingRepository.deleteByQuestionId(questionId);
-            sectionQuestionMappingRepository.deleteByQuestionId(questionId);
-            questionRepository.deleteById(questionId);
-            log.info("[LIBRARY] Deleted question id={} | removed {} opt-mappings {} sec-mappings",
-                    questionId, optMappings, secMappings);
-            deleted++;
+        // Filter to only IDs that actually exist — avoids silent skips and keeps the
+        // response accurate without N individual existsById round-trips.
+        List<Long> existing = questionRepository.findAllById(questionIds)
+                .stream().map(q -> q.getId()).toList();
+        int skipped = questionIds.size() - existing.size();
+
+        if (!existing.isEmpty()) {
+            // 3 bulk DELETE WHERE IN queries instead of N×5 individual queries.
+            // For 100 questions this cuts ~500 DB round-trips down to 3.
+            questionOptionMappingRepository.deleteByQuestionIdIn(existing);
+            sectionQuestionMappingRepository.deleteByQuestionIdIn(existing);
+            questionRepository.deleteAllById(existing);
         }
 
-        log.info("[LIBRARY] Bulk delete complete | deleted={} | skipped={}", deleted, skipped);
+        log.info("[LIBRARY] Bulk delete questions complete | deleted={} | skipped={}", existing.size(), skipped);
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "deleted", deleted, "skipped", skipped, "requested", questionIds.size())));
+                "deleted", existing.size(), "skipped", skipped, "requested", questionIds.size())));
     }
 
     // ── Bulk delete options ────────────────────────────────────────
@@ -311,25 +317,24 @@ public class AssessmentLibraryController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteOptions(
             @RequestBody List<Long> optionIds) {
 
-        log.info("[LIBRARY] Bulk deleting {} options | ids={}", optionIds.size(), optionIds);
-        int deleted = 0, skipped = 0;
+        if (optionIds == null || optionIds.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
+        }
+        log.info("[LIBRARY] Bulk deleting {} options", optionIds.size());
 
-        for (Long optionId : optionIds) {
-            if (!optionRepository.existsById(optionId)) {
-                log.warn("[LIBRARY] Option id={} not found — skipping", optionId);
-                skipped++;
-                continue;
-            }
-            int mappings = questionOptionMappingRepository.findByOptionId(optionId).size();
-            questionOptionMappingRepository.deleteByOptionId(optionId);
-            optionRepository.deleteById(optionId);
-            log.info("[LIBRARY] Deleted option id={} | removed {} question-mappings", optionId, mappings);
-            deleted++;
+        List<Long> existing = optionRepository.findAllById(optionIds)
+                .stream().map(o -> o.getId()).toList();
+        int skipped = optionIds.size() - existing.size();
+
+        if (!existing.isEmpty()) {
+            // 2 bulk DELETE WHERE IN queries instead of N×3 individual queries.
+            questionOptionMappingRepository.deleteByOptionIdIn(existing);
+            optionRepository.deleteAllById(existing);
         }
 
-        log.info("[LIBRARY] Bulk delete options complete | deleted={} | skipped={}", deleted, skipped);
+        log.info("[LIBRARY] Bulk delete options complete | deleted={} | skipped={}", existing.size(), skipped);
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "deleted", deleted, "skipped", skipped, "requested", optionIds.size())));
+                "deleted", existing.size(), "skipped", skipped, "requested", optionIds.size())));
     }
 
     // ── Bulk delete sections ───────────────────────────────────────
@@ -339,28 +344,25 @@ public class AssessmentLibraryController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteSections(
             @RequestBody List<Long> sectionIds) {
 
-        log.info("[LIBRARY] Bulk deleting {} sections | ids={}", sectionIds.size(), sectionIds);
-        int deleted = 0, skipped = 0;
+        if (sectionIds == null || sectionIds.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
+        }
+        log.info("[LIBRARY] Bulk deleting {} sections", sectionIds.size());
 
-        for (Long sectionId : sectionIds) {
-            if (!sectionRepository.existsById(sectionId)) {
-                log.warn("[LIBRARY] Section id={} not found — skipping", sectionId);
-                skipped++;
-                continue;
-            }
-            long qMappings = sectionQuestionMappingRepository.countBySectionId(sectionId);
-            long tMappings = templateSectionMappingRepository.findBySectionId(sectionId).size();
-            sectionQuestionMappingRepository.deleteBySectionId(sectionId);
-            templateSectionMappingRepository.deleteBySectionId(sectionId);
-            sectionRepository.deleteById(sectionId);
-            log.info("[LIBRARY] Deleted section id={} | removed {} question-mappings {} template-mappings",
-                    sectionId, qMappings, tMappings);
-            deleted++;
+        List<Long> existing = sectionRepository.findAllById(sectionIds)
+                .stream().map(s -> s.getId()).toList();
+        int skipped = sectionIds.size() - existing.size();
+
+        if (!existing.isEmpty()) {
+            // 3 bulk DELETE WHERE IN queries instead of N×4 individual queries.
+            sectionQuestionMappingRepository.deleteBySectionIdIn(existing);
+            templateSectionMappingRepository.deleteBySectionIdIn(existing);
+            sectionRepository.deleteAllById(existing);
         }
 
-        log.info("[LIBRARY] Bulk delete sections complete | deleted={} | skipped={}", deleted, skipped);
+        log.info("[LIBRARY] Bulk delete sections complete | deleted={} | skipped={}", existing.size(), skipped);
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "deleted", deleted, "skipped", skipped, "requested", sectionIds.size())));
+                "deleted", existing.size(), "skipped", skipped, "requested", sectionIds.size())));
     }
 
     // ── Library CSV import (questions only) ───────────────────────
@@ -482,9 +484,15 @@ public class AssessmentLibraryController {
                 log.debug("[LIBRARY] Option id={} already linked to question id={}", optId, questionId);
                 continue;
             }
-            questionOptionMappingRepository.save(QuestionOptionMapping.builder()
-                    .questionId(questionId).optionId(optId).orderNo(i + 1).build());
-            count++;
+            try {
+                questionOptionMappingRepository.save(QuestionOptionMapping.builder()
+                        .questionId(questionId).optionId(optId).orderNo(i + 1).build());
+                count++;
+            } catch (DataIntegrityViolationException e) {
+                // Concurrent import created the same mapping between our existsBy check and save.
+                // The DB unique constraint on (question_id, option_id) caught it — treat as already linked.
+                log.debug("[LIBRARY] Option id={} → question id={} race-condition duplicate — skipping", optId, questionId);
+            }
         }
         return count;
     }

@@ -42,30 +42,48 @@ public class RiskTemplateMappingController {
                 .sorted(Comparator.comparing(RiskMappingConfigRequest.MappingEntry::getMinScore))
                 .toList();
 
+        // Deduplicate to one entry per tier range before gap/overlap validation.
+        // Multiple rows with the same (minScore, maxScore) are valid — they represent
+        // multiple template options for the same tier. Validating all rows as if they
+        // were distinct ranges produces false gap/overlap warnings.
+        // One representative entry per distinct (minScore, maxScore) pair
+        Set<String> seenRanges = new LinkedHashSet<>();
+        List<RiskMappingConfigRequest.MappingEntry> uniqueRanges = new ArrayList<>();
+        for (RiskMappingConfigRequest.MappingEntry e : sorted) {
+            String rangeKey = e.getMinScore().stripTrailingZeros().toPlainString()
+                    + "|" + e.getMaxScore().stripTrailingZeros().toPlainString();
+            if (seenRanges.add(rangeKey)) {
+                uniqueRanges.add(e);
+            }
+        }
+
         boolean noGaps = true, noOverlaps = true;
-        for (int i = 1; i < sorted.size(); i++) {
-            BigDecimal prevMax = sorted.get(i - 1).getMaxScore();
-            BigDecimal currMin = sorted.get(i).getMinScore();
+        for (int i = 1; i < uniqueRanges.size(); i++) {
+            BigDecimal prevMax = uniqueRanges.get(i - 1).getMaxScore();
+            BigDecimal currMin = uniqueRanges.get(i).getMinScore();
             if (currMin.subtract(prevMax).compareTo(new BigDecimal("0.01")) != 0) noGaps     = false;
             if (currMin.compareTo(prevMax) <= 0)                                  noOverlaps = false;
         }
-        boolean coversFullRange = !sorted.isEmpty()
-                && sorted.get(0).getMinScore().compareTo(BigDecimal.ZERO) == 0
-                && sorted.get(sorted.size() - 1).getMaxScore().compareTo(new BigDecimal("100")) == 0;
+        boolean coversFullRange = !uniqueRanges.isEmpty()
+                && uniqueRanges.get(0).getMinScore().compareTo(BigDecimal.ZERO) == 0
+                && uniqueRanges.get(uniqueRanges.size() - 1).getMaxScore().compareTo(new BigDecimal("100")) == 0;
 
         // Delete existing global mappings then recreate
         mappingRepository.deleteByTenantIdIsNull();
 
-        List<RiskTemplateMapping> saved = sorted.stream().map(e -> mappingRepository.save(
-                RiskTemplateMapping.builder()
-                        .tenantId(null)              // ← global
-                        .minScore(e.getMinScore())
-                        .maxScore(e.getMaxScore())
-                        .tierId(e.getTierId())
-                        .templateId(e.getTemplateId())
-                        .tierLabel(e.getTierLabel())
-                        .build()
-        )).toList();
+        List<RiskTemplateMapping> saved = new ArrayList<>();
+        for (RiskMappingConfigRequest.MappingEntry e : sorted) {
+            saved.add(mappingRepository.save(
+                    RiskTemplateMapping.builder()
+                            .tenantId(null)
+                            .minScore(e.getMinScore())
+                            .maxScore(e.getMaxScore())
+                            .tierId(e.getTierId())
+                            .templateId(e.getTemplateId())
+                            .tierLabel(e.getTierLabel())
+                            .build()
+            ));
+        }
 
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(Map.of(
                 "scope",           "GLOBAL",

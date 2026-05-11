@@ -118,6 +118,7 @@ public class WorkflowEngineService {
     private final ApplicationEventPublisher eventPublisher;
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
+    private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
 
     // ══════════════════════════════════════════════════════════════
     // BLUEPRINT MANAGEMENT — Platform Admin only (logic unchanged)
@@ -528,7 +529,14 @@ public class WorkflowEngineService {
             throw new BusinessException("TASK_TERMINAL",
                     "Task is already in terminal state: " + task.getStatus());
 
-        StepInstance stepInstance = stepInstanceRepository.findById(task.getStepInstanceId())
+        // Pessimistic write lock — serialises concurrent approvals on the same step.
+        // Without this, two actors approving within milliseconds of each other both
+        // read status=IN_PROGRESS, both satisfy isStepApprovalSatisfied(), and both
+        // call createStepInstance for the next step → duplicate step instances → false
+        // "+N revisits" badge on every subsequent workflow instance.
+        // With this lock the second transaction blocks until the first commits; by then
+        // the step is already APPROVED and the guard in handleApprove() exits early.
+        StepInstance stepInstance = stepInstanceRepository.findByIdForUpdate(task.getStepInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("StepInstance", task.getStepInstanceId()));
         WorkflowInstance instance = instanceRepository.findById(stepInstance.getWorkflowInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance",
@@ -601,6 +609,21 @@ public class WorkflowEngineService {
                 stepInstance.getId(), stepInstance.getSnapApprovalType(), stepComplete);
 
         if (stepComplete) {
+            // ── Concurrent-advance guard ──────────────────────────────────────
+            // Re-read the step status from the DB after acquiring the lock.
+            // If another transaction already completed this step (status != IN_PROGRESS),
+            // skip the advance entirely — creating a second next-step instance would
+            // produce the duplicate "+N revisits" bug on all future workflow instances.
+            StepStatus freshStatus = stepInstanceRepository.findById(stepInstance.getId())
+                    .map(StepInstance::getStatus)
+                    .orElse(StepStatus.IN_PROGRESS);
+            if (freshStatus != StepStatus.IN_PROGRESS) {
+                log.warn("[WORKFLOW-ACTION] Step already advanced by concurrent approval — skipping duplicate advance | stepInstanceId={} | freshStatus={}",
+                        stepInstance.getId(), freshStatus);
+                return buildInstanceResponse(instance);
+            }
+            // ── End concurrent-advance guard ──────────────────────────────────
+
             completeStep(stepInstance, StepStatus.APPROVED, req.getRemarks());
             expirePendingTasks(stepInstance, task.getId());
 
@@ -683,9 +706,28 @@ public class WorkflowEngineService {
     }
 
     // ── SEND_BACK — supports N steps back via targetStepId ───────────────────
+    // IMPORTANT: Send Back is a nuclear operation — it rolls back the ENTIRE step,
+    // cancels all other actors' tasks, and restarts from a previous step.
+    // This is restricted to ORG_ADMIN / ORG_OWNER only.
+    // All other roles should use Action Items (Revision Request / Remediation Request / Reopen Section).
 
     private WorkflowInstanceResponse handleSendBack(TaskInstance task, StepInstance stepInstance,
                                                     WorkflowInstance instance, TaskActionRequest req, Long performedBy) {
+
+        // Role guard — only ORG_ADMIN / ORG_OWNER may roll back a workflow step.
+        // Use roleRepository.findByNameAndSide to avoid lazy-loading User.roles.
+        Long tenantId = instance.getTenantId();
+        boolean isAdmin = java.util.stream.Stream.of("ORG_ADMIN", "ORG_OWNER")
+                .map(name -> roleRepository.findByNameAndSide(name, com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION))
+                .filter(java.util.Optional::isPresent)
+                .map(java.util.Optional::get)
+                .anyMatch(r -> dbRepository.findUserIdsByRoleAndTenant(r.getId(), tenantId).contains(performedBy));
+        if (!isAdmin) {
+            throw new BusinessException("SEND_BACK_NOT_AUTHORIZED",
+                    "Only ORG_ADMIN or ORG_OWNER can roll back a workflow step. " +
+                            "Use Revision Request, Reopen Section, or Remediation Request for content-level corrections.",
+                    HttpStatus.FORBIDDEN);
+        }
 
         log.info("[WORKFLOW-ACTION] SEND_BACK | instanceId={} | from='{}' | targetStepId={}",
                 instance.getId(), stepInstance.getSnapName(), req.getTargetStepId());
@@ -1082,6 +1124,60 @@ public class WorkflowEngineService {
         return workflowRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Workflow", id));
     }
+
+    /**
+     * Completes a SYSTEM step that is stuck IN_PROGRESS (its automated action
+     * returned false while waiting for human input) and advances the workflow to
+     * the next step.
+     *
+     * Used by the template-selection endpoint: after the ORG_ADMIN/ORG_OWNER picks
+     * a template, the QUEUE_ASSESSMENT_CANDIDATES step can be approved so
+     * EXECUTE_ASSESSMENT fires automatically on the next step.
+     *
+     * Mirrors the auto-advance block inside createStepInstance() but is exposed
+     * publicly so non-engine code can drive the advance without duplicating the logic.
+     */
+    @org.springframework.transaction.annotation.Transactional
+    public void completeSystemStepAndAdvance(Long stepInstanceId, Long performedBy, String remarks) {
+        StepInstance si = stepInstanceRepository.findById(stepInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", stepInstanceId));
+        WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));
+        WorkflowStep step = stepRepository.findById(si.getStepId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowStep", si.getStepId()));
+
+        completeStep(si, StepStatus.APPROVED, remarks);
+        recordHistory(instance, si, null, "STEP_MANUALLY_ADVANCED",
+                StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
+                performedBy, remarks);
+
+        stepRepository.findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                        step.getWorkflowId(), step.getStepOrder())
+                .ifPresentOrElse(
+                        nextStep -> {
+                            StepInstance nextSI = createStepInstance(instance, nextStep);
+                            instance.setCurrentStepId(nextSI.getId());
+                            instanceRepository.save(instance);
+                            assignTasksForStep(nextSI, nextStep, instance);
+                            recordHistory(instance, nextSI, null, "STEP_STARTED",
+                                    null, nextSI.getStatus().name(), performedBy,
+                                    "Moved to: " + nextStep.getName());
+                            log.info("[WORKFLOW] System step manually advanced | instanceId={} | nextStep='{}'",
+                                    instance.getId(), nextStep.getName());
+                        },
+                        () -> {
+                            instance.setStatus(WorkflowStatus.COMPLETED);
+                            instance.setCurrentStepId(null);
+                            instance.setCompletedAt(java.time.LocalDateTime.now());
+                            instanceRepository.save(instance);
+                            recordHistory(instance, si, null, "WORKFLOW_COMPLETED",
+                                    WorkflowStatus.IN_PROGRESS.name(), WorkflowStatus.COMPLETED.name(),
+                                    performedBy, "All steps completed");
+                            log.info("[WORKFLOW] Workflow COMPLETED after manual advance | instanceId={}", instance.getId());
+                        }
+                );
+    }
+
 
     public List<WorkflowHistoryResponse> getHistoryByUser(Long userId, Long tenantId) {
         return historyRepository.findByPerformedByAndTenantId(userId, tenantId)
@@ -2082,11 +2178,17 @@ public class WorkflowEngineService {
      * same StepInstance) are evaluated correctly.
      */
     private boolean isStepApprovalSatisfied(StepInstance si) {
-        long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRole(si.getId(), TaskRole.ACTOR);
+        // REJECTED tasks are intentionally excluded from both counts.
+        // A REJECTED contributor task means the responder closed it (section locked before
+        // contributor finished) — it is a terminal "done" state that should not block
+        // the step from advancing once the real ACTOR tasks (responders) are all approved.
+        // Including REJECTED in total but not approved would permanently stall the step.
+        long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatusNot(
+                si.getId(), TaskRole.ACTOR, TaskStatus.REJECTED);
         long approved = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatus(
                 si.getId(), TaskRole.ACTOR, TaskStatus.APPROVED);
 
-        // No actor tasks exist yet (step still AWAITING_ASSIGNMENT) → not satisfied
+        // No non-rejected actor tasks exist yet (step still AWAITING_ASSIGNMENT) → not satisfied
         if (total == 0) return false;
 
         ApprovalType approvalType = si.getSnapApprovalType() != null
@@ -2193,36 +2295,80 @@ public class WorkflowEngineService {
     /** Builds full workflow blueprint response with all steps. Logic unchanged. */
     public WorkflowResponse buildWorkflowResponse(Workflow w) {
         List<WorkflowStep> steps = stepRepository.findByWorkflowIdOrderByStepOrderAsc(w.getId());
-        List<WorkflowStepResponse> stepResponses = steps.stream().map(s -> WorkflowStepResponse.builder()
-                        .id(s.getId()).workflowId(w.getId()).stepOrder(s.getStepOrder())
-                        .name(s.getName()).side(s.getSide()).description(s.getDescription())
-                        .approvalType(s.getApprovalType()).minApprovalsRequired(s.getMinApprovalsRequired())
-                        .isParallel(s.isParallel()).isOptional(s.isOptional()).slaHours(s.getSlaHours())
-                        .automatedAction(s.getAutomatedAction())
-                        .roleIds(stepRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepRole::getRoleId).toList())
-                        .userIds(stepUserRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepUser::getUserId).toList())
-                        .assignerRoleIds(stepAssignerRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepAssignerRole::getRoleId).toList())
-                        .observerRoleIds(stepObserverRoleRepository.findByStepId(s.getId()).stream()
-                                .map(WorkflowStepObserverRole::getRoleId).toList())
-                        .assignerResolution(s.getAssignerResolution())
-                        .allowOverride(s.isAllowOverride())
-                        .stepAction(s.getStepAction())
-                        .navKey(s.getNavKey())
-                        .assignerNavKey(s.getAssignerNavKey())
-                        // Gap 1+2: return sections so admin UI can read them back
-                        .sections(stepSectionRepository.findByStepIdOrderBySectionOrderAsc(s.getId())
-                                .stream().map(sec -> com.kashi.grc.workflow.dto.response.StepSectionResponse.builder()
-                                        .id(sec.getId()).sectionKey(sec.getSectionKey())
-                                        .sectionOrder(sec.getSectionOrder()).label(sec.getLabel())
-                                        .description(sec.getDescription()).required(sec.isRequired())
-                                        .completionEvent(sec.getCompletionEvent())
-                                        .requiresAssignment(sec.isRequiresAssignment())
-                                        .tracksItems(sec.isTracksItems())
-                                        .build()).toList())
-                        .build())
+
+        if (steps.isEmpty()) {
+            return WorkflowResponse.builder()
+                    .id(w.getId()).name(w.getName()).entityType(w.getEntityType())
+                    .description(w.getDescription()).version(w.getVersion()).isActive(w.isActive())
+                    .createdAt(w.getCreatedAt()).steps(List.of()).build();
+        }
+
+        // ── Bulk-load all step associations in 5 queries instead of 5×N ──────
+        // Previously: stepRoleRepository.findByStepId(s.getId()) was called once
+        // per step for 5 different tables → 5×N queries for a workflow with N steps.
+        // A 12-step workflow fired 60 queries just to render a single list row.
+        // Now: one IN query per table, results grouped in memory — always 5 queries.
+        List<Long> stepIds = steps.stream().map(WorkflowStep::getId).toList();
+
+        Map<Long, List<Long>> roleIdsByStepId = stepRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> userIdsByStepId = stepUserRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepUser::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepUser::getUserId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> assignerRoleIdsByStepId = stepAssignerRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepAssignerRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepAssignerRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> observerRoleIdsByStepId = stepObserverRoleRepository.findByStepIdIn(stepIds)
+                .stream().collect(java.util.stream.Collectors.groupingBy(
+                        WorkflowStepObserverRole::getStepId,
+                        java.util.stream.Collectors.mapping(WorkflowStepObserverRole::getRoleId,
+                                java.util.stream.Collectors.toList())));
+
+        // Gap 1+2: return sections so admin UI can read them back
+        Map<Long, List<com.kashi.grc.workflow.dto.response.StepSectionResponse>> sectionsByStepId =
+                stepSectionRepository.findByStepIdInOrderBySectionOrderAsc(stepIds)
+                        .stream().collect(java.util.stream.Collectors.groupingBy(
+                                com.kashi.grc.workflow.domain.WorkflowStepSection::getStepId,
+                                java.util.stream.Collectors.mapping(
+                                        sec -> com.kashi.grc.workflow.dto.response.StepSectionResponse.builder()
+                                                .id(sec.getId()).sectionKey(sec.getSectionKey())
+                                                .sectionOrder(sec.getSectionOrder()).label(sec.getLabel())
+                                                .description(sec.getDescription()).required(sec.isRequired())
+                                                .completionEvent(sec.getCompletionEvent())
+                                                .requiresAssignment(sec.isRequiresAssignment())
+                                                .tracksItems(sec.isTracksItems())
+                                                .build(),
+                                        java.util.stream.Collectors.toList())));
+
+        // ── Assemble responses from pre-loaded maps (zero additional DB hits) ─
+        List<WorkflowStepResponse> stepResponses = steps.stream().map(s ->
+                        WorkflowStepResponse.builder()
+                                .id(s.getId()).workflowId(w.getId()).stepOrder(s.getStepOrder())
+                                .name(s.getName()).side(s.getSide()).description(s.getDescription())
+                                .approvalType(s.getApprovalType()).minApprovalsRequired(s.getMinApprovalsRequired())
+                                .isParallel(s.isParallel()).isOptional(s.isOptional()).slaHours(s.getSlaHours())
+                                .automatedAction(s.getAutomatedAction())
+                                .roleIds(roleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .userIds(userIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .assignerRoleIds(assignerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .observerRoleIds(observerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                .assignerResolution(s.getAssignerResolution())
+                                .allowOverride(s.isAllowOverride())
+                                .stepAction(s.getStepAction())
+                                .navKey(s.getNavKey())
+                                .assignerNavKey(s.getAssignerNavKey())
+                                .sections(sectionsByStepId.getOrDefault(s.getId(), List.of()))
+                                .build())
                 .collect(java.util.stream.Collectors.toList());
 
         return WorkflowResponse.builder()
@@ -2628,4 +2774,234 @@ public class WorkflowEngineService {
         log.info("[WF-ADMIN] getStuckSteps — found {} stuck step(s)", stuck.size());
         return stuck;
     }
+
+    /**
+     * Re-evaluates the approval gate on a specific step and advances the workflow
+     * if isStepApprovalSatisfied() now returns true.
+     *
+     * Use case: step 4 got stuck because legacy contributor REJECTED tasks were
+     * being counted in the approval denominator (now fixed). Call this endpoint
+     * on affected instances to immediately unblock them without data migration.
+     */
+    @Transactional
+    public Map<String, Object> reEvaluateStep(Long instanceId, Long stepInstanceId, Long performedBy) {
+        WorkflowInstance instance = instanceRepository.findById(instanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
+        StepInstance si = stepInstanceRepository.findById(stepInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", stepInstanceId));
+
+        if (!si.getWorkflowInstanceId().equals(instanceId)) {
+            throw new BusinessException("MISMATCH", "StepInstance does not belong to this workflow instance");
+        }
+        if (si.getStatus() != StepStatus.IN_PROGRESS) {
+            return Map.of("advanced", false, "reason",
+                    "Step is not IN_PROGRESS (status=" + si.getStatus() + ")");
+        }
+
+        boolean satisfied = isStepApprovalSatisfied(si);
+        log.info("[WF-ADMIN] re-evaluate | stepInstanceId={} | satisfied={}", stepInstanceId, satisfied);
+
+        if (!satisfied) {
+            long total    = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatusNot(
+                    si.getId(), TaskRole.ACTOR, TaskStatus.REJECTED);
+            long approved = taskInstanceRepository.countByStepInstanceIdAndTaskRoleAndStatus(
+                    si.getId(), TaskRole.ACTOR, TaskStatus.APPROVED);
+            return Map.of("advanced", false, "reason",
+                    "Gate not satisfied — approved=" + approved + " / total(excl.rejected)=" + total);
+        }
+
+        // Gate passes — complete step and advance
+        completeStep(si, StepStatus.APPROVED, "Re-evaluated and auto-advanced by admin");
+        expirePendingTasks(si, null);
+        recordHistory(instance, si, null, "STEP_APPROVED",
+                StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(), performedBy,
+                "Re-evaluated by admin — step gate satisfied");
+        eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                instance.getId(), si.getId(), si.getSnapName(), "APPROVED", performedBy));
+
+        Optional<WorkflowStep> nextStep = stepRepository
+                .findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                        instance.getWorkflowId(), si.getSnapStepOrder());
+
+        if (nextStep.isPresent()) {
+            StepInstance newSI = createStepInstance(instance, nextStep.get());
+            instance.setCurrentStepId(newSI.getId());
+            instanceRepository.save(instance);
+            assignTasksForStep(newSI, nextStep.get(), instance);
+            recordHistory(instance, newSI, null, "STEP_STARTED", null, newSI.getStatus().name(),
+                    performedBy, "Moved to: " + nextStep.get().getName());
+            eventPublisher.publishEvent(new WorkflowEvent.StepAdvanced(
+                    instance.getId(), newSI.getId(), nextStep.get().getName(),
+                    nextStep.get().getStepOrder(), newSI.getStatus().name(), performedBy));
+            log.info("[WF-ADMIN] Step advanced | from='{}' | to='{}'", si.getSnapName(), nextStep.get().getName());
+            return Map.of("advanced", true, "nextStep", nextStep.get().getName(),
+                    "nextStepInstanceId", newSI.getId());
+        } else {
+            instance.setStatus(WorkflowStatus.COMPLETED);
+            instanceRepository.save(instance);
+            return Map.of("advanced", true, "nextStep", "WORKFLOW_COMPLETED");
+        }
+    }
+
+
+    /**
+     * Reset a task back to IN_PROGRESS so the assignee can re-work it.
+     *
+     * Workflow-layer half of the admin "reopen task" feature. Resets task status
+     * and re-arms compound section gates. Assessment-domain state (reviewer
+     * submitted sections, evaluations) is handled by AssessmentController separately.
+     *
+     *   1. Reset task status to IN_PROGRESS, clear acted_at
+     *   2. Reset all TaskSectionCompletion rows (completed=false, re-arms gates)
+     *   3. If step was APPROVED, revert to IN_PROGRESS so engine knows it's not done
+     *   4. Write audit history
+     */
+    @Transactional
+    public Map<String, Object> resetTask(Long instanceId, Long taskId, Long performedBy, boolean rollbackDownstream) {
+        WorkflowInstance instance = instanceRepository.findById(instanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
+
+        TaskInstance task = taskInstanceRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskId));
+
+        StepInstance si = stepInstanceRepository.findById(task.getStepInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", task.getStepInstanceId()));
+
+        if (!si.getWorkflowInstanceId().equals(instanceId)) {
+            throw new BusinessException("MISMATCH", "Task does not belong to this workflow instance");
+        }
+
+        String previousStatus = task.getStatus().name();
+
+        // 1. Reset task
+        task.setStatus(TaskStatus.IN_PROGRESS);
+        task.setActedAt(null);
+        task.setRemarks("Reset by admin (was " + previousStatus + ") — re-work in progress");
+        taskInstanceRepository.save(task);
+        log.info("[WF-ADMIN] RESET-TASK | taskId={} | {} -> IN_PROGRESS", taskId, previousStatus);
+
+        // 2. Re-arm all section completion gates
+        List<TaskSectionCompletion> sections =
+                taskSectionCompletionRepository
+                        .findByTaskInstanceIdOrderBySnapSectionOrderAsc(taskId);
+        for (TaskSectionCompletion sc : sections) {
+            sc.setCompleted(false);
+            sc.setCompletedAt(null);
+            sc.setCompletedBy(null);
+            sc.setRemarks("Reset by admin");
+        }
+        taskSectionCompletionRepository.saveAll(sections);
+        log.info("[WF-ADMIN] RESET-TASK | {} section gate(s) re-armed for taskId={}", sections.size(), taskId);
+
+        // 3. Revert step to IN_PROGRESS if it was already APPROVED.
+        // Capture whether the step was reverted — used in step 4 to decide
+        // whether downstream steps need to be rolled back.
+        boolean stepReverted = si.getStatus() == StepStatus.APPROVED;
+        if (stepReverted) {
+            si.setStatus(StepStatus.IN_PROGRESS);
+            si.setCompletedAt(null);
+            stepInstanceRepository.save(si);
+            log.info("[WF-ADMIN] RESET-TASK | stepInstance={} APPROVED -> IN_PROGRESS", si.getId());
+        }
+
+        // 4. Roll back all subsequent steps and expire their tasks —
+        //    BUT ONLY when the step itself was reverted (was APPROVED → IN_PROGRESS).
+        //
+        // If the step is already IN_PROGRESS with multiple tasks and only ONE task is
+        // being reset (e.g. reopening Rohan's task while Karan's is still PENDING),
+        // the step stays IN_PROGRESS, downstream steps are unaffected, and other
+        // responders keep their work. Rollback only makes sense when the entire step
+        // was completed and is being pulled back — that's when downstream is invalid.
+        //
+        // Example A — rollback NEEDED:
+        //   Step 5 was APPROVED (CISO confirmed all sections). Step 6 has active tasks.
+        //   Reset step 5 → downstream must be rolled back so CISO can reassign fresh.
+        //
+        // Example B — rollback NOT needed:
+        //   Step 6 is IN_PROGRESS. Rohan's task is reset. Karan's task is still PENDING.
+        //   Step 6 stays IN_PROGRESS. Steps 7+ are untouched. Only Rohan re-does his work.
+        if (rollbackDownstream) {
+            // Determine the current step's order. snapStepOrder may be null on older
+            // step instances created before the field was added — fall back to looking
+            // it up from the blueprint step via stepId.
+            Integer currentOrder = si.getSnapStepOrder();
+            if (currentOrder == null && si.getStepId() != null) {
+                currentOrder = stepRepository.findById(si.getStepId())
+                        .map(WorkflowStep::getStepOrder).orElse(null);
+            }
+            log.info("[WF-ADMIN] RESET-TASK rollback | currentStepInstanceId={} snapStepOrder={} resolved={}",
+                    si.getId(), si.getSnapStepOrder(), currentOrder);
+
+            final Integer resolvedOrder = currentOrder;
+            List<StepInstance> allSteps = stepInstanceRepository.findByWorkflowInstanceId(instanceId);
+            log.info("[WF-ADMIN] RESET-TASK rollback | total step instances in workflow={} orders={}",
+                    allSteps.size(),
+                    allSteps.stream().map(s -> s.getId() + ":" + s.getSnapStepOrder()).toList());
+
+            List<StepInstance> subsequentSteps = allSteps.stream()
+                    .filter(s -> !s.getId().equals(si.getId()))
+                    .filter(s -> {
+                        // If we have order info, filter by order
+                        if (resolvedOrder != null && s.getSnapStepOrder() != null) {
+                            return s.getSnapStepOrder() > resolvedOrder;
+                        }
+                        // If snapStepOrder is missing on downstream steps, include ALL
+                        // other non-terminal step instances as a safe fallback
+                        return s.getStatus() == StepStatus.IN_PROGRESS
+                                || s.getStatus() == StepStatus.AWAITING_ASSIGNMENT;
+                    })
+                    .toList();
+
+            if (!subsequentSteps.isEmpty()) {
+                List<Long> subsequentStepIds = subsequentSteps.stream()
+                        .map(StepInstance::getId).toList();
+
+                // Expire all non-terminal tasks on those steps
+                List<TaskInstance> downstreamTasks =
+                        taskInstanceRepository.findByStepInstanceIdIn(subsequentStepIds);
+                int expiredCount = 0;
+                for (TaskInstance dt : downstreamTasks) {
+                    if (dt.getStatus() != TaskStatus.EXPIRED
+                            && dt.getStatus() != TaskStatus.APPROVED) {
+                        dt.setStatus(TaskStatus.EXPIRED);
+                        dt.setRemarks("Expired — upstream step was reset for rework");
+                        taskInstanceRepository.save(dt);
+                        expiredCount++;
+                    }
+                }
+
+                // Delete child task_section_completions FIRST to satisfy the FK
+                // constraint (fk_tsc_step_i: task_section_completions.step_instance_id
+                // → step_instances.id). Deleting step instances without clearing
+                // their children throws a DataIntegrityViolationException.
+                for (StepInstance ds : subsequentSteps) {
+                    List<TaskSectionCompletion> tsc =
+                            taskSectionCompletionRepository.findByStepInstanceId(ds.getId());
+                    if (!tsc.isEmpty()) {
+                        taskSectionCompletionRepository.deleteAll(tsc);
+                        log.info("[WF-ADMIN] RESET-TASK rollback | deleted {} task_section_completion(s) for stepInstanceId={}",
+                                tsc.size(), ds.getId());
+                    }
+                }
+                // Now safe to delete the step instances
+                stepInstanceRepository.deleteAll(subsequentSteps);
+
+                log.info("[WF-ADMIN] RESET-TASK | rolled back {} downstream step(s), expired {} task(s) | instanceId={} | requestedRollback=true",
+                        subsequentSteps.size(), expiredCount, instanceId);
+            }
+        }
+
+        // 5. Audit trail
+        recordHistory(instance, si, task, "TASK_RESET",
+                previousStatus, TaskStatus.IN_PROGRESS.name(), performedBy,
+                "Task reset by admin — assignee can re-work");
+
+        return Map.of(
+                "reset",          true,
+                "taskId",         taskId,
+                "previousStatus", previousStatus,
+                "sectionsReset",  sections.size()
+        );
+    }
+
 }

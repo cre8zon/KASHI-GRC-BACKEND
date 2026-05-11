@@ -68,13 +68,40 @@ public record ModuleSubmitEvent(
      * This is what the ANSWER_MISSING condition type checks for.
      */
     public record QuestionContext(
-            String  questionTagSnapshot, // tag from instance — guard rule lookup key
-            Long    questionInstanceId,  // instance ID — action item entity + idempotency
-            String  responseText,        // null if never answered
-            boolean fileUploaded,        // true if a file was attached
-            Double  score,               // numeric score, null if not applicable
-            String  navContext           // JSON: { assigneeRoute, reviewerRoute, questionInstanceId, ... }
+            String       questionTagSnapshot,    // tag from instance — guard rule lookup key
+            Long         questionInstanceId,     // instance ID — action item entity + idempotency
+            String       responseText,           // null if never answered (TEXT / NUMERIC / DATE)
+            boolean      fileUploaded,           // true if a DocumentLink exists (FILE_UPLOAD questions)
+            Double       score,                  // numeric score, null if not applicable
+            String       navContext,             // JSON: { assigneeRoute, reviewerRoute, questionInstanceId, ... }
+            List<String> selectedOptionValues,   // resolved option text(s) for SINGLE/MULTI_CHOICE questions
+            Long         assignedUserId          // section responder or contributor — direct assignee for action items.
+            // When set, action item is assigned directly to this user instead of
+            // falling back to assignedGroupRole. Keeps inbox clean — the specific
+            // person responsible gets it, not the whole group.
     ) {
+        /**
+         * Backwards-compatible constructor without assignedUserId.
+         * Falls back to assignedGroupRole from the guard rule / blueprint.
+         */
+        public QuestionContext(String questionTagSnapshot, Long questionInstanceId,
+                               String responseText, boolean fileUploaded,
+                               Double score, String navContext,
+                               List<String> selectedOptionValues) {
+            this(questionTagSnapshot, questionInstanceId, responseText,
+                    fileUploaded, score, navContext, selectedOptionValues, null);
+        }
+
+        /**
+         * Backwards-compatible constructor without option values or assignedUserId.
+         */
+        public QuestionContext(String questionTagSnapshot, Long questionInstanceId,
+                               String responseText, boolean fileUploaded,
+                               Double score, String navContext) {
+            this(questionTagSnapshot, questionInstanceId, responseText,
+                    fileUploaded, score, navContext, null, null);
+        }
+
         /**
          * Convenience for a completely unanswered question.
          * ANSWER_MISSING condition fires for these.
@@ -83,7 +110,7 @@ public record ModuleSubmitEvent(
                                                  Long questionInstanceId,
                                                  String navContext) {
             return new QuestionContext(questionTagSnapshot, questionInstanceId,
-                    null, false, null, navContext);
+                    null, false, null, navContext, null, null);
         }
     }
 }

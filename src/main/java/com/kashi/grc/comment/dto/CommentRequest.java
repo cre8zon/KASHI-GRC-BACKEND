@@ -19,4 +19,12 @@ public class CommentRequest {
     private EntityComment.CommentType commentType = EntityComment.CommentType.COMMENT;
     private EntityComment.Visibility  visibility  = EntityComment.Visibility.ALL;
     private Long                      parentCommentId;
+
+    /**
+     * User IDs explicitly @mentioned in the comment.
+     * Populated by the frontend's mention-input component when user types @name
+     * and selects from the autocomplete dropdown.
+     * Backend sends a MENTIONED notification to each listed user ID.
+     */
+    private java.util.List<Long> mentionedUserIds;
 }

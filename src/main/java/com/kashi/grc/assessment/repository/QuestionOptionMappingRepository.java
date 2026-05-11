@@ -24,7 +24,15 @@ public interface QuestionOptionMappingRepository extends JpaRepository<QuestionO
 
     void deleteByQuestionId(Long questionId);
 
+    /** Bulk variant — deletes all option mappings for multiple questions in one DELETE WHERE IN query.
+     *  Replaces N individual deleteByQuestionId calls in bulk-delete operations. */
+    void deleteByQuestionIdIn(java.util.Collection<Long> questionIds);
+
     void deleteByOptionId(Long optionId);
+
+    /** Bulk variant — deletes all question mappings for multiple options in one DELETE WHERE IN query.
+     *  Replaces N individual deleteByOptionId calls in bulk-delete operations. */
+    void deleteByOptionIdIn(java.util.Collection<Long> optionIds);
 
     void deleteByQuestionIdAndOptionId(Long questionId, Long optionId);
 }

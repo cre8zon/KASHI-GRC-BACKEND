@@ -31,6 +31,7 @@ import java.time.LocalDateTime;
         @Index(name = "idx_ai_entity",        columnList = "entity_type,entity_id"),
         @Index(name = "idx_ai_tenant_status", columnList = "tenant_id,status"),
         @Index(name = "idx_ai_blueprint",     columnList = "blueprint_id"),
+        @Index(name = "idx_ai_vendor",        columnList = "vendor_id"),        // NEW
 })
 @Getter @Setter
 @SuperBuilder
@@ -58,6 +59,24 @@ public class ActionItem extends TenantAwareEntity {
 
     @Column(name = "created_by", nullable = false)
     private Long createdBy;
+
+    /**
+     * Vendor scope for role-based assignment.
+     *
+     * WHY THIS FIELD EXISTS:
+     *   assignedGroupRole = 'VENDOR_RESPONDER' matches ALL responders in the tenant.
+     *   Without vendorId, Rohan Sharma (Clearview responder) would see action items
+     *   assigned to VENDOR_RESPONDER for Razorpay's assessment — a cross-vendor leak.
+     *
+     *   vendorId scopes role-based queries to items belonging to the user's vendor:
+     *     WHERE assigned_group_role = 'VENDOR_RESPONDER' AND vendor_id = :userVendorId
+     *
+     * Set whenever the action item relates to a vendor assessment.
+     * Null for org-internal items (audit findings, control gaps, etc.)
+     * that are role-scoped within the org, not a specific vendor.
+     */
+    @Column(name = "vendor_id")
+    private Long vendorId;
 
     // ── What triggered this ────────────────────────────────────────────────
     @Enumerated(EnumType.STRING)
