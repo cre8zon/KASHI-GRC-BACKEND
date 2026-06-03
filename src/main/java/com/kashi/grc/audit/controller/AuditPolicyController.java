@@ -229,6 +229,51 @@ public class AuditPolicyController {
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", "DEPRECATED")));
     }
 
+    @PostMapping("/v1/audit/library/policies/{id}/new-version")
+    @Operation(summary = "Create a new draft version of an APPROVED policy — copies all content, increments version, links previousVersionId")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> newVersion(@PathVariable Long id) {
+        Long userId   = utilityService.getLoggedInDataContext().getId();
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        AuditPolicy source = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+
+        if (source.getStatus() != AuditPolicy.PolicyStatus.APPROVED) {
+            throw new BusinessException("INVALID_STATUS",
+                    "Only APPROVED policies can be versioned. Use Save Draft for DRAFT policies.",
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        AuditPolicy newVersion = AuditPolicy.builder()
+                .title(source.getTitle())
+                .policyRef(source.getPolicyRef())
+                .description(source.getDescription())
+                .version(source.getVersion() + 1)
+                .previousVersionId(source.getId())
+                .contentType(source.getContentType())
+                .contentBody(source.getContentBody())
+                .externalUrl(source.getExternalUrl())
+                .evidenceRecordId(source.getEvidenceRecordId())
+                .status(AuditPolicy.PolicyStatus.DRAFT)
+                .ownerId(source.getOwnerId())
+                .ownerTeam(source.getOwnerTeam())
+                .reviewFrequencyMonths(source.getReviewFrequencyMonths())
+                .controlTags(source.getControlTags())
+                .frameworkRefs(source.getFrameworkRefs())
+                .createdBy(userId)
+                .tenantId(tenantId)
+                .build();
+
+        policyRepository.save(newVersion);
+        log.info("[AUDIT-POLICY] New version created | sourceId={} newId={} version={}",
+                source.getId(), newVersion.getId(), newVersion.getVersion());
+        return ResponseEntity.status(org.springframework.http.HttpStatus.CREATED)
+                .body(ApiResponse.success(Map.of(
+                        "id",      newVersion.getId(),
+                        "version", newVersion.getVersion(),
+                        "status",  "DRAFT")));
+    }
+
     @DeleteMapping("/v1/audit/library/policies")
     @Transactional
     @Operation(summary = "Bulk delete policies by ID list")
