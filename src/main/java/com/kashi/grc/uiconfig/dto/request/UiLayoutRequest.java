@@ -13,4 +13,12 @@ public class UiLayoutRequest {
     public String roleAccessJson;
     public boolean selectable;
     public boolean reorderable;
+    public String layoutMode;  // FULL_PAGE | DRAWER | SIDE_PANEL
+
+    /**
+     * JSON array of tab definitions for DETAIL screens.
+     * Format: [{key: "overview", label: "Overview"}, {key: "tests", label: "Tests"}, ...]
+     * Null means "use frontend defaults" — sent as null when only other fields are being updated.
+     */
+    public String tabsJson;
 }

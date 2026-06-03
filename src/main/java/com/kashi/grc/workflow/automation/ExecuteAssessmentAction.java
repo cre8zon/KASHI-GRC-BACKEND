@@ -95,7 +95,7 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
         // Fallback path: blueprint uses the old single-step style — find the one
         // mapped template directly from the risk score (backward compatible).
         Long templateId;
-        java.util.Optional<VendorTemplateSelection> selectionOpt =
+        Optional<VendorTemplateSelection> selectionOpt =
                 templateSelectionRepository.findByWorkflowInstanceId(wi.getId());
 
         if (selectionOpt.isPresent()) {

@@ -2,6 +2,7 @@ package com.kashi.grc.workflow.domain;
 
 import com.kashi.grc.common.domain.BaseEntity;
 import com.kashi.grc.workflow.enums.ApprovalType;
+import com.kashi.grc.workflow.enums.ActorResolution;
 import com.kashi.grc.workflow.enums.AssignerResolution;
 import com.kashi.grc.workflow.enums.StepAction;
 import jakarta.persistence.*;
@@ -68,6 +69,16 @@ public class WorkflowStep extends BaseEntity {
     private AssignerResolution assignerResolution;
 
     /**
+     * Controls how ACTOR task recipients are resolved when this step activates.
+     * ROLE_BASED (default) — all role holders get a task.
+     * ASSIGNMENT_SCOPED — WorkflowActorResolver SPI returns only the assigned users.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "actor_resolution", length = 50)
+    @Builder.Default
+    private ActorResolution actorResolution = ActorResolution.ROLE_BASED;
+
+    /**
      * If true, the resolved assigner can redirect the task to a specific person.
      * Defaults true for flexibility.
      */
@@ -106,4 +117,37 @@ public class WorkflowStep extends BaseEntity {
      */
     @Column(name = "assigner_nav_key", length = 100)
     private String assignerNavKey;
+
+    // ── NEW FIELD ─────────────────────────────────────────────────────────────
+
+    /**
+     * Optional UI restrictions for actors on this step.
+     * Platform Admin sets this per step in the WorkflowBlueprintDesigner UI.
+     * Snapshotted into StepInstance.snapUiOverrideJson at instance creation time
+     * to preserve blueprint isolation — running instances never re-read this.
+     *
+     * JSON format (all keys optional):
+     * {
+     *   "visibleTabs":    ["overview", "evidence"],
+     *   "hiddenTabs":     ["audit_trail"],
+     *   "editableFields": ["mitigationPlan", "residualRisk"],
+     *   "readOnlyFields": ["inherentRisk", "riskOwner"],
+     *   "hiddenFields":   ["internalNotes"],
+     *   "availableActions": ["APPROVE", "REJECT", "SEND_BACK"]
+     * }
+     *
+     * Step override can only RESTRICT what the role allows — never expand beyond
+     * the user's role ceiling. Enforced in WorkflowAccessService.mergeContext().
+     */
+    @Column(name = "step_ui_override_json", columnDefinition = "JSON")
+    private String stepUiOverrideJson;
+
+    // ── Migration SQL ─────────────────────────────────────────────────────────
+    // ALTER TABLE workflow_steps
+    //   ADD COLUMN step_ui_override_json JSON NULL
+    //   COMMENT 'UI restrictions for actors on this step: visibleTabs, editableFields, availableActions';
+
+    @Column(name = "auto_approve_assigner_on_fill", nullable = false)
+    @Builder.Default
+    private boolean autoApproveAssignerOnFill = false;
 }

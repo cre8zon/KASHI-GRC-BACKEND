@@ -3,6 +3,7 @@ package com.kashi.grc.workflow.dto.request;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.kashi.grc.workflow.enums.ApprovalType;
 import com.kashi.grc.workflow.enums.StepAction;
+import com.kashi.grc.workflow.enums.ActorResolution;
 import com.kashi.grc.workflow.enums.AssignerResolution;
 import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotBlank;
@@ -49,6 +50,8 @@ public class WorkflowStepRequest {
 
     /** POOL | PUSH_TO_ROLES | PREVIOUS_ACTOR | INITIATOR */
     public AssignerResolution assignerResolution;
+    public ActorResolution     actorResolution;
+    public Boolean             autoApproveAssignerOnFill;
 
     /** Assigner roles for PUSH_TO_ROLES — any side (workflow_step_assigner_roles) */
     public List<Long> assignerRoleIds;

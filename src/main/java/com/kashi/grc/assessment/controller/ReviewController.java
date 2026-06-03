@@ -228,13 +228,13 @@ public class ReviewController {
                                                     rm.put("answeredByName",            resolveUserName(resp.getSubmittedBy()));
                                                     rm.put("selectedOptionInstanceId",  resp.getSelectedOptionInstanceId());
                                                     // Parse multi-choice IDs stored as JSON array in responseText e.g. "[4257,4259]"
-                                                    List<Long> multiIds = new java.util.ArrayList<>();
+                                                    List<Long> multiIds = new ArrayList<>();
                                                     String rt = resp.getResponseText();
                                                     if (rt != null && rt.startsWith("[")) {
                                                         try {
                                                             Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
                                                                     .readValue(rt, Long[].class);
-                                                            multiIds.addAll(java.util.Arrays.asList(arr));
+                                                            multiIds.addAll(Arrays.asList(arr));
                                                         } catch (Exception ignored) {}
                                                     }
                                                     rm.put("selectedOptionInstanceIds", multiIds);
@@ -758,7 +758,7 @@ public class ReviewController {
 
                     return m;
                 })
-                .filter(java.util.Objects::nonNull)
+                .filter(Objects::nonNull)
                 .toList();
 
         return ResponseEntity.ok(ApiResponse.success(reports));
@@ -792,7 +792,7 @@ public class ReviewController {
                 })
                 .count() + 1;
 
-        Map<String, Object> generatedData = new java.util.HashMap<>();
+        Map<String, Object> generatedData = new HashMap<>();
         generatedData.put("reportVersion",          version);
         generatedData.put("compliancePct",          pct);
         generatedData.put("totalEarnedScore",       earned);

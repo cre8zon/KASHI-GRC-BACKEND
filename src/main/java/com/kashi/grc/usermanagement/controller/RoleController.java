@@ -154,13 +154,34 @@ public class RoleController {
                             Map<String, Object> m = new java.util.LinkedHashMap<>();
                             m.put("id",           p.getId());
                             m.put("code",         p.getCode());
-                            m.put("name",         p.getName());
-                            m.put("resourceType", p.getResourceType());
+                            m.put("name",         p.getName() != null ? p.getName() : "");
+                            // Derive module from resource_type for legacy perms without explicit module
+                            String pm = (p.getModule() != null && !p.getModule().isBlank())
+                                    ? p.getModule() : deriveModule(p.getResourceType());
+                            m.put("module",       pm);
+                            m.put("resourceType", p.getResourceType() != null ? p.getResourceType() : "");
                             m.put("moduleId",     p.getModuleId());
                             return m;
                         })
                         .toList()
         ));
+    }
+
+
+    private String deriveModule(String rt) {
+        if (rt == null || rt.isBlank()) return "SYSTEM";
+        return switch (rt.toUpperCase()) {
+            case "AUDIT_ENGAGEMENT", "AUDIT_SECTION", "AUDIT_CONTROL",
+                 "AUDIT_FINDING", "AUDIT_POLICY", "AUDIT_REPORT", "AUDIT" -> "AUDIT";
+            case "VENDOR"                    -> "VENDOR";
+            case "ASSESSMENT"                -> "ASSESSMENT";
+            case "USER", "ROLE"              -> "USER_MGMT";
+            case "WORKFLOW", "WORKFLOW_TASK" -> "WORKFLOW";
+            case "ISSUE"                     -> "ISSUE";
+            case "REPORT"                    -> "REPORT";
+            case "DOCUMENT"                  -> "DOCUMENT";
+            default                          -> "SYSTEM";
+        };
     }
 
     @PostMapping("/v1/permissions")

@@ -82,7 +82,7 @@ public class DocumentLink {
 
     @Column(name = "created_at", nullable = false)
     @Builder.Default
-    private java.time.LocalDateTime createdAt = LocalDateTime.now();
+    private LocalDateTime createdAt = LocalDateTime.now();
 
     /** Optional reviewer note about why this evidence satisfies a requirement */
     @Column(name = "notes", columnDefinition = "TEXT")

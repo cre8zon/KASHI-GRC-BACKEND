@@ -2,6 +2,7 @@ package com.kashi.grc.workflow.dto.response;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.kashi.grc.workflow.enums.ApprovalType;
+import com.kashi.grc.workflow.enums.ActorResolution;
 import com.kashi.grc.workflow.enums.AssignerResolution;
 import com.kashi.grc.workflow.enums.StepAction;
 import lombok.Builder;
@@ -37,6 +38,7 @@ public class WorkflowStepResponse {
 
     /** Assignment resolution: POOL | PUSH_TO_ROLES | PREVIOUS_ACTOR | INITIATOR */
     private AssignerResolution assignerResolution;
+    private ActorResolution     actorResolution;
 
     /** Assigner roles for PUSH_TO_ROLES — any side (workflow_step_assigner_roles) */
     private List<Long>       assignerRoleIds;

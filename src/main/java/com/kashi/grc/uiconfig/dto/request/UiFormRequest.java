@@ -8,7 +8,7 @@ public class UiFormRequest {
     @NotBlank public String formKey;
     public String title;
     public String description;
-    @NotBlank public String submitUrl;
+    public String submitUrl;   // optional — DynamicForm falls back to ModuleBlueprint.apiBasePath
     public String httpMethod = "POST";
     public String stepsJson;
 }

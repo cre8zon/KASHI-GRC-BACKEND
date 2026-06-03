@@ -67,10 +67,7 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
     /**
      * Check if the user has an active task on a specific workflow instance — single JOIN query.
      *
-     * Replaces the N+1 pattern in AssessmentController.assertUserHasActiveTask():
-     *   findByAssignedUserIdAndStatus(PENDING) + findByAssignedUserIdAndStatus(IN_PROGRESS)
-     *   + N × stepInstanceRepository.findById(task.getStepInstanceId())
-     *
+     * Replaces the N+1 pattern in AssessmentController.assertUserHasActiveTask().
      * All that is now a single EXISTS subquery — O(1) regardless of task count.
      * The statuses collection is typically [PENDING, IN_PROGRESS].
      */
@@ -87,13 +84,8 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
             @Param("statuses")           Collection<TaskStatus> statuses);
 
     /**
-     * Check if the user has EVER had any task on a specific workflow instance — single JOIN query.
-     *
-     * Replaces the N+1 pattern in AssessmentController.assertUserHasParticipated():
-     *   findByAssignedUserId(userId) + N × stepInstanceRepository.findById(task.getStepInstanceId())
-     *
-     * Used for read-only access guard on COMPLETED assessments — any historical participant
-     * (regardless of task status) can view the completed data.
+     * Check if the user has EVER had any task on a specific workflow instance.
+     * Used for read-only access guard on COMPLETED assessments.
      */
     @Query("""
         SELECT COUNT(t) > 0 FROM TaskInstance t
@@ -104,4 +96,27 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
     boolean existsByUserIdAndWorkflowInstanceId(
             @Param("userId")             Long userId,
             @Param("workflowInstanceId") Long workflowInstanceId);
+
+    /**
+     * Finds all completed ACTOR tasks for a specific user on a specific workflow instance.
+     *
+     * Used by WorkflowAccessService.evaluateSod() to determine which steps a user has
+     * already acted on — needed to detect if the user is now trying to act on a
+     * conflicting step (SoD violation: e.g. created a risk AND trying to approve it).
+     *
+     * Only ACTOR tasks are checked — ASSIGNER tasks don't represent the user doing the
+     * substantive work on the record. Only APPROVED and COMPLETED statuses mean the
+     * user has fully exercised their permissions on that step.
+     */
+    @Query("""
+        SELECT t FROM TaskInstance t
+        JOIN StepInstance s ON s.id = t.stepInstanceId
+        WHERE s.workflowInstanceId = :instanceId
+          AND t.assignedUserId     = :userId
+          AND t.taskRole           = 'ACTOR'
+          AND t.status             IN ('APPROVED', 'COMPLETED')
+        """)
+    List<TaskInstance> findActorTasksForInstance(
+            @Param("instanceId") Long workflowInstanceId,
+            @Param("userId")     Long userId);
 }

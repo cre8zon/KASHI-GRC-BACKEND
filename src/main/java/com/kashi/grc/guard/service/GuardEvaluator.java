@@ -126,7 +126,7 @@ public class GuardEvaluator {
                          boolean fileUploaded,
                          Double score,
                          String navContext,
-                         java.util.List<String> selectedOptionValues,
+                         List<String> selectedOptionValues,
                          Long tenantId) {
         evaluate(new QuestionContext(questionTagSnapshot, questionInstanceId,
                 responseText, fileUploaded, score, navContext, selectedOptionValues), tenantId);

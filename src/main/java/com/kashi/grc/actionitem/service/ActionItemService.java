@@ -13,6 +13,7 @@ import com.kashi.grc.common.exception.ForbiddenException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.notification.service.NotificationService;
 import com.kashi.grc.usermanagement.repository.UserRepository;
+import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.jpa.domain.Specification;
@@ -24,7 +25,6 @@ import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 @Slf4j
 @Service
@@ -37,12 +37,10 @@ public class ActionItemService {
     private final SimpMessagingTemplate         messagingTemplate;
     private final NotificationService           notificationService;
 
-    // ── Create ────────────────────────────────────────────────────────────
+    // ── Create ────────────────────────────────────────────────────────────────
 
     @Transactional
     public ActionItemResponse create(ActionItemRequest req, Long createdBy, Long tenantId) {
-        // Resolve blueprint if provided
-        // Resolve blueprint — accept either blueprintId or blueprintCode
         if (req.getBlueprintId() == null && req.getBlueprintCode() != null) {
             blueprintRepository.findByBlueprintCode(req.getBlueprintCode())
                     .ifPresent(b -> req.setBlueprintId(b.getId()));
@@ -61,6 +59,9 @@ public class ActionItemService {
                 .sourceId(req.getSourceId())
                 .entityType(req.getEntityType())
                 .entityId(req.getEntityId())
+                // NEW: parent context
+                .parentEntityType(req.getParentEntityType())
+                .parentEntityId(req.getParentEntityId())
                 .title(req.getTitle())
                 .description(req.getDescription())
                 .resolutionReservedFor(req.getResolutionReservedFor())
@@ -69,8 +70,12 @@ public class ActionItemService {
                 .priority(blueprint != null && req.getPriority() == null
                         ? blueprint.getDefaultPriority() : (req.getPriority() != null
                                                             ? req.getPriority() : ActionItem.Priority.MEDIUM))
+                .dueAt(req.getDueAt() != null ? LocalDateTime.parse(req.getDueAt()) : null)
                 .navContext(req.getNavContext())
                 .vendorId(req.getVendorId())
+                // NEW: item UI rendering
+                .itemScreenKey(req.getItemScreenKey())
+                .itemUiJson(req.getItemUiJson())
                 .status(ActionItem.Status.OPEN)
                 .build();
 
@@ -85,8 +90,8 @@ public class ActionItemService {
     }
 
     /**
-     * Convenience method called by CommentService when a REVISION_REQUEST comment is saved.
-     * Avoids duplicate action items for the same source comment.
+     * Convenience method called by CommentService for REVISION_REQUEST comments.
+     * Unchanged — idempotency guard preserved.
      */
     @Transactional
     public ActionItemResponse createFromComment(EntityComment comment,
@@ -95,7 +100,6 @@ public class ActionItemService {
                                                 String navContextJson,
                                                 Long tenantId,
                                                 Long vendorId) {
-        // Idempotency — don't create duplicate for same comment
         if (actionItemRepository.existsOpenForSource(ActionItem.SourceType.COMMENT, comment.getId())) {
             log.debug("[ACTION-ITEM] Skipping duplicate for comment={}", comment.getId());
             return null;
@@ -105,10 +109,10 @@ public class ActionItemService {
         req.setSourceType(ActionItem.SourceType.COMMENT);
         req.setSourceId(comment.getId());
         req.setEntityType(ActionItem.EntityType.QUESTION_RESPONSE);
-        req.setEntityId(comment.getEntityId()); // questionInstanceId
+        req.setEntityId(comment.getEntityId());
         req.setAssignedTo(assignedTo);
-        req.setVendorId(vendorId); // scope role-based assignment to this vendor
-        req.setResolutionReservedFor(comment.getCreatedBy()); // only the requester can resolve
+        req.setVendorId(vendorId);
+        req.setResolutionReservedFor(comment.getCreatedBy());
         req.setResolutionRole(resolutionRole);
         req.setTitle("Revision requested: " + truncate(comment.getCommentText(), 80));
         req.setDescription(comment.getCommentText());
@@ -118,7 +122,46 @@ public class ActionItemService {
         return create(req, comment.getCreatedBy(), tenantId);
     }
 
-    // ── Status update ─────────────────────────────────────────────────────
+    // ── Get by ID ─────────────────────────────────────────────────────────────
+
+    @Transactional(readOnly = true)
+    public ActionItemResponse getById(Long id, Long callerId, List<String> callerRoles, Long tenantId) {
+        ActionItem item = actionItemRepository.findById(id)
+                .filter(a -> a.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("ActionItem", id));
+        return toResponse(item, callerId, callerRoles);
+    }
+
+    // ── Update ────────────────────────────────────────────────────────────────
+
+    @Transactional
+    public ActionItemResponse update(Long id, UpdateRequest req,
+                                     Long callerId, List<String> callerRoles, Long tenantId) {
+        ActionItem item = actionItemRepository.findById(id)
+                .filter(a -> a.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("ActionItem", id));
+
+        boolean isCreator = item.getCreatedBy().equals(callerId);
+        boolean isAdmin   = hasRole(callerRoles, "ORG_ADMIN", "SYSTEM_ADMIN");
+        if (!isCreator && !isAdmin) {
+            throw new ForbiddenException("Only the creator or admin can update this action item");
+        }
+
+        if (req.getTitle()             != null) item.setTitle(req.getTitle());
+        if (req.getDescription()       != null) item.setDescription(req.getDescription());
+        if (req.getDueAt()             != null) item.setDueAt(LocalDateTime.parse(req.getDueAt()));
+        if (req.getPriority()          != null) item.setPriority(req.getPriority());
+        if (req.getAssignedTo()        != null) item.setAssignedTo(req.getAssignedTo());
+        if (req.getAssignedGroupRole() != null) item.setAssignedGroupRole(req.getAssignedGroupRole());
+        if (req.getNavContext()        != null) item.setNavContext(req.getNavContext());
+        if (req.getItemScreenKey()     != null) item.setItemScreenKey(req.getItemScreenKey());
+        if (req.getItemUiJson()        != null) item.setItemUiJson(req.getItemUiJson());
+
+        actionItemRepository.save(item);
+        return toResponse(item, callerId, callerRoles);
+    }
+
+    // ── Status update ─────────────────────────────────────────────────────────
 
     @Transactional
     public ActionItemResponse updateStatus(Long id, ActionItemStatusUpdate update,
@@ -132,131 +175,75 @@ public class ActionItemService {
         validateTransition(item, newStatus, userId, userRoles);
 
         item.setStatus(newStatus);
+
         if (newStatus == ActionItem.Status.RESOLVED) {
             item.setResolvedAt(LocalDateTime.now());
             item.setResolvedBy(userId);
             item.setResolutionNote(update.getResolutionNote());
-        } else if (newStatus == ActionItem.Status.OPEN) {
-            // Re-opening clears resolution fields
-            item.setResolvedAt(null);
-            item.setResolvedBy(null);
-            item.setResolutionNote(null);
         }
 
-        actionItemRepository.save(item);
         log.info("[ACTION-ITEM] Status update id={} → {} by userId={}", id, newStatus, userId);
+        actionItemRepository.save(item);
 
         ActionItemResponse response = toResponse(item, userId, userRoles);
-        // Push to assignee + resolver
-        pushToUser(item.getAssignedTo(), "ACTION_ITEM_UPDATED", response);
-        if (!userId.equals(item.getAssignedTo())) {
-            pushToUser(userId, "ACTION_ITEM_UPDATED", response);
-        }
-        // Push to the item's own topic for entity-level listeners
-        pushToTopic("/topic/action-items/" + id, "ACTION_ITEM_UPDATED", response);
 
-        // ── Lifecycle notifications (scalable — covers all modules) ────────
-        // RESOLVED → notify createdBy: "work you requested is done"
-        // DISMISSED → notify createdBy: "your request was dismissed"
-        // These two events cover the full lifecycle in one place.
-        // No per-module notification code needed anywhere else.
-        // Scalable lifecycle notifications — covers ALL modules
-        String actorName = resolveName(userId);
-        String entityType = item.getEntityType() != null
-                ? item.getEntityType().name() : "ACTION_ITEM";
-
-        if (newStatus == ActionItem.Status.PENDING_REVIEW) {
-            // Assignee submitted work → notify reviewer "ready for your review"
-            Long reviewerId = item.getResolutionReservedFor() != null
-                    ? item.getResolutionReservedFor() : item.getCreatedBy();
-            if (reviewerId != null && reviewerId != 0L && !reviewerId.equals(userId)) {
-                notificationService.send(reviewerId, "ACTION_ITEM_PENDING_REVIEW",
-                        actorName + " submitted for review: " + truncate(item.getTitle(), 80),
-                        entityType, item.getId());
-            }
-        } else if (newStatus == ActionItem.Status.IN_PROGRESS
-                && item.getStatus() == ActionItem.Status.PENDING_REVIEW) {
-            // Reviewer pushed back → notify assignee + createdBy "rework needed"
-            String reworkMsg = actorName + " sent back for rework: " + truncate(item.getTitle(), 80);
+        if (newStatus == ActionItem.Status.RESOLVED) {
+            String actorName = resolveName(userId);
+            pushToUser(item.getCreatedBy(), "ACTION_ITEM_RESOLVED", response);
             if (item.getAssignedTo() != null && !item.getAssignedTo().equals(userId)) {
-                notificationService.send(item.getAssignedTo(), "ACTION_ITEM_REWORK",
-                        reworkMsg, entityType, item.getId());
+                pushToUser(item.getAssignedTo(), "ACTION_ITEM_RESOLVED", response);
             }
-            // Also notify createdBy if different (they raised the remediation)
-            if (item.getCreatedBy() != null && !item.getCreatedBy().equals(userId)
-                    && !item.getCreatedBy().equals(item.getAssignedTo())) {
-                notificationService.send(item.getCreatedBy(), "ACTION_ITEM_REWORK",
-                        reworkMsg, entityType, item.getId());
-            }
-        } else if (newStatus == ActionItem.Status.RESOLVED) {
-            // Reviewer accepted → notify createdBy "your request is done"
-            if (item.getCreatedBy() != null && item.getCreatedBy() != 0L
-                    && !item.getCreatedBy().equals(userId)) {
-                notificationService.send(item.getCreatedBy(), "ACTION_ITEM_RESOLVED",
-                        actorName + " resolved: " + truncate(item.getTitle(), 80),
-                        entityType, item.getId());
-            }
-            // Also notify assignee if different from createdBy
-            if (item.getAssignedTo() != null && !item.getAssignedTo().equals(userId)
-                    && !item.getAssignedTo().equals(item.getCreatedBy())) {
-                notificationService.send(item.getAssignedTo(), "ACTION_ITEM_RESOLVED",
-                        "Resolved: " + truncate(item.getTitle(), 80),
-                        entityType, item.getId());
-            }
+            notificationService.send(item.getCreatedBy(), "ACTION_ITEM_RESOLVED",
+                    actorName + " resolved: " + truncate(item.getTitle(), 80),
+                    "ACTION_ITEM", item.getId());
         } else if (newStatus == ActionItem.Status.DISMISSED) {
-            // Dismissed → notify createdBy
-            if (item.getCreatedBy() != null && item.getCreatedBy() != 0L
-                    && !item.getCreatedBy().equals(userId)) {
-                notificationService.send(item.getCreatedBy(), "ACTION_ITEM_DISMISSED",
-                        actorName + " dismissed: " + truncate(item.getTitle(), 80),
-                        entityType, item.getId());
-            }
-        } else if (newStatus == ActionItem.Status.OPEN
-                && item.getStatus() == ActionItem.Status.RESOLVED) {
-            // Re-opened → notify assignee "this issue recurred"
-            if (item.getAssignedTo() != null && !item.getAssignedTo().equals(userId)) {
-                notificationService.send(item.getAssignedTo(), "ACTION_ITEM_REOPENED",
-                        actorName + " re-opened: " + truncate(item.getTitle(), 80),
-                        entityType, item.getId());
-            }
+            String actorName = resolveName(userId);
+            pushToUser(item.getCreatedBy(), "ACTION_ITEM_DISMISSED", response);
+            notificationService.send(item.getCreatedBy(), "ACTION_ITEM_DISMISSED",
+                    actorName + " dismissed: " + truncate(item.getTitle(), 80),
+                    "ACTION_ITEM", item.getId());
+        } else if (newStatus == ActionItem.Status.PENDING_REVIEW) {
+            pushToUser(item.getResolutionReservedFor(), "ACTION_ITEM_PENDING_REVIEW", response);
         }
+
         return response;
     }
 
-    // ── Queries ───────────────────────────────────────────────────────────
+    // ── Dismiss (soft delete) ─────────────────────────────────────────────────
 
-    /**
-     * My open action items — items I must act on, from two perspectives:
-     *
-     * 1. ASSIGNEE VIEW: items assigned to me (I do the work)
-     *    → assignedTo = userId OR assignedGroupRole in userRoles
-     *
-     * 2. REVIEWER VIEW: items I must review/resolve (PENDING_REVIEW status)
-     *    → resolutionReservedFor = userId OR resolutionRole in userRoles
-     *    These are items where someone submitted work waiting for my approval.
-     *
-     * Combined: union of both, deduplicated by id.
-     */
+    @Transactional
+    public void dismiss(Long id, Long callerId, List<String> callerRoles, Long tenantId) {
+        ActionItem item = actionItemRepository.findById(id)
+                .filter(a -> a.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("ActionItem", id));
+
+        boolean isCreator = item.getCreatedBy().equals(callerId);
+        boolean isAdmin   = hasRole(callerRoles, "ORG_ADMIN", "SYSTEM_ADMIN");
+        if (!isCreator && !isAdmin) {
+            throw new ForbiddenException("Only the creator or admin can delete this action item");
+        }
+
+        item.setStatus(ActionItem.Status.DISMISSED);
+        actionItemRepository.save(item);
+        log.info("[ACTION-ITEM] Dismissed id={} by userId={}", id, callerId);
+    }
+
+    // ── My open items ─────────────────────────────────────────────────────────
+
     @Transactional(readOnly = true)
     public List<ActionItemResponse> getMyOpenItems(Long userId, List<String> userRoles,
                                                    Long tenantId, Long userVendorId) {
-        // Assignee view: items I need to work on.
-        // userVendorId scopes role-based matches to this vendor only —
-        // prevents VENDOR_RESPONDER from seeing items of other vendors in the same tenant.
         Specification<ActionItem> assigneeSpec =
                 ActionItemSpecification.forTenant(tenantId)
                         .and(ActionItemSpecification.assignedToUserOrRole(userId, userRoles, userVendorId))
                         .and(ActionItemSpecification.open());
 
-        // Reviewer view: items awaiting my review/resolution (PENDING_REVIEW)
         Specification<ActionItem> reviewerSpec =
                 ActionItemSpecification.forTenant(tenantId)
                         .and(ActionItemSpecification.resolvableBy(userId, userRoles))
-                        .and(ActionItemSpecification.withStatus(
-                                ActionItem.Status.PENDING_REVIEW));
+                        .and(ActionItemSpecification.withStatus(ActionItem.Status.PENDING_REVIEW));
 
-        // Union deduplicated by id
-        java.util.Map<Long, ActionItem> combined = new java.util.LinkedHashMap<>();
+        Map<Long, ActionItem> combined = new LinkedHashMap<>();
         actionItemRepository.findAll(assigneeSpec).forEach(a -> combined.put(a.getId(), a));
         actionItemRepository.findAll(reviewerSpec).forEach(a -> combined.putIfAbsent(a.getId(), a));
 
@@ -265,7 +252,8 @@ public class ActionItemService {
                 .toList();
     }
 
-    /** All action items for an entity — for oversight views (CISO, VRM, coordinator) */
+    // ── For entity ────────────────────────────────────────────────────────────
+
     @Transactional(readOnly = true)
     public List<ActionItemResponse> getForEntity(ActionItem.EntityType entityType,
                                                  Long entityId, Long userId,
@@ -279,24 +267,21 @@ public class ActionItemService {
                 .toList();
     }
 
-    /** Count of open items — includes items user must resolve (PENDING_REVIEW) */
+    // ── Count ─────────────────────────────────────────────────────────────────
+
     @Transactional(readOnly = true)
     public long countOpenForUser(Long userId, Long tenantId) {
         long asAssignee = actionItemRepository.countOpenForUser(userId, tenantId);
-        // Also count PENDING_REVIEW items where user is the resolver
         long asReviewer = actionItemRepository.findAll(
                 ActionItemSpecification.forTenant(tenantId)
-                        .and(ActionItemSpecification.resolvableBy(userId, java.util.List.of()))
+                        .and(ActionItemSpecification.resolvableBy(userId, List.of()))
                         .and(ActionItemSpecification.withStatus(ActionItem.Status.PENDING_REVIEW))
         ).size();
-        // Use Set to avoid double-counting items where user is both assignee and resolver
         return asAssignee + asReviewer;
     }
 
-    /**
-     * Resolve action items linked to a comment (called when RESOLVED comment is added).
-     * Finds all open action items sourced from the given comment and resolves them.
-     */
+    // ── Resolve by comment ────────────────────────────────────────────────────
+
     @Transactional
     public void resolveByComment(Long commentId, Long resolvedBy,
                                  List<String> userRoles, Long tenantId) {
@@ -318,31 +303,20 @@ public class ActionItemService {
         });
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────
+    // ── Private helpers ───────────────────────────────────────────────────────
 
-    /**
-     * State transition rules:
-     *   OPEN → IN_PROGRESS   : assignedTo only
-     *   OPEN → DISMISSED     : assignedTo or admin
-     *   * → RESOLVED         : resolutionReservedFor (if set) OR user has resolutionRole
-     *   RESOLVED → OPEN      : same as RESOLVED permission (re-open)
-     */
     private void validateTransition(ActionItem item, ActionItem.Status newStatus,
                                     Long userId, List<String> userRoles) {
         switch (newStatus) {
             case IN_PROGRESS -> {
-                // Assignee moves to IN_PROGRESS ("I'm working on it")
-                // Reviewer can also push back to IN_PROGRESS ("not good enough, rework")
-                // assignedGroupRole members (e.g. VENDOR_CISO) can also start working
-                boolean isAssignee      = userId.equals(item.getAssignedTo());
-                boolean isGroupMember   = item.getAssignedGroupRole() != null && userRoles != null
+                boolean isAssignee    = userId.equals(item.getAssignedTo());
+                boolean isGroupMember = item.getAssignedGroupRole() != null && userRoles != null
                         && userRoles.contains(item.getAssignedGroupRole());
                 if (!isAssignee && !isGroupMember && !canResolve(item, userId, userRoles)) {
                     throw new ForbiddenException("Only the assignee or reviewer can change to In Progress");
                 }
             }
             case PENDING_REVIEW -> {
-                // Assignee or group role member submits for review ("I've done my part")
                 boolean isAssignee    = userId.equals(item.getAssignedTo());
                 boolean isGroupMember = item.getAssignedGroupRole() != null && userRoles != null
                         && userRoles.contains(item.getAssignedGroupRole());
@@ -351,7 +325,6 @@ public class ActionItemService {
                 }
             }
             case DISMISSED -> {
-                // Reviewer or admin can dismiss
                 if (!canResolve(item, userId, userRoles)
                         && !hasRole(userRoles, "ORG_ADMIN", "SYSTEM_ADMIN")) {
                     throw new ForbiddenException("Only the reviewer or admin can dismiss");
@@ -368,28 +341,19 @@ public class ActionItemService {
     }
 
     private boolean canResolve(ActionItem item, Long userId, List<String> userRoles) {
-        // Specific user reservation takes precedence
-        if (item.getResolutionReservedFor() != null) {
-            return userId.equals(item.getResolutionReservedFor());
-        }
-        // Role-based resolution
-        if (item.getResolutionRole() != null && userRoles != null) {
+        if (item.getResolutionReservedFor() != null) return userId.equals(item.getResolutionReservedFor());
+        if (item.getResolutionRole() != null && userRoles != null)
             return userRoles.stream().anyMatch(r -> r.equals(item.getResolutionRole()));
-        }
-        // No restriction — assignee can resolve
         return userId.equals(item.getAssignedTo());
     }
 
     private boolean hasRole(List<String> userRoles, String... required) {
         if (userRoles == null) return false;
-        for (String r : required) {
-            if (userRoles.contains(r)) return true;
-        }
+        for (String r : required) if (userRoles.contains(r)) return true;
         return false;
     }
 
-    private ActionItemResponse toResponse(ActionItem item, Long callerId,
-                                          List<String> callerRoles) {
+    private ActionItemResponse toResponse(ActionItem item, Long callerId, List<String> callerRoles) {
         return ActionItemResponse.builder()
                 .id(item.getId())
                 .blueprintId(item.getBlueprintId())
@@ -398,10 +362,14 @@ public class ActionItemService {
                 .assignedGroupRole(item.getAssignedGroupRole())
                 .createdBy(item.getCreatedBy())
                 .createdByName(resolveName(item.getCreatedBy()))
+                .vendorId(item.getVendorId())
                 .sourceType(item.getSourceType())
                 .sourceId(item.getSourceId())
                 .entityType(item.getEntityType())
                 .entityId(item.getEntityId())
+                // NEW: parent context
+                .parentEntityType(item.getParentEntityType())
+                .parentEntityId(item.getParentEntityId())
                 .title(item.getTitle())
                 .description(item.getDescription())
                 .status(item.getStatus())
@@ -415,13 +383,15 @@ public class ActionItemService {
                 .resolvedByName(resolveName(item.getResolvedBy()))
                 .resolutionNote(item.getResolutionNote())
                 .navContext(item.getNavContext())
+                // NEW: item UI rendering
+                .itemScreenKey(item.getItemScreenKey())
+                .itemUiJson(item.getItemUiJson())
                 .createdAt(item.getCreatedAt())
                 .updatedAt(item.getUpdatedAt())
                 .canResolve(canResolve(item, callerId, callerRoles))
                 .isOverdue(item.getDueAt() != null && LocalDateTime.now().isAfter(item.getDueAt())
                         && item.getStatus() != ActionItem.Status.RESOLVED
                         && item.getStatus() != ActionItem.Status.DISMISSED)
-                // Remediation / clarification specific fields
                 .remediationType(item.getRemediationType())
                 .severity(item.getSeverity())
                 .expectedEvidence(item.getExpectedEvidence())
@@ -463,5 +433,20 @@ public class ActionItemService {
     private String truncate(String s, int max) {
         if (s == null) return "";
         return s.length() > max ? s.substring(0, max) + "…" : s;
+    }
+
+    // ── Inner update request ──────────────────────────────────────────────────
+
+    @Data
+    public static class UpdateRequest {
+        private String                  title;
+        private String                  description;
+        private String                  dueAt;
+        private ActionItem.Priority     priority;
+        private Long                    assignedTo;
+        private String                  assignedGroupRole;
+        private String                  navContext;
+        private String                  itemScreenKey;
+        private String                  itemUiJson;
     }
 }

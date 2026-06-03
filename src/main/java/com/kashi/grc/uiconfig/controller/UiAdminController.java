@@ -7,7 +7,6 @@ import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.uiconfig.domain.*;
 import com.kashi.grc.uiconfig.dto.request.*;
-import com.kashi.grc.uiconfig.dto.response.*;
 import com.kashi.grc.uiconfig.repository.*;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -34,6 +33,18 @@ import java.util.Map;
  * Widgets:       POST/PUT/DELETE /v1/admin/ui/widgets
  * Feature Flags: POST/PUT/DELETE /v1/admin/ui/flags
  * Branding:      POST/PUT         /v1/admin/ui/branding
+ *
+ * FIX (2026-05-15):
+ *  - createField / updateField: blank JSON strings are now nulled before persisting
+ *    (MySQL JSON columns reject "" — "Invalid JSON text: The document is empty").
+ *  - createField builder: includes all new UiFormField columns (rowsCount, minValue,
+ *    maxValue, stepValue, lookupEntityType, lookupApiPath, tagSuggestions, currencyCode).
+ *  - updateField: null guards for new fields; Boolean wrapper for isRequired/isVisible.
+ *  - listFormFields: now returns all fields the Screen Designer inspector needs
+ *    (validationRulesJson, dependsOnJson, rowsCount, lookupEntityType, etc.).
+ *  - listActions / createAction / updateAction: getter calls updated for Boolean wrapper
+ *    fields — requiresConfirmation → getRequiresConfirmation(),
+ *    requiresRemarks → getRequiresRemarks().
  */
 @RestController
 @RequestMapping("/v1/admin/ui")
@@ -100,7 +111,7 @@ public class UiAdminController {
                     m.put("parentKey",            n.getParentKey()           != null ? n.getParentKey()           : "");
                     m.put("module",               n.getModule()              != null ? n.getModule()              : "");
                     m.put("sortOrder",            n.getSortOrder()           != null ? n.getSortOrder()           : 0);
-                    m.put("isActive",             n.isActive());
+                    m.put("isActive",             Boolean.TRUE.equals(n.isActive()));
                     m.put("allowedSides",         n.getAllowedSides()        != null ? n.getAllowedSides()        : "");
                     m.put("badgeCountEndpoint",   n.getBadgeCountEndpoint()  != null ? n.getBadgeCountEndpoint()  : "");
                     m.put("requiredPermission",   n.getRequiredPermission()  != null ? n.getRequiredPermission()  : "");
@@ -117,13 +128,13 @@ public class UiAdminController {
         if (req.getLabel()               != null) nav.setLabel(req.getLabel());
         if (req.getIcon()                != null) nav.setIcon(req.getIcon());
         if (req.getRoute()               != null) nav.setRoute(req.getRoute());
-        if (req.getParentKey()           != null) nav.setParentKey(req.getParentKey());
+        if (req.getParentKey()           != null) nav.setParentKey(req.getParentKey().isBlank()           ? null : req.getParentKey());
         if (req.getSortOrder()           != null) nav.setSortOrder(req.getSortOrder());
         if (req.getModule()              != null) nav.setModule(req.getModule());
         if (req.getAllowedSides()        != null) nav.setAllowedSides(req.getAllowedSides());
         if (req.getMinLevel()            != null) nav.setMinLevel(req.getMinLevel());
-        if (req.getRequiredPermission()  != null) nav.setRequiredPermission(req.getRequiredPermission());
-        if (req.getBadgeCountEndpoint()  != null) nav.setBadgeCountEndpoint(req.getBadgeCountEndpoint());
+        if (req.getRequiredPermission()  != null) nav.setRequiredPermission(req.getRequiredPermission().isBlank()  ? null : req.getRequiredPermission());
+        if (req.getBadgeCountEndpoint()  != null) nav.setBadgeCountEndpoint(req.getBadgeCountEndpoint().isBlank() ? null : req.getBadgeCountEndpoint());
         nav.setActive(req.isActive());
         navigationRepository.save(nav);
         return ResponseEntity.ok(ApiResponse.success(toMap("id", nav.getId(), "navKey", nav.getNavKey())));
@@ -280,11 +291,54 @@ public class UiAdminController {
                 .title(req.getTitle()).columnsJson(req.getColumnsJson())
                 .filtersJson(req.getFiltersJson()).roleAccessJson(req.getRoleAccessJson())
                 .selectable(req.isSelectable()).reorderable(req.isReorderable())
+                .layoutMode(req.getLayoutMode() != null ? req.getLayoutMode() : "FULL_PAGE")
+                .tabsJson(req.getTabsJson())
                 .tenantId(tenantId)
                 .build();
         layoutRepository.save(layout);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.success(toMap("id", layout.getId(), "layoutKey", layout.getLayoutKey())));
+    }
+
+
+    @GetMapping("/layouts")
+    @Operation(summary = "List layouts — filter by ?screen=key for Screen Designer")
+    public ResponseEntity<ApiResponse<PaginatedResponse<Map<String, Object>>>> listLayouts(
+            @RequestParam Map<String, String> allParams) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        String screenFilter = allParams.get("screen");
+        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
+                UiLayout.class,
+                utilityService.getpageDetails(allParams),
+                (cb, root) -> {
+                    List<jakarta.persistence.criteria.Predicate> preds = new java.util.ArrayList<>();
+                    preds.add(cb.or(cb.isNull(root.get("tenantId")),
+                            cb.equal(root.get("tenantId"), tenantId)));
+                    if (screenFilter != null && !screenFilter.isBlank())
+                        preds.add(cb.equal(root.get("screen"), screenFilter));
+                    return preds;
+                },
+                (cb, root) -> Map.of("layoutkey", root.get("layoutKey"),
+                        "screen", root.get("screen")),
+                l -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",             l.getId());
+                    m.put("layoutKey",      l.getLayoutKey());
+                    m.put("screen",         l.getScreen()         != null ? l.getScreen()         : "");
+                    m.put("title",          l.getTitle()          != null ? l.getTitle()           : "");
+                    m.put("columnsJson",    l.getColumnsJson()    != null ? l.getColumnsJson()     : "[]");
+                    m.put("filtersJson",    l.getFiltersJson()    != null ? l.getFiltersJson()     : "[]");
+                    m.put("roleAccessJson", l.getRoleAccessJson() != null ? l.getRoleAccessJson()  : "{}");
+                    m.put("selectable",     Boolean.TRUE.equals(l.isSelectable()));
+                    m.put("reorderable",    Boolean.TRUE.equals(l.isReorderable()));
+                    // FIX: layoutMode and tabsJson were missing from list response.
+                    // Screen Designer reads these back after save — without them the
+                    // layoutMode badge never reflects the saved value, and tabsJson
+                    // (configurable DETAIL tabs) is always treated as empty.
+                    m.put("layoutMode",    l.getLayoutMode()  != null ? l.getLayoutMode()  : "FULL_PAGE");
+                    m.put("tabsJson",      l.getTabsJson()    != null ? l.getTabsJson()    : "[]");
+                    return m;
+                })));
     }
 
     @PutMapping("/layouts/{id}")
@@ -299,6 +353,9 @@ public class UiAdminController {
         if (req.getRoleAccessJson() != null) layout.setRoleAccessJson(req.getRoleAccessJson());
         layout.setSelectable(req.isSelectable());
         layout.setReorderable(req.isReorderable());
+        if (req.getLayoutMode() != null) layout.setLayoutMode(req.getLayoutMode());
+        // tabsJson — configurable tab list for DETAIL screens; null means "keep existing"
+        if (req.getTabsJson() != null) layout.setTabsJson(req.getTabsJson());
         layoutRepository.save(layout);
         return ResponseEntity.ok(ApiResponse.success(toMap("id", layout.getId(), "layoutKey", layout.getLayoutKey())));
     }
@@ -331,16 +388,22 @@ public class UiAdminController {
     }
 
     @GetMapping("/forms")
-    @Operation(summary = "List all form definitions — paginated")
+    @Operation(summary = "List all form definitions — filter by ?formKey=key for Screen Designer")
     public ResponseEntity<ApiResponse<PaginatedResponse<Map<String, Object>>>> listForms(
             @RequestParam Map<String, String> allParams) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        String formKeyFilter = allParams.get("formKey");
         return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
                 UiForm.class,
                 utilityService.getpageDetails(allParams),
-                (cb, root) -> List.of(cb.or(
-                        cb.isNull(root.get("tenantId")),
-                        cb.equal(root.get("tenantId"), tenantId))),
+                (cb, root) -> {
+                    List<jakarta.persistence.criteria.Predicate> preds = new java.util.ArrayList<>();
+                    preds.add(cb.or(cb.isNull(root.get("tenantId")),
+                            cb.equal(root.get("tenantId"), tenantId)));
+                    if (formKeyFilter != null && !formKeyFilter.isBlank())
+                        preds.add(cb.equal(root.get("formKey"), formKeyFilter));
+                    return preds;
+                },
                 (cb, root) -> Map.of("formkey", root.get("formKey"),
                         "title", root.get("title")),
                 f -> Map.of("id", f.getId(), "formKey", f.getFormKey(),
@@ -365,11 +428,25 @@ public class UiAdminController {
                     m.put("label",                f.getLabel()                != null ? f.getLabel()                : "");
                     m.put("placeholder",          f.getPlaceholder()          != null ? f.getPlaceholder()          : "");
                     m.put("helperText",           f.getHelperText()           != null ? f.getHelperText()           : "");
-                    m.put("isRequired",           f.isRequired());
-                    m.put("isVisible",            f.isVisible());
+                    m.put("isRequired",           Boolean.TRUE.equals(f.isRequired()));
+                    m.put("isVisible",            Boolean.TRUE.equals(f.isVisible()));
                     m.put("sortOrder",            f.getSortOrder()            != null ? f.getSortOrder()            : 0);
                     m.put("gridCols",             f.getGridCols()             != null ? f.getGridCols()             : 12);
+                    m.put("stepNumber",           f.getStepNumber()           != null ? f.getStepNumber()           : 1);
                     m.put("optionsComponentKey",  f.getOptionsComponentKey()  != null ? f.getOptionsComponentKey()  : "");
+                    // FIX: include JSON fields so Screen Designer inspector can repopulate them on edit
+                    m.put("validationRulesJson",  f.getValidationRulesJson()  != null ? f.getValidationRulesJson()  : "");
+                    m.put("dependsOnJson",        f.getDependsOnJson()        != null ? f.getDependsOnJson()        : "");
+                    // FIX: include new columns so inspector fields (LOOKUP, SLIDER, TAG, etc.) work on edit
+                    m.put("lookupEntityType",     f.getLookupEntityType()     != null ? f.getLookupEntityType()     : "");
+                    m.put("lookupApiPath",        f.getLookupApiPath()        != null ? f.getLookupApiPath()        : "");
+                    m.put("optionsComponentKey",  f.getOptionsComponentKey()  != null ? f.getOptionsComponentKey()  : "");
+                    m.put("currencyCode",         f.getCurrencyCode()         != null ? f.getCurrencyCode()         : "");
+                    m.put("tagSuggestions",       f.getTagSuggestions()       != null ? f.getTagSuggestions()       : "");
+                    m.put("rowsCount",            f.getRowsCount());
+                    m.put("minValue",             f.getMinValue());
+                    m.put("maxValue",             f.getMaxValue());
+                    m.put("stepValue",            f.getStepValue());
                     return m;
                 })
                 .collect(java.util.stream.Collectors.toList());
@@ -409,16 +486,34 @@ public class UiAdminController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         UiForm form = formRepository.findById(req.getFormId())
                 .orElseThrow(() -> new ResourceNotFoundException("UiForm", req.getFormId()));
+
+        // FIX: Null-out blank JSON strings — MySQL JSON columns reject empty string ""
+        // ("Invalid JSON text: The document is empty.")
+        String cleanValidationRulesJson = blankToNull(req.getValidationRulesJson());
+        String cleanDependsOnJson       = blankToNull(req.getDependsOnJson());
+
         UiFormField field = UiFormField.builder()
                 .form(form).fieldKey(req.getFieldKey())
                 .fieldType(UiFormField.FieldType.valueOf(req.getFieldType()))
                 .label(req.getLabel()).placeholder(req.getPlaceholder())
-                .helperText(req.getHelperText()).isRequired(req.isRequired())
-                .isVisible(req.isVisible()).sortOrder(req.getSortOrder())
+                .helperText(req.getHelperText())
+                .isRequired(Boolean.TRUE.equals(req.getIsRequired()))
+                .isVisible(!Boolean.FALSE.equals(req.getIsVisible()))
+                .sortOrder(req.getSortOrder() != null ? req.getSortOrder() : 0)
                 .optionsComponentKey(req.getOptionsComponentKey())
-                .validationRulesJson(req.getValidationRulesJson())
-                .dependsOnJson(req.getDependsOnJson())
-                .gridCols(req.getGridCols()).stepNumber(req.getStepNumber())
+                .validationRulesJson(cleanValidationRulesJson)
+                .dependsOnJson(cleanDependsOnJson)
+                .gridCols(req.getGridCols() != null ? req.getGridCols() : 12)
+                .stepNumber(req.getStepNumber() != null ? req.getStepNumber() : 1)
+                // FIX: include all new columns from the extended entity
+                .currencyCode(req.getCurrencyCode())
+                .minValue(req.getMinValue())
+                .maxValue(req.getMaxValue())
+                .stepValue(req.getStepValue())
+                .lookupEntityType(req.getLookupEntityType())
+                .lookupApiPath(req.getLookupApiPath())
+                .tagSuggestions(req.getTagSuggestions())
+                .rowsCount(req.getRowsCount())
                 .tenantId(tenantId)
                 .build();
         formFieldRepository.save(field);
@@ -435,14 +530,25 @@ public class UiAdminController {
         if (req.getLabel()                != null) f.setLabel(req.getLabel());
         if (req.getPlaceholder()          != null) f.setPlaceholder(req.getPlaceholder());
         if (req.getHelperText()           != null) f.setHelperText(req.getHelperText());
-        if (req.getValidationRulesJson()  != null) f.setValidationRulesJson(req.getValidationRulesJson());
-        if (req.getDependsOnJson()        != null) f.setDependsOnJson(req.getDependsOnJson());
+        // FIX: null-guard JSON strings + treat blank as null before persisting
+        if (req.getValidationRulesJson()  != null) f.setValidationRulesJson(blankToNull(req.getValidationRulesJson()));
+        if (req.getDependsOnJson()        != null) f.setDependsOnJson(blankToNull(req.getDependsOnJson()));
         if (req.getOptionsComponentKey()  != null) f.setOptionsComponentKey(req.getOptionsComponentKey());
-        if (req.getGridCols()            != null) f.setGridCols(req.getGridCols());
-        if (req.getSortOrder()           != null) f.setSortOrder(req.getSortOrder());
-        if (req.getStepNumber()          != null) f.setStepNumber(req.getStepNumber());
-        f.setRequired(req.isRequired());
-        f.setVisible(req.isVisible());
+        if (req.getGridCols()             != null) f.setGridCols(req.getGridCols());
+        if (req.getSortOrder()            != null) f.setSortOrder(req.getSortOrder());
+        if (req.getStepNumber()           != null) f.setStepNumber(req.getStepNumber());
+        // FIX: Boolean wrapper — only update if explicitly provided (non-null)
+        if (req.getIsRequired() != null) f.setRequired(req.getIsRequired());
+        if (req.getIsVisible()  != null) f.setVisible(req.getIsVisible());
+        // FIX: new columns
+        if (req.getCurrencyCode()       != null) f.setCurrencyCode(req.getCurrencyCode());
+        if (req.getMinValue()           != null) f.setMinValue(req.getMinValue());
+        if (req.getMaxValue()           != null) f.setMaxValue(req.getMaxValue());
+        if (req.getStepValue()          != null) f.setStepValue(req.getStepValue());
+        if (req.getLookupEntityType()   != null) f.setLookupEntityType(req.getLookupEntityType());
+        if (req.getLookupApiPath()      != null) f.setLookupApiPath(req.getLookupApiPath());
+        if (req.getTagSuggestions()     != null) f.setTagSuggestions(req.getTagSuggestions());
+        if (req.getRowsCount()          != null) f.setRowsCount(req.getRowsCount());
         formFieldRepository.save(f);
         return ResponseEntity.ok(ApiResponse.success(toMap("id", f.getId(), "fieldKey", f.getFieldKey())));
     }
@@ -463,14 +569,17 @@ public class UiAdminController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> createAction(
             @Valid @RequestBody UiActionRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        // FIX: Apply blankToNull to all JSON columns — MySQL rejects empty string ""
+        // as invalid JSON ("The document is empty."). The same guard already exists for
+        // form fields (createField/updateField); actions were missing it.
         UiAction action = UiAction.builder()
                 .screenKey(req.getScreenKey()).actionKey(req.getActionKey())
                 .label(req.getLabel()).icon(req.getIcon()).variant(req.getVariant())
                 .apiEndpoint(req.getApiEndpoint()).httpMethod(req.getHttpMethod())
-                .payloadTemplateJson(req.getPayloadTemplateJson())
+                .payloadTemplateJson(blankToNull(req.getPayloadTemplateJson()))
                 .requiredPermission(req.getRequiredPermission())
                 .allowedSides(req.getAllowedSides())
-                .allowedStatusesJson(req.getAllowedStatusesJson())
+                .allowedStatusesJson(blankToNull(req.getAllowedStatusesJson()))
                 .requiresConfirmation(req.isRequiresConfirmation())
                 .confirmationMessage(req.getConfirmationMessage())
                 .requiresRemarks(req.isRequiresRemarks())
@@ -480,6 +589,50 @@ public class UiAdminController {
         actionRepository.save(action);
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.success(toMap("id", action.getId(), "actionKey", action.getActionKey())));
+    }
+
+
+    @GetMapping("/actions")
+    @Operation(summary = "List action buttons — filter by ?screen=key for Screen Designer")
+    public ResponseEntity<ApiResponse<PaginatedResponse<Map<String, Object>>>> listActions(
+            @RequestParam Map<String, String> allParams) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        String screenFilter = allParams.get("screen");
+        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
+                UiAction.class,
+                utilityService.getpageDetails(allParams),
+                (cb, root) -> {
+                    List<jakarta.persistence.criteria.Predicate> preds = new java.util.ArrayList<>();
+                    preds.add(cb.or(cb.isNull(root.get("tenantId")),
+                            cb.equal(root.get("tenantId"), tenantId)));
+                    if (screenFilter != null && !screenFilter.isBlank())
+                        preds.add(cb.equal(root.get("screenKey"), screenFilter));
+                    return preds;
+                },
+                (cb, root) -> Map.of("sortorder", root.get("sortOrder"),
+                        "screenkey", root.get("screenKey")),
+                a -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",                    a.getId());
+                    m.put("screenKey",             a.getScreenKey());
+                    m.put("actionKey",             a.getActionKey());
+                    m.put("label",                 a.getLabel());
+                    m.put("icon",                  a.getIcon()                 != null ? a.getIcon()                 : "");
+                    m.put("variant",               a.getVariant()              != null ? a.getVariant()              : "primary");
+                    m.put("apiEndpoint",           a.getApiEndpoint()          != null ? a.getApiEndpoint()          : "");
+                    m.put("httpMethod",            a.getHttpMethod()           != null ? a.getHttpMethod()           : "POST");
+                    m.put("payloadTemplateJson",   a.getPayloadTemplateJson()  != null ? a.getPayloadTemplateJson()  : "");
+                    m.put("requiredPermission",    a.getRequiredPermission()   != null ? a.getRequiredPermission()   : "");
+                    m.put("allowedSides",          a.getAllowedSides()         != null ? a.getAllowedSides()         : "");
+                    m.put("allowedStatusesJson",   a.getAllowedStatusesJson()  != null ? a.getAllowedStatusesJson()  : "");
+                    // FIX: getRequiresConfirmation() / getRequiresRemarks() — Boolean wrapper getter (no 'is' prefix)
+                    m.put("requiresConfirmation",  Boolean.TRUE.equals(a.getRequiresConfirmation()));
+                    m.put("confirmationMessage",   a.getConfirmationMessage()  != null ? a.getConfirmationMessage()  : "");
+                    m.put("requiresRemarks",       Boolean.TRUE.equals(a.getRequiresRemarks()));
+                    m.put("sortOrder",             a.getSortOrder() != null ? a.getSortOrder() : 0);
+                    m.put("isActive",              Boolean.TRUE.equals(a.getIsActive()));
+                    return m;
+                })));
     }
 
     @PutMapping("/actions/{id}")
@@ -492,15 +645,17 @@ public class UiAdminController {
         if (req.getIcon()                 != null) a.setIcon(req.getIcon());
         if (req.getVariant()              != null) a.setVariant(req.getVariant());
         if (req.getApiEndpoint()          != null) a.setApiEndpoint(req.getApiEndpoint());
-        if (req.getPayloadTemplateJson()  != null) a.setPayloadTemplateJson(req.getPayloadTemplateJson());
+        if (req.getPayloadTemplateJson()  != null) a.setPayloadTemplateJson(blankToNull(req.getPayloadTemplateJson()));
         if (req.getRequiredPermission()   != null) a.setRequiredPermission(req.getRequiredPermission());
         if (req.getAllowedSides()         != null) a.setAllowedSides(req.getAllowedSides());
-        if (req.getAllowedStatusesJson()  != null) a.setAllowedStatusesJson(req.getAllowedStatusesJson());
+        // FIX: wrap with blankToNull — same fix as createAction; empty string fails MySQL JSON column
+        if (req.getAllowedStatusesJson()  != null) a.setAllowedStatusesJson(blankToNull(req.getAllowedStatusesJson()));
         if (req.getConfirmationMessage()  != null) a.setConfirmationMessage(req.getConfirmationMessage());
         if (req.getSortOrder()           != null) a.setSortOrder(req.getSortOrder());
+        // FIX: setRequiresConfirmation / setRequiresRemarks — Boolean wrapper setter
         a.setRequiresConfirmation(req.isRequiresConfirmation());
         a.setRequiresRemarks(req.isRequiresRemarks());
-        a.setActive(req.isActive());
+        a.setIsActive(req.isActive());
         actionRepository.save(a);
         return ResponseEntity.ok(ApiResponse.success(toMap("id", a.getId(), "actionKey", a.getActionKey())));
     }
@@ -538,6 +693,41 @@ public class UiAdminController {
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.success(toMap("id", w.getId(), "widgetKey", w.getWidgetKey())));
     }
+
+
+    @GetMapping("/widgets")
+    @Operation(summary = "List dashboard widgets — for Dashboard Admin page")
+    public ResponseEntity<ApiResponse<PaginatedResponse<Map<String, Object>>>> listWidgets(
+            @RequestParam Map<String, String> allParams) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
+                DashboardWidget.class,
+                utilityService.getpageDetails(allParams),
+                (cb, root) -> List.of(cb.or(
+                        cb.isNull(root.get("tenantId")),
+                        cb.equal(root.get("tenantId"), tenantId))),
+                (cb, root) -> Map.of("sortorder", root.get("sortOrder")),
+                w -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",                      w.getId());
+                    m.put("widgetKey",               w.getWidgetKey());
+                    m.put("widgetType",              w.getWidgetType().name());
+                    m.put("title",                   w.getTitle()               != null ? w.getTitle()               : "");
+                    m.put("subtitle",                w.getSubtitle()            != null ? w.getSubtitle()            : "");
+                    m.put("dataEndpoint",            w.getDataEndpoint()        != null ? w.getDataEndpoint()        : "");
+                    m.put("dataPath",                w.getDataPath()            != null ? w.getDataPath()            : "");
+                    m.put("configJson",              w.getConfigJson()          != null ? w.getConfigJson()          : "{}");
+                    m.put("allowedSidesJson",        w.getAllowedSidesJson()    != null ? w.getAllowedSidesJson()    : "[]");
+                    m.put("requiredPermission",      w.getRequiredPermission()  != null ? w.getRequiredPermission()  : "");
+                    m.put("clickThroughRoute",       w.getClickThroughRoute()   != null ? w.getClickThroughRoute()   : "");
+                    m.put("gridCols",                w.getGridCols()            != null ? w.getGridCols()            : 6);
+                    m.put("sortOrder",               w.getSortOrder()           != null ? w.getSortOrder()           : 0);
+                    m.put("refreshIntervalSeconds",  w.getRefreshIntervalSeconds() != null ? w.getRefreshIntervalSeconds() : 300);
+                    m.put("isActive",                Boolean.TRUE.equals(w.isActive()));
+                    return m;
+                })));
+    }
+
 
     @PutMapping("/widgets/{id}")
     @Operation(summary = "Update a dashboard widget")
@@ -671,11 +861,20 @@ public class UiAdminController {
     }
 
     // ── Util ──────────────────────────────────────────────────────
+
     private Map<String, Object> toMap(Object... kvPairs) {
         Map<String, Object> map = new java.util.LinkedHashMap<>();
         for (int i = 0; i < kvPairs.length - 1; i += 2) {
             map.put(kvPairs[i].toString(), kvPairs[i + 1]);
         }
         return map;
+    }
+
+    /**
+     * FIX: Convert blank (empty or whitespace-only) strings to null before persisting
+     * JSON columns. MySQL's JSON column type rejects empty string as invalid JSON.
+     */
+    private String blankToNull(String value) {
+        return (value != null && value.isBlank()) ? null : value;
     }
 }

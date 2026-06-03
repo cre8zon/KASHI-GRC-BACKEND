@@ -182,13 +182,13 @@ public class GuardRuleController {
         if (rule.getTenantId() == null && user.getTenantId() != null) {
             throw new BusinessException("FORBIDDEN",
                     "Global rules can only be managed by platform administrators",
-                    org.springframework.http.HttpStatus.FORBIDDEN);
+                    HttpStatus.FORBIDDEN);
         }
         if (rule.getTenantId() != null
                 && !rule.getTenantId().equals(user.getTenantId())) {
             throw new BusinessException("FORBIDDEN",
                     "You do not have permission to manage this rule",
-                    org.springframework.http.HttpStatus.FORBIDDEN);
+                    HttpStatus.FORBIDDEN);
         }
         return rule;
     }

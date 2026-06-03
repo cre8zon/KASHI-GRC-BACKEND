@@ -2,6 +2,9 @@ package com.kashi.grc.workflow.repository;
 
 import com.kashi.grc.workflow.domain.WorkflowStepSection;
 import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.Collection;
@@ -35,16 +38,21 @@ public interface WorkflowStepSectionRepository extends JpaRepository<WorkflowSte
     // ── Gap 1+2 additions ─────────────────────────────────────────────────────
 
     /**
-     * Used by saveSteps() to wipe all sections before re-inserting.
-     * Safe because saveSteps() is only called on blueprint creation
-     * (no running instances yet).
+     * Bulk DELETE that flushes immediately — avoids Hibernate action-queue
+     * ordering issue where a DELETE queued after the INSERT causes a UK
+     * constraint violation (uk_wss_step_key) on re-import.
+     *
+     * Must be @Modifying so Spring Data issues a direct JPQL DELETE
+     * instead of select-then-delete (which Hibernate batches after inserts).
      */
-    void deleteByStepId(Long stepId);
+    @Modifying
+    @Query("DELETE FROM WorkflowStepSection s WHERE s.stepId = :stepId")
+    void deleteByStepId(@Param("stepId") Long stepId);
 
     /**
      * Used by upsertSteps() to delete removed sections while keeping
      * sections whose IDs are still present in the incoming request.
      * Prevents phantom sections from accumulating on blueprint edits.
      */
-    void deleteByStepIdAndIdNotIn(Long stepId, java.util.List<Long> keepIds);
+    void deleteByStepIdAndIdNotIn(Long stepId, List<Long> keepIds);
 }

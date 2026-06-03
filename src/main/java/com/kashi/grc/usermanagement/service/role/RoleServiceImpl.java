@@ -2,6 +2,8 @@ package com.kashi.grc.usermanagement.service.role;
 
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.exception.ValidationException;
+import com.kashi.grc.guard.domain.SodRule;
+import com.kashi.grc.guard.repository.SodRuleRepository;
 import com.kashi.grc.usermanagement.domain.*;
 import com.kashi.grc.usermanagement.dto.request.*;
 import com.kashi.grc.usermanagement.dto.response.*;
@@ -19,6 +21,9 @@ public class RoleServiceImpl implements RoleService {
     private final RoleRepository       roleRepository;
     private final PermissionRepository permissionRepository;
     private final UserRepository       userRepository;
+    // SodRuleRepository is now guard.SodRuleRepository — unified entity in guard module.
+    // ROLE_PAIR rules (role conflict at assignment time) and PERMISSION_PAIR rules
+    // (permission conflict at access resolution time) both live in guard.SodRule / sod_rules table.
     private final SodRuleRepository    sodRuleRepository;
     private final com.kashi.grc.common.util.UtilityService utilityService;
 
@@ -108,11 +113,14 @@ public class RoleServiceImpl implements RoleService {
                 List<Long> existingRoleIds = user.getRoles().stream()
                         .map(Role::getId).collect(Collectors.toList());
                 for (Long existingId : existingRoleIds) {
+                    // findConflictBetween returns only ROLE_PAIR rules (see SodRuleRepository query).
                     List<SodRule> conflicts = sodRuleRepository
                             .findConflictBetween(tenantId, existingId, finalRoleId);
                     if (!conflicts.isEmpty()) {
                         SodRule rule = conflicts.get(0);
-                        if ("HARD_BLOCK".equals(rule.getEnforcementMode())) {
+                        // Unified check: ConflictType.HARD blocks the assignment.
+                        // Replaces the old "HARD_BLOCK".equals(rule.getEnforcementMode()) string check.
+                        if (rule.getConflictType() == SodRule.ConflictType.HARD) {
                             throw new ValidationException("SOD_VIOLATION: " + rule.getDescription());
                         }
                     }

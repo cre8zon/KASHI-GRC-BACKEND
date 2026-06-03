@@ -7,7 +7,7 @@ import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.workflow.automation.AutomatedActionRegistry;
-import com.kashi.grc.common.service.CsvImportService;
+import com.kashi.grc.workflow.csv.WorkflowBlueprintImportService;
 import com.kashi.grc.common.dto.CsvImportResult;
 import org.springframework.http.MediaType;
 import org.springframework.web.multipart.MultipartFile;
@@ -25,6 +25,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -48,11 +49,11 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class WorkflowController {
 
-    private final WorkflowEngineService     service;
-    private final DbRepository              dbRepository;
-    private final UtilityService            utilityService;
-    private final AutomatedActionRegistry   automatedActionRegistry;
-    private final CsvImportService           csvImportService;
+    private final WorkflowEngineService          service;
+    private final DbRepository                   dbRepository;
+    private final UtilityService                 utilityService;
+    private final AutomatedActionRegistry        automatedActionRegistry;
+    private final WorkflowBlueprintImportService blueprintImportService;
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -168,40 +169,59 @@ public class WorkflowController {
         return ResponseEntity.ok(ApiResponse.success(keys));
     }
 
-
-
     // ── IMPORT STEPS FROM CSV ─────────────────────────────────────
     /**
      * POST /v1/workflows/{id}/import-steps
      *
-     * Bulk import workflow steps from a CSV file.
-     * Auto-detects DB export format or human-authored template format.
-     * Role names are resolved to IDs by the server.
-     * Returns CsvImportResult with per-row log.
+     * Bulk import workflow steps from a CSV file using the extended
+     * WorkflowBlueprintImportService. Supports all fields including
+     * description, isOptional, isParallel, autoApproveAssignerOnFill,
+     * stepUiOverrideJson, and extended section columns
+     * (sectionScreenKey, itemScreenKey, itemRefType, sectionUiJson, itemUiJson).
+     *
+     * Role names are resolved to IDs by the server. Pass targetTenantId to
+     * resolve org-specific roles (Platform Admin's own tenant only has system roles).
      *
      * Platform Admin only.
      */
     @PostMapping(value = "/{id}/import-steps", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    @Operation(summary = "Bulk import workflow steps from CSV — auto-detects DB export or template format")
+    @Operation(summary = "Bulk import workflow steps from CSV — extended format with all blueprint fields")
     public ResponseEntity<ApiResponse<CsvImportResult>> importSteps(
             @PathVariable Long id,
             @RequestParam("file") MultipartFile file,
             @RequestParam(value = "tenantId", required = false) Long targetTenantId) {
         guardPlatformAdmin();
-        // targetTenantId: the org whose roles should be used for name resolution.
-        // Platform Admin's own tenantId (1) only has system roles — org roles (VENDOR_VRM etc.)
-        // live under the org's tenantId. The frontend passes the org's tenantId explicitly.
-        // Falls back to Platform Admin's tenantId if not provided (backward compatible).
         Long resolvedTenantId = targetTenantId != null
                 ? targetTenantId
                 : utilityService.getLoggedInDataContext().getTenantId();
         log.info("[WF-IMPORT] POST /{}/import-steps | file={} | targetTenantId={}", id,
                 file != null ? file.getOriginalFilename() : "null", resolvedTenantId);
-        CsvImportResult result = csvImportService.importWorkflowSteps(file, id, resolvedTenantId);
+        CsvImportResult result = blueprintImportService.importSteps(file, id, resolvedTenantId);
         if (result.isFatalError()) {
             return ResponseEntity.badRequest().body(ApiResponse.error(new ErrorResponse("IMPORT_ERROR", result.getSummary())));
         }
         return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
+    // ── IMPORT TEMPLATE DOWNLOAD ──────────────────────────────────
+    /**
+     * GET /v1/workflows/import-template
+     *
+     * Downloads the SOC 2 engagement lifecycle blueprint as a ready-to-use
+     * CSV import template. Platform Admin can edit column values and re-upload
+     * via POST /{id}/import-steps without touching any other step manually.
+     *
+     * No guard — all authenticated users can download the template.
+     * The template contains no tenant-specific data.
+     */
+    @GetMapping(value = "/import-template", produces = "text/csv")
+    @Operation(summary = "Download the workflow step import template CSV — SOC 2 blueprint example")
+    public ResponseEntity<byte[]> downloadImportTemplate() {
+        byte[] csv = WorkflowBlueprintImportService.SOC2_EXAMPLE_CSV.getBytes(StandardCharsets.UTF_8);
+        log.debug("[WorkflowController] IMPORT-TEMPLATE download");
+        return ResponseEntity.ok()
+                .header("Content-Disposition", "attachment; filename=workflow_step_import_template.csv")
+                .body(csv);
     }
 
     // ── GUARD ─────────────────────────────────────────────────────

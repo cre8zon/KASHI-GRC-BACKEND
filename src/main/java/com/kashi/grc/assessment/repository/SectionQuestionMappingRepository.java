@@ -28,7 +28,7 @@ public interface SectionQuestionMappingRepository extends JpaRepository<SectionQ
     void deleteBySectionId(Long sectionId);
 
     /** Bulk variant — deletes all question mappings for multiple sections in one DELETE WHERE IN query. */
-    void deleteBySectionIdIn(java.util.Collection<Long> sectionIds);
+    void deleteBySectionIdIn(Collection<Long> sectionIds);
 
     void deleteBySectionIdAndQuestionId(Long sectionId, Long questionId);
 
@@ -37,7 +37,7 @@ public interface SectionQuestionMappingRepository extends JpaRepository<SectionQ
     void deleteByQuestionId(Long questionId);
 
     /** Bulk variant — deletes all section mappings for multiple questions in one DELETE WHERE IN query. */
-    void deleteByQuestionIdIn(java.util.Collection<Long> questionIds);
+    void deleteByQuestionIdIn(Collection<Long> questionIds);
 
     /**
      * Count all questions across every section in a template — single subquery.

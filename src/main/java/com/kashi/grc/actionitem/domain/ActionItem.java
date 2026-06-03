@@ -10,18 +10,44 @@ import java.time.LocalDateTime;
 /**
  * Runtime instance of an action obligation.
  *
- * Always tenant-scoped (extends TenantAwareEntity).
- * Never global — instances are runtime data belonging to a specific org.
+ * Always tenant-scoped. Never global.
  *
- * blueprint_id is nullable:
- *   null     = ad-hoc (REVISION_REQUEST, one-off escalation)
- *   non-null = instantiated from a standard blueprint (audit finding, control gap)
+ * ── NEW FIELDS ─────────────────────────────────────────────────────────────────
  *
- * Resolution rules (enforced by ActionItemService):
- *   OPEN → IN_PROGRESS   : assigned_to ("I'm working on it")
- *   OPEN → DISMISSED     : assigned_to or ORG_ADMIN
- *   * → RESOLVED         : resolution_reserved_for (if set) OR any user with resolutionRole
- *   RESOLVED → OPEN      : same as RESOLVED (re-open if not satisfied)
+ * itemScreenKey — screen config key for rendering the action item work UI.
+ *   When an assignee opens this action item, they need to see the item they're
+ *   working on with a UI appropriate to the work type.
+ *   GET /v1/ui-config/screen/:itemScreenKey returns fields, actions, ItemPanel config.
+ *   Null = generic action item view (title, description, resolve button only).
+ *   Examples:
+ *     "risk_control_item"       — control evidence form (CONTROL entity)
+ *     "audit_finding_item"      — finding detail with evaluate/accept buttons
+ *     "vendor_fill_question"    — question response card (TPRM, backward compat)
+ *
+ * itemUiJson — inline UI override for the item work screen.
+ *   Applied on top of itemScreenKey config. Same pattern as WorkflowStepSection.itemUiJson.
+ *   { "editableFields": [...], "showEvidence": true, "showComments": true, "itemPanelMode": "responder" }
+ *   Null = all defaults from itemScreenKey apply.
+ *
+ * parentEntityType / parentEntityId — the parent record context.
+ *   entityType + entityId = the specific item being delegated (CONTROL 42, FINDING 99)
+ *   parentEntityType + parentEntityId = the parent record (RISK 10, AUDIT 5)
+ *   Used for:
+ *     - "Back to [risk]" navigation in action item work screen
+ *     - Breadcrumb: Risk #10 > Control #42 > Action item
+ *     - Invalidating parent page queries after action item resolution
+ *   Null for global action items (no parent context).
+ *
+ * MIGRATION:
+ *   ALTER TABLE action_items
+ *     ADD COLUMN item_screen_key    VARCHAR(100) NULL
+ *       COMMENT 'Screen config key for item work UI',
+ *     ADD COLUMN item_ui_json       JSON NULL
+ *       COMMENT 'Inline UI override for item work screen',
+ *     ADD COLUMN parent_entity_type VARCHAR(30) NULL
+ *       COMMENT 'Parent record entity type (e.g. RISK, AUDIT)',
+ *     ADD COLUMN parent_entity_id   BIGINT NULL
+ *       COMMENT 'Parent record entity ID';
  */
 @Entity
 @Table(name = "action_items", indexes = {
@@ -31,7 +57,8 @@ import java.time.LocalDateTime;
         @Index(name = "idx_ai_entity",        columnList = "entity_type,entity_id"),
         @Index(name = "idx_ai_tenant_status", columnList = "tenant_id,status"),
         @Index(name = "idx_ai_blueprint",     columnList = "blueprint_id"),
-        @Index(name = "idx_ai_vendor",        columnList = "vendor_id"),        // NEW
+        @Index(name = "idx_ai_vendor",        columnList = "vendor_id"),
+        @Index(name = "idx_ai_parent",        columnList = "parent_entity_type,parent_entity_id"),
 })
 @Getter @Setter
 @SuperBuilder
@@ -40,20 +67,13 @@ import java.time.LocalDateTime;
 public class ActionItem extends TenantAwareEntity {
 
     // ── Blueprint link ─────────────────────────────────────────────────────
-    /** null for ad-hoc items; set for standard finding instances */
     @Column(name = "blueprint_id")
     private Long blueprintId;
 
     // ── Assignment ─────────────────────────────────────────────────────────
-    /** Specific user who must act. Nullable if assigned to a group role. */
     @Column(name = "assigned_to")
     private Long assignedTo;
 
-    /**
-     * Role-based assignment fallback.
-     * Any user with this role on the entity's workflow can claim and act.
-     * e.g. 'VENDOR_RESPONDER', 'VENDOR_CISO', 'ORG_REVIEWER'
-     */
     @Column(name = "assigned_group_role", length = 60)
     private String assignedGroupRole;
 
@@ -62,18 +82,8 @@ public class ActionItem extends TenantAwareEntity {
 
     /**
      * Vendor scope for role-based assignment.
-     *
-     * WHY THIS FIELD EXISTS:
-     *   assignedGroupRole = 'VENDOR_RESPONDER' matches ALL responders in the tenant.
-     *   Without vendorId, Rohan Sharma (Clearview responder) would see action items
-     *   assigned to VENDOR_RESPONDER for Razorpay's assessment — a cross-vendor leak.
-     *
-     *   vendorId scopes role-based queries to items belonging to the user's vendor:
-     *     WHERE assigned_group_role = 'VENDOR_RESPONDER' AND vendor_id = :userVendorId
-     *
-     * Set whenever the action item relates to a vendor assessment.
-     * Null for org-internal items (audit findings, control gaps, etc.)
-     * that are role-scoped within the org, not a specific vendor.
+     * Prevents cross-vendor leaks when assignedGroupRole is used.
+     * Set only for TPRM items. Null for org-internal items.
      */
     @Column(name = "vendor_id")
     private Long vendorId;
@@ -83,7 +93,6 @@ public class ActionItem extends TenantAwareEntity {
     @Column(name = "source_type", nullable = false, length = 30)
     private SourceType sourceType;
 
-    /** ID of the triggering record — e.g. comment.id, finding.id */
     @Column(name = "source_id", nullable = false)
     private Long sourceId;
 
@@ -94,6 +103,22 @@ public class ActionItem extends TenantAwareEntity {
 
     @Column(name = "entity_id", nullable = false)
     private Long entityId;
+
+    // ── NEW: Parent context ────────────────────────────────────────────────
+    /**
+     * Parent record entity type. The record that contains the entity being worked on.
+     * entityType=CONTROL, entityId=42, parentEntityType=RISK, parentEntityId=10
+     * → "Working on Control #42 within Risk #10"
+     *
+     * Used for breadcrumb navigation and parent page query invalidation.
+     * Null for top-level action items (no parent context).
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "parent_entity_type", length = 30)
+    private EntityType parentEntityType;
+
+    @Column(name = "parent_entity_id")
+    private Long parentEntityId;
 
     // ── Content ────────────────────────────────────────────────────────────
     @Column(name = "title", nullable = false)
@@ -117,20 +142,9 @@ public class ActionItem extends TenantAwareEntity {
     private LocalDateTime dueAt;
 
     // ── Resolution ─────────────────────────────────────────────────────────
-    /**
-     * Specific user who can mark RESOLVED.
-     * Takes precedence over resolutionRole when set.
-     * Used when a specific person must personally sign off (e.g. lead auditor).
-     */
     @Column(name = "resolution_reserved_for")
     private Long resolutionReservedFor;
 
-    /**
-     * Role-based resolution.
-     * Any user with this role can mark RESOLVED.
-     * e.g. 'VENDOR_RESPONDER', 'ORG_REVIEWER', 'LEAD_AUDITOR'
-     * Used when any team member of the right role can accept the fix.
-     */
     @Column(name = "resolution_role", length = 60)
     private String resolutionRole;
 
@@ -146,29 +160,64 @@ public class ActionItem extends TenantAwareEntity {
     // ── Navigation context ─────────────────────────────────────────────────
     /**
      * JSON deep-link context for frontend routing.
-     * Tells the frontend exactly where to navigate for this action item.
-     * Example:
-     * {
-     *   "route": "/vendor/assessments/23/fill",
-     *   "questionInstanceId": 1239,
-     *   "sectionInstanceId": 45,
-     *   "assessmentId": 23
-     * }
-     * The action items system is agnostic to module-specific routing.
-     * Each module populates this at creation time.
+     * Tells the assignee exactly where to navigate to do the work.
+     *
+     * For TPRM (existing, unchanged):
+     * { "route": "/vendor/assessments/23/fill",
+     *   "questionInstanceId": 1239, "sectionInstanceId": 45, "assessmentId": 23 }
+     *
+     * For new modules (Universal Module Page):
+     * { "route": "/module/risk/10",
+     *   "tab": "evidence",
+     *   "sectionKey": "control_assessment",
+     *   "itemId": 88,
+     *   "itemRefType": "CONTROL",
+     *   "itemRefId": 42 }
      */
     @Column(name = "nav_context", columnDefinition = "JSON")
     private String navContext;
 
-    // Remediation tracking fields (nullable — only set for CLARIFICATION/REMEDIATION_REQUEST items)
+    // ── NEW: Item UI rendering ─────────────────────────────────────────────
+    /**
+     * Screen config key for the item work UI.
+     * When assignee opens this action item, frontend fetches:
+     *   GET /v1/ui-config/screen/:itemScreenKey
+     * Returns fields, actions, and ItemPanel config for the item.
+     *
+     * Null = generic action item view (title, description, resolve button).
+     *
+     * Examples:
+     *   "risk_control_item"    — control evidence form
+     *   "audit_finding_item"   — finding detail with evaluate/accept
+     *   "vendor_fill_question" — question response card (TPRM)
+     */
+    @Column(name = "item_screen_key", length = 100)
+    private String itemScreenKey;
+
+    /**
+     * Inline UI override for the item work screen.
+     * Applied on top of itemScreenKey defaults.
+     * Same pattern as WorkflowStepSection.itemUiJson.
+     *
+     * { "editableFields": ["evidenceText", "complianceStatus"],
+     *   "readOnlyFields": ["controlCode"],
+     *   "showEvidence":   true,
+     *   "showComments":   true,
+     *   "showActionItems": true,
+     *   "itemPanelMode":  "responder" }
+     */
+    @Column(name = "item_ui_json", columnDefinition = "JSON")
+    private String itemUiJson;
+
+    // ── Remediation tracking ───────────────────────────────────────────────
     @Column(name = "severity", length = 20)
-    private String severity;                      // LOW | MEDIUM | HIGH | CRITICAL
+    private String severity;
 
     @Column(name = "expected_evidence", columnDefinition = "TEXT")
-    private String expectedEvidence;              // what resolves this item
+    private String expectedEvidence;
 
     @Column(name = "remediation_type", length = 30)
-    private String remediationType;               // CLARIFICATION | REMEDIATION_REQUEST
+    private String remediationType;
 
     @Column(name = "accepted_risk")
     @Builder.Default
@@ -186,13 +235,13 @@ public class ActionItem extends TenantAwareEntity {
     // ── Enums ──────────────────────────────────────────────────────────────
 
     public enum Status {
-        OPEN,           // created, assigned — in assignee's court
-        IN_PROGRESS,    // assignee has started work
+        OPEN,
+        IN_PROGRESS,
         PENDING_REVIEW,
         PENDING_VALIDATION,
-        SUBMITTED,      // assignee done — in reviewer's court ("pending review")
-        RESOLVED,       // reviewer accepted
-        DISMISSED       // dropped without resolution
+        SUBMITTED,
+        RESOLVED,
+        DISMISSED
     }
 
     public enum Priority {
@@ -200,15 +249,19 @@ public class ActionItem extends TenantAwareEntity {
     }
 
     public enum SourceType {
-        COMMENT,          // created from a REVISION_REQUEST or REMEDIATION comment
-        AUDIT_FINDING,    // created from an audit finding
-        CONTROL_GAP,      // created from a control gap assessment
-        RISK_ESCALATION,  // created from a risk management escalation
-        ISSUE,            // created from the issue management module
-        SYSTEM            // auto-created by the system
+        COMMENT,           // from REVISION_REQUEST or REMEDIATION comment
+        AUDIT_FINDING,     // from audit finding
+        CONTROL_GAP,       // from control gap assessment
+        RISK_ESCALATION,   // from risk management
+        ISSUE,             // from issue management
+        SYSTEM,            // auto-created by system (or direct actor delegation)
+        WORKFLOW_STEP,     // created directly from a compound task section item
+        POLICY_REVIEW,     // from policy review cycle
+        INCIDENT_REPORT    // from incident management
     }
 
     public enum EntityType {
+        // Existing
         QUESTION_RESPONSE,
         ASSESSMENT,
         VENDOR,
@@ -217,6 +270,14 @@ public class ActionItem extends TenantAwareEntity {
         RISK,
         AUDIT,
         FINDING,
-        ISSUE
+        ISSUE,
+        // New modules
+        POLICY,
+        POLICY_CLAUSE,
+        RISK_CONTROL,
+        AUDIT_EVIDENCE,
+        RISK_GAP,
+        EXCEPTION,
+        INCIDENT
     }
 }

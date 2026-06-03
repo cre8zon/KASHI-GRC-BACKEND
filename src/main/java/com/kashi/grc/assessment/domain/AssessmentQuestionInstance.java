@@ -39,6 +39,10 @@ public class AssessmentQuestionInstance extends BaseEntity {
     @Column(name = "assessment_id", nullable = false)
     private Long assessmentId;
 
+    // add this explicitly — no aspect interference, no hidden behavior
+    @Column(name = "tenant_id")
+    private Long tenantId;
+
     /** Groups this question under its section snapshot */
     @Column(name = "section_instance_id", nullable = false)
     private Long sectionInstanceId;

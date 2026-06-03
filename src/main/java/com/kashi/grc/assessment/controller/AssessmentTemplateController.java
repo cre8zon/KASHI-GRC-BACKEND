@@ -182,7 +182,7 @@ public class AssessmentTemplateController {
         if (!isSystem) {
             throw new BusinessException("FORBIDDEN",
                     "Only Platform Admin can unpublish templates",
-                    org.springframework.http.HttpStatus.FORBIDDEN);
+                    HttpStatus.FORBIDDEN);
         }
         log.info("[TEMPLATE] Unpublishing template | id={}", templateId);
 

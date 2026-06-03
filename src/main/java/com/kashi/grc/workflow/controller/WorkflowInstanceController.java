@@ -371,7 +371,7 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
             @PathVariable Long id,
             @PathVariable Long taskId,
-            @RequestBody(required = false) java.util.Map<String, Object> body) {
+            @RequestBody(required = false) Map<String, Object> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         boolean rollbackDownstream = body != null
                 && Boolean.TRUE.equals(body.get("rollbackDownstream"));

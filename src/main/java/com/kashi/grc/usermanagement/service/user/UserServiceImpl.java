@@ -194,7 +194,7 @@ public class UserServiceImpl implements UserService {
                 pageDetails,
                 (cb, root) -> {
                     List<jakarta.persistence.criteria.Predicate> predicates =
-                            new java.util.ArrayList<>();
+                            new ArrayList<>();
                     predicates.add(cb.isFalse(root.get("isDeleted")));
                     if (!isSystemUser) {
                         // Org/Vendor users only see their own tenant
@@ -221,7 +221,7 @@ public class UserServiceImpl implements UserService {
                             if (!noRoles) {
                                 jakarta.persistence.criteria.Subquery<Long> sub =
                                         cb.createQuery(Long.class).subquery(Long.class);
-                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.User> subRoot =
+                                jakarta.persistence.criteria.Root<User> subRoot =
                                         sub.correlate(root);
                                 jakarta.persistence.criteria.Join<Object, Object> rolesJoin = subRoot.join("roles");
                                 sub.select(subRoot.get("id"))
@@ -529,7 +529,7 @@ public class UserServiceImpl implements UserService {
     }
 
     private static final List<String> ALLOWED_PREF_KEYS =
-            java.util.Arrays.asList("ui_app_theme", "ui_sidebar_theme", "ui_sidebar_color");
+            Arrays.asList("ui_app_theme", "ui_sidebar_theme", "ui_sidebar_color");
 
     @Override
     @Transactional
@@ -554,7 +554,7 @@ public class UserServiceImpl implements UserService {
     @Transactional(readOnly = true)
     public Map<String, String> getPreferences() {
         User user = utilityService.getLoggedInDataContext();
-        Map<String, String> result = new java.util.HashMap<>();
+        Map<String, String> result = new HashMap<>();
         ALLOWED_PREF_KEYS.forEach(key ->
                 attributeRepository.findByUserIdAndAttributeKey(user.getId(), key)
                         .ifPresent(attr -> result.put(key, attr.getAttributeValue()))

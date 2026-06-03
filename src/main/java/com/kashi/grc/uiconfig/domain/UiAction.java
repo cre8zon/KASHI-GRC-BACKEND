@@ -9,6 +9,15 @@ import lombok.*;
  * The backend decides which actions are available based on
  * user permissions, role side, and entity status.
  * Add "Request More Info" to vendor detail = insert one row.
+ *
+ * FIX (2026-05-15): requiresConfirmation, requiresRemarks, isActive changed from
+ * primitive boolean → Boolean wrapper so Hibernate can load legacy rows that have
+ * NULL in those columns without throwing PropertyAccessException.
+ *
+ * Run this once to backfill existing NULLs if desired:
+ *   UPDATE ui_actions SET requires_confirmation = 0 WHERE requires_confirmation IS NULL;
+ *   UPDATE ui_actions SET requires_remarks      = 0 WHERE requires_remarks      IS NULL;
+ *   UPDATE ui_actions SET is_active             = 1 WHERE is_active             IS NULL;
  */
 @Entity
 @Table(name = "ui_actions")
@@ -67,26 +76,38 @@ public class UiAction extends BaseEntity {
     @Column(name = "allowed_statuses_json", columnDefinition = "JSON")
     private String allowedStatusesJson;
 
-    /** Show a confirmation dialog before executing? */
+    /**
+     * Show a confirmation dialog before executing?
+     * FIX: Boolean (wrapper) instead of boolean (primitive) — allows NULL in existing DB rows.
+     * Lombok generates getRequiresConfirmation() for this field.
+     */
     @Column(name = "requires_confirmation")
     @Builder.Default
-    private boolean requiresConfirmation = false;
+    private Boolean requiresConfirmation = false;
 
     @Column(name = "confirmation_message", columnDefinition = "TEXT")
     private String confirmationMessage;
 
-    /** Does this action require a remarks/comment input? */
+    /**
+     * Does this action require a remarks/comment input?
+     * FIX: Boolean (wrapper) instead of boolean (primitive) — allows NULL in existing DB rows.
+     * Lombok generates getRequiresRemarks() for this field.
+     */
     @Column(name = "requires_remarks")
     @Builder.Default
-    private boolean requiresRemarks = false;
+    private Boolean requiresRemarks = false;
 
     @Column(name = "sort_order")
     @Builder.Default
     private Integer sortOrder = 0;
 
+    /**
+     * FIX: Boolean (wrapper) instead of boolean (primitive) — allows NULL in existing DB rows.
+     * Lombok generates isActive() for fields named isXxx with Boolean type (Lombok 1.18+).
+     */
     @Column(name = "is_active")
     @Builder.Default
-    private boolean isActive = true;
+    private Boolean isActive = true;
 
     @Column(name = "tenant_id")
     private Long tenantId;

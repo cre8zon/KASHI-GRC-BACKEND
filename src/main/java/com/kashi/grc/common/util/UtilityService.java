@@ -147,7 +147,7 @@ public class UtilityService {
                     org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR);
         }
         // ── Criteria query with eager fetch for roles + permissions ───
-        jakarta.persistence.EntityManager em = getEntityManager();
+        EntityManager em = getEntityManager();
         jakarta.persistence.criteria.CriteriaBuilder cb = em.getCriteriaBuilder();
         jakarta.persistence.criteria.CriteriaQuery<User> cq = cb.createQuery(User.class);
         jakarta.persistence.criteria.Root<User> root = cq.from(User.class);
@@ -164,7 +164,21 @@ public class UtilityService {
         return user;
     }
 
-    private jakarta.persistence.EntityManager getEntityManager() {
+    /**
+     * Alias for getLoggedInDataContext() that makes the intent explicit for callers
+     * that need role and permission data (e.g. ViewContextController for 3-layer
+     * access resolution).
+     *
+     * getLoggedInDataContext() already loads roles + role.permissions via the criteria
+     * JOIN FETCH query above, so no additional DB work is needed here. This method
+     * exists purely for call-site clarity and satisfies the explicit method reference
+     * in ViewContextController.
+     */
+    public User getLoggedInUserWithRolesAndPermissions() {
+        return getLoggedInDataContext();
+    }
+
+    private EntityManager getEntityManager() {
         return entityManager;
     }
 

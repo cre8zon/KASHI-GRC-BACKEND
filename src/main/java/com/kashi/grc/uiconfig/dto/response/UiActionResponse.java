@@ -7,6 +7,7 @@ import lombok.Data;
 @Data @Builder
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class UiActionResponse {
+    private Long    id;
     private String  actionKey;
     private String  label;
     private String  icon;
@@ -14,6 +15,7 @@ public class UiActionResponse {
     private String  apiEndpoint;
     private String  httpMethod;
     private String  payloadTemplateJson;
+    private String  allowedStatusesJson;
     private boolean requiresConfirmation;
     private String  confirmationMessage;
     private boolean requiresRemarks;

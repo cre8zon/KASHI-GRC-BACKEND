@@ -28,6 +28,12 @@ public interface RoleRepository extends JpaRepository<Role, Long> {
     @Query("SELECT r FROM Role r WHERE (r.tenantId = :tenantId OR r.tenantId IS NULL) AND (:side IS NULL OR r.side = :side)")
     List<Role> findAllForTenantBySide(@Param("tenantId") Long tenantId, @Param("side") RoleSide side);
 
+    /** Count roles for a specific tenant (tenant-specific roles) */
+    long countByTenantId(Long tenantId);
+
+    /** Count global system roles (tenantId IS NULL) */
+    long countByTenantIdIsNull();
+
     /** Count users that have this role assigned */
     @Query("SELECT COUNT(u) FROM User u JOIN u.roles r WHERE r.id = :roleId")
     long countUsersWithRole(@Param("roleId") Long roleId);
