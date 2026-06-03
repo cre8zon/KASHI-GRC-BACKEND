@@ -167,7 +167,7 @@ public class TaskSectionCompletionService {
                     || section.getItemRefType().isBlank()) {
                 continue;
             }
-            eventPublisher.publishEvent(new SectionItemsNeededEvent(
+            eventPublisher.publishEvent(new com.kashi.grc.workflow.event.SectionItemsNeededEvent(
                     task.getId(),
                     si.getId(),
                     wi.getId(),

@@ -131,7 +131,7 @@ public class AuditInstanceController {
 
         ctrl.setTestResult(req.getTestResult());
         if (req.getTestNotes() != null) ctrl.setTestNotes(req.getTestNotes());
-        ctrl.setTestedAt(LocalDateTime.now());
+        ctrl.setTestedAt(java.time.LocalDateTime.now());
         ctrl.setTestedBy(ctx.getId());
         controlRepo.save(ctrl);
         // Cascade to section completion tracking
@@ -160,7 +160,7 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
         ctrl.setAuditeeEvidenceSubmitted(true);
-        ctrl.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
+        ctrl.setAuditeeEvidenceSubmittedAt(java.time.LocalDateTime.now());
         controlRepo.save(ctrl);
         return ResponseEntity.ok(ApiResponse.success());
     }

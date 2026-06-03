@@ -50,7 +50,7 @@ public class AuditTestController {
 
     private final AuditTestRepository                       testRepository;
     private final AuditControlTestMappingRepository         controlTestMappingRepository;
-    private final AuditControlRepository controlRepository;
+    private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditTestInstanceRepository               testInstanceRepository;
     private final AuditControlInstanceTestMappingRepository controlInstanceTestMappingRepository;
     private final AuditTestPolicySnapshotService            snapshotService;

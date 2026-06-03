@@ -604,8 +604,8 @@ public class StorageService {
      */
     public byte[] streamFileBytes(String s3Key) {
         try {
-            GetObjectRequest req =
-                    GetObjectRequest.builder()
+            software.amazon.awssdk.services.s3.model.GetObjectRequest req =
+                    software.amazon.awssdk.services.s3.model.GetObjectRequest.builder()
                             .bucket(bucket)
                             .key(s3Key)
                             .build();

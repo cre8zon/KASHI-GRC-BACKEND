@@ -54,5 +54,5 @@ public interface WorkflowStepSectionRepository extends JpaRepository<WorkflowSte
      * sections whose IDs are still present in the incoming request.
      * Prevents phantom sections from accumulating on blueprint edits.
      */
-    void deleteByStepIdAndIdNotIn(Long stepId, List<Long> keepIds);
+    void deleteByStepIdAndIdNotIn(Long stepId, java.util.List<Long> keepIds);
 }

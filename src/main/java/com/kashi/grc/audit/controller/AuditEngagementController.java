@@ -110,7 +110,7 @@ public class AuditEngagementController {
         Long tenantId = ctx.getTenantId();
 
         // Use MAX on ref to get a globally unique sequence — avoids collisions from count-based approach
-        int year = LocalDateTime.now().getYear();
+        int year = java.time.LocalDateTime.now().getYear();
         String prefix = "PROJ-" + year + "-";
         long seq = projectRepository.findAll().stream()
                 .map(p -> p.getProjectRef())
@@ -700,7 +700,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.PLANNING) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in PLANNING status to activate. Current: " + e.getStatus(),
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.FIELDWORK);
@@ -756,7 +756,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.FIELDWORK) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in FIELDWORK to start evidence review. Current: " + e.getStatus(),
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.EVIDENCE_REVIEW);
@@ -779,7 +779,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.EVIDENCE_REVIEW) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in EVIDENCE_REVIEW to draft report. Current: " + e.getStatus(),
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.DRAFT_REPORT);
@@ -805,7 +805,7 @@ public class AuditEngagementController {
                 || e.getStatus() == AuditEngagement.Status.CANCELLED) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement is already " + e.getStatus(),
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.CLOSED);

@@ -88,7 +88,7 @@ public class ActionItemBlueprintController {
         if (bp.getTenantId() == null && user.getTenantId() != null) {
             throw new BusinessException("FORBIDDEN",
                     "Global blueprints can only be modified by platform administrators",
-                    HttpStatus.FORBIDDEN);
+                    org.springframework.http.HttpStatus.FORBIDDEN);
         }
 
         bp.setSourceType(req.getSourceType());
@@ -114,7 +114,7 @@ public class ActionItemBlueprintController {
         if (bp.getTenantId() == null && user.getTenantId() != null) {
             throw new BusinessException("FORBIDDEN",
                     "Global blueprints can only be deleted by platform administrators",
-                    HttpStatus.FORBIDDEN);
+                    org.springframework.http.HttpStatus.FORBIDDEN);
         }
 
         blueprintRepository.delete(bp);

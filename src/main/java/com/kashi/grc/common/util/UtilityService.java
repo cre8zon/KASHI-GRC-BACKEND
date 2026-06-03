@@ -147,7 +147,7 @@ public class UtilityService {
                     org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR);
         }
         // ── Criteria query with eager fetch for roles + permissions ───
-        EntityManager em = getEntityManager();
+        jakarta.persistence.EntityManager em = getEntityManager();
         jakarta.persistence.criteria.CriteriaBuilder cb = em.getCriteriaBuilder();
         jakarta.persistence.criteria.CriteriaQuery<User> cq = cb.createQuery(User.class);
         jakarta.persistence.criteria.Root<User> root = cq.from(User.class);
@@ -178,7 +178,7 @@ public class UtilityService {
         return getLoggedInDataContext();
     }
 
-    private EntityManager getEntityManager() {
+    private jakarta.persistence.EntityManager getEntityManager() {
         return entityManager;
     }
 

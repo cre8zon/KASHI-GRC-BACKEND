@@ -356,7 +356,7 @@ public class AuditEngagementService {
                     "Control does not belong to this engagement");
 
         control.setAuditeeEvidenceSubmitted(true);
-        control.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
+        control.setAuditeeEvidenceSubmittedAt(java.time.LocalDateTime.now());
         controlInstanceRepository.save(control);
 
         // Fire section completion — advances compound section gate in workflow step

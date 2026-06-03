@@ -142,7 +142,7 @@ public class WorkflowEventListener {
     // Gap 8: handler for TaskSectionAssignedEvent — was missing, assignees got no real-time push
     @Async
     @EventListener
-    public void onSectionAssigned(TaskSectionAssignedEvent event) {
+    public void onSectionAssigned(com.kashi.grc.workflow.event.TaskSectionAssignedEvent event) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("type",              "SECTION_ASSIGNED");
         payload.put("workflowInstanceId", event.workflowInstanceId());
@@ -176,7 +176,7 @@ public class WorkflowEventListener {
 
     @Async
     @EventListener
-    public void onSectionProgress(TaskSectionProgressEvent event) {
+    public void onSectionProgress(com.kashi.grc.workflow.event.TaskSectionProgressEvent event) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("type",              "SECTION_PROGRESS");
         payload.put("workflowInstanceId", event.workflowInstanceId());
@@ -195,7 +195,7 @@ public class WorkflowEventListener {
 
     @Async
     @EventListener
-    public void onItemCompleted(TaskSectionItemCompletedEvent event) {
+    public void onItemCompleted(com.kashi.grc.workflow.event.TaskSectionItemCompletedEvent event) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("type",           "SECTION_ITEM_COMPLETED");
         payload.put("taskInstanceId", event.taskInstanceId());

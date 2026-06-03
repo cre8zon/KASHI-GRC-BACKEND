@@ -99,5 +99,5 @@ public class TaskInstance extends BaseEntity {
     private String draftData;
 
     @Column(name = "draft_saved_at")
-    private LocalDateTime draftSavedAt;
+    private java.time.LocalDateTime draftSavedAt;
 }

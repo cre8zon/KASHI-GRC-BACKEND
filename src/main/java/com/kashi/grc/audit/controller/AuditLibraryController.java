@@ -579,15 +579,15 @@ public class AuditLibraryController {
         // 1 query: all controls referenced by those mappings
         Set<Long> controlIds = allMappings.stream()
                 .map(AuditSectionControlMapping::getControlId)
-                .collect(Collectors.toSet());
+                .collect(java.util.stream.Collectors.toSet());
         Map<Long, AuditControl> controlById = controlIds.isEmpty()
                 ? Map.of()
                 : controlRepository.findAllById(controlIds).stream()
-                  .collect(Collectors.toMap(AuditControl::getId, c -> c));
+                  .collect(java.util.stream.Collectors.toMap(AuditControl::getId, c -> c));
 
         // Group mappings by sectionId for O(1) lookup during tree serialisation
         Map<Long, List<AuditSectionControlMapping>> mappingsBySectionId = allMappings.stream()
-                .collect(Collectors.groupingBy(AuditSectionControlMapping::getSectionId));
+                .collect(java.util.stream.Collectors.groupingBy(AuditSectionControlMapping::getSectionId));
 
         // Serialise tree using the pre-loaded maps — zero extra DB queries
         List<Map<String, Object>> tree = nodes.stream()
@@ -910,7 +910,7 @@ public class AuditLibraryController {
         var ctx = utilityService.getLoggedInDataContext();
 
         // Use MAX on ref to get a globally unique sequence — avoids collisions from count-based approach
-        int year = LocalDateTime.now().getYear();
+        int year = java.time.LocalDateTime.now().getYear();
         String prefix = "PROJ-" + year + "-";
         long seq = projectRepository.findAll().stream()
                 .map(p -> p.getProjectRef())
@@ -1250,7 +1250,7 @@ public class AuditLibraryController {
     @PostMapping("/library/tests-policies/import")
     @Operation(summary = "Import tests, policies, and their control mappings from extended CSV")
     public ResponseEntity<ApiResponse<CsvImportResult>> importTestsPoliciesCsv(
-            @RequestParam("file") MultipartFile file) {
+            @RequestParam("file") org.springframework.web.multipart.MultipartFile file) {
         var ctx = utilityService.getLoggedInDataContext();
         CsvImportResult result = csvImportExtension.importTestsPoliciesAndMappings(
                 file, ctx.getTenantId(), ctx.getId());

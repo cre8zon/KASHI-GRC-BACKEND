@@ -88,7 +88,7 @@ public class VendorTemplateSelectionController {
     public void saveSelection(VendorTemplateSelection sel, Long templateId, Long userId) {
         sel.setSelectedTemplateId(templateId);
         sel.setSelectedByUserId(userId);
-        sel.setSelectedAt(LocalDateTime.now());
+        sel.setSelectedAt(java.time.LocalDateTime.now());
         selectionRepository.save(sel);
     }
 
@@ -207,7 +207,7 @@ public class VendorTemplateSelectionController {
         // AWAITING_ASSIGNMENT on creation and transitions to IN_PROGRESS after
         // assignTasksForStep runs. For role-based steps with no roles the transition
         // may not happen, so we check both to be safe.
-        List<StepInstance> activeSteps = new ArrayList<>();
+        List<StepInstance> activeSteps = new java.util.ArrayList<>();
         activeSteps.addAll(stepInstanceRepository.findByWorkflowInstanceIdAndStatus(instanceId, StepStatus.IN_PROGRESS));
         activeSteps.addAll(stepInstanceRepository.findByWorkflowInstanceIdAndStatus(instanceId, StepStatus.AWAITING_ASSIGNMENT));
         activeSteps.stream()

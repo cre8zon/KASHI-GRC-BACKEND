@@ -243,7 +243,7 @@ public class ActionItemService {
                         .and(ActionItemSpecification.resolvableBy(userId, userRoles))
                         .and(ActionItemSpecification.withStatus(ActionItem.Status.PENDING_REVIEW));
 
-        Map<Long, ActionItem> combined = new LinkedHashMap<>();
+        java.util.Map<Long, ActionItem> combined = new java.util.LinkedHashMap<>();
         actionItemRepository.findAll(assigneeSpec).forEach(a -> combined.put(a.getId(), a));
         actionItemRepository.findAll(reviewerSpec).forEach(a -> combined.putIfAbsent(a.getId(), a));
 
@@ -274,7 +274,7 @@ public class ActionItemService {
         long asAssignee = actionItemRepository.countOpenForUser(userId, tenantId);
         long asReviewer = actionItemRepository.findAll(
                 ActionItemSpecification.forTenant(tenantId)
-                        .and(ActionItemSpecification.resolvableBy(userId, List.of()))
+                        .and(ActionItemSpecification.resolvableBy(userId, java.util.List.of()))
                         .and(ActionItemSpecification.withStatus(ActionItem.Status.PENDING_REVIEW))
         ).size();
         return asAssignee + asReviewer;

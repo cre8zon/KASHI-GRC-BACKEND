@@ -167,7 +167,7 @@ public class CsvImportService {
         // Caching by (optionValue + "|" + score) reduces those to 0 DB hits after
         // the first occurrence, cutting per-question time from ~1.2s to ~0.2s.
         // The cache is local to this method call — never shared between requests.
-        final Map<String, AssessmentQuestionOption> optionCache = new HashMap<>();
+        final java.util.Map<String, AssessmentQuestionOption> optionCache = new java.util.HashMap<>();
 
         for (int i = 0; i < rows.size(); i++) {
             String[] row    = rows.get(i);
@@ -510,7 +510,7 @@ public class CsvImportService {
         // In-memory option cache — same optimisation as template import.
         // Eliminates repeated SELECT calls for the same (optionValue, score) pair
         // across questions in this library import run.
-        final Map<String, AssessmentQuestionOption> optionCache = new HashMap<>();
+        final java.util.Map<String, AssessmentQuestionOption> optionCache = new java.util.HashMap<>();
 
         for (int i = 0; i < rows.size(); i++) {
             String[] row    = rows.get(i);
@@ -755,7 +755,7 @@ public class CsvImportService {
         Map<String, Long> roleMap = new HashMap<>();
         roleRepository.findAllForTenant(tenantId).stream()
                 // Global roles (tenantId=null) first, org-specific last → org IDs win on name clash
-                .sorted(Comparator.comparing(r -> r.getTenantId() == null ? 0L : r.getTenantId()))
+                .sorted(java.util.Comparator.comparing(r -> r.getTenantId() == null ? 0L : r.getTenantId()))
                 .forEach(r -> roleMap.put(r.getName().toLowerCase().replace(" ", "_"), r.getId()));
         log.info("[CSV-WF] Loaded {} roles for name resolution | tenantId={}", roleMap.size(), tenantId);
 

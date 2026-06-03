@@ -41,7 +41,7 @@ public class UiConfigServiceImpl implements UiConfigService {
         // getLoggedInDataContext() returns the User entity directly.
         // Called once here — all sub-methods (getNavigation, getDashboardWidgets, etc.)
         // reuse the same cached result via UtilityService.REQUEST_USER_CACHE.
-        User currentUser =
+        com.kashi.grc.usermanagement.domain.User currentUser =
                 utilityService.getLoggedInDataContext();
         Long tenantId = currentUser.getTenantId();
 

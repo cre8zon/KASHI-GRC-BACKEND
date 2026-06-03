@@ -34,7 +34,7 @@ public class AuditPolicyController {
 
     private final AuditPolicyRepository                       policyRepository;
     private final AuditPolicyControlMappingRepository         policyControlMappingRepository;
-    private final AuditControlRepository controlRepository;
+    private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditPolicyInstanceRepository               policyInstanceRepository;
     private final AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
     private final UtilityService                              utilityService;
@@ -202,7 +202,7 @@ public class AuditPolicyController {
         if (policy.getStatus() != AuditPolicy.PolicyStatus.DRAFT) {
             throw new BusinessException("INVALID_STATUS",
                     "Only DRAFT policies can be sent for review",
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         policy.setStatus(AuditPolicy.PolicyStatus.UNDER_REVIEW);
