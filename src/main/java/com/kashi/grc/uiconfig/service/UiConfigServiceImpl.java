@@ -329,6 +329,8 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .layoutKey(l.getLayoutKey()).title(l.getTitle())
                 .columnsJson(l.getColumnsJson()).filtersJson(l.getFiltersJson())
                 .selectable(l.isSelectable()).reorderable(l.isReorderable())
+                .layoutMode(l.getLayoutMode() != null ? l.getLayoutMode() : "FULL_PAGE")
+                .tabsJson(l.getTabsJson())
                 .build();
     }
 
@@ -342,18 +344,29 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .validationRulesJson(f.getValidationRulesJson())
                 .dependsOnJson(f.getDependsOnJson())
                 .gridCols(f.getGridCols()).stepNumber(f.getStepNumber())
+                // Extended field-type metadata — all nullable, ignored when null by @JsonInclude
+                .lookupEntityType(f.getLookupEntityType())
+                .lookupApiPath(f.getLookupApiPath())
+                .rowsCount(f.getRowsCount())
+                .minValue(f.getMinValue())
+                .maxValue(f.getMaxValue())
+                .stepValue(f.getStepValue())
+                .currencyCode(f.getCurrencyCode())
+                .tagSuggestions(f.getTagSuggestions())
                 .build();
     }
 
     private UiActionResponse toActionResponse(UiAction a) {
         return UiActionResponse.builder()
+                .id(a.getId())
                 .actionKey(a.getActionKey()).label(a.getLabel())
                 .icon(a.getIcon()).variant(a.getVariant())
                 .apiEndpoint(a.getApiEndpoint()).httpMethod(a.getHttpMethod())
                 .payloadTemplateJson(a.getPayloadTemplateJson())
-                .requiresConfirmation(a.isRequiresConfirmation())
+                .allowedStatusesJson(a.getAllowedStatusesJson())
+                .requiresConfirmation(a.getRequiresConfirmation())
                 .confirmationMessage(a.getConfirmationMessage())
-                .requiresRemarks(a.isRequiresRemarks()).sortOrder(a.getSortOrder())
+                .requiresRemarks(a.getRequiresRemarks()).sortOrder(a.getSortOrder())
                 .build();
     }
 

@@ -13,4 +13,6 @@ public class LayoutResponse {
     private String filtersJson;
     private boolean selectable;
     private boolean reorderable;
+    private String layoutMode;  // FULL_PAGE | DRAWER | SIDE_PANEL
+    private String tabsJson;    // JSON array of tab definitions for DETAIL screens
 }

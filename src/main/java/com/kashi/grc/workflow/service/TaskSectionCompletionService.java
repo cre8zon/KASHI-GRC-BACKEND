@@ -1,8 +1,11 @@
 package com.kashi.grc.workflow.service;
 
+import com.kashi.grc.actionitem.domain.ActionItem;
+import com.kashi.grc.actionitem.repository.ActionItemRepository;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.notification.service.NotificationService;
+import com.kashi.grc.usermanagement.repository.UserRepository;
 import com.kashi.grc.workflow.domain.*;
 import com.kashi.grc.workflow.dto.request.TaskActionRequest;
 import com.kashi.grc.workflow.dto.response.TaskSectionProgressResponse;
@@ -27,16 +30,23 @@ import java.util.stream.Collectors;
 /**
  * Compound task engine — full blueprint isolation (Option A).
  *
- * workflow_step_sections is read exactly ONCE per task, in snapshotSectionsForTask(),
- * called by WorkflowEngineService.assignTasksForStep(). Every section field is
- * copied into TaskSectionCompletion.snap_* rows at that moment.
- * After snapshot, ALL runtime logic reads exclusively from task_section_completions.
+ * workflow_step_sections is read exactly ONCE per task in snapshotSectionsForTask().
+ * Every section field is copied into TaskSectionCompletion.snap_* at that moment.
+ * After snapshot, ALL runtime logic reads from task_section_completions only.
  * Blueprint edits have zero effect on running instances.
  *
- * ── CIRCULAR DEPENDENCY RESOLUTION ───────────────────────────────
+ * ── CHANGES vs original ───────────────────────────────────────────────────────
+ *
+ * snapshotSectionsForTask(): now copies 5 new UI fields:
+ *   snapSectionScreenKey, snapItemScreenKey, snapItemRefType,
+ *   snapSectionUiJson, snapItemUiJson
+ *
+ * getProgress(): now returns 5 new UI fields + populated items list
+ *   (SectionItemResponse per tracked item including hasOpenActionItem flag).
+ *
+ * ── CIRCULAR DEPENDENCY RESOLUTION ───────────────────────────────────────────
  * WorkflowEngineService injects TaskSectionCompletionService (eager)
  * TaskSectionCompletionService injects WorkflowEngineService (@Lazy proxy)
- * Spring resolves the proxy on first method call — after both beans are fully initialised.
  */
 @Slf4j
 @Service
@@ -54,6 +64,9 @@ public class TaskSectionCompletionService {
     private final NotificationService                 notificationService;
     private final ApplicationEventPublisher           eventPublisher;
     private final WorkflowEngineService               workflowEngineService;
+    // NEW dependencies for enriched getProgress()
+    private final ActionItemRepository                actionItemRepository;
+    private final UserRepository                      userRepository;
 
     @Autowired
     public TaskSectionCompletionService(
@@ -68,7 +81,9 @@ public class TaskSectionCompletionService {
             WorkflowInstanceRepository          workflowInstanceRepository,
             NotificationService                 notificationService,
             ApplicationEventPublisher           eventPublisher,
-            @Lazy WorkflowEngineService         workflowEngineService) {
+            @Lazy WorkflowEngineService         workflowEngineService,
+            ActionItemRepository                actionItemRepository,
+            UserRepository                      userRepository) {
         this.stepSectionRepository    = stepSectionRepository;
         this.completionRepository     = completionRepository;
         this.assignmentRepository     = assignmentRepository;
@@ -81,13 +96,22 @@ public class TaskSectionCompletionService {
         this.notificationService      = notificationService;
         this.eventPublisher           = eventPublisher;
         this.workflowEngineService    = workflowEngineService;
+        this.actionItemRepository     = actionItemRepository;
+        this.userRepository           = userRepository;
     }
 
     // ════════════════════════════════════════════════════════════════
-    // SNAPSHOT — called by WorkflowEngineService.assignTasksForStep()
-    // Only place workflow_step_sections is ever read at runtime.
+    // SNAPSHOT — only place workflow_step_sections is ever read at runtime
     // ════════════════════════════════════════════════════════════════
 
+    /**
+     * Copies all section blueprint fields into TaskSectionCompletion snap_* columns.
+     * Called by WorkflowEngineService.assignTasksForStep() when a step becomes active.
+     * After this method returns, workflow_step_sections is never read for this task again.
+     *
+     * NEW: also copies sectionScreenKey, itemScreenKey, itemRefType,
+     *      sectionUiJson, itemUiJson for frontend UI rendering.
+     */
     @Transactional
     public void snapshotSectionsForTask(TaskInstance task, StepInstance si, WorkflowInstance wi) {
         List<WorkflowStepSection> blueprint =
@@ -109,6 +133,7 @@ public class TaskSectionCompletionService {
                     .taskInstanceId(task.getId())
                     .stepInstanceId(si.getId())
                     .workflowInstanceId(wi.getId())
+                    // ── Existing snap fields ───────────────────────────────
                     .snapSectionKey(section.getSectionKey())
                     .snapSectionOrder(section.getSectionOrder())
                     .snapLabel(section.getLabel())
@@ -117,6 +142,13 @@ public class TaskSectionCompletionService {
                     .snapCompletionEvent(section.getCompletionEvent())
                     .snapRequiresAssignment(section.isRequiresAssignment())
                     .snapTracksItems(section.isTracksItems())
+                    // ── NEW: UI rendering snap fields ──────────────────────
+                    .snapSectionScreenKey(section.getSectionScreenKey())
+                    .snapItemScreenKey(section.getItemScreenKey())
+                    .snapItemRefType(section.getItemRefType())
+                    .snapSectionUiJson(section.getSectionUiJson())
+                    .snapItemUiJson(section.getItemUiJson())
+                    // ── Runtime state ──────────────────────────────────────
                     .completed(false)
                     .build());
             snapshotted++;
@@ -124,11 +156,36 @@ public class TaskSectionCompletionService {
 
         log.info("[SNAPSHOT] {} section(s) snapshotted | taskId={} | step='{}'",
                 snapshotted, task.getId(), si.getSnapName());
+
+        // ── Notify item registrars for sections that need item population ─────
+        // ONLY fires when blueprint section has tracksItems=true AND itemRefType set.
+        // Existing TPRM blueprints have NO sections → blueprint.isEmpty() returns
+        // early above → this loop never runs → zero events fired → zero behavior change.
+        for (WorkflowStepSection section : blueprint) {
+            if (!section.isTracksItems()
+                    || section.getItemRefType() == null
+                    || section.getItemRefType().isBlank()) {
+                continue;
+            }
+            eventPublisher.publishEvent(new com.kashi.grc.workflow.event.SectionItemsNeededEvent(
+                    task.getId(),
+                    si.getId(),
+                    wi.getId(),
+                    wi.getTenantId(),
+                    section.getSectionKey(),
+                    section.getItemRefType(),
+                    section.getSectionScreenKey(),
+                    section.getItemScreenKey(),
+                    section.getSectionUiJson(),
+                    task.getAssignedUserId()   // scope item registration to this task's assignee
+            ));
+            log.debug("[SNAPSHOT] SectionItemsNeededEvent fired | sectionKey={} | itemRefType={} | taskId={}",
+                    section.getSectionKey(), section.getItemRefType(), task.getId());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════
     // CASE 1: TaskSectionEvent listener
-    // Matches event against snap_completion_event — no blueprint read.
     // ════════════════════════════════════════════════════════════════
 
     @EventListener
@@ -149,7 +206,6 @@ public class TaskSectionCompletionService {
             return;
         }
 
-        // Runtime-only lookup — snap_completion_event, no blueprint join
         TaskSectionCompletion matched = completionRepository
                 .findByTaskInstanceIdAndSnapCompletionEvent(task.getId(), event.completionEvent())
                 .orElse(null);
@@ -208,7 +264,6 @@ public class TaskSectionCompletionService {
         WorkflowInstance wi = workflowInstanceRepository.findById(si.getWorkflowInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));
 
-        // Resolve from snapshot — no blueprint read
         TaskSectionCompletion sectionSnap = completionRepository
                 .findByTaskInstanceIdAndSnapSectionKey(taskInstanceId, sectionKey)
                 .orElseThrow(() -> new BusinessException("SECTION_NOT_FOUND",
@@ -232,15 +287,6 @@ public class TaskSectionCompletionService {
                     si, userId, TaskRole.ACTOR, wi.getTenantId(),
                     sectionSnap.getSnapLabel() + " — assigned by coordinator");
             subTaskIds.add(subTask.getId());
-
-            // Gap 7: do NOT snapshot sections onto sub-tasks.
-            // Sub-tasks are scoped work items for one section on the parent task.
-            // Their completion is tracked via TaskSectionAssignment rows, not via
-            // a section gate on the sub-task itself. Snapshotting all sections here
-            // would force sub-tasks to complete ALL sections before approving —
-            // which is wrong; they only do the one section they were assigned.
-            // When all sub-tasks for a section complete, onSubTaskCompleted()
-            // fires TaskSectionEvent on the PARENT task (not the sub-task).
 
             TaskSectionAssignment assignment = TaskSectionAssignment.builder()
                     .taskInstanceId(taskInstanceId)
@@ -293,7 +339,6 @@ public class TaskSectionCompletionService {
                 subTaskInstanceId, assignment.getSectionKey(), incompleteSubTasks);
 
         if (incompleteSubTasks == 0) {
-            // Read completion_event from snapshot — no blueprint join
             TaskSectionCompletion sectionSnap = completionRepository
                     .findByTaskInstanceIdAndSnapSectionKey(
                             assignment.getTaskInstanceId(), assignment.getSectionKey())
@@ -410,8 +455,7 @@ public class TaskSectionCompletionService {
         long done  = itemCompletionRepository.countByTaskInstanceIdAndSectionKey(taskInstanceId, sectionKey);
         long total = itemRepository.countByTaskInstanceIdAndSectionKey(taskInstanceId, sectionKey);
 
-        log.info("[CASE3] Item {} done | section={} | progress={}/{}",
-                itemId, sectionKey, done, total);
+        log.info("[CASE3] Item {} done | section={} | progress={}/{}", itemId, sectionKey, done, total);
 
         resolveWiAndSi(taskInstanceId).ifPresent(ctx ->
                 eventPublisher.publishEvent(new TaskSectionItemCompletedEvent(
@@ -423,17 +467,6 @@ public class TaskSectionCompletionService {
     // CASE 3: auto-complete item-tracked section
     // ════════════════════════════════════════════════════════════════
 
-    /**
-     * Called by WorkflowEventListener.onItemCompleted() when itemsCompleted >= itemsTotal.
-     *
-     * Looks up the snapshotted section for this (task, sectionKey) pair,
-     * reads its snapCompletionEvent, and publishes a TaskSectionEvent so the
-     * normal section-gate pipeline marks the section done and re-checks if all
-     * required sections on the task are complete.
-     *
-     * This is the Case 3 auto-gate: individual item completions eventually bubble
-     * up to a section completion without any extra button click from the user.
-     */
     @Transactional
     public void autoCompleteItemTrackedSection(Long taskInstanceId, String sectionKey, Long completedBy) {
         TaskInstance task = taskInstanceRepository.findById(taskInstanceId).orElse(null);
@@ -443,7 +476,6 @@ public class TaskSectionCompletionService {
             return;
         }
 
-        // Find the snapshotted section for this key on this task
         completionRepository
                 .findByTaskInstanceIdAndSnapSectionKey(taskInstanceId, sectionKey)
                 .ifPresentOrElse(snap -> {
@@ -470,12 +502,9 @@ public class TaskSectionCompletionService {
         TaskInstance task = taskInstanceRepository.findById(taskInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskInstanceId));
         if (task.getStatus() != TaskStatus.PENDING && task.getStatus() != TaskStatus.IN_PROGRESS) {
-            throw new BusinessException("TASK_NOT_EDITABLE",
-                    "Task is in terminal state: " + task.getStatus());
+            throw new BusinessException("TASK_NOT_EDITABLE", "Task is in terminal state: " + task.getStatus());
         }
-        if (task.getStatus() == TaskStatus.PENDING) {
-            task.setStatus(TaskStatus.IN_PROGRESS);
-        }
+        if (task.getStatus() == TaskStatus.PENDING) task.setStatus(TaskStatus.IN_PROGRESS);
         task.setDraftData(draftJson);
         task.setDraftSavedAt(LocalDateTime.now());
         taskInstanceRepository.save(task);
@@ -490,6 +519,7 @@ public class TaskSectionCompletionService {
 
     // ════════════════════════════════════════════════════════════════
     // PROGRESS QUERY — reads snap_* only, no blueprint join
+    // NOW: returns UI fields + populated items list
     // ════════════════════════════════════════════════════════════════
 
     public List<TaskSectionProgressResponse> getProgress(Long taskInstanceId) {
@@ -499,6 +529,7 @@ public class TaskSectionCompletionService {
         if (snapshots.isEmpty()) return List.of();
 
         return snapshots.stream().map(snap -> {
+            // ── Case 2 & 3 progress counting (unchanged) ─────────────
             long itemsTotal = 0, itemsDone = 0;
             if (snap.isSnapTracksItems()) {
                 itemsTotal = itemRepository.countByTaskInstanceIdAndSectionKey(
@@ -516,7 +547,42 @@ public class TaskSectionCompletionService {
                         .filter(a -> "COMPLETED".equals(a.getStatus())).count();
             }
 
+            // ── NEW: populate item list when tracksItems = true ──────
+            List<TaskSectionProgressResponse.SectionItemResponse> itemResponses = List.of();
+            if (snap.isSnapTracksItems()) {
+                List<TaskSectionItem> items = itemRepository
+                        .findByTaskInstanceIdAndSectionKey(taskInstanceId, snap.getSnapSectionKey());
+
+                itemResponses = items.stream().map(item -> {
+                    // Check for open action items on this specific item (for badge)
+                    boolean hasOpenAi = actionItemRepository.existsOpenForEntity(
+                            snap.getSnapItemRefType(),
+                            item.getItemRefId());
+
+                    // Resolve assignee name if set
+                    String assigneeName = null;
+                    if (item.getAssignedToUserId() != null) {
+                        assigneeName = userRepository.findById(item.getAssignedToUserId())
+                                .map(u -> u.getFirstName() + " " + u.getLastName())
+                                .orElse(null);
+                    }
+
+                    return TaskSectionProgressResponse.SectionItemResponse.builder()
+                            .id(item.getId())
+                            .itemRefType(snap.getSnapItemRefType())
+                            .itemRefId(item.getItemRefId())
+                            .itemLabel(item.getItemLabel())
+                            .status(item.getStatus())
+                            .assignedToUserId(item.getAssignedToUserId())
+                            .assignedToUserName(assigneeName)
+                            .hasOpenActionItem(hasOpenAi)
+                            .build();
+                }).toList();
+            }
+
+            // ── Build full response ───────────────────────────────────
             return TaskSectionProgressResponse.builder()
+                    // Existing fields (unchanged)
                     .sectionKey(snap.getSnapSectionKey())
                     .sectionOrder(snap.getSnapSectionOrder())
                     .label(snap.getSnapLabel())
@@ -534,20 +600,25 @@ public class TaskSectionCompletionService {
                     .itemsCompleted((int) itemsDone)
                     .assigneesTotal((int) assigneesTotal)
                     .assigneesCompleted((int) assigneesDone)
+                    // NEW fields
+                    .sectionScreenKey(snap.getSnapSectionScreenKey())
+                    .itemScreenKey(snap.getSnapItemScreenKey())
+                    .itemRefType(snap.getSnapItemRefType())
+                    .sectionUiJson(snap.getSnapSectionUiJson())
+                    .itemUiJson(snap.getSnapItemUiJson())
+                    .items(itemResponses)
                     .build();
         }).toList();
     }
 
     // ════════════════════════════════════════════════════════════════
-    // GATE CHECK — called by WorkflowEngineService before APPROVE
+    // GATE CHECK
     // ════════════════════════════════════════════════════════════════
 
-    /** Returns true if this task has snapshotted sections. No blueprint access. */
     public boolean hasSections(Long taskInstanceId) {
         return completionRepository.existsByTaskInstanceId(taskInstanceId);
     }
 
-    /** Throws if any required section is incomplete. All reads from snap_* columns. */
     public void validateReadyForApproval(Long taskInstanceId) {
         List<TaskSectionCompletion> incomplete =
                 completionRepository.findIncompleteRequired(taskInstanceId);
@@ -565,41 +636,20 @@ public class TaskSectionCompletionService {
     // PRIVATE HELPERS
     // ════════════════════════════════════════════════════════════════
 
-    /**
-     * Directly marks ALL snapshotted sections complete for a task, then checks
-     * the gate and auto-approves if all required sections are done.
-     *
-     * More robust than firing named events (which can miss if completionEvent values
-     * in the snapshot don't match — e.g. workflow started before blueprint updated).
-     *
-     * Called by markSectionComplete endpoint (step 4 responder submit).
-     */
     @Transactional
     public void markAllSectionsCompleteForTask(Long taskId, Long performedBy) {
         TaskInstance task = taskInstanceRepository.findById(taskId).orElse(null);
-        if (task == null) {
-            log.warn("[SECTION] markAllSections: task {} not found", taskId);
-            return;
-        }
+        if (task == null) { log.warn("[SECTION] markAllSections: task {} not found", taskId); return; }
         if (task.getStatus() != TaskStatus.PENDING && task.getStatus() != TaskStatus.IN_PROGRESS) {
-            log.debug("[SECTION] markAllSections: task {} already terminal ({})", taskId, task.getStatus());
-            return;
+            log.debug("[SECTION] markAllSections: task {} already terminal ({})", taskId, task.getStatus()); return;
         }
 
         List<TaskSectionCompletion> sections =
                 completionRepository.findByTaskInstanceIdOrderBySnapSectionOrderAsc(taskId);
-
-        if (sections.isEmpty()) {
-            log.warn("[SECTION] markAllSections: no snapshotted sections for task {}", taskId);
-            return;
-        }
+        if (sections.isEmpty()) { log.warn("[SECTION] markAllSections: no snapshotted sections for task {}", taskId); return; }
 
         LocalDateTime now = LocalDateTime.now();
-        // Transition task to IN_PROGRESS if still PENDING before processing sections
-        if (task.getStatus() == TaskStatus.PENDING) {
-            task.setStatus(TaskStatus.IN_PROGRESS);
-            taskInstanceRepository.save(task);
-        }
+        if (task.getStatus() == TaskStatus.PENDING) { task.setStatus(TaskStatus.IN_PROGRESS); taskInstanceRepository.save(task); }
 
         for (TaskSectionCompletion sec : sections) {
             if (!sec.isCompleted()) {
@@ -608,22 +658,15 @@ public class TaskSectionCompletionService {
                 sec.setCompletedBy(performedBy);
                 sec.setArtifactType("VENDOR_ASSESSMENT");
                 completionRepository.save(sec);
-                log.info("[SECTION] Marked complete | taskId={} | section='{}'",
-                        taskId, sec.getSnapSectionKey());
+                log.info("[SECTION] Marked complete | taskId={} | section='{}'", taskId, sec.getSnapSectionKey());
             }
         }
 
         boolean allDone = isAllRequiredComplete(taskId);
         log.info("[SECTION] Gate check after markAll | taskId={} | allDone={}", taskId, allDone);
 
-        // Push progress event so the compound task widget updates in real-time
-        if (!sections.isEmpty()) {
-            pushProgressEvent(task, sections.get(sections.size() - 1), allDone);
-        }
-
-        if (allDone) {
-            autoApproveTask(task, performedBy);
-        }
+        if (!sections.isEmpty()) pushProgressEvent(task, sections.get(sections.size() - 1), allDone);
+        if (allDone) autoApproveTask(task, performedBy);
     }
 
     private boolean isAllRequiredComplete(Long taskInstanceId) {
@@ -641,7 +684,6 @@ public class TaskSectionCompletionService {
             req.setRemarks("All required sections completed — auto-approved");
             workflowEngineService.performAction(req, performedBy);
         } catch (BusinessException ex) {
-            // getErrorCode() — correct method name on your BusinessException
             if ("TASK_TERMINAL".equals(ex.getErrorCode())) {
                 log.debug("[SECTION] Task {} already approved — idempotent", task.getId());
             } else {

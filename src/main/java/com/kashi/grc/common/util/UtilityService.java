@@ -164,6 +164,20 @@ public class UtilityService {
         return user;
     }
 
+    /**
+     * Alias for getLoggedInDataContext() that makes the intent explicit for callers
+     * that need role and permission data (e.g. ViewContextController for 3-layer
+     * access resolution).
+     *
+     * getLoggedInDataContext() already loads roles + role.permissions via the criteria
+     * JOIN FETCH query above, so no additional DB work is needed here. This method
+     * exists purely for call-site clarity and satisfies the explicit method reference
+     * in ViewContextController.
+     */
+    public User getLoggedInUserWithRolesAndPermissions() {
+        return getLoggedInDataContext();
+    }
+
     private jakarta.persistence.EntityManager getEntityManager() {
         return entityManager;
     }

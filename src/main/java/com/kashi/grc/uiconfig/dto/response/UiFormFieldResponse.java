@@ -20,4 +20,21 @@ public class UiFormFieldResponse {
     private String  dependsOnJson;
     private Integer gridCols;
     private Integer stepNumber;
+    // ── Extended field-type metadata ──────────────────────────────────────────
+    /** LOOKUP: which entity to search (USER, ROLE, AUDIT_TEMPLATE, WORKFLOW…) */
+    private String  lookupEntityType;
+    /** LOOKUP: override API path if not derivable from lookupEntityType */
+    private String  lookupApiPath;
+    /** TEXTAREA / JSON_EDITOR: visible row count */
+    private Integer rowsCount;
+    /** SLIDER / NUMBER: minimum value */
+    private Double  minValue;
+    /** SLIDER / RATING: maximum value */
+    private Double  maxValue;
+    /** SLIDER: step increment */
+    private Double  stepValue;
+    /** CURRENCY: ISO code e.g. USD, INR */
+    private String  currencyCode;
+    /** TAG: comma-separated autocomplete suggestions */
+    private String  tagSuggestions;
 }

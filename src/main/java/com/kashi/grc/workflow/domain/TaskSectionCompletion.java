@@ -4,7 +4,6 @@ import com.kashi.grc.common.domain.BaseEntity;
 import jakarta.persistence.*;
 import lombok.*;
 
-import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 // ================================================================
@@ -18,7 +17,17 @@ import java.time.LocalDateTime;
 //   - workflow_step_sections is NEVER queried again for this task
 //   - Blueprint edits have zero effect on this running task
 //
-// This is identical in design to StepInstance.snap_* for WorkflowStep.
+// NEW snap fields: snapSectionScreenKey, snapItemScreenKey, snapItemRefType,
+//                  snapSectionUiJson, snapItemUiJson
+//
+// MIGRATION (run once):
+//   ALTER TABLE task_section_completions
+//     ADD COLUMN snap_section_screen_key VARCHAR(100) NULL,
+//     ADD COLUMN snap_item_screen_key    VARCHAR(100) NULL,
+//     ADD COLUMN snap_item_ref_type      VARCHAR(100) NULL,
+//     ADD COLUMN snap_section_ui_json    JSON         NULL,
+//     ADD COLUMN snap_item_ui_json       JSON         NULL,
+//     ADD COLUMN remarks                 TEXT         NULL;
 // ================================================================
 @Entity
 @Table(name = "task_section_completions",
@@ -73,6 +82,23 @@ public class TaskSectionCompletion extends BaseEntity {
     @Builder.Default
     private boolean snapTracksItems = false;
 
+    // ── NEW snapshot UI fields ────────────────────────────────────
+
+    @Column(name = "snap_section_screen_key", length = 100)
+    private String snapSectionScreenKey;
+
+    @Column(name = "snap_item_screen_key", length = 100)
+    private String snapItemScreenKey;
+
+    @Column(name = "snap_item_ref_type", length = 100)
+    private String snapItemRefType;
+
+    @Column(name = "snap_section_ui_json", columnDefinition = "JSON")
+    private String snapSectionUiJson;
+
+    @Column(name = "snap_item_ui_json", columnDefinition = "JSON")
+    private String snapItemUiJson;
+
     // ── Runtime state ─────────────────────────────────────────────
     // Mutated by TaskSectionCompletionService when events arrive.
 
@@ -92,8 +118,11 @@ public class TaskSectionCompletion extends BaseEntity {
     @Column(name = "artifact_id")
     private Long artifactId;
 
+    /**
+     * Optional notes recorded when a section is completed.
+     * Set by markAllSectionsCompleteForTask and onSectionEvent — passed through
+     * from TaskSectionEvent.remarks() and VendorAssessmentFillPage submission.
+     */
     @Column(name = "remarks", columnDefinition = "TEXT")
     private String remarks;
 }
-
-

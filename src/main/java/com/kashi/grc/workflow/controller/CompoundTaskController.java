@@ -50,6 +50,33 @@ public class CompoundTaskController {
         return ApiResponse.success(sectionService.getDraft(taskInstanceId));
     }
 
+    // ── Case 1: explicit section submit ───────────────────────────
+
+    /**
+     * POST /v1/compound-tasks/{taskInstanceId}/sections/{sectionKey}/complete
+     *
+     * Explicitly marks a section as done — used by the "Submit section" button
+     * in CompoundSectionRenderer when the section type does not use event-driven
+     * auto-completion (e.g. a compound section backed by a DynamicForm where
+     * the submit action triggers this endpoint directly).
+     *
+     * Delegates to autoCompleteItemTrackedSection which:
+     *   1. Looks up the snapshotted section by sectionKey
+     *   2. Reads its snapCompletionEvent
+     *   3. Fires TaskSectionEvent so the normal section-gate pipeline runs
+     *   4. If all required sections complete → auto-approves the task
+     *
+     * Idempotent — repeated calls on an already-completed section are no-ops.
+     */
+    @PostMapping("/{taskInstanceId}/sections/{sectionKey}/complete")
+    public ApiResponse<Void> completeSection(
+            @PathVariable Long taskInstanceId,
+            @PathVariable String sectionKey) {
+        Long userId = securityHelper.userId();
+        sectionService.autoCompleteItemTrackedSection(taskInstanceId, sectionKey, userId);
+        return ApiResponse.success(null);
+    }
+
     // ── Case 2: section-level assignment ──────────────────────────
 
     @PostMapping("/{taskInstanceId}/sections/{sectionKey}/assign")

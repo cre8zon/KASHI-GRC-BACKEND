@@ -9,6 +9,7 @@ import com.kashi.grc.workflow.domain.*;
 import com.kashi.grc.workflow.dto.request.*;
 import com.kashi.grc.workflow.dto.response.*;
 import com.kashi.grc.workflow.enums.*;
+import com.kashi.grc.workflow.spi.WorkflowActorResolverRegistry;
 import com.kashi.grc.workflow.enums.ApprovalType;
 import com.kashi.grc.workflow.spi.WorkflowEntityResolverRegistry;
 import com.kashi.grc.workflow.repository.WorkflowStepObserverRoleRepository;
@@ -103,6 +104,7 @@ public class WorkflowEngineService {
     private final WorkflowStepAssignerRoleRepository  stepAssignerRoleRepository; // assigner roles
     private final WorkflowStepObserverRoleRepository  stepObserverRoleRepository; // observer roles
     private final WorkflowEntityResolverRegistry       entityResolverRegistry;     // artifact resolution
+    private final WorkflowActorResolverRegistry        actorResolverRegistry;      // assignment-scoped actor resolution
     private final WorkflowStepUserRepository          stepUserRepository;
     private final WorkflowInstanceRepository      instanceRepository;
     private final StepInstanceRepository          stepInstanceRepository;
@@ -1512,6 +1514,11 @@ public class WorkflowEngineService {
                 step.setAssignerResolution(AssignerResolution.INITIATOR);
             }
             // else: existing step, resolution not changed — keep whatever was there
+            if (req.getActorResolution() != null) {
+                step.setActorResolution(req.getActorResolution());
+            } else if (step.getActorResolution() == null) {
+                step.setActorResolution(ActorResolution.ROLE_BASED);
+            }
 
             if (req.getAllowOverride() != null) {
                 step.setAllowOverride(req.getAllowOverride());
@@ -1598,6 +1605,10 @@ public class WorkflowEngineService {
                     .assignerResolution(req.getAssignerResolution() != null
                             ? req.getAssignerResolution()
                             : AssignerResolution.POOL)
+                    .actorResolution(req.getActorResolution() != null
+                            ? req.getActorResolution()
+                            : ActorResolution.ROLE_BASED)
+                    .autoApproveAssignerOnFill(Boolean.TRUE.equals(req.getAutoApproveAssignerOnFill()))
                     .allowOverride(req.getAllowOverride() != null ? req.getAllowOverride() : true)
                     .stepAction(req.getStepAction())
                     .navKey(req.getNavKey())
@@ -1687,6 +1698,8 @@ public class WorkflowEngineService {
                 .snapSlaHours(step.getSlaHours())
                 .snapAutomatedAction(step.getAutomatedAction())
                 .snapAssignerResolution(step.getAssignerResolution())
+                .snapActorResolution(step.getActorResolution())
+                .snapAutoApproveAssignerOnFill(step.isAutoApproveAssignerOnFill())
                 .snapAllowOverride(step.isAllowOverride())
                 .snapStepAction(step.getStepAction())
                 .snapNavKey(step.getNavKey())
@@ -1921,34 +1934,58 @@ public class WorkflowEngineService {
                     si.getSnapName());
         }
 
-        // ── ACTOR tasks: fan out to every user holding an actorRole ──────────
-        // actorRoleName is stored on each task so the frontend can dispatch to the
-        // correct sub-view (VRM/CISO/Responder) without hardcoding role names or step numbers.
+        // ── ACTOR tasks: fan out based on actorResolution ────────────────────
+        // ROLE_BASED (default): all role holders get a task (POOL behaviour).
+        // ASSIGNMENT_SCOPED:    WorkflowActorResolverRegistry returns only the
+        //                       users who were explicitly assigned work in a prior
+        //                       step. Falls back to ROLE_BASED if resolver returns
+        //                       empty (nobody assigned yet — step must not stall).
         List<WorkflowStepRole> actorRoles = stepRoleRepository.findByStepId(step.getId());
         int actorTaskCount = 0;
-        if (!actorRoles.isEmpty()) {
-            for (WorkflowStepRole ar : actorRoles) {
-                String roleName = roleRepository.findById(ar.getRoleId())
-                        .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
-                // CRITICAL: vendor-side steps must resolve actors ONLY from the specific vendor
-                // this workflow belongs to (instance.entityId = vendorId).
-                // Using tenant-wide lookup fans tasks out to ALL vendors' VRMs/CISOs/Responders —
-                // a serious data isolation violation. Org-side steps remain tenant-wide.
-                List<Long> uids = "VENDOR".equalsIgnoreCase(si.getSnapSide())
-                        ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
-                        : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
-                for (Long uid : uids) {
-                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, roleName);
+
+        ActorResolution actorResolution = si.getSnapActorResolution() != null
+                ? si.getSnapActorResolution() : ActorResolution.ROLE_BASED;
+
+        if (actorResolution == ActorResolution.ASSIGNMENT_SCOPED) {
+            // Ask the domain resolver for the specifically-assigned users
+            List<Long> assignedUserIds = actorResolverRegistry.resolve(instance, si);
+            if (!assignedUserIds.isEmpty()) {
+                for (Long uid : assignedUserIds) {
+                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     actorTaskCount++;
                 }
+                log.info("[WORKFLOW] Step '{}' ASSIGNMENT_SCOPED — {} ACTOR task(s) from resolver",
+                        si.getSnapName(), actorTaskCount);
+            } else {
+                log.warn("[WORKFLOW] Step '{}' ASSIGNMENT_SCOPED — resolver returned 0 users. " +
+                        "Falling back to ROLE_BASED so step is not stuck.", si.getSnapName());
+                actorResolution = ActorResolution.ROLE_BASED; // fall through to ROLE_BASED below
             }
-            log.info("[WORKFLOW] Step '{}' — {} ACTOR task(s) for {} actorRole(s)",
-                    si.getSnapName(), actorTaskCount, actorRoles.size());
-        } else {
-            log.warn("[WORKFLOW] Step '{}' has no actorRoles — no ACTOR tasks created. " +
-                            "Step will never reach approval. Add actorRoles in the blueprint.",
-                    si.getSnapName());
+        }
+
+        if (actorResolution == ActorResolution.ROLE_BASED) {
+            if (!actorRoles.isEmpty()) {
+                for (WorkflowStepRole ar : actorRoles) {
+                    String roleName = roleRepository.findById(ar.getRoleId())
+                            .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
+                    // CRITICAL: vendor-side steps must resolve actors ONLY from the specific vendor.
+                    List<Long> uids = "VENDOR".equalsIgnoreCase(si.getSnapSide())
+                            ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
+                            : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
+                    for (Long uid : uids) {
+                        TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, roleName);
+                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                        actorTaskCount++;
+                    }
+                }
+                log.info("[WORKFLOW] Step '{}' ROLE_BASED — {} ACTOR task(s) for {} actorRole(s)",
+                        si.getSnapName(), actorTaskCount, actorRoles.size());
+            } else {
+                log.warn("[WORKFLOW] Step '{}' has no actorRoles — no ACTOR tasks created. " +
+                                "Step will never reach approval. Add actorRoles in the blueprint.",
+                        si.getSnapName());
+            }
         }
 
         // ── FALLBACK: zero actor tasks resolved from roles ────────────────────
@@ -2363,6 +2400,7 @@ public class WorkflowEngineService {
                                 .assignerRoleIds(assignerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
                                 .observerRoleIds(observerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
                                 .assignerResolution(s.getAssignerResolution())
+                                .actorResolution(s.getActorResolution())
                                 .allowOverride(s.isAllowOverride())
                                 .stepAction(s.getStepAction())
                                 .navKey(s.getNavKey())

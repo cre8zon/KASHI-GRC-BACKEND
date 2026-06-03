@@ -12,5 +12,5 @@ public class WorkflowCreateRequest {
     @NotBlank public String entityType;
     public String description;
     /** Steps are required at creation time — no orphan blueprints */
-    @NotEmpty @Valid public List<WorkflowStepRequest> steps;
+    @Valid public List<WorkflowStepRequest> steps;
 }

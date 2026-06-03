@@ -223,41 +223,59 @@ public class VendorItemActionController {
         // Stamp OVERRIDDEN status
 <span class="nc" id="L224">        responseRepository.updateResponderStatus(assessmentId, questionInstanceId, &quot;OVERRIDDEN&quot;);</span>
 
+        // Close any open REVISION_REQUEST action items for this question — override is a resolution.
+        // Same behaviour as accept: the responder has resolved the contribution question.
+<span class="nc" id="L228">        actionItemRepository.findAll(</span>
+<span class="nc" id="L229">                        ActionItemSpecification.forTenant(tenantId)</span>
+<span class="nc" id="L230">                                .and(ActionItemSpecification.forEntity(</span>
+                                        ActionItem.EntityType.QUESTION_RESPONSE, questionInstanceId))
+<span class="nc" id="L232">                                .and(ActionItemSpecification.open())</span>
+<span class="nc" id="L233">                ).stream()</span>
+<span class="nc bnc" id="L234" title="All 2 branches missed.">                .filter(ai -&gt; &quot;REVISION_REQUEST&quot;.equals(ai.getRemediationType())</span>
+<span class="nc bnc" id="L235" title="All 4 branches missed.">                        || (ai.getRemediationType() == null &amp;&amp; ai.getSourceType() == ActionItem.SourceType.COMMENT))</span>
+<span class="nc" id="L236">                .forEach(ai -&gt; {</span>
+<span class="nc" id="L237">                    ai.setStatus(ActionItem.Status.RESOLVED);</span>
+<span class="nc" id="L238">                    ai.setResolvedAt(LocalDateTime.now());</span>
+<span class="nc" id="L239">                    ai.setResolvedBy(userId);</span>
+<span class="nc" id="L240">                    ai.setResolutionNote(&quot;Answer overridden by &quot; + resolveUserName(userId));</span>
+<span class="nc" id="L241">                    actionItemRepository.save(ai);</span>
+<span class="nc" id="L242">                });</span>
+
         // Log override event
-<span class="nc" id="L227">        String auditMsg = &quot;Answer overridden by &quot; + resolveUserName(userId)</span>
-<span class="nc bnc" id="L228" title="All 2 branches missed.">                + (overrideReason.isBlank() ? &quot;&quot; : &quot; — reason: &quot; + overrideReason);</span>
-<span class="nc" id="L229">        commentService.addSystemComment(</span>
+<span class="nc" id="L245">        String auditMsg = &quot;Answer overridden by &quot; + resolveUserName(userId)</span>
+<span class="nc bnc" id="L246" title="All 2 branches missed.">                + (overrideReason.isBlank() ? &quot;&quot; : &quot; — reason: &quot; + overrideReason);</span>
+<span class="nc" id="L247">        commentService.addSystemComment(</span>
                 EntityComment.EntityType.QUESTION_RESPONSE,
                 questionInstanceId, tenantId, auditMsg);
 
         // Notify contributor
-<span class="nc bnc" id="L234" title="All 4 branches missed.">        if (qi.getAssignedUserId() != null &amp;&amp; !qi.getAssignedUserId().equals(userId))</span>
-<span class="nc" id="L235">            notificationService.send(qi.getAssignedUserId(), &quot;ANSWER_OVERRIDDEN&quot;,</span>
-<span class="nc" id="L236">                    resolveUserName(userId) + &quot; overrode your answer for a question&quot;,</span>
+<span class="nc bnc" id="L252" title="All 4 branches missed.">        if (qi.getAssignedUserId() != null &amp;&amp; !qi.getAssignedUserId().equals(userId))</span>
+<span class="nc" id="L253">            notificationService.send(qi.getAssignedUserId(), &quot;ANSWER_OVERRIDDEN&quot;,</span>
+<span class="nc" id="L254">                    resolveUserName(userId) + &quot; overrode your answer for a question&quot;,</span>
                     &quot;QUESTION_RESPONSE&quot;, questionInstanceId);
 
-<span class="nc" id="L239">        log.info(&quot;[OVERRIDE] qi={} | by={} | assessmentId={}&quot;, questionInstanceId, userId, assessmentId);</span>
-<span class="nc" id="L240">        return ResponseEntity.ok(ApiResponse.success(Map.of(</span>
+<span class="nc" id="L257">        log.info(&quot;[OVERRIDE] qi={} | by={} | assessmentId={}&quot;, questionInstanceId, userId, assessmentId);</span>
+<span class="nc" id="L258">        return ResponseEntity.ok(ApiResponse.success(Map.of(</span>
                 &quot;questionInstanceId&quot;, questionInstanceId,
                 &quot;responderStatus&quot;,    &quot;OVERRIDDEN&quot;,
-<span class="nc" id="L243">                &quot;overriddenByName&quot;,   resolveUserName(userId))));</span>
+<span class="nc" id="L261">                &quot;overriddenByName&quot;,   resolveUserName(userId))));</span>
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private String resolveUserName(Long userId) {
-<span class="nc bnc" id="L249" title="All 2 branches missed.">        if (userId == null) return &quot;Unknown&quot;;</span>
-<span class="nc" id="L250">        return userRepository.findById(userId).map(u -&gt; {</span>
-<span class="nc bnc" id="L251" title="All 2 branches missed.">            String fn = u.getFirstName() != null ? u.getFirstName() : &quot;&quot;;</span>
-<span class="nc bnc" id="L252" title="All 2 branches missed.">            String ln = u.getLastName()  != null ? u.getLastName()  : &quot;&quot;;</span>
-<span class="nc" id="L253">            String full = (fn + &quot; &quot; + ln).trim();</span>
-<span class="nc bnc" id="L254" title="All 2 branches missed.">            return full.isEmpty() ? u.getEmail() : full;</span>
-<span class="nc" id="L255">        }).orElse(&quot;Unknown&quot;);</span>
+<span class="nc bnc" id="L267" title="All 2 branches missed.">        if (userId == null) return &quot;Unknown&quot;;</span>
+<span class="nc" id="L268">        return userRepository.findById(userId).map(u -&gt; {</span>
+<span class="nc bnc" id="L269" title="All 2 branches missed.">            String fn = u.getFirstName() != null ? u.getFirstName() : &quot;&quot;;</span>
+<span class="nc bnc" id="L270" title="All 2 branches missed.">            String ln = u.getLastName()  != null ? u.getLastName()  : &quot;&quot;;</span>
+<span class="nc" id="L271">            String full = (fn + &quot; &quot; + ln).trim();</span>
+<span class="nc bnc" id="L272" title="All 2 branches missed.">            return full.isEmpty() ? u.getEmail() : full;</span>
+<span class="nc" id="L273">        }).orElse(&quot;Unknown&quot;);</span>
     }
 
     private String truncate(String s, int max) {
-<span class="nc bnc" id="L259" title="All 2 branches missed.">        if (s == null) return &quot;&quot;;</span>
-<span class="nc bnc" id="L260" title="All 2 branches missed.">        return s.length() &lt;= max ? s : s.substring(0, max) + &quot;…&quot;;</span>
+<span class="nc bnc" id="L277" title="All 2 branches missed.">        if (s == null) return &quot;&quot;;</span>
+<span class="nc bnc" id="L278" title="All 2 branches missed.">        return s.length() &lt;= max ? s : s.substring(0, max) + &quot;…&quot;;</span>
     }
 }
 </pre><div class="footer"><span class="right">Created with <a href="http://www.jacoco.org/jacoco">JaCoCo</a> 0.8.12.202403310830</span></div></body></html>

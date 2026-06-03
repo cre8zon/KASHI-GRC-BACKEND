@@ -2,6 +2,7 @@ package com.kashi.grc.workflow.domain;
 
 import com.kashi.grc.common.domain.BaseEntity;
 import com.kashi.grc.workflow.enums.ApprovalType;
+import com.kashi.grc.workflow.enums.ActorResolution;
 import com.kashi.grc.workflow.enums.AssignerResolution;
 import com.kashi.grc.workflow.enums.StepAction;
 import com.kashi.grc.workflow.enums.StepStatus;
@@ -96,6 +97,9 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_assigner_resolution", length = 50)
     private AssignerResolution snapAssignerResolution;
 
+    @Column(name = "snap_actor_resolution", length = 50)
+    private ActorResolution snapActorResolution;
+
     @Column(name = "snap_allow_override")
     private Boolean snapAllowOverride;
 
@@ -120,4 +124,34 @@ public class StepInstance extends BaseEntity {
      */
     @Column(name = "snap_assigner_nav_key", length = 100)
     private String snapAssignerNavKey;
+
+    // ── NEW FIELD ─────────────────────────────────────────────────────────────
+
+    /**
+     * Snapshot of WorkflowStep.stepUiOverrideJson — UI restrictions for actors on this step.
+     * Copied at step instance creation; never mutated after that (blueprint isolation).
+     *
+     * JSON format (all keys optional — null means no restriction on that dimension):
+     * {
+     *   "visibleTabs":    ["overview", "evidence"],
+     *   "hiddenTabs":     ["audit_trail"],
+     *   "editableFields": ["mitigationPlan", "residualRisk"],
+     *   "readOnlyFields": ["inherentRisk", "riskOwner"],
+     *   "hiddenFields":   ["internalNotes"],
+     *   "availableActions": ["APPROVE", "REJECT", "SEND_BACK"]
+     * }
+     *
+     * Consumed by WorkflowAccessService.resolve() to populate AccessContext.
+     * Step override can only RESTRICT what the role allows — never expand it.
+     */
+    @Column(name = "snap_auto_approve_assigner_on_fill")
+    private Boolean snapAutoApproveAssignerOnFill;
+
+    @Column(name = "snap_ui_override_json", columnDefinition = "JSON")
+    private String snapUiOverrideJson;
+
+    // ── Migration SQL ─────────────────────────────────────────────────────────
+    // ALTER TABLE step_instances
+    //   ADD COLUMN snap_ui_override_json JSON NULL
+    //   COMMENT 'Snapshot of workflow_steps.step_ui_override_json at instance creation';
 }

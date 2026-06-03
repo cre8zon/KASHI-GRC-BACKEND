@@ -4,11 +4,19 @@ import com.kashi.grc.common.domain.BaseEntity;
 import jakarta.persistence.*;
 import lombok.*;
 
-import java.math.BigDecimal;
-import java.time.LocalDateTime;
-
 // ================================================================
 // TaskSectionItem.java  (Case 3)
+//
+// Each row represents one tracked item within a compound task section.
+// e.g. one CONTROL, one FINDING, one QUESTION_RESPONSE.
+//
+// NEW: assignedToUserId — the user currently assigned to work on this item.
+// Set by TaskSectionCompletionService.assignItems().
+// Displayed in SectionItemResponse.assignedToUserId for item card rendering.
+//
+// MIGRATION (run once):
+//   ALTER TABLE task_section_items
+//     ADD COLUMN assigned_to_user_id BIGINT NULL;
 // ================================================================
 @Entity
 @Table(name = "task_section_items",
@@ -46,4 +54,13 @@ public class TaskSectionItem extends BaseEntity {
     @Column(name = "status", nullable = false, length = 50)
     @Builder.Default
     private String status = "PENDING";
+
+    /**
+     * User currently assigned to work on this specific item.
+     * Null = unassigned (visible to the section ACTOR but not delegated yet).
+     * Set by TaskSectionCompletionService.assignItems() when the ACTOR delegates.
+     * Displayed in TaskSectionProgressResponse.SectionItemResponse for item cards.
+     */
+    @Column(name = "assigned_to_user_id")
+    private Long assignedToUserId;
 }

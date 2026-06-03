@@ -8,6 +8,7 @@ import org.springframework.stereotype.Repository;
 
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 
 @Repository
 public interface AssessmentQuestionInstanceRepository
@@ -30,27 +31,13 @@ public interface AssessmentQuestionInstanceRepository
 
     /**
      * Bulk fetch all questions across multiple section instances in one query.
-     *
-     * Replaces the per-section findBySectionInstanceIdOrderByOrderNo pattern
-     * in getMySections() and other bulk-assembly endpoints where each section's
-     * questions were loaded one section at a time (N queries for N sections).
-     *
-     * Used in getMySections() to pre-load all questions before the mapping loop
-     * so name lookups, response lookups, and option lookups can be done in bulk.
+     * Replaces N per-section queries in getMySections() and bulk-assembly endpoints.
      */
     List<AssessmentQuestionInstance> findBySectionInstanceIdInOrderByOrderNo(
             Collection<Long> sectionInstanceIds);
 
     /**
-     * SUM weight directly at the DB — replaces the load-all-questions-to-sum-weight
-     * pattern in AssessmentController.listAssessments():
-     *
-     *   questionInstanceRepository.findByAssessmentIdOrderByOrderNo(a.getId())
-     *           .stream().mapToDouble(q -> q.getWeight() != null ? q.getWeight() : 1.0).sum()
-     *
-     * That pattern loaded every question instance row into Java heap just to sum one column.
-     * This query does it in a single SQL SUM with a CASE for null weights.
-     * Returns 0.0 when the assessment has no question instances.
+     * SUM weight directly at DB — replaces load-all-questions-to-sum pattern.
      */
     @Query("""
         SELECT COALESCE(SUM(CASE WHEN q.weight IS NOT NULL THEN q.weight ELSE 1.0 END), 0.0)
@@ -58,4 +45,29 @@ public interface AssessmentQuestionInstanceRepository
         WHERE q.assessmentId = :assessmentId
         """)
     Double sumWeightByAssessmentId(@Param("assessmentId") Long assessmentId);
+
+    // ── Evidence reuse engine — tag snapshot matching ─────────────────────────
+
+    /**
+     * Find all question instances across all assessments for a tenant
+     * that carry a specific questionTagSnapshot.
+     *
+     * Called by EvidenceReuseEngine.propagate() to auto-link uploaded evidence
+     * to all questions with the matching tag, regardless of which assessment they belong to.
+     *
+     * Returns id and assignedUserId so the engine can notify the responsible actor.
+     *
+     * NOTE: If AssessmentQuestionInstance uses a different field name for the assigned user
+     * (e.g. contributorUserId, responderUserId), update the field name in the query below.
+     */
+    @Query("""
+        SELECT new map(q.id as id, q.assignedUserId as assignedUserId)
+        FROM AssessmentQuestionInstance q
+        WHERE q.tenantId = :tenantId
+          AND q.questionTagSnapshot = :tag
+    """)
+    List<Map<String, Object>> findByTenantIdAndQuestionTagSnapshot(
+            @Param("tenantId") Long tenantId,
+            @Param("tag") String tag
+    );
 }
