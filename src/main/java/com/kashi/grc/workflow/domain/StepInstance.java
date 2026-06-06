@@ -147,6 +147,10 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_auto_approve_assigner_on_fill")
     private Boolean snapAutoApproveAssignerOnFill;
 
+    /** Snapshotted from WorkflowStep.autoCompleteActorOnSubmit at step instance creation. */
+    @Column(name = "snap_auto_complete_actor_on_submit")
+    private Boolean snapAutoCompleteActorOnSubmit;
+
     @Column(name = "snap_ui_override_json", columnDefinition = "JSON")
     private String snapUiOverrideJson;
 

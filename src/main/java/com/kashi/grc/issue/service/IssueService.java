@@ -54,13 +54,15 @@ import java.util.*;
 @RequiredArgsConstructor
 public class IssueService {
 
-    private final IssueRepository          issueRepository;
-    private final WorkflowEngineService    workflowEngineService;
-    private final WorkflowRepository       workflowRepository;
-    private final WorkflowInstanceRepository instanceRepository;
-    private final NotificationService      notificationService;
-    private final EmailSenderService       emailSenderService;
-    private final UserRepository           userRepository;
+    private final IssueRepository                                    issueRepository;
+    private final WorkflowEngineService                              workflowEngineService;
+    private final WorkflowRepository                                 workflowRepository;
+    private final WorkflowInstanceRepository                         instanceRepository;
+    private final com.kashi.grc.workflow.repository.StepInstanceRepository  stepInstanceRepository;
+    private final com.kashi.grc.workflow.repository.TaskInstanceRepository  taskInstanceRepository;
+    private final NotificationService                                notificationService;
+    private final EmailSenderService                                 emailSenderService;
+    private final UserRepository                                     userRepository;
     private final ObjectMapper             objectMapper;
 
     /**
@@ -261,13 +263,25 @@ public class IssueService {
         if (req.getCategory()            != null) issue.setCategory(req.getCategory());
         if (req.getOwnerId()             != null) issue.setOwnerId(req.getOwnerId());
         if (req.getDueAt()               != null) issue.setDueAt(req.getDueAt());
-        if (req.getRcaJson()             != null) issue.setRcaJson(req.getRcaJson());
-        if (req.getRootCauseCategory()   != null) issue.setRootCauseCategory(req.getRootCauseCategory());
-        if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
-        if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
         if (req.getFrameworkRef()        != null) issue.setFrameworkRef(req.getFrameworkRef());
         if (req.getLinkedControlIds()    != null) issue.setLinkedControlIds(listToJson(req.getLinkedControlIds()));
         if (req.getLinkedRiskIds()       != null) issue.setLinkedRiskIds(listToJson(req.getLinkedRiskIds()));
+
+        // ── RCA flat fields ──────────────────────────────────────────────────
+        if (req.getRcaMethod()           != null) issue.setRcaMethod(req.getRcaMethod());
+        if (req.getRootCauseCategory()   != null) issue.setRootCauseCategory(req.getRootCauseCategory());
+        if (req.getImmediateCause()      != null) issue.setImmediateCause(req.getImmediateCause());
+        if (req.getRootCause()           != null) issue.setRootCause(req.getRootCause());
+        if (req.getContributingFactors() != null) issue.setContributingFactors(req.getContributingFactors());
+        if (req.getIsSystemic()          != null) issue.setSystemic(req.getIsSystemic());
+        if (req.getRcaJson()             != null) issue.setRcaJson(req.getRcaJson()); // legacy
+
+        // ── Remediation fields ───────────────────────────────────────────────
+        if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
+        if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
+        if (req.getAcceptedRisk()        != null) issue.setAcceptedRisk(req.getAcceptedRisk());
+        if (req.getAcceptedRiskNote()    != null) issue.setAcceptedRiskNote(req.getAcceptedRiskNote());
+        if (req.getClosureSummary()      != null) issue.setClosureSummary(req.getClosureSummary());
 
         issueRepository.save(issue);
         return toResponse(issue, tenantId);
@@ -294,6 +308,68 @@ public class IssueService {
 
         issueRepository.save(issue);
         log.info("[ISSUE] Status updated | id={} | status={} | by={}", id, newStatus, userId);
+        return toResponse(issue, tenantId);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // REOPEN — starts a fresh workflow cycle
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Reopens a CLOSED or ACCEPTED_RISK issue and starts a new workflow cycle.
+     *
+     * Behaviour:
+     *   1. Sets issue status back to OPEN.
+     *   2. Clears closedAt / closedBy so SLA timer restarts cleanly.
+     *   3. If the previous workflow instance is COMPLETED, starts a brand-new
+     *      workflow instance on the same workflowId and attaches it.
+     *      The old completed instance is preserved in history (Show History tab).
+     *   4. If the previous workflow is still IN_PROGRESS (edge case: manual status
+     *      change without completing workflow), leaves it as-is — no new instance.
+     *
+     * This matches Vanta / AuditBoard behaviour: each remediation attempt gets
+     * its own workflow instance with a full audit trail.
+     */
+    @Transactional
+    public IssueResponse reopen(Long id, Long userId, Long tenantId) {
+        Issue issue = issueRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
+        if (!issue.getTenantId().equals(tenantId))
+            throw new ForbiddenException("Issue does not belong to this tenant");
+
+        // Reset to OPEN
+        issue.setStatus(Issue.Status.OPEN);
+        issue.setClosedAt(null);
+        issue.setClosedBy(null);
+        issueRepository.save(issue);
+        log.info("[ISSUE] Reopened | id={} | ref={} | by={}", id, issue.getIssueRef(), userId);
+
+        // Start a new workflow cycle if the previous one is COMPLETED
+        if (issue.getWorkflowInstanceId() != null) {
+            instanceRepository.findById(issue.getWorkflowInstanceId()).ifPresent(prev -> {
+                if (com.kashi.grc.workflow.enums.WorkflowStatus.COMPLETED
+                        .name().equals(prev.getStatus() != null ? prev.getStatus().name() : "")) {
+                    log.info("[ISSUE] Previous workflow COMPLETED — starting new cycle | issueId={} | prevInstanceId={}",
+                            id, prev.getId());
+                    // Re-use the same workflowId from the completed instance
+                    startWorkflowIfConfigured(issue, prev.getWorkflowId(), userId, tenantId);
+                    // Auto-approve step 1 on behalf of the reopener.
+                    // Step 1 is ENTITY_CREATOR + autoCompleteActorOnSubmit — on creation the
+                    // form submit triggers approval automatically. On reopen there is no form
+                    // submit, so we approve the step 1 ACTOR task programmatically here.
+                    // The reopener IS the new triage actor — clicking Reopen = intent to retriage.
+                    autoApproveStep1ForReopen(issue, userId, tenantId);
+                } else {
+                    log.info("[ISSUE] Previous workflow still {} — no new instance started | issueId={}",
+                            prev.getStatus(), id);
+                }
+            });
+        } else {
+            // No previous workflow — start fresh (e.g. manually created issue)
+            startWorkflowIfConfigured(issue, null, userId, tenantId);
+            autoApproveStep1ForReopen(issue, userId, tenantId);
+        }
+
         return toResponse(issue, tenantId);
     }
 
@@ -400,6 +476,57 @@ public class IssueService {
     // ─────────────────────────────────────────────────────────────────────────
     // Private helpers
     // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * After reopen creates a new workflow cycle, auto-approve the step 1 ACTOR task
+     * for the reopener. This mirrors what happens at creation time when the frontend
+     * calls task APPROVE after form submit (autoCompleteActorOnSubmit).
+     *
+     * Step 1 is "Raise & Triage Issue" (ENTITY_CREATOR). On creation, the form submit
+     * triggers auto-approval. On reopen there is no form — clicking Reopen IS the triage
+     * intent, so we approve immediately on their behalf.
+     */
+    private void autoApproveStep1ForReopen(Issue issue, Long userId, Long tenantId) {
+        if (issue.getWorkflowInstanceId() == null) return;
+        try {
+            Thread.sleep(300); // let new instance fully persist
+        } catch (InterruptedException ignored) {}
+        try {
+            // Find step 1 step instance for the new workflow instance
+            stepInstanceRepository
+                    .findByWorkflowInstanceId(issue.getWorkflowInstanceId())
+                    .stream()
+                    .filter(si -> si.getSnapStepOrder() != null && si.getSnapStepOrder() == 1)
+                    .findFirst()
+                    .ifPresent(si -> {
+                        // Find PENDING ACTOR task assigned to this user
+                        taskInstanceRepository.findByStepInstanceId(si.getId())
+                                .stream()
+                                .filter(t -> com.kashi.grc.workflow.enums.TaskStatus.PENDING
+                                        .equals(t.getStatus())
+                                        && userId.equals(t.getAssignedUserId()))
+                                .findFirst()
+                                .ifPresent(task -> {
+                                    try {
+                                        com.kashi.grc.workflow.dto.request.TaskActionRequest req =
+                                                new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+                                        req.setTaskInstanceId(task.getId());
+                                        req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+                                        req.setRemarks("Auto-approved on reopen — triage intent confirmed");
+                                        workflowEngineService.performAction(req, userId);
+                                        log.info("[ISSUE] Step 1 auto-approved on reopen | issueId={} | taskId={} | userId={}",
+                                                issue.getId(), task.getId(), userId);
+                                    } catch (Exception e) {
+                                        log.warn("[ISSUE] Step 1 auto-approve failed | issueId={} | error={}",
+                                                issue.getId(), e.getMessage());
+                                    }
+                                });
+                    });
+        } catch (Exception e) {
+            log.warn("[ISSUE] autoApproveStep1ForReopen error | issueId={} | error={}",
+                    issue.getId(), e.getMessage());
+        }
+    }
 
     private void startWorkflowIfConfigured(Issue issue, Long overrideWorkflowId,
                                            Long initiatedBy, Long tenantId) {
@@ -543,12 +670,18 @@ public class IssueService {
                 .acknowledgedAt(i.getAcknowledgedAt())
                 .remediatedAt(i.getRemediatedAt())
                 .closedAt(i.getClosedAt())
-                .rcaJson(i.getRcaJson())
+                .rcaMethod(i.getRcaMethod())
                 .rootCauseCategory(i.getRootCauseCategory())
+                .immediateCause(i.getImmediateCause())
+                .rootCause(i.getRootCause())
+                .contributingFactors(i.getContributingFactors())
+                .isSystemic(i.isSystemic())
+                .rcaJson(i.getRcaJson())
                 .remediationPlan(i.getRemediationPlan())
                 .remediationType(i.getRemediationType())
                 .acceptedRisk(i.isAcceptedRisk())
                 .acceptedRiskNote(i.getAcceptedRiskNote())
+                .closureSummary(i.getClosureSummary())
                 .linkedControlIds(i.getLinkedControlIds())
                 .linkedRiskIds(i.getLinkedRiskIds())
                 .frameworkRef(i.getFrameworkRef())

@@ -21,4 +21,13 @@ public class UiLayoutRequest {
      * Null means "use frontend defaults" — sent as null when only other fields are being updated.
      */
     public String tabsJson;
+
+    /**
+     * Configuration scope — controls which tenants see this layout:
+     *   GLOBAL   → null tenantId, all tenants inherit (default for platform admin)
+     *   PLATFORM → tenantId=1, only platform admin sees it
+     *   TENANT   → targetTenantId, only that specific tenant sees it
+     */
+    public String scope;          // "GLOBAL" | "PLATFORM" | "TENANT"
+    public Long   targetTenantId; // required when scope=TENANT
 }

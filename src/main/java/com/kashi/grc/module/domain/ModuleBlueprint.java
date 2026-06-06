@@ -120,19 +120,19 @@ public class ModuleBlueprint extends GlobalOrTenantEntity {
 
     @Column(name = "supports_action_items", nullable = false)
     @Builder.Default
-    private boolean supportsActionItems = true;
+    private boolean supportsActionItems = false;  // opt-in: enable in Blueprint Settings
 
     @Column(name = "supports_documents", nullable = false)
     @Builder.Default
-    private boolean supportsDocuments = true;
+    private boolean supportsDocuments = false;  // opt-in: enable in Blueprint Settings
 
     @Column(name = "supports_comments", nullable = false)
     @Builder.Default
-    private boolean supportsComments = true;
+    private boolean supportsComments = false;  // opt-in: enable in Blueprint Settings
 
     @Column(name = "supports_workflow", nullable = false)
     @Builder.Default
-    private boolean supportsWorkflow = true;
+    private boolean supportsWorkflow = false;  // opt-in: enable in Blueprint Settings
 
     @Column(name = "show_in_nav", nullable = false)
     @Builder.Default

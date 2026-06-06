@@ -150,4 +150,24 @@ public class WorkflowStep extends BaseEntity {
     @Column(name = "auto_approve_assigner_on_fill", nullable = false)
     @Builder.Default
     private boolean autoApproveAssignerOnFill = false;
+
+    /**
+     * When true: as soon as an ACTOR submits a FILL step form (i.e. their task
+     * is approved), the engine immediately auto-approves ALL remaining PENDING
+     * tasks on this step and completes it — no inbox action needed.
+     *
+     * Use this for any FILL step where form submission IS the approval:
+     *   - Issue creation / triage (step 1 of Issue Remediation Lifecycle)
+     *   - Policy draft submission
+     *   - Evidence upload confirmation
+     *   - Any form where "submit" means "done"
+     *
+     * Works with ANY_ONE approval_type: first actor to submit triggers completion.
+     * Works with ALL approval_type: every actor must submit, last one triggers completion.
+     *
+     * Set via workflow_steps.auto_complete_actor_on_submit = 1 in DB.
+     */
+    @Column(name = "auto_complete_actor_on_submit", nullable = false)
+    @Builder.Default
+    private boolean autoCompleteActorOnSubmit = false;
 }

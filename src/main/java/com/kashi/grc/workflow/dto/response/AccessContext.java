@@ -134,6 +134,14 @@ public class AccessContext {
     /** Explicitly hidden tabs. Applied on top of visibleTabs. */
     private List<String> hiddenTabs;
 
+    /**
+     * When true: the frontend should auto-approve the actor's workflow task
+     * immediately after a successful form PUT — no separate inbox action needed.
+     * Set from StepInstance.snapAutoCompleteActorOnSubmit.
+     * Only meaningful when canEdit=true and the user has an active ACTOR task.
+     */
+    private boolean autoCompleteActorOnSubmit;
+
     // ── New: action buttons ───────────────────────────────────────────────────
 
     /**

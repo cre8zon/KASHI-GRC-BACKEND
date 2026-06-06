@@ -1,6 +1,7 @@
 package com.kashi.grc.usermanagement.repository;
 
 import com.kashi.grc.usermanagement.domain.PermissionGrant;
+import com.kashi.grc.usermanagement.domain.Permission;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
@@ -44,11 +45,17 @@ public interface PermissionGrantRepository extends JpaRepository<PermissionGrant
      * Uses the denormalized permission_code column on PermissionGrant for a single-table
      * query — avoids a JOIN with the permissions table on the hot path.
      */
+    /**
+     * Returns (permissionCode, granted) for all role grants.
+     * Uses denormalized permissionCode when available, falls back to JOIN
+     * with permissions table for older rows where permissionCode was not populated.
+     */
     @Query("""
-        SELECT g.permissionCode, g.granted
+        SELECT COALESCE(g.permissionCode, p.code), g.granted
         FROM PermissionGrant g
+        LEFT JOIN Permission p ON p.id = g.permissionId
         WHERE g.roleId IN :roleIds
-          AND g.permissionCode IS NOT NULL
+          AND (g.permissionCode IS NOT NULL OR p.code IS NOT NULL)
         """)
     List<Object[]> findGrantsForUserRoles(@Param("roleIds") List<Long> roleIds);
 

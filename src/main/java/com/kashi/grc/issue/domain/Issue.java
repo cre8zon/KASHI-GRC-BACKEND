@@ -183,16 +183,43 @@ public class Issue extends TenantAwareEntity {
     // ── Root cause analysis ────────────────────────────────────────────────────
 
     /**
-     * Structured RCA data as JSON — populated via issue_rca_form screen key.
-     * Schema: { "immediateCause": "...", "rootCause": "...",
-     *           "contributingFactors": ["...", "..."],
-     *           "isSystemic": true, "rcaMethod": "5WHY" }
+     * RCA method used — e.g. 5WHY, FISHBONE, FMEA.
+     * Maps to rcaMethod field on issue_detail_tab_rca form.
+     */
+    @Column(name = "rca_method", length = 50)
+    private String rcaMethod;
+
+    @Column(name = "root_cause_category", length = 100)
+    private String rootCauseCategory; // PROCESS_FAILURE, TECHNOLOGY, HUMAN_ERROR, THIRD_PARTY, etc.
+
+    /** What directly failed — the proximate/immediate cause. */
+    @Column(name = "immediate_cause", columnDefinition = "TEXT")
+    private String immediateCause;
+
+    /** Underlying systemic cause — the 5-Why answer. */
+    @Column(name = "root_cause", columnDefinition = "TEXT")
+    private String rootCause;
+
+    /**
+     * Contributing factors — stored as a JSON array of strings.
+     * e.g. ["Lack of training", "Insufficient monitoring"]
+     * Maps to the MULTILINE_LIST field on issue_detail_tab_rca form.
+     */
+    @Column(name = "contributing_factors", columnDefinition = "JSON")
+    private String contributingFactors;
+
+    /** Whether this is a systemic issue (affects multiple areas). */
+    @Column(name = "is_systemic", nullable = false)
+    @Builder.Default
+    private boolean isSystemic = false;
+
+    /**
+     * Legacy JSON blob — kept for backward compatibility and any
+     * raw RCA payloads from older data. New code uses flat columns above.
      */
     @Column(name = "rca_json", columnDefinition = "JSON")
     private String rcaJson;
 
-    @Column(name = "root_cause_category", length = 100)
-    private String rootCauseCategory; // PROCESS_FAILURE, TECHNOLOGY, HUMAN_ERROR, THIRD_PARTY, etc.
 
     // ── Remediation ────────────────────────────────────────────────────────────
 
@@ -211,6 +238,10 @@ public class Issue extends TenantAwareEntity {
 
     @Column(name = "accepted_risk_by")
     private Long acceptedRiskBy;
+
+    /** Summary of how the issue was resolved — filled at closure. */
+    @Column(name = "closure_summary", columnDefinition = "TEXT")
+    private String closureSummary;
 
     // ── Framework linkage ─────────────────────────────────────────────────────
 

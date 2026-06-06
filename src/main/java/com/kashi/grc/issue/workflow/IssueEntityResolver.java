@@ -40,4 +40,25 @@ public class IssueEntityResolver implements WorkflowEntityResolver {
         log.debug("[ISSUE-RESOLVER] issueId={} exists={}", instance.getEntityId(), exists);
         return exists ? instance.getEntityId() : null;
     }
+
+    /**
+     * Resolves the issue owner for ENTITY_OWNER actor resolution.
+     * Used by workflow steps 2-6 of Issue Remediation Lifecycle:
+     *   Step 2 (Owner Acknowledges & Plans)  → issue.ownerId
+     *   Step 3 (Execute Remediation)         → issue.ownerId
+     *   Step 4 (Submit for Review)            → issue.ownerId
+     *
+     * Returns null if no owner assigned yet — engine falls back to
+     * PREVIOUS_ACTOR (whoever triaged in step 1).
+     */
+    @Override
+    public Long resolveOwnerId(WorkflowInstance instance) {
+        return issueRepository.findById(instance.getEntityId())
+                .map(issue -> {
+                    log.debug("[ISSUE-RESOLVER] resolveOwnerId issueId={} ownerId={}",
+                            instance.getEntityId(), issue.getOwnerId());
+                    return issue.getOwnerId();
+                })
+                .orElse(null);
+    }
 }

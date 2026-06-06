@@ -28,5 +28,13 @@ public enum AssignerResolution {
     POOL,
     PUSH_TO_ROLES,
     PREVIOUS_ACTOR,
-    INITIATOR
+    INITIATOR,
+
+    /**
+     * No assigner tasks created at all.
+     * Use when actorResolution = ENTITY_CREATOR or ENTITY_OWNER —
+     * the actor is already resolved directly, no coordinator needed.
+     * e.g. Issue step 1: creator triages, no separate assigner required.
+     */
+    NONE
 }

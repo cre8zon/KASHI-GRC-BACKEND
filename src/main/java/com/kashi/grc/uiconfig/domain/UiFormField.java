@@ -25,8 +25,8 @@ public class UiFormField extends BaseEntity {
     @Column(name = "field_key", nullable = false, length = 100)
     private String fieldKey;
 
-    @Column(name = "field_type", nullable = false, length = 50)
-    @Enumerated(EnumType.STRING)
+    @Column(name = "field_type", length = 50)
+    @Convert(converter = FieldTypeConverter.class)
     private FieldType fieldType;
 
     @Column(name = "label", nullable = false, length = 255)
@@ -129,6 +129,31 @@ public class UiFormField extends BaseEntity {
      */
     @Column(name = "rows_count")
     private Integer rowsCount;
+
+    // ── FieldType converter — tolerant of empty/null/unknown DB values ─────────
+
+    @jakarta.persistence.Converter
+    public static class FieldTypeConverter
+            implements jakarta.persistence.AttributeConverter<FieldType, String> {
+
+        @Override
+        public String convertToDatabaseColumn(FieldType attribute) {
+            return attribute == null ? null : attribute.name();
+        }
+
+        @Override
+        public FieldType convertToEntityAttribute(String dbData) {
+            if (dbData == null || dbData.isBlank()) return null;
+            try {
+                return FieldType.valueOf(dbData.toUpperCase().trim());
+            } catch (IllegalArgumentException e) {
+                // Unknown value in DB — log and return TEXT as safe fallback
+                org.slf4j.LoggerFactory.getLogger(UiFormField.class)
+                        .warn("[UI-FORM-FIELD] Unknown field_type='{}' in DB — defaulting to TEXT", dbData);
+                return FieldType.TEXT;
+            }
+        }
+    }
 
     // ── FieldType enum ────────────────────────────────────────────────────────
 

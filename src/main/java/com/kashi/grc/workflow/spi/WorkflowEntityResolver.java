@@ -55,4 +55,21 @@ public interface WorkflowEntityResolver {
      * @return artifact ID (e.g. assessmentId, engagementId) or null
      */
     Long resolveArtifactId(WorkflowInstance instance);
+
+    /**
+     * Resolves the owner user ID for the entity linked to this workflow instance.
+     * Used by the engine when actorResolution = ENTITY_OWNER to assign tasks to
+     * exactly the user who owns the entity — not a pool of role holders.
+     *
+     * Default implementation returns null — override in resolvers for entities
+     * that have an owner field (Issue.ownerId, Policy.ownerId, Risk.ownerId, etc.)
+     *
+     * Falls back to PREVIOUS_ACTOR then ROLE_BASED when null.
+     *
+     * @param instance the active workflow instance
+     * @return userId of the entity owner, or null if not set / not applicable
+     */
+    default Long resolveOwnerId(WorkflowInstance instance) {
+        return null;
+    }
 }
