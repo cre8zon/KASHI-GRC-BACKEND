@@ -9,6 +9,8 @@ import com.kashi.grc.issue.dto.IssueIngestRequest;
 import com.kashi.grc.issue.dto.IssueRequest;
 import com.kashi.grc.issue.dto.IssueResponse;
 import com.kashi.grc.issue.service.IssueService;
+import com.kashi.grc.workflow.dto.response.WorkflowHistoryResponse;
+import com.kashi.grc.workflow.service.WorkflowEngineService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -29,9 +31,11 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class IssueController {
 
-    private final IssueService    issueService;
-    private final UtilityService  utilityService;
-    private final DbRepository    dbRepository;
+    private final IssueService                                               issueService;
+    private final UtilityService                                             utilityService;
+    private final DbRepository                                               dbRepository;
+    private final WorkflowEngineService                                      workflowEngineService;
+    private final com.kashi.grc.workflow.repository.WorkflowInstanceRepository instanceRepository;
 
     @Value("${app.ingest.token:}")
     private String ingestToken;
@@ -262,11 +266,10 @@ public class IssueController {
     }
 
     @PostMapping("/{id}/reopen")
-    @Operation(summary = "Reopen issue — CLOSED/RESOLVED → OPEN")
+    @Operation(summary = "Reopen issue — CLOSED/ACCEPTED_RISK → OPEN + new workflow cycle")
     public ResponseEntity<ApiResponse<IssueResponse>> reopen(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.OPEN, ctx.getId(), ctx.getTenantId());
+        IssueResponse resp = issueService.reopen(id, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Reopened | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
@@ -279,6 +282,34 @@ public class IssueController {
      * Replace with a proper IssueIngestionToken entity lookup for multi-tenant.
      * Format: "tenant_42_secrettoken" → tenantId = 42
      */
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HISTORY — proxies to workflow instance history for this issue
+    // Frontend HistoryTab calls GET /{apiBasePath}/{id}/history
+    // ─────────────────────────────────────────────────────────────────────────
+
+    @GetMapping("/{id}/history")
+    @Operation(summary = "Full chronological history for an issue across ALL workflow cycles")
+    public ResponseEntity<ApiResponse<List<WorkflowHistoryResponse>>> getHistory(
+            @PathVariable Long id) {
+        var ctx = utilityService.getLoggedInDataContext();
+        // Fetch ALL workflow instances for this issue (covers reopen cycles)
+        // sorted oldest first so history reads chronologically
+        List<com.kashi.grc.workflow.domain.WorkflowInstance> instances =
+                instanceRepository.findByTenantIdAndEntityTypeAndEntityId(
+                        ctx.getTenantId(), "ISSUE", id);
+        if (instances.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.success(List.of()));
+        }
+        // Collect history from all cycles, oldest instance first
+        List<WorkflowHistoryResponse> allHistory = new java.util.ArrayList<>();
+        instances.stream()
+                .sorted(java.util.Comparator.comparing(
+                        com.kashi.grc.workflow.domain.WorkflowInstance::getId))
+                .forEach(inst -> allHistory.addAll(
+                        workflowEngineService.getFullHistory(inst.getId())));
+        return ResponseEntity.ok(ApiResponse.success(allHistory));
+    }
 
     private Long resolveTenantFromToken(String token) {
         try {

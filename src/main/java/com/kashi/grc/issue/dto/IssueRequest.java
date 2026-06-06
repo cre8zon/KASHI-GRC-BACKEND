@@ -67,8 +67,34 @@ public class IssueRequest {
 
     // ── RCA (optional at creation, filled via workflow FILL step) ─────────────
 
-    private String rcaJson;
+    /** RCA method — e.g. 5WHY, FISHBONE, FMEA */
+    private String rcaMethod;
+
     private String rootCauseCategory;
+
+    /** Proximate / immediate cause — what directly failed */
+    private String immediateCause;
+
+    /** Underlying systemic cause — the 5-Why answer */
+    private String rootCause;
+
+    /**
+     * Contributing factors — the MULTILINE_LIST field serializes entries as a JSON array.
+     * e.g. ["Lack of training", "Insufficient monitoring"]
+     */
+    private String contributingFactors;
+
+    /** Whether this is a systemic issue affecting multiple areas */
+    private Boolean isSystemic;
+
+    /** Legacy RCA blob — accepted for backward compatibility */
+    private String rcaJson;
+
+    // ── Remediation ───────────────────────────────────────────────────────────
+
     private String remediationPlan;
     private String remediationType;
+    private Boolean acceptedRisk;
+    private String  acceptedRiskNote;
+    private String  closureSummary;
 }

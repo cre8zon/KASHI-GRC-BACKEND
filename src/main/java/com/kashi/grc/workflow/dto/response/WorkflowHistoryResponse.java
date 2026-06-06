@@ -7,6 +7,6 @@ public class WorkflowHistoryResponse {
     private Long id; private Long workflowInstanceId; private Long stepInstanceId;
     private Long taskInstanceId; private String eventType;
     private String fromStatus; private String toStatus;
-    private Long performedBy; private LocalDateTime performedAt; private String remarks;
+    private Long performedBy; private String performedByName; private LocalDateTime performedAt; private String remarks;
     private Long stepId; private String stepName; private Integer stepOrder;
 }

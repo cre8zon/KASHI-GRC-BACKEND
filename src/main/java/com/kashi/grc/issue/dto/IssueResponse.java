@@ -61,14 +61,23 @@ public class IssueResponse {
     private LocalDateTime acknowledgedAt;
     private LocalDateTime remediatedAt;
     private LocalDateTime closedAt;
+    private Long           closedBy;
 
-    // ── RCA + Remediation ─────────────────────────────────────────────────────
-    private String rcaJson;
-    private String rootCauseCategory;
-    private String remediationPlan;
-    private String remediationType;
+    // ── RCA ───────────────────────────────────────────────────────────────────
+    private String  rcaMethod;
+    private String  rootCauseCategory;
+    private String  immediateCause;
+    private String  rootCause;
+    private String  contributingFactors;  // JSON array string
+    private boolean isSystemic;
+    private String  rcaJson;              // legacy blob — kept for compatibility
+
+    // ── Remediation ───────────────────────────────────────────────────────────
+    private String  remediationPlan;
+    private String  remediationType;
     private boolean acceptedRisk;
     private String  acceptedRiskNote;
+    private String  closureSummary;
 
     // ── Framework ─────────────────────────────────────────────────────────────
     private String linkedControlIds;

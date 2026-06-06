@@ -26,22 +26,24 @@ import java.time.LocalDateTime;
  */
 @Entity
 @Table(name = "audit_templates",
-    indexes = {
-        @Index(name = "idx_audit_tmpl_tenant", columnList = "tenant_id"),
-        @Index(name = "idx_audit_tmpl_status", columnList = "status"),
-        @Index(name = "idx_audit_tmpl_type",   columnList = "audit_type")
-    }
+        indexes = {
+                @Index(name = "idx_audit_tmpl_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_audit_tmpl_status", columnList = "status"),
+                @Index(name = "idx_audit_tmpl_type",   columnList = "audit_type")
+        }
 )
 @Getter @Setter
 @lombok.experimental.SuperBuilder
 @NoArgsConstructor @AllArgsConstructor
 public class AuditTemplate extends GlobalOrTenantEntity {
 
-    @Column(name = "name", nullable = false, length = 255)
-    private String name;
-
-    @Column(name = "templateName", nullable = false, length = 255)
+    /** Primary name — maps to template_name column (NOT NULL) */
+    @Column(name = "template_name", nullable = false, length = 255)
     private String templateName;
+
+    /** Legacy alias — kept in sync with templateName, maps to name column */
+    @Column(name = "name", length = 255)
+    private String name;
 
     @Column(name = "description", columnDefinition = "TEXT")
     private String description;

@@ -23,6 +23,40 @@ package com.kashi.grc.workflow.enums;
  *   falls back to ROLE_BASED so the step is never permanently stuck.
  */
 public enum ActorResolution {
+
+    /**
+     * All users holding the step's actorRoles in the tenant receive a task (pool behaviour).
+     * Step advances when approval_type is satisfied across the pool.
+     * e.g. "Any compliance manager can review this" — pool of all compliance managers.
+     */
     ROLE_BASED,
-    ASSIGNMENT_SCOPED
+
+    /**
+     * Only users explicitly assigned work in a prior step receive a task.
+     * Falls back to ROLE_BASED if resolver returns empty.
+     * e.g. TPRM: only responders who were assigned questionnaire sections.
+     */
+    ASSIGNMENT_SCOPED,
+
+    /**
+     * Task goes only to the user who created/initiated the workflow (instance.initiatedBy).
+     * Use for step 1 of any workflow where the creator IS the actor:
+     *   - Issue triage: the GRC Manager who raised the issue triages it
+     *   - Policy draft: the author who started the draft is the drafter
+     *   - Vendor onboarding: the org user who onboarded the vendor fills step 1
+     * Creates exactly ONE task — no pool, no fan-out.
+     * Falls back to ROLE_BASED if initiatedBy is null.
+     */
+    ENTITY_CREATOR,
+
+    /**
+     * Task goes to the owner field on the entity (e.g. issue.ownerId, policy.ownerId).
+     * Resolved via WorkflowEntityResolverRegistry.resolveOwnerId().
+     * Use for steps where the assigned owner does the work:
+     *   - Issue step 2+: the owner who was assigned during triage
+     *   - Policy review: the policy owner
+     * Creates exactly ONE task.
+     * Falls back to PREVIOUS_ACTOR if owner is null, then to ROLE_BASED.
+     */
+    ENTITY_OWNER
 }

@@ -130,7 +130,8 @@ public class WorkflowAccessService {
 
         return mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
                 si.getSnapName(),
-                si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null);
+                si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
+                Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()));
     }
 
     /**
@@ -195,6 +196,7 @@ public class WorkflowAccessService {
                 .hiddenTabs(nullIfEmpty(stepOverride.getHiddenTabs()))
                 .permissions(effectivePermissions)
                 .sodViolations(sodViolations.isEmpty() ? null : sodViolations)
+                .autoCompleteActorOnSubmit(false)  // no active task in module view
                 .build();
     }
 
@@ -459,7 +461,8 @@ public class WorkflowAccessService {
     private AccessContext mergeContext(AccessContext base, StepUiOverride override,
                                        List<String> permissions, List<String> availableActions,
                                        List<AccessContext.SodViolation> sodViolations,
-                                       String stepLabel, String stepAction) {
+                                       String stepLabel, String stepAction,
+                                       boolean snapAutoCompleteActorOnSubmit) {
         return AccessContext.builder()
                 // ── Existing fields (from mode resolution) ────────────────────
                 .mode(base.getMode())
@@ -486,6 +489,10 @@ public class WorkflowAccessService {
                 .permissions(applyPermissionOverrides(permissions, override))
                 // ── SoD ───────────────────────────────────────────────────────
                 .sodViolations(sodViolations.isEmpty() ? null : sodViolations)
+                .autoCompleteActorOnSubmit(
+                        base.isCanAct()
+                                && "ACTOR".equals(base.getTaskRole())
+                                && Boolean.TRUE.equals(snapAutoCompleteActorOnSubmit))
                 .build();
     }
 

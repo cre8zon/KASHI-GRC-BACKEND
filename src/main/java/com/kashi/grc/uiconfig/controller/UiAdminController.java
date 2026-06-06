@@ -52,6 +52,33 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class UiAdminController {
 
+    /**
+     * System tenant ID (tenantId=1 = Kashi System Tenant = Platform Admin).
+     */
+    private static final Long SYSTEM_TENANT_ID = 1L;
+
+    /**
+     * Resolves the tenantId to store for a config record based on scope.
+     *
+     * scope = "GLOBAL"   → null       (all tenants inherit)
+     * scope = "PLATFORM" → 1L         (platform admin only)
+     * scope = "TENANT"   → targetId   (specific tenant)
+     *
+     * Default (no scope): platform admin → null (global), others → their tenantId
+     */
+    private Long resolveConfigTenantId(Long callerTenantId, String scope, Long targetTenantId) {
+        if (scope == null) {
+            // Default: platform admin saves globally, others save for themselves
+            return SYSTEM_TENANT_ID.equals(callerTenantId) ? null : callerTenantId;
+        }
+        return switch (scope.toUpperCase()) {
+            case "GLOBAL"   -> null;
+            case "PLATFORM" -> SYSTEM_TENANT_ID;
+            case "TENANT"   -> targetTenantId != null ? targetTenantId : callerTenantId;
+            default         -> SYSTEM_TENANT_ID.equals(callerTenantId) ? null : callerTenantId;
+        };
+    }
+
     private final UiNavigationRepository    navigationRepository;
     private final UiComponentRepository     componentRepository;
     private final UiOptionRepository        optionRepository;
@@ -293,7 +320,7 @@ public class UiAdminController {
                 .selectable(req.isSelectable()).reorderable(req.isReorderable())
                 .layoutMode(req.getLayoutMode() != null ? req.getLayoutMode() : "FULL_PAGE")
                 .tabsJson(req.getTabsJson())
-                .tenantId(tenantId)
+                .tenantId(resolveConfigTenantId(tenantId, req.getScope(), req.getTargetTenantId()))
                 .build();
         layoutRepository.save(layout);
         return ResponseEntity.status(HttpStatus.CREATED)

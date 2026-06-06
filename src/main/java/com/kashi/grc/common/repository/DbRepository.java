@@ -114,6 +114,31 @@ public class DbRepository {
     }
 
     /**
+     * Resolves user IDs for a role, scoped to a tenant AND a specific side.
+     * Prevents cross-side task assignment (e.g. AUDITOR users getting ORGANIZATION step tasks).
+     * Use this for ROLE_BASED actor resolution when step has a specific side.
+     */
+    public List<Long> findUserIdsByRoleAndTenantAndSide(Long roleId, Long tenantId, String side) {
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<com.kashi.grc.usermanagement.domain.User> root =
+                cq.from(com.kashi.grc.usermanagement.domain.User.class);
+
+        Join<Object, Object> rolesJoin = root.join("roles", JoinType.INNER);
+
+        cq.select(root.get("id"))
+                .distinct(true)
+                .where(
+                        cb.equal(rolesJoin.get("id"), roleId),
+                        cb.equal(root.get("tenantId"), tenantId),
+                        cb.equal(rolesJoin.get("side"), side),
+                        cb.isFalse(root.get("isDeleted"))
+                );
+
+        return entityManager.createQuery(cq).getResultList();
+    }
+
+    /**
      * Vendor-scoped variant: finds users holding a role AND belonging to a specific vendor.
      *
      * Used for VENDOR-side workflow steps so tasks go only to users of the workflow's

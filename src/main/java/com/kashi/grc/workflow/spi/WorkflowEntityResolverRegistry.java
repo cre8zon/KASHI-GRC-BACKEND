@@ -70,6 +70,32 @@ public class WorkflowEntityResolverRegistry {
         }
     }
 
+    /**
+     * Resolves the owner user ID for the entity linked to a workflow instance.
+     * Delegates to the registered resolver for the instance's entityType.
+     * Returns null if no resolver exists or resolver returns null.
+     * Used by WorkflowEngineService when actorResolution = ENTITY_OWNER.
+     */
+    public Long resolveOwnerId(WorkflowInstance instance) {
+        if (instance == null || instance.getEntityType() == null) return null;
+        WorkflowEntityResolver resolver = byEntityType.get(instance.getEntityType());
+        if (resolver == null) {
+            log.debug("[ENTITY-RESOLVER] No resolver for entityType='{}' — ownerId will be null",
+                    instance.getEntityType());
+            return null;
+        }
+        try {
+            Long ownerId = resolver.resolveOwnerId(instance);
+            log.debug("[ENTITY-RESOLVER] Resolved ownerId={} for entityType='{}' instanceId={}",
+                    ownerId, instance.getEntityType(), instance.getId());
+            return ownerId;
+        } catch (Exception e) {
+            log.warn("[ENTITY-RESOLVER] resolveOwnerId threw for instanceId={} — returning null: {}",
+                    instance.getId(), e.getMessage());
+            return null;
+        }
+    }
+
     /** True if a resolver is registered for this entityType */
     public boolean supports(String entityType) {
         return byEntityType.containsKey(entityType);

@@ -606,6 +606,66 @@ public class WorkflowEngineService {
         updateTask(task, TaskStatus.APPROVED, req.getRemarks());
         recordAction(task, stepInstance, instance, ActionType.APPROVE, performedBy, req);
 
+        // ── autoCompleteActorOnSubmit ─────────────────────────────────────────
+        // When this flag is set on the step, submitting a FILL form IS the approval.
+        // Auto-approve all remaining PENDING tasks on this step so the workflow
+        // advances immediately — no separate inbox action needed.
+        // Covers: issue creation/triage, policy draft submission, evidence upload, etc.
+        if (Boolean.TRUE.equals(stepInstance.getSnapAutoCompleteActorOnSubmit())
+                && task.getTaskRole() != TaskRole.ASSIGNER) {
+            log.info("[WORKFLOW-AUTO] autoCompleteActorOnSubmit — expiring all pending tasks | stepInstanceId={}",
+                    stepInstance.getId());
+            // Expire all other PENDING tasks on this step (they are redundant now)
+            taskInstanceRepository.findByStepInstanceId(stepInstance.getId()).stream()
+                    .filter(t -> t.getStatus() == TaskStatus.PENDING && !t.getId().equals(task.getId()))
+                    .forEach(t -> {
+                        t.setStatus(TaskStatus.EXPIRED);
+                        t.setActedAt(java.time.LocalDateTime.now());
+                        taskInstanceRepository.save(t);
+                    });
+            // Force step completion regardless of approval_type
+            completeStep(stepInstance, StepStatus.APPROVED, "Auto-completed on form submit");
+            expirePendingTasks(stepInstance, task.getId());
+            recordHistory(instance, stepInstance, task, "STEP_AUTO_COMPLETED_ON_SUBMIT",
+                    StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
+                    performedBy, "Form submitted — step auto-completed");
+            eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                    instance.getId(), stepInstance.getId(), stepInstance.getSnapName(), "APPROVED", performedBy));
+            // Advance to next step (same logic as normal approval path)
+            Optional<WorkflowStep> nextStep = stepRepository
+                    .findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                            instance.getWorkflowId(), stepInstance.getSnapStepOrder());
+            if (nextStep.isPresent()) {
+                Long currentStepIdBeforeCreate = instance.getCurrentStepId();
+                StepInstance newSI = createStepInstance(instance, nextStep.get());
+                if (instance.getCurrentStepId() == null ||
+                        instance.getCurrentStepId().equals(currentStepIdBeforeCreate)) {
+                    instance.setCurrentStepId(newSI.getId());
+                    instanceRepository.save(instance);
+                }
+                assignTasksForStep(newSI, nextStep.get(), instance);
+                recordHistory(instance, newSI, null, "STEP_STARTED",
+                        null, newSI.getStatus().name(), performedBy,
+                        "Moved to: " + nextStep.get().getName());
+                eventPublisher.publishEvent(new WorkflowEvent.StepAdvanced(
+                        instance.getId(), newSI.getId(), nextStep.get().getName(),
+                        nextStep.get().getStepOrder(), newSI.getStatus().name(), performedBy));
+                log.info("[WORKFLOW-AUTO] Advanced after submit | instanceId={} | to='{}'",
+                        instance.getId(), nextStep.get().getName());
+            } else {
+                instance.setStatus(WorkflowStatus.COMPLETED);
+                instance.setCurrentStepId(null);
+                instance.setCompletedAt(LocalDateTime.now());
+                instanceRepository.save(instance);
+                recordHistory(instance, stepInstance, null, "WORKFLOW_COMPLETED",
+                        WorkflowStatus.IN_PROGRESS.name(), WorkflowStatus.COMPLETED.name(),
+                        performedBy, "All steps completed");
+                log.info("[WORKFLOW-AUTO] COMPLETED after submit | instanceId={}", instance.getId());
+            }
+            return buildInstanceResponse(instance);
+        }
+        // ── end autoCompleteActorOnSubmit ─────────────────────────────────────
+
         boolean stepComplete = isStepApprovalSatisfied(stepInstance);
         log.debug("[WORKFLOW-ACTION] Step approval check | stepInstanceId={} | type={} | satisfied={}",
                 stepInstance.getId(), stepInstance.getSnapApprovalType(), stepComplete);
@@ -1700,6 +1760,7 @@ public class WorkflowEngineService {
                 .snapAssignerResolution(step.getAssignerResolution())
                 .snapActorResolution(step.getActorResolution())
                 .snapAutoApproveAssignerOnFill(step.isAutoApproveAssignerOnFill())
+                .snapAutoCompleteActorOnSubmit(step.isAutoCompleteActorOnSubmit())
                 .snapAllowOverride(step.isAllowOverride())
                 .snapStepAction(step.getStepAction())
                 .snapNavKey(step.getNavKey())
@@ -1861,6 +1922,12 @@ public class WorkflowEngineService {
 
             switch (resolution) {
 
+                case NONE -> {
+                    // No assigner tasks — actor is resolved directly (ENTITY_CREATOR / ENTITY_OWNER).
+                    // Skip coordinator tasks entirely to keep the step clean.
+                    log.info("[WORKFLOW] Step '{}' assigner_resolution=NONE — skipping ASSIGNER tasks", si.getSnapName());
+                }
+
                 case POOL -> {
                     TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
@@ -1946,6 +2013,55 @@ public class WorkflowEngineService {
         ActorResolution actorResolution = si.getSnapActorResolution() != null
                 ? si.getSnapActorResolution() : ActorResolution.ROLE_BASED;
 
+        // ── ENTITY_CREATOR: one task for the workflow initiator only ─────────
+        // Correct for step 1 of any workflow where the creator IS the actor.
+        // Issue triage, policy draft, vendor onboarding step 1, etc.
+        // Creates exactly 1 task — no pool fan-out.
+        if (actorResolution == ActorResolution.ENTITY_CREATOR) {
+            Long creatorId = instance.getInitiatedBy();
+            if (creatorId != null) {
+                TaskInstance t = createTask(si, creatorId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
+                sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                actorTaskCount++;
+                log.info("[WORKFLOW] Step '{}' ENTITY_CREATOR — 1 ACTOR task for creator userId={}",
+                        si.getSnapName(), creatorId);
+            } else {
+                log.warn("[WORKFLOW] Step '{}' ENTITY_CREATOR — initiatedBy is null, falling back to ROLE_BASED",
+                        si.getSnapName());
+                actorResolution = ActorResolution.ROLE_BASED; // fall through
+            }
+        }
+
+        // ── ENTITY_OWNER: one task for the entity's owner field ──────────────
+        // Correct for steps 2+ of issue workflow where the assigned owner does the work.
+        // Resolved via WorkflowEntityResolverRegistry.resolveOwnerId().
+        // Falls back to PREVIOUS_ACTOR then ROLE_BASED if owner not set.
+        if (actorResolution == ActorResolution.ENTITY_OWNER) {
+            Long ownerId = entityResolverRegistry.resolveOwnerId(instance);
+            if (ownerId != null) {
+                TaskInstance t = createTask(si, ownerId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
+                sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                actorTaskCount++;
+                log.info("[WORKFLOW] Step '{}' ENTITY_OWNER — 1 ACTOR task for owner userId={}",
+                        si.getSnapName(), ownerId);
+            } else {
+                // Owner not set yet — fall back to previous actor (e.g. whoever triaged in step 1)
+                Long previousActor = getPreviousStepActor(instance);
+                Long fallbackId = previousActor != null ? previousActor : instance.getInitiatedBy();
+                if (fallbackId != null) {
+                    TaskInstance t = createTask(si, fallbackId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
+                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    actorTaskCount++;
+                    log.warn("[WORKFLOW] Step '{}' ENTITY_OWNER — owner not set, fell back to userId={}",
+                            si.getSnapName(), fallbackId);
+                } else {
+                    log.warn("[WORKFLOW] Step '{}' ENTITY_OWNER — owner and fallback both null, falling back to ROLE_BASED",
+                            si.getSnapName());
+                    actorResolution = ActorResolution.ROLE_BASED; // fall through
+                }
+            }
+        }
+
         if (actorResolution == ActorResolution.ASSIGNMENT_SCOPED) {
             // Ask the domain resolver for the specifically-assigned users
             List<Long> assignedUserIds = actorResolverRegistry.resolve(instance, si);
@@ -1966,20 +2082,42 @@ public class WorkflowEngineService {
 
         if (actorResolution == ActorResolution.ROLE_BASED) {
             if (!actorRoles.isEmpty()) {
+                // Collect all user IDs across all actor roles first, then deduplicate.
+                // A user holding multiple matching roles (e.g. ORG_OWNER + ORG_ADMIN + CISO)
+                // should receive exactly ONE task, not one per role.
+                java.util.Set<Long> seenUids = new java.util.LinkedHashSet<>();
+
                 for (WorkflowStepRole ar : actorRoles) {
                     String roleName = roleRepository.findById(ar.getRoleId())
                             .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
                     // CRITICAL: vendor-side steps must resolve actors ONLY from the specific vendor.
-                    List<Long> uids = "VENDOR".equalsIgnoreCase(si.getSnapSide())
-                            ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
-                            : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
-                    for (Long uid : uids) {
-                        TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, roleName);
-                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
-                        actorTaskCount++;
+                    // Use side-filtered query to prevent cross-side task assignment
+                    // e.g. AUDITOR users must not get tasks on ORGANIZATION side steps
+                    List<Long> uids;
+                    if ("VENDOR".equalsIgnoreCase(si.getSnapSide())) {
+                        uids = dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId());
+                    } else if (si.getSnapSide() != null) {
+                        uids = dbRepository.findUserIdsByRoleAndTenantAndSide(ar.getRoleId(), tenantId, si.getSnapSide());
+                        if (uids.isEmpty()) {
+                            // No users for this role on this side — skip entirely.
+                            // NO fallback to tenant-wide — that would assign wrong-side users
+                            // (e.g. LEAD_AUDITOR/AUDITOR side getting ORGANIZATION step tasks).
+                            log.warn("[WORKFLOW] Step '{}' role '{}' (id={}) has no users on side='{}' — skipping.",
+                                    si.getSnapName(), roleName, ar.getRoleId(), si.getSnapSide());
+                        }
+                    } else {
+                        uids = dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
                     }
+                    seenUids.addAll(uids);
                 }
-                log.info("[WORKFLOW] Step '{}' ROLE_BASED — {} ACTOR task(s) for {} actorRole(s)",
+
+                // Create exactly ONE task per unique user — regardless of how many roles matched
+                for (Long uid : seenUids) {
+                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, null);
+                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    actorTaskCount++;
+                }
+                log.info("[WORKFLOW] Step '{}' ROLE_BASED — {} ACTOR task(s) for {} actorRole(s) (deduplicated by userId)",
                         si.getSnapName(), actorTaskCount, actorRoles.size());
             } else {
                 log.warn("[WORKFLOW] Step '{}' has no actorRoles — no ACTOR tasks created. " +
@@ -2619,11 +2757,23 @@ public class WorkflowEngineService {
 
     /** Maps a WorkflowInstanceHistory entity to its response DTO. Logic unchanged. */
     private WorkflowHistoryResponse toHistoryResponse(WorkflowInstanceHistory h) {
+        // Resolve performedBy userId to display name
+        String performedByName = null;
+        if (h.getPerformedBy() != null) {
+            performedByName = userRepository.findById(h.getPerformedBy())
+                    .map(u -> {
+                        String name = ((u.getFirstName() != null ? u.getFirstName() : "") + " "
+                                + (u.getLastName() != null ? u.getLastName() : "")).trim();
+                        return name.isEmpty() ? u.getEmail() : name;
+                    })
+                    .orElse("User #" + h.getPerformedBy());
+        }
         return WorkflowHistoryResponse.builder()
                 .id(h.getId()).workflowInstanceId(h.getWorkflowInstanceId())
                 .stepInstanceId(h.getStepInstanceId()).taskInstanceId(h.getTaskInstanceId())
                 .eventType(h.getEventType()).fromStatus(h.getFromStatus()).toStatus(h.getToStatus())
-                .performedBy(h.getPerformedBy()).performedAt(h.getPerformedAt())
+                .performedBy(h.getPerformedBy()).performedByName(performedByName)
+                .performedAt(h.getPerformedAt())
                 .remarks(h.getRemarks())
                 .stepId(h.getStepId()).stepName(h.getStepName()).stepOrder(h.getStepOrder())
                 .build();

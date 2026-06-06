@@ -617,8 +617,13 @@ public class AuditLibraryController {
         var ctx          = utilityService.getLoggedInDataContext();
         Long tenantId    = isSystem ? null : ctx.getTenantId();
 
+        String effectiveName = req.getEffectiveName();
+        if (effectiveName == null || effectiveName.isBlank())
+            throw new BusinessException("VALIDATION_ERROR", "Template name is required");
+
         AuditTemplate template = AuditTemplate.builder()
-                .name(req.getName())
+                .templateName(effectiveName)  // primary — maps to template_name column
+                .name(effectiveName)          // kept in sync for any legacy reads
                 .description(req.getDescription())
                 .frameworkRef(req.getFrameworkRef())
                 .auditType(req.getAuditType() != null ? req.getAuditType() : AuditTemplate.AuditType.INTERNAL)
@@ -654,7 +659,11 @@ public class AuditLibraryController {
             throw new BusinessException("TEMPLATE_ACCESS_DENIED",
                     "You can only edit templates belonging to your organisation");
 
-        if (req.getName()         != null) template.setName(req.getName());
+        String updName = req.getEffectiveName();
+        if (updName != null && !updName.isBlank()) {
+            template.setTemplateName(updName);  // primary
+            template.setName(updName);           // keep in sync
+        }
         if (req.getDescription()  != null) template.setDescription(req.getDescription());
         if (req.getFrameworkRef() != null) template.setFrameworkRef(req.getFrameworkRef());
         if (req.getAuditType()    != null) template.setAuditType(req.getAuditType());
@@ -1138,7 +1147,10 @@ public class AuditLibraryController {
     private Map<String, Object> buildTemplateMap(AuditTemplate t) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",           t.getId());
-        m.put("name",         t.getName());
+        // Return both for frontend compatibility — prefer templateName
+        String displayName = t.getTemplateName() != null ? t.getTemplateName() : t.getName();
+        m.put("name",         displayName);
+        m.put("templateName", displayName);
         m.put("description",  t.getDescription());
         m.put("frameworkRef", t.getFrameworkRef());
         m.put("auditType",    t.getAuditType() != null ? t.getAuditType().name() : null);

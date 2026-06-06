@@ -5,6 +5,7 @@ import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.uiconfig.domain.*;
 import com.kashi.grc.uiconfig.dto.response.*;
 import com.kashi.grc.uiconfig.repository.*;
+import com.kashi.grc.usermanagement.repository.PermissionGrantRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
@@ -31,6 +32,7 @@ public class UiConfigServiceImpl implements UiConfigService {
     private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
     private final TenantBrandingRepository  brandingRepository;
     private final UtilityService            utilityService;
+    private final PermissionGrantRepository permissionGrantRepository;
     private final com.kashi.grc.usermanagement.service.user.UserService userService;
 
     // ── Bootstrap (single call after login) ───────────────────────
@@ -118,10 +120,7 @@ public class UiConfigServiceImpl implements UiConfigService {
         Set<String> userSides       = extractSides(user);
         Set<String> userPermissions = extractPermissions(user);
 
-        log.debug("=== NAV DEBUG ===");
-        log.debug("UserId: {}, TenantId: {}", user.getId(), tenantId);
-        log.debug("User sides: {}", userSides);
-        log.debug("User permissions: {}", userPermissions);
+        log.info("[NAV-DEBUG] userId={} sides={} perms={}", user.getId(), userSides, userPermissions);
 
         List<UiNavigation> all = navigationRepository.findAllForTenant(tenantId);
         log.info("[NAV] userId={} tenantId={} total={}", user.getId(), tenantId, all.size());
@@ -134,9 +133,11 @@ public class UiConfigServiceImpl implements UiConfigService {
         List<UiNavigation> visible = all.stream()
                 .filter(item -> {
                     boolean v = isNavVisible(item, userSides, userPermissions);
-                    log.debug("  item={} active={} allowedSides='{}' → visible={}",
-                            item.getNavKey(), item.isActive(),
-                            item.getAllowedSides(), v);
+                    if ("module_issue".equals(item.getNavKey())) {
+                        log.info("[NAV-DEBUG] module_issue: active={} sides='{}' requiredPerm='{}' userSides={} userPerms={} → visible={}",
+                                item.isActive(), item.getAllowedSides(), item.getRequiredPermission(),
+                                userSides, userPermissions, v);
+                    }
                     return v;
                 })
                 .toList();
@@ -233,11 +234,30 @@ public class UiConfigServiceImpl implements UiConfigService {
     /** Derive permission codes by walking User -> Roles -> Permissions. */
     private Set<String> extractPermissions(User user) {
         if (user.getRoles() == null) return Set.of();
-        return user.getRoles().stream()
+
+        // Base permissions from role_permissions (static ManyToMany)
+        Set<String> perms = user.getRoles().stream()
                 .filter(r -> r.getPermissions() != null)
                 .flatMap(r -> r.getPermissions().stream())
                 .map(p -> p.getCode())
-                .collect(Collectors.toSet());
+                .collect(Collectors.toCollection(java.util.HashSet::new));
+
+        // Dynamic grants from permission_grants table (UI-managed, supports revoke)
+        List<Long> roleIds = user.getRoles().stream()
+                .map(r -> r.getId())
+                .collect(Collectors.toList());
+        if (!roleIds.isEmpty()) {
+            permissionGrantRepository.findGrantsForUserRoles(roleIds)
+                    .forEach(row -> {
+                        String code    = (String)  row[0];
+                        Boolean granted = (Boolean) row[1];
+                        if (code != null) {
+                            if (Boolean.TRUE.equals(granted)) perms.add(code);
+                            else perms.remove(code);  // explicit revoke overrides static grant
+                        }
+                    });
+        }
+        return perms;
     }
 
     private Map<String, Boolean> getEnabledFeatureFlags() {

@@ -232,16 +232,23 @@ public class RbacAdminController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> upsertGrant(
             @PathVariable Long roleId, @Valid @RequestBody GrantRequest req) {
         Long actorId = utilityService.getLoggedInDataContext().getId();
+        // Resolve permissionCode for denormalized query (used by extractPermissions)
+        String permCode = permissionRepository.findById(req.getPermissionId())
+                .map(p -> p.getCode())
+                .orElse(null);
+
         PermissionGrant grant = permissionGrantRepository
                 .findByRoleIdAndPermissionId(roleId, req.getPermissionId())
                 .orElse(PermissionGrant.builder()
                         .roleId(roleId)
                         .permissionId(req.getPermissionId())
+                        .permissionCode(permCode)
                         .grantedBy(actorId)
                         .build());
         grant.setGranted(req.isGranted());
         grant.setNotes(req.getNotes());
         grant.setGrantedBy(actorId);
+        if (permCode != null) grant.setPermissionCode(permCode); // keep in sync
         permissionGrantRepository.save(grant);
         log.info("[RBAC] Grant upserted role={} perm={} granted={}", roleId, req.getPermissionId(), req.isGranted());
         return ResponseEntity.ok(ApiResponse.success(
