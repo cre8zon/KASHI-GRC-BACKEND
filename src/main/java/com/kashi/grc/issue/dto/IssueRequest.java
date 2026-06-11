@@ -99,7 +99,33 @@ public class IssueRequest {
      * Contributing factors — the MULTILINE_LIST field serializes entries as a JSON array.
      * e.g. ["Lack of training", "Insufficient monitoring"]
      */
+    /** Accepts either a JSON array ["a","b"] or a plain string from the TAG field */
+    @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = FlexibleListDeserializer.class)
     private String contributingFactors;
+
+    /** Deserializes both ["a","b"] arrays and plain strings into a comma-joined String */
+    public static class FlexibleListDeserializer extends com.fasterxml.jackson.databind.deser.std.StdDeserializer<String> {
+        public FlexibleListDeserializer() { super(String.class); }
+        @Override
+        public String deserialize(com.fasterxml.jackson.core.JsonParser p,
+                                  com.fasterxml.jackson.databind.DeserializationContext ctx) throws java.io.IOException {
+            if (p.currentToken() == com.fasterxml.jackson.core.JsonToken.START_ARRAY) {
+                // Column type is JSON — store as valid JSON array string
+                java.util.List<String> items = new java.util.ArrayList<>();
+                while (p.nextToken() != com.fasterxml.jackson.core.JsonToken.END_ARRAY)
+                    items.add(p.getValueAsString());
+                return new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(items);
+            }
+            String val = p.getValueAsString();
+            if (val == null || val.isBlank()) return null;
+            // If plain string (not JSON array), wrap it in a JSON array
+            if (!val.trim().startsWith("[")) {
+                return new com.fasterxml.jackson.databind.ObjectMapper()
+                        .writeValueAsString(java.util.List.of(val));
+            }
+            return val;
+        }
+    }
 
     /** Whether this is a systemic issue affecting multiple areas */
     private Boolean isSystemic;
@@ -111,6 +137,10 @@ public class IssueRequest {
 
     private String remediationPlan;
     private String remediationType;
+    @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = FlexibleDateDeserializer.class)
+    private LocalDateTime remediatedAt;
+    @com.fasterxml.jackson.databind.annotation.JsonDeserialize(using = FlexibleDateDeserializer.class)
+    private LocalDateTime validatedAt;
     private Boolean acceptedRisk;
     private String  acceptedRiskNote;
     private String  closureSummary;

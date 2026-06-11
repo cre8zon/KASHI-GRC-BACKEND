@@ -157,6 +157,10 @@ public class Issue extends TenantAwareEntity {
     @Column(name = "remediated_at")
     private LocalDateTime remediatedAt;
 
+    /** When remediation was validated by the validator */
+    @Column(name = "validated_at")
+    private LocalDateTime validatedAt;
+
     /** When the issue was formally closed */
     @Column(name = "closed_at")
     private LocalDateTime closedAt;

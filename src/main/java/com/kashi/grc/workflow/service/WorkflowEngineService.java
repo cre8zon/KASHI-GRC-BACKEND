@@ -1939,6 +1939,7 @@ public class WorkflowEngineService {
                 .snapStepAction(step.getStepAction())
                 .snapNavKey(step.getNavKey())
                 .snapAssignerNavKey(step.getAssignerNavKey())
+                .snapUiOverrideJson(step.getStepUiOverrideJson())
                 .build();
         stepInstanceRepository.save(si);
 

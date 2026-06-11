@@ -283,6 +283,8 @@ public class IssueService {
         // ── Remediation fields ───────────────────────────────────────────────
         if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
         if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
+        if (req.getRemediatedAt()        != null) issue.setRemediatedAt(req.getRemediatedAt());
+        if (req.getValidatedAt()         != null) issue.setValidatedAt(req.getValidatedAt());
         if (req.getAcceptedRisk()        != null) issue.setAcceptedRisk(req.getAcceptedRisk());
         if (req.getAcceptedRiskNote()    != null) issue.setAcceptedRiskNote(req.getAcceptedRiskNote());
         if (req.getClosureSummary()      != null) issue.setClosureSummary(req.getClosureSummary());
@@ -817,6 +819,7 @@ public class IssueService {
                 .updatedAt(i.getUpdatedAt())
                 .acknowledgedAt(i.getAcknowledgedAt())
                 .remediatedAt(i.getRemediatedAt())
+                .validatedAt(i.getValidatedAt())
                 .closedAt(i.getClosedAt())
                 .rcaMethod(i.getRcaMethod())
                 .rootCauseCategory(i.getRootCauseCategory())
