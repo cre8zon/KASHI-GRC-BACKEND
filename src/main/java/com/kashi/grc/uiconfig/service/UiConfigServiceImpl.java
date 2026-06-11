@@ -163,11 +163,26 @@ public class UiConfigServiceImpl implements UiConfigService {
         List<UiFormField> fields = formFieldRepository
                 .findByFormIdAndIsVisibleTrueOrderBySortOrder(form.getId());
 
+        // Include global components (screen IS NULL) so SELECT/MULTI_SELECT fields
+        // can resolve their options without needing a separate screen config call.
+        // Uses the same findByScreenForTenant query — passing a non-existent key
+        // returns only global components (WHERE screen IS NULL OR screen = '').
+        List<UiComponent> components = componentRepository
+                .findByScreenForTenant("__form_globals__", tenantId);
+        Map<String, UiComponentResponse> componentMap = new java.util.LinkedHashMap<>();
+        for (UiComponent c : components) {
+            if (!c.isVisible()) continue;
+            List<UiOption> options = optionRepository
+                    .findByComponentKeyAndTenant(c.getComponentKey(), tenantId);
+            componentMap.put(c.getComponentKey(), toComponentResponse(c, options));
+        }
+
         return UiFormResponse.builder()
                 .formKey(form.getFormKey()).title(form.getTitle())
                 .description(form.getDescription()).submitUrl(form.getSubmitUrl())
                 .httpMethod(form.getHttpMethod()).stepsJson(form.getStepsJson())
                 .fields(fields.stream().map(this::toFormFieldResponse).toList())
+                .components(componentMap)
                 .build();
     }
 
@@ -373,6 +388,7 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .stepValue(f.getStepValue())
                 .currencyCode(f.getCurrencyCode())
                 .tagSuggestions(f.getTagSuggestions())
+                .defaultValue(f.getDefaultValue())
                 .build();
     }
 

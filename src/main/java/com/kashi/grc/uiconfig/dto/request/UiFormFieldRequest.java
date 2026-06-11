@@ -70,4 +70,6 @@ public class UiFormFieldRequest {
      * For TEXTAREA and JSON_EDITOR types: number of visible rows.
      */
     public Integer rowsCount;
+    /** Pre-populated value; for hidden fields, the submitted payload value */
+    public String  defaultValue;
 }

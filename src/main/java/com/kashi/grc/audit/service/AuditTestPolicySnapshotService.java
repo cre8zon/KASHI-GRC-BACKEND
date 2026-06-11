@@ -56,6 +56,13 @@ public class AuditTestPolicySnapshotService {
     private final AuditPolicyInstanceRepository                policyInstanceRepository;
     private final AuditPolicyInstanceControlMappingRepository  policyInstanceControlMappingRepository;
 
+    // ── ADDED: needed by syncEngagementScore() ────────────────────────────────
+    private final AuditEngagementRepository                    engagementRepository;
+    private final AuditFindingRepository                       findingRepository;
+
+    // ── ADDED: creates engagement-scoped integration snapshots after test snapshotting ──
+    private final com.kashi.grc.integration.service.EngagementIntegrationSnapshotService engagementIntegrationSnapshotService;
+
     /**
      * Called by AuditEngagementService.snapshotTemplate() after control instances are created.
      *
@@ -97,6 +104,12 @@ public class AuditTestPolicySnapshotService {
 
         snapshotTests(engagementId, tenantId, originalControlIds, originalToInstanceId);
         snapshotPolicies(engagementId, tenantId, originalControlIds, originalToInstanceId);
+
+        // ADDED: create engagement-scoped integration snapshots for all AUTOMATED test instances.
+        // This maps each AUTOMATED AuditTestInstance to the precise IntegrationCheckConfig
+        // identified by automationKeySnapshot, so IntegrationRunner can push results
+        // to the correct test instance by checkKey rather than by controlTagSnapshot.
+        engagementIntegrationSnapshotService.snapshotForEngagement(engagementId, tenantId);
 
         log.info("[AUDIT-SNAPSHOT] Tests and policies snapshotted | engagementId={}", engagementId);
     }
@@ -319,6 +332,9 @@ public class AuditTestPolicySnapshotService {
         log.info("[AUDIT-DERIVE] Cascading result derivation | testInstanceId={} affects {} controls",
                 testInstanceId, controlInstanceIds.size());
 
+        // ADDED: track which engagements are touched to sync their score counters once
+        Set<Long> touchedEngagementIds = new HashSet<>();
+
         for (Long controlInstanceId : controlInstanceIds) {
             controlInstanceRepository.findById(controlInstanceId).ifPresent(control -> {
                 AuditControlInstance.TestResult derived = deriveControlResult(controlInstanceId);
@@ -327,7 +343,59 @@ public class AuditTestPolicySnapshotService {
                     controlInstanceRepository.save(control);
                     log.debug("[AUDIT-DERIVE] Control {} → {}", controlInstanceId, derived);
                 }
+                // ADDED: collect the engagement so we sync score after the loop
+                touchedEngagementIds.add(control.getEngagementId());
             });
         }
+
+        // ADDED: sync score counters for every engagement touched in this cascade
+        for (Long engagementId : touchedEngagementIds) {
+            syncEngagementScore(engagementId, tenantId);
+        }
+    }
+
+    // ── ADDED: syncEngagementScore ────────────────────────────────────────────
+
+    /**
+     * Syncs all denormalized score counters on AuditEngagement after any test result change
+     * or finding status change.
+     *
+     * Writes to: totalControls, testedControls, passedControls, failedControls,
+     *            notApplicableControls, openFindingCount.
+     *
+     * These fields power the overview tab KPI strip (ui_layouts id=38):
+     *   ui_form_fields 118 (passedControls), 119 (failedControls), 120 (openFindingCount),
+     *                  223 (totalControls), 224 (testedControls).
+     *
+     * Also called from AuditFindingController after escalate/close/accept-risk,
+     * and from AuditInstanceController.reviewPolicy() after INADEQUATE result.
+     */
+    @Transactional
+    public void syncEngagementScore(Long engagementId, Long tenantId) {
+        engagementRepository.findById(engagementId).ifPresent(engagement -> {
+            long total         = controlInstanceRepository.countByEngagementId(engagementId);
+            long tested        = controlInstanceRepository.countTestedByEngagementId(engagementId);
+            long passed        = controlInstanceRepository.countByEngagementIdAndTestResult(
+                    engagementId, AuditControlInstance.TestResult.EFFECTIVE);
+            long failed        = controlInstanceRepository.countByEngagementIdAndTestResult(
+                    engagementId, AuditControlInstance.TestResult.INEFFECTIVE);
+            long notApplicable = controlInstanceRepository.countByEngagementIdAndTestResult(
+                    engagementId, AuditControlInstance.TestResult.NOT_APPLICABLE);
+            long openFindings  = findingRepository.countByEngagementIdAndStatusAndTenantId(
+                    engagementId, AuditFinding.Status.OPEN, tenantId)
+                    + findingRepository.countByEngagementIdAndStatusAndTenantId(
+                    engagementId, AuditFinding.Status.IN_REMEDIATION, tenantId);
+
+            engagement.setTotalControls((int) total);
+            engagement.setTestedControls((int) tested);
+            engagement.setPassedControls((int) passed);
+            engagement.setFailedControls((int) failed);
+            engagement.setNotApplicableControls((int) notApplicable);
+            engagement.setOpenFindingCount((int) openFindings);
+            engagementRepository.save(engagement);
+
+            log.info("[AUDIT-SCORE] Synced | engagementId={} total={} tested={} passed={} failed={} openFindings={}",
+                    engagementId, total, tested, passed, failed, openFindings);
+        });
     }
 }

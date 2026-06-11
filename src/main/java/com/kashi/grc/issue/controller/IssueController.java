@@ -1,13 +1,17 @@
 package com.kashi.grc.issue.controller;
 
+import com.kashi.grc.audit.domain.AuditFinding;
+import com.kashi.grc.audit.repository.AuditFindingRepository;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.PaginatedResponse;
+import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.issue.domain.Issue;
 import com.kashi.grc.issue.dto.IssueIngestRequest;
 import com.kashi.grc.issue.dto.IssueRequest;
 import com.kashi.grc.issue.dto.IssueResponse;
+import com.kashi.grc.issue.repository.IssueRepository;
 import com.kashi.grc.issue.service.IssueService;
 import com.kashi.grc.workflow.dto.response.WorkflowHistoryResponse;
 import com.kashi.grc.workflow.service.WorkflowEngineService;
@@ -21,6 +25,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -36,6 +41,9 @@ public class IssueController {
     private final DbRepository                                               dbRepository;
     private final WorkflowEngineService                                      workflowEngineService;
     private final com.kashi.grc.workflow.repository.WorkflowInstanceRepository instanceRepository;
+    // ADDED
+    private final IssueRepository                                            issueRepository;
+    private final AuditFindingRepository                                     findingRepository;
 
     @Value("${app.ingest.token:}")
     private String ingestToken;
@@ -309,6 +317,66 @@ public class IssueController {
                 .forEach(inst -> allHistory.addAll(
                         workflowEngineService.getFullHistory(inst.getId())));
         return ResponseEntity.ok(ApiResponse.success(allHistory));
+    }
+
+    // ── ADDED: linked-findings endpoints ─────────────────────────────────────
+
+    @GetMapping("/{id}/linked-findings")
+    @Operation(summary = "Get all audit findings linked to this issue")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getLinkedFindings(
+            @PathVariable Long id) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        issueRepository.findById(id)
+                .filter(i -> i.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
+
+        List<Map<String, Object>> findings = findingRepository
+                .findByLinkedIssueIdAndTenantId(id, tenantId)
+                .stream()
+                .map(f -> {
+                    Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("findingId",          f.getId());
+                    m.put("findingRef",          f.getFindingRef());
+                    m.put("engagementId",        f.getEngagementId());
+                    m.put("controlInstanceId",   f.getControlInstanceId());
+                    m.put("controlRefSnapshot",  f.getControlRefSnapshot());
+                    m.put("title",               f.getTitle());
+                    m.put("severity",            f.getSeverity());
+                    m.put("findingType",         f.getFindingType());
+                    m.put("status",              f.getStatus());
+                    m.put("frameworkRef",        f.getFrameworkRef());
+                    m.put("raisedAt",            f.getRaisedAt());
+                    m.put("remediationPlan",     f.getRemediationPlan());
+                    return m;
+                })
+                .toList();
+
+        return ResponseEntity.ok(ApiResponse.success(findings));
+    }
+
+    @PostMapping("/{id}/link-finding")
+    @Operation(summary = "Link an existing audit finding to this issue")
+    public ResponseEntity<ApiResponse<Void>> linkFinding(
+            @PathVariable Long id,
+            @RequestBody Map<String, Object> body) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        Long findingId = body.get("findingId") instanceof Number n ? n.longValue()
+                : Long.parseLong(body.get("findingId").toString());
+
+        issueRepository.findById(id)
+                .filter(i -> i.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
+
+        AuditFinding finding = findingRepository.findByIdAndTenantId(findingId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", findingId));
+
+        finding.setLinkedIssueId(id);
+        findingRepository.save(finding);
+
+        log.info("[ISSUE] Finding linked | issueId={} findingId={}", id, findingId);
+        return ResponseEntity.ok(ApiResponse.success());
     }
 
     private Long resolveTenantFromToken(String token) {

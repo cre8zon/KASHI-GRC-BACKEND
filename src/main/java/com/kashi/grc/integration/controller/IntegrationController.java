@@ -4,10 +4,13 @@ import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.integration.domain.IntegrationConfig;
 import com.kashi.grc.integration.domain.IntegrationRun;
+import com.kashi.grc.integration.domain.TenantIntegrationCheck;
+import com.kashi.grc.integration.repository.EngagementIntegrationSnapshotRepository;
 import com.kashi.grc.integration.repository.IntegrationConfigRepository;
-import com.kashi.grc.integration.repository.IntegrationCheckConfigRepository;
 import com.kashi.grc.integration.repository.IntegrationRunRepository;
+import com.kashi.grc.integration.repository.TenantIntegrationCheckRepository;
 import com.kashi.grc.integration.service.IntegrationRunner;
+import com.kashi.grc.integration.service.TenantIntegrationCheckService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -20,13 +23,15 @@ import java.util.*;
 /**
  * IntegrationController — manage connected integrations and trigger checks.
  *
- * GET  /v1/integrations/catalog          — all available integration types + their checks
- * GET  /v1/integrations/connected        — tenant's connected integrations
- * POST /v1/integrations/{key}/connect    — connect an integration (save auth config)
- * DELETE /v1/integrations/{key}          — disconnect (deactivate, keeps history)
- * POST /v1/integrations/{key}/checks/{checkKey}/run — manually trigger a check
- * GET  /v1/integrations/runs             — run history for this tenant
- * GET  /v1/integrations/runs/{id}        — single run detail with raw payload
+ * GET    /v1/integrations/catalog                              — all available integration types + their checks
+ * GET    /v1/integrations/connected                           — tenant's connected integrations
+ * POST   /v1/integrations/{key}/connect                       — connect an integration (save auth + snapshot checks)
+ * DELETE /v1/integrations/{key}                               — disconnect (deactivate, keeps history)
+ * GET    /v1/integrations/{key}/checks                        — tenant's check instances for this integration
+ * PUT    /v1/integrations/{key}/checks/{checkKey}             — customise a tenant check instance
+ * POST   /v1/integrations/{key}/checks/{checkKey}/run         — manually trigger a check
+ * GET    /v1/integrations/runs                                — run history for this tenant
+ * GET    /v1/integrations/runs/{id}                           — single run detail with raw payload
  */
 @RestController
 @RequestMapping("/v1/integrations")
@@ -34,17 +39,18 @@ import java.util.*;
 @RequiredArgsConstructor
 public class IntegrationController {
 
-    private final IntegrationConfigRepository     configRepo;
-    private final IntegrationCheckConfigRepository checkConfigRepo;
+    private final IntegrationConfigRepository      configRepo;
+    private final TenantIntegrationCheckRepository tenantCheckRepo;
     private final IntegrationRunRepository         runRepo;
     private final IntegrationRunner                runner;
+    private final TenantIntegrationCheckService    tenantCheckService;
     private final UtilityService                   utilityService;
+    private final EngagementIntegrationSnapshotRepository engagementSnapshotRepo;
 
     @GetMapping("/catalog")
     @Operation(summary = "List all available integrations with their checks")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> catalog() {
-        List<Map<String, Object>> catalog = buildCatalog();
-        return ResponseEntity.ok(ApiResponse.success(catalog));
+        return ResponseEntity.ok(ApiResponse.success(buildCatalog()));
     }
 
     @GetMapping("/connected")
@@ -55,14 +61,14 @@ public class IntegrationController {
 
         configRepo.findByTenantId(tenantId).forEach(config -> {
             Map<String, Object> m = new LinkedHashMap<>();
-            m.put("id",              config.getId());
-            m.put("integrationKey",  config.getIntegrationKey());
-            m.put("displayName",     config.getDisplayName());
-            m.put("isActive",        config.isActive());
-            m.put("lastRunAt",       config.getLastRunAt());
-            m.put("lastRunStatus",   config.getLastRunStatus());
-            m.put("checksCount",
-                    checkConfigRepo.countByIntegrationKeyAndIsActiveTrue(config.getIntegrationKey()));
+            m.put("id",             config.getId());
+            m.put("integrationKey", config.getIntegrationKey());
+            m.put("displayName",    config.getDisplayName());
+            m.put("isActive",       config.isActive());
+            m.put("lastRunAt",      config.getLastRunAt());
+            m.put("lastRunStatus",  config.getLastRunStatus());
+            // Use tenant check stats, not global library count
+            m.put("checksStats",    tenantCheckService.getStats(tenantId, config.getIntegrationKey()));
             result.add(m);
         });
 
@@ -70,22 +76,42 @@ public class IntegrationController {
     }
 
     @PostMapping("/{key}/connect")
-    @Operation(summary = "Connect an integration — saves encrypted auth config")
+    @Operation(summary = "Connect an integration — saves auth config and snapshots checks into tenant layer")
     public ResponseEntity<ApiResponse<Map<String, Object>>> connect(
             @PathVariable String key,
             @RequestBody Map<String, Object> body) {
 
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // ADDED: guard — reject connect if auth config is missing or entirely blank
+        Object rawAuth = body.get("authConfig");
+        if (rawAuth == null) {
+            return ResponseEntity.badRequest()
+                    .body(ApiResponse.error("MISSING_AUTH_CONFIG",
+                            "Auth credentials are required to connect this integration."));
+        }
+        if (rawAuth instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> authMap = (Map<String, Object>) rawAuth;
+            boolean allBlank = authMap.isEmpty() || authMap.values().stream()
+                    .allMatch(v -> v == null || v.toString().isBlank());
+            if (allBlank) {
+                return ResponseEntity.badRequest()
+                        .body(ApiResponse.error("MISSING_AUTH_CONFIG",
+                                "Please fill in all required credentials before connecting."));
+            }
+        }
+
         String authConfigJson;
         try {
             authConfigJson = new com.fasterxml.jackson.databind.ObjectMapper()
-                    .writeValueAsString(body.get("authConfig"));
+                    .writeValueAsString(rawAuth);
         } catch (Exception e) {
             return ResponseEntity.badRequest()
                     .body(ApiResponse.error("INVALID_AUTH_CONFIG", "Invalid auth config"));
         }
 
-        // Upsert — if already exists, update auth config
+        // Upsert IntegrationConfig (auth credentials)
         IntegrationConfig config = configRepo
                 .findByTenantIdAndIntegrationKey(tenantId, key.toUpperCase())
                 .map(existing -> {
@@ -101,26 +127,85 @@ public class IntegrationController {
                         .authConfig(authConfigJson) // TODO: encrypt before saving
                         .isActive(true)
                         .build());
-
         configRepo.save(config);
 
+        // Snapshot global checks into tenant layer (creates TenantIntegrationCheck rows)
+        int checksActivated = tenantCheckService.activateForTenant(key.toUpperCase(), tenantId);
+
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(Map.of(
-                "id",             config.getId(),
-                "integrationKey", config.getIntegrationKey(),
-                "status",         "connected"
+                "id",               config.getId(),
+                "integrationKey",   config.getIntegrationKey(),
+                "status",           "connected",
+                "checksActivated",  checksActivated
         )));
     }
 
     @DeleteMapping("/{key}")
-    @Operation(summary = "Disconnect an integration — deactivates, keeps run history")
+    @Operation(summary = "Disconnect an integration — deactivates checks and auth, keeps run history")
     public ResponseEntity<ApiResponse<Void>> disconnect(@PathVariable String key) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // Deactivate auth config
         configRepo.findByTenantIdAndIntegrationKey(tenantId, key.toUpperCase())
                 .ifPresent(config -> {
                     config.setActive(false);
                     configRepo.save(config);
                 });
+
+        // Deactivate tenant check instances (preserves history)
+        tenantCheckService.deactivateForTenant(key.toUpperCase(), tenantId);
+
         return ResponseEntity.ok(ApiResponse.success());
+    }
+
+    @GetMapping("/{key}/checks")
+    @Operation(summary = "List tenant's check instances for this integration with current status")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listChecks(
+            @PathVariable String key) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        List<Map<String, Object>> result = new ArrayList<>();
+
+        tenantCheckService.getActiveChecks(tenantId, key.toUpperCase()).forEach(check -> {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("id",                  check.getId());
+            m.put("checkKey",            check.getCheckKey());
+            m.put("integrationKey",      check.getIntegrationKey());
+            m.put("displayName",         check.getDisplayName());
+            m.put("description",         check.getDescription());
+            m.put("controlTag",          check.getControlTag());
+            m.put("runFrequency",        check.getRunFrequency());
+            m.put("isActive",            check.isActive());
+            m.put("lastRunAt",           check.getLastRunAt());
+            m.put("lastRunStatus",       check.getLastRunStatus());
+            m.put("lastRunSummary",      check.getLastRunSummary());
+            m.put("nextRunAt",           check.getNextRunAt());
+            m.put("totalRunCount",       check.getTotalRunCount());
+            m.put("hasCustomConfig",     check.getCheckConfigJson() != null);
+            m.put("hasCustomCriteria",   check.getPassCriteriaJson() != null);
+            m.put("lastCustomisedAt",    check.getLastCustomisedAt());
+            result.add(m);
+        });
+
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
+    @PutMapping("/{key}/checks/{checkKey}")
+    @Operation(summary = "Customise a tenant check instance — override config, criteria, frequency")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> customiseCheck(
+            @PathVariable String key,
+            @PathVariable String checkKey,
+            @RequestBody Map<String, Object> overrides) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        TenantIntegrationCheck updated = tenantCheckService.customise(
+                tenantId, key.toUpperCase(), checkKey, overrides);
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "id",               updated.getId(),
+                "checkKey",         updated.getCheckKey(),
+                "lastCustomisedAt", updated.getLastCustomisedAt()
+        )));
     }
 
     @PostMapping("/{key}/checks/{checkKey}/run")
@@ -138,10 +223,10 @@ public class IntegrationController {
         IntegrationRun run = runner.triggerManual(config.getId(), checkKey);
 
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "runId",         run.getId(),
-                "result",        run.getResult(),
-                "resultSummary", run.getResultSummary() != null ? run.getResultSummary() : "",
-                "durationMs",    run.getDurationMs() != null ? run.getDurationMs() : 0,
+                "runId",            run.getId(),
+                "result",           run.getResult(),
+                "resultSummary",    run.getResultSummary() != null ? run.getResultSummary() : "",
+                "durationMs",       run.getDurationMs() != null ? run.getDurationMs() : 0,
                 "evidenceRecordId", run.getEvidenceRecordId() != null ? run.getEvidenceRecordId() : ""
         )));
     }
@@ -164,8 +249,42 @@ public class IntegrationController {
     public ResponseEntity<ApiResponse<IntegrationRun>> getRun(@PathVariable Long id) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         IntegrationRun run = runRepo.findByIdAndTenantId(id, tenantId)
-                .orElseThrow(() -> new com.kashi.grc.common.exception.ResourceNotFoundException("IntegrationRun", id));
+                .orElseThrow(() -> new com.kashi.grc.common.exception.ResourceNotFoundException(
+                        "IntegrationRun", id));
         return ResponseEntity.ok(ApiResponse.success(run));
+    }
+
+    @GetMapping("/v1/audit/engagements/{engagementId}/integration-snapshots")
+    @Operation(summary = "List engagement-scoped integration snapshots — one per AUTOMATED test instance")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getEngagementSnapshots(
+            @PathVariable Long engagementId) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        List<Map<String, Object>> result = new java.util.ArrayList<>();
+        engagementSnapshotRepo
+                .findByEngagementIdAndTenantId(engagementId, tenantId)
+                .forEach(snap -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",                  snap.getId());
+                    m.put("engagementId",         snap.getEngagementId());
+                    m.put("testInstanceId",       snap.getTestInstanceId());
+                    m.put("checkKey",             snap.getCheckKey());
+                    m.put("integrationKey",       snap.getIntegrationKey());
+                    m.put("controlTagSnapshot",   snap.getControlTagSnapshot());
+                    m.put("displayNameSnapshot",  snap.getDisplayNameSnapshot());
+                    m.put("runFrequencySnapshot", snap.getRunFrequencySnapshot());
+                    m.put("isActive",             snap.isActive());
+                    m.put("lastResult",           snap.getLastResult());
+                    m.put("lastResultSummary",    snap.getLastResultSummary());
+                    m.put("lastRunAt",            snap.getLastRunAt());
+                    m.put("lastEvidenceRecordId", snap.getLastEvidenceRecordId());
+                    m.put("runCount",             snap.getRunCount());
+                    m.put("snapshottedAt",        snap.getSnapshottedAt());
+                    result.add(m);
+                });
+
+        return ResponseEntity.ok(ApiResponse.success(result));
     }
 
     // ── Catalog builder ───────────────────────────────────────────────────────

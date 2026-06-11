@@ -72,4 +72,13 @@ public interface WorkflowEntityResolver {
     default Long resolveOwnerId(WorkflowInstance instance) {
         return null;
     }
+
+    /**
+     * Resolves a human-readable title for the entity (e.g. Issue title, Policy name).
+     * Used by the task inbox to show context without a separate API call.
+     * Default returns null — override in module resolvers.
+     */
+    default String resolveEntityTitle(WorkflowInstance instance) {
+        return null;
+    }
 }

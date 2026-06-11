@@ -6,11 +6,18 @@ import com.kashi.grc.audit.domain.AuditFinding;
 import com.kashi.grc.audit.repository.AuditControlInstanceRepository;
 import com.kashi.grc.audit.repository.AuditEngagementRepository;
 import com.kashi.grc.audit.repository.AuditFindingRepository;
+import com.kashi.grc.audit.service.AuditTestPolicySnapshotService;
+import com.kashi.grc.audit.service.ComplianceScoreService;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.PaginatedResponse;
+import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.common.util.UtilityService;
+import com.kashi.grc.issue.domain.Issue;
+import com.kashi.grc.issue.dto.IssueRequest;
+import com.kashi.grc.issue.dto.IssueResponse;
+import com.kashi.grc.issue.service.IssueService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -39,6 +46,7 @@ import java.util.List;
  *   POST   /v1/audit/findings/{id}/accept-risk        — OPEN/IN_REMEDIATION → ACCEPTED_RISK
  *   POST   /v1/audit/findings/{id}/close              — manual close (any status)
  *   POST   /v1/audit/findings/{id}/reopen             — CLOSED → OPEN
+ *   POST   /v1/audit/findings/{id}/escalate-to-issue  — create linked Issue in Issue Management
  *   DELETE /v1/audit/findings/{id}                    — soft-delete (CANCELLED)
  */
 @Slf4j
@@ -47,11 +55,16 @@ import java.util.List;
 @Tag(name = "Audit Findings", description = "Raise, track, and close audit findings per engagement")
 public class AuditFindingController {
 
-    private final AuditFindingRepository       findingRepository;
-    private final AuditEngagementRepository    engagementRepository;
+    private final AuditFindingRepository         findingRepository;
+    private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
-    private final DbRepository                 dbRepository;
-    private final UtilityService               utilityService;
+    private final DbRepository                   dbRepository;
+    private final UtilityService                 utilityService;
+    // EXISTING
+    private final IssueService                   issueService;
+    private final AuditTestPolicySnapshotService snapshotService;
+    // ADDED: full finding-aware compliance recalculation (Vanta/AuditBoard model)
+    private final ComplianceScoreService         complianceScoreService;
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
@@ -239,6 +252,8 @@ public class AuditFindingController {
         f.setClosedBy(ctx.getId());
 
         findingRepository.save(f);
+        // ADDED: full compliance recalculation (finding-aware: open/accepted/closed counts)
+        complianceScoreService.syncEngagementScore(f.getEngagementId(), ctx.getTenantId());
         log.info("[AUDIT-FINDING] Validated/closed | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", f.getStatus())));
     }
@@ -259,6 +274,8 @@ public class AuditFindingController {
         if (body != null) f.setAcceptedRiskNote(getString(body, "acceptedRiskNote"));
 
         findingRepository.save(f);
+        // ADDED: full compliance recalculation — accepted risk improves compliancePct
+        complianceScoreService.syncEngagementScore(f.getEngagementId(), ctx.getTenantId());
         log.info("[AUDIT-FINDING] Risk accepted | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", f.getStatus())));
     }
@@ -273,6 +290,8 @@ public class AuditFindingController {
         f.setClosedAt(LocalDateTime.now());
         f.setClosedBy(ctx.getId());
         findingRepository.save(f);
+        // ADDED: full compliance recalculation
+        complianceScoreService.syncEngagementScore(f.getEngagementId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", f.getStatus())));
     }
 
@@ -285,6 +304,8 @@ public class AuditFindingController {
         f.setStatus(AuditFinding.Status.OPEN);
         f.setClosedAt(null); f.setClosedBy(null);
         findingRepository.save(f);
+        // ADDED: full compliance recalculation — reopening reduces compliance
+        complianceScoreService.syncEngagementScore(f.getEngagementId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", f.getStatus())));
     }
 
@@ -298,37 +319,107 @@ public class AuditFindingController {
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    // ── EXISTING: escalate finding to Issue Management ────────────────────────
+
+    @PostMapping("/v1/audit/findings/{id}/escalate-to-issue")
+    @Operation(summary = "Escalate finding — creates a linked Issue in Issue Management")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> escalateToIssue(
+            @PathVariable Long id,
+            @RequestBody(required = false) Map<String, Object> body) {
+
+        var ctx       = utilityService.getLoggedInDataContext();
+        Long tenantId = ctx.getTenantId();
+        Long userId   = ctx.getId();
+
+        AuditFinding finding = findingRepository.findByIdAndTenantId(id, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        if (finding.getLinkedIssueId() != null) {
+            throw new BusinessException("ALREADY_ESCALATED",
+                    "This finding is already linked to Issue #" + finding.getLinkedIssueId());
+        }
+
+        IssueRequest req = new IssueRequest();
+        req.setTitle(finding.getTitle());
+        req.setDescription(finding.getDescription() != null ? finding.getDescription()
+                : "Escalated from audit finding " + finding.getFindingRef());
+        req.setIssueType(Issue.IssueType.EXTERNAL);
+        req.setSeverity(mapFindingSeverityToIssueSeverity(finding.getSeverity()));
+        req.setSourceModule("AUDIT");
+        req.setSourceEntityType("AUDIT_FINDING");
+        req.setSourceEntityId(finding.getId());
+        req.setFrameworkRef(finding.getFrameworkRef());
+        req.setOwnerId(finding.getOwnerId());
+        req.setWorkflowId(15L);
+
+        IssueResponse issueResponse = issueService.create(req, userId, tenantId);
+
+        finding.setLinkedIssueId(issueResponse.getId());
+        findingRepository.save(finding);
+
+        if (finding.getControlInstanceId() != null) {
+            controlInstanceRepository.findById(finding.getControlInstanceId()).ifPresent(ctrl -> {
+                ctrl.setFindingLinked(true);
+                ctrl.setFindingIssueId(issueResponse.getId());
+                controlInstanceRepository.save(ctrl);
+            });
+        }
+
+        // Sync both snapshot score and compliance score after escalation
+        snapshotService.syncEngagementScore(finding.getEngagementId(), tenantId);
+
+        log.info("[AUDIT-FINDING] Escalated to issue | findingId={} issueId={} by={}",
+                id, issueResponse.getId(), userId);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("findingId",     id);
+        result.put("findingRef",    finding.getFindingRef());
+        result.put("linkedIssueId", issueResponse.getId());
+        result.put("issueRef",      issueResponse.getIssueRef());
+        return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(result));
+    }
+
+    private Issue.Severity mapFindingSeverityToIssueSeverity(AuditFinding.Severity s) {
+        if (s == null) return Issue.Severity.MEDIUM;
+        return switch (s) {
+            case CRITICAL           -> Issue.Severity.CRITICAL;
+            case HIGH               -> Issue.Severity.HIGH;
+            case MEDIUM             -> Issue.Severity.MEDIUM;
+            case LOW, INFORMATIONAL -> Issue.Severity.LOW;
+        };
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private Map<String, Object> toMap(AuditFinding f) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id",                 f.getId());
-        m.put("findingRef",         f.getFindingRef());
-        m.put("engagementId",       f.getEngagementId());
-        m.put("controlInstanceId",  f.getControlInstanceId());
-        m.put("controlRefSnapshot", f.getControlRefSnapshot());
-        m.put("title",              f.getTitle());
-        m.put("description",        f.getDescription());
-        m.put("rootCause",          f.getRootCause());
-        m.put("recommendation",     f.getRecommendation());
-        m.put("auditorNotes",       f.getAuditorNotes());
-        m.put("severity",           f.getSeverity());
-        m.put("findingType",        f.getFindingType());
-        m.put("status",             f.getStatus());
-        m.put("frameworkRef",       f.getFrameworkRef());
-        m.put("raisedBy",           f.getRaisedBy());
-        m.put("ownerId",            f.getOwnerId());
-        m.put("dueAt",              f.getDueAt());
-        m.put("raisedAt",           f.getRaisedAt());
-        m.put("remediationPlan",    f.getRemediationPlan());
-        m.put("remediationType",    f.getRemediationType());
+        m.put("id",                   f.getId());
+        m.put("findingRef",           f.getFindingRef());
+        m.put("engagementId",         f.getEngagementId());
+        m.put("controlInstanceId",    f.getControlInstanceId());
+        m.put("controlRefSnapshot",   f.getControlRefSnapshot());
+        m.put("title",                f.getTitle());
+        m.put("description",          f.getDescription());
+        m.put("rootCause",            f.getRootCause());
+        m.put("recommendation",       f.getRecommendation());
+        m.put("auditorNotes",         f.getAuditorNotes());
+        m.put("severity",             f.getSeverity());
+        m.put("findingType",          f.getFindingType());
+        m.put("status",               f.getStatus());
+        m.put("frameworkRef",         f.getFrameworkRef());
+        m.put("raisedBy",             f.getRaisedBy());
+        m.put("ownerId",              f.getOwnerId());
+        m.put("dueAt",                f.getDueAt());
+        m.put("raisedAt",             f.getRaisedAt());
+        m.put("remediationPlan",      f.getRemediationPlan());
+        m.put("remediationType",      f.getRemediationType());
         m.put("remediationStartedAt", f.getRemediationStartedAt());
-        m.put("remediatedAt",       f.getRemediatedAt());
-        m.put("validatedAt",        f.getValidatedAt());
-        m.put("closedAt",           f.getClosedAt());
-        m.put("acceptedRisk",       f.isAcceptedRisk());
-        m.put("acceptedRiskNote",   f.getAcceptedRiskNote());
-        m.put("linkedIssueId",      f.getLinkedIssueId());
+        m.put("remediatedAt",         f.getRemediatedAt());
+        m.put("validatedAt",          f.getValidatedAt());
+        m.put("closedAt",             f.getClosedAt());
+        m.put("acceptedRisk",         f.isAcceptedRisk());
+        m.put("acceptedRiskNote",     f.getAcceptedRiskNote());
+        m.put("linkedIssueId",        f.getLinkedIssueId());
         return m;
     }
 

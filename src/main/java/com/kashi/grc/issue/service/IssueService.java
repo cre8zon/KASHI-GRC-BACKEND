@@ -132,6 +132,10 @@ public class IssueService {
         // Auto-start workflow if workflowId provided or default exists
         startWorkflowIfConfigured(issue, req.getWorkflowId(), createdBy, tenantId);
 
+        // If Step 1 auto-completed on creation, sync issue status to TRIAGED
+        // so the UI shows the correct state and the Triage button disappears.
+        syncStatusAfterWorkflowStart(issue, createdBy, tenantId);
+
         // Notify owner
         if (req.getOwnerId() != null) {
             notificationService.send(req.getOwnerId(), "ISSUE_ASSIGNED",
@@ -295,16 +299,36 @@ public class IssueService {
             throw new ForbiddenException("Issue does not belong to this tenant");
 
         issue.setStatus(newStatus);
-        if (newStatus == Issue.Status.TRIAGED && issue.getAcknowledgedAt() == null) {
-            issue.setAcknowledgedAt(LocalDateTime.now());
+
+        // ── Per-status side-effects ───────────────────────────────────────────
+        // IMPORTANT: advanceWorkflowTask() is only called when the current step
+        // matches the expected step ORDER for this transition.
+        // Step 1 auto-completes on issue creation → currentStep is already Step 2
+        // when triage is called. In that case we skip advance to avoid double-advancing.
+        if (newStatus == Issue.Status.TRIAGED) {
+            if (issue.getAcknowledgedAt() == null) issue.setAcknowledgedAt(LocalDateTime.now());
+            // Only advance if still on Step 1 (auto-complete may have already moved to Step 2)
+            advanceWorkflowTaskIfOnStep(issue, userId, "Triaged via issue action", 1);
+        }
+        if (newStatus == Issue.Status.IN_PROGRESS) {
+            advanceWorkflowTaskIfOnStep(issue, userId, "Owner acknowledged and started remediation", 2);
+        }
+        if (newStatus == Issue.Status.PENDING_REVIEW) {
+            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for review", 3);
+        }
+        if (newStatus == Issue.Status.PENDING_VALIDATION) {
+            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for validation", 4);
         }
         if (newStatus == Issue.Status.RESOLVED) {
             issue.setRemediatedAt(LocalDateTime.now());
+            advanceWorkflowTaskIfOnStep(issue, userId, "Remediation validated", 5);
         }
         if (newStatus == Issue.Status.CLOSED || newStatus == Issue.Status.ACCEPTED_RISK) {
             issue.setClosedAt(LocalDateTime.now());
             issue.setClosedBy(userId);
+            advanceWorkflowTaskIfOnStep(issue, userId, "Issue closed", 6);
         }
+
 
         issueRepository.save(issue);
         log.info("[ISSUE] Status updated | id={} | status={} | by={}", id, newStatus, userId);
@@ -528,17 +552,141 @@ public class IssueService {
         }
     }
 
+    /**
+     * Approves the current pending workflow task for this issue.
+     * Called by every status-transition action (triage, start-remediation,
+     * submit-for-review, etc.) so the workflow advances in sync with the
+     * issue status change.
+     */
+    /**
+     * Advances the workflow only if the current step matches the expected stepOrder.
+     * Prevents double-advancing when Step 1 auto-completes on creation and triage
+     * is then called — at that point currentStep is already Step 2, not Step 1.
+     */
+    /**
+     * After workflow start, if Step 1 auto-completed (currentStep is now Step 2),
+     * sync issue status to TRIAGED so the UI reflects the correct state.
+     */
+    private void syncStatusAfterWorkflowStart(Issue issue, Long userId, Long tenantId) {
+        if (issue.getWorkflowInstanceId() == null) return;
+        try {
+            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
+                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+            if (wfInst == null || wfInst.getCurrentStepId() == null) return;
+            com.kashi.grc.workflow.domain.StepInstance currentSI =
+                    stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
+            if (currentSI == null) return;
+            int currentOrder = currentSI.getSnapStepOrder() != null ? currentSI.getSnapStepOrder() : 1;
+            // If already past Step 1, status should be TRIAGED
+            if (currentOrder > 1 && issue.getStatus() == Issue.Status.OPEN) {
+                issue.setStatus(Issue.Status.TRIAGED);
+                if (issue.getAcknowledgedAt() == null)
+                    issue.setAcknowledgedAt(LocalDateTime.now());
+                issueRepository.save(issue);
+                log.info("[ISSUE] Status auto-synced to TRIAGED after Step 1 auto-complete | issueId={}", issue.getId());
+            }
+        } catch (Exception e) {
+            log.warn("[ISSUE] syncStatusAfterWorkflowStart error | issueId={} | {}", issue.getId(), e.getMessage());
+        }
+    }
+
+    private void advanceWorkflowTaskIfOnStep(Issue issue, Long userId, String remarks, int expectedStepOrder) {
+        if (issue.getWorkflowInstanceId() == null) {
+            log.warn("[ISSUE-WF] workflowInstanceId is NULL | issueId={}", issue.getId());
+            return;
+        }
+        try {
+            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
+                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+            if (wfInst == null || wfInst.getCurrentStepId() == null) {
+                log.warn("[ISSUE-WF] No active step | instanceId={}", issue.getWorkflowInstanceId());
+                return;
+            }
+            // Check actual step order from the StepInstance snapshot
+            com.kashi.grc.workflow.domain.StepInstance currentSI =
+                    stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
+            if (currentSI == null) return;
+            int actualOrder = currentSI.getSnapStepOrder() != null ? currentSI.getSnapStepOrder() : -1;
+            log.info("[ISSUE-WF] advanceWorkflowTaskIfOnStep | issueId={} | expectedStep={} | actualStep={} | remarks={}",
+                    issue.getId(), expectedStepOrder, actualOrder, remarks);
+            if (actualOrder != expectedStepOrder) {
+                log.info("[ISSUE-WF] Skipping advance — currentStep={} != expectedStep={} (likely auto-completed already)",
+                        actualOrder, expectedStepOrder);
+                return;
+            }
+            advanceWorkflowTask(issue, userId, remarks);
+        } catch (Exception e) {
+            log.warn("[ISSUE-WF] advanceWorkflowTaskIfOnStep error | issueId={} | {}", issue.getId(), e.getMessage(), e);
+        }
+    }
+
+    private void advanceWorkflowTask(Issue issue, Long userId, String remarks) {
+        log.info("[ISSUE-WF] advanceWorkflowTask | issueId={} | wfInstanceId={} | remarks={}",
+                issue.getId(), issue.getWorkflowInstanceId(), remarks);
+        if (issue.getWorkflowInstanceId() == null) {
+            log.warn("[ISSUE-WF] workflowInstanceId is NULL — workflow was never started for issueId={}", issue.getId());
+            return;
+        }
+        try {
+            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
+                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+            if (wfInst == null) {
+                log.warn("[ISSUE-WF] WorkflowInstance not found | id={}", issue.getWorkflowInstanceId());
+                return;
+            }
+            if (wfInst.getCurrentStepId() == null) {
+                log.warn("[ISSUE-WF] currentStepId is NULL | instanceId={} | status={}",
+                        wfInst.getId(), wfInst.getStatus());
+                return;
+            }
+            log.info("[ISSUE-WF] currentStepId={} | wfStatus={}", wfInst.getCurrentStepId(), wfInst.getStatus());
+
+            java.util.List<com.kashi.grc.workflow.domain.TaskInstance> allTasks =
+                    taskInstanceRepository.findByStepInstanceId(wfInst.getCurrentStepId());
+            log.info("[ISSUE-WF] Tasks on currentStep={} | count={} | statuses={}",
+                    wfInst.getCurrentStepId(), allTasks.size(),
+                    allTasks.stream().map(t -> t.getId() + ":" + t.getStatus() + ":" + t.getTaskRole())
+                            .collect(java.util.stream.Collectors.joining(", ")));
+
+            java.util.Optional<com.kashi.grc.workflow.domain.TaskInstance> pendingTask =
+                    allTasks.stream()
+                            .filter(t -> t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING)
+                            .findFirst();
+
+            if (pendingTask.isEmpty()) {
+                log.warn("[ISSUE-WF] No PENDING task found on currentStep={} — cannot advance",
+                        wfInst.getCurrentStepId());
+                return;
+            }
+
+            com.kashi.grc.workflow.domain.TaskInstance task = pendingTask.get();
+            log.info("[ISSUE-WF] Approving taskId={} | assignedTo={}", task.getId(), task.getAssignedUserId());
+            com.kashi.grc.workflow.dto.request.TaskActionRequest req =
+                    new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+            req.setTaskInstanceId(task.getId());
+            req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+            req.setRemarks(remarks);
+            try {
+                workflowEngineService.performAction(req, userId);
+                log.info("[ISSUE-WF] performAction succeeded | taskId={}", task.getId());
+            } catch (Exception e) {
+                log.warn("[ISSUE-WF] performAction failed | issueId={} | taskId={} | {}",
+                        issue.getId(), task.getId(), e.getMessage(), e);
+            }
+        } catch (Exception e) {
+            log.warn("[ISSUE-WF] advanceWorkflowTask error | issueId={} | {}", issue.getId(), e.getMessage(), e);
+        }
+    }
+
     private void startWorkflowIfConfigured(Issue issue, Long overrideWorkflowId,
                                            Long initiatedBy, Long tenantId) {
         // Use override if provided; otherwise look up default for issueType
         Long workflowId = overrideWorkflowId;
         if (workflowId == null) {
-            // Convention: workflow name matches "ISSUE_MGMT_" + issueType
-            // e.g. "ISSUE_MGMT_INTERNAL", "ISSUE_MGMT_AUTOMATED"
-            String expectedName = "ISSUE_MGMT_" + issue.getIssueType().name();
-            workflowId = workflowRepository.findAll().stream()
-                    .filter(w -> w.isActive() && expectedName.equals(w.getName()))
-                    .findFirst()
+            // Fall back to any active ISSUE workflow — works regardless of workflow name.
+            workflowId = workflowRepository
+                    .findByTenantIdIsNullAndEntityTypeAndIsActiveTrue("ISSUE")
+                    .stream().findFirst()
                     .map(w -> w.getId())
                     .orElse(null);
         }

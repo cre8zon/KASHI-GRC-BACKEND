@@ -1,4 +1,5 @@
 package com.kashi.grc.audit.matcher;
+
 import com.kashi.grc.audit.domain.AuditTestInstance;
 import com.kashi.grc.audit.repository.AuditTestInstanceRepository;
 import com.kashi.grc.evidence.service.EvidenceTagMatcher;
@@ -9,21 +10,32 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * AuditTestEvidenceMatcher — links uploaded evidence to AuditTestInstance rows by tag.
+ * AuditTestEvidenceMatcher — links uploaded evidence to AuditTestInstance rows.
  *
- * Implements EvidenceTagMatcher SPI.
- * Spring discovers this automatically — no EvidenceReuseEngine changes needed.
+ * Implements EvidenceTagMatcher SPI — discovered by EvidenceReuseEngine automatically.
  *
- * When evidence is uploaded with controlTag = 'MFA':
- *   → This matcher queries AuditTestInstance.controlTagSnapshot = 'MFA'
- *   → Returns all matching test instances
- *   → EvidenceReuseEngine creates EvidenceLink(AUDIT_TEST_INSTANCE, id) for each
- *   → Status = PENDING_REVIEW → auditor must accept or reject
+ * ── MATCHING STRATEGY ──────────────────────────────────────────────────────────
  *
- * After the auditor accepts the evidence for the test:
- *   → AuditTestInstance.testResult is set to PASS (by the auditor or reviewer)
- *   → AuditTestPolicySnapshotService.cascadeDeriveControlResults() is called
- *   → All linked controls are re-evaluated automatically
+ * MANUAL / HYBRID tests (automationTypeSnapshot != "AUTOMATED"):
+ *   Match by controlTagSnapshot = tag. This is correct — a human uploading evidence
+ *   tagged "MFA_ADMIN" should link to all manual MFA_ADMIN test instances, since
+ *   the same document may cover multiple controls in the same domain.
+ *
+ * AUTOMATED tests (automationTypeSnapshot = "AUTOMATED"):
+ *   EXCLUDED from this matcher entirely. Automated test instances are fed results
+ *   by EngagementIntegrationSnapshotService.recordResult() which uses the precise
+ *   checkKey → testInstanceId mapping established at engagement snapshot time.
+ *
+ *   If automated tests were included here, every EvidenceRecord produced by an
+ *   integration check would propagate to ALL automated tests sharing the same
+ *   controlTagSnapshot across ALL engagements — e.g. an Okta MFA check result
+ *   would incorrectly mark AWS MFA tests as PASS because they share the
+ *   "MFA_ADMIN" tag.
+ *
+ * ── FIX FROM PREVIOUS VERSION ──────────────────────────────────────────────────
+ * The original implementation called findAll() + in-memory filter (full table scan)
+ * AND included automated tests in the results, causing both a performance bug and
+ * a correctness bug. Both are fixed here.
  */
 @Slf4j
 @Component
@@ -36,18 +48,19 @@ public class AuditTestEvidenceMatcher implements EvidenceTagMatcher {
     public List<MatchResult> findMatches(String tag, Long tenantId) {
         if (tag == null || tag.isBlank()) return List.of();
 
-        List<AuditTestInstance> matches =
-                testInstanceRepository.findByEngagementIdAndControlTagSnapshot(null, tag);
-        // Note: we search all test instances for this tenant by controlTagSnapshot
-        // The repository method above filters by tag only — tenantId is enforced below
+        // Indexed query: tenantId + tag — no full table scan
+        List<AuditTestInstance> candidates =
+                testInstanceRepository.findByTenantIdAndControlTagSnapshot(tenantId, tag.toUpperCase());
 
-        return testInstanceRepository.findAll().stream()
-                .filter(t -> tag.equalsIgnoreCase(t.getControlTagSnapshot()))
-                .filter(t -> tenantId.equals(t.getTenantId()))
+        return candidates.stream()
+                // AUTOMATED tests are handled by EngagementIntegrationSnapshotService
+                // via precise checkKey → testInstanceId mapping. Exclude them here
+                // to prevent cross-contamination between checks sharing the same tag.
+                .filter(t -> !"AUTOMATED".equalsIgnoreCase(t.getAutomationTypeSnapshot()))
                 .map(t -> new MatchResult(
                         "AUDIT_TEST_INSTANCE",
                         t.getId(),
-                        t.getRunByUserId()  // responsible user (may be null for automated tests)
+                        t.getRunByUserId()
                 ))
                 .toList();
     }

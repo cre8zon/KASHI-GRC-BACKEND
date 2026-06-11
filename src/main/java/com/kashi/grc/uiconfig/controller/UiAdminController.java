@@ -470,6 +470,7 @@ public class UiAdminController {
                     m.put("optionsComponentKey",  f.getOptionsComponentKey()  != null ? f.getOptionsComponentKey()  : "");
                     m.put("currencyCode",         f.getCurrencyCode()         != null ? f.getCurrencyCode()         : "");
                     m.put("tagSuggestions",       f.getTagSuggestions()       != null ? f.getTagSuggestions()       : "");
+                    m.put("defaultValue",         f.getDefaultValue()         != null ? f.getDefaultValue()         : "");
                     m.put("rowsCount",            f.getRowsCount());
                     m.put("minValue",             f.getMinValue());
                     m.put("maxValue",             f.getMaxValue());
@@ -540,6 +541,7 @@ public class UiAdminController {
                 .lookupEntityType(req.getLookupEntityType())
                 .lookupApiPath(req.getLookupApiPath())
                 .tagSuggestions(req.getTagSuggestions())
+                .defaultValue(req.getDefaultValue())
                 .rowsCount(req.getRowsCount())
                 .tenantId(tenantId)
                 .build();

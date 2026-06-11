@@ -84,4 +84,6 @@ public class TaskInstanceResponse {
      * Frontend routing: WORKFLOW_ROUTES[entityType][resolvedStepSide][resolvedStepAction](artifactId)
      */
     private Long          artifactId;
+    /** Human-readable title of the entity (e.g. issue title, policy name) */
+    private String        entityTitle;
 }
