@@ -286,9 +286,10 @@ public class Issue extends TenantAwareEntity {
     // ── Enums ──────────────────────────────────────────────────────────────────
 
     public enum IssueType {
-        INTERNAL,   // audit findings, self-assessments, control failures
-        EXTERNAL,   // regulatory, external audit, pen-test, customer complaints
-        AUTOMATED   // scanner alerts, SIEM, KRI breaches, continuous monitoring
+        INTERNAL,     // audit findings, self-assessments, control failures
+        EXTERNAL,     // external audit, pen-test, vendor findings, customer complaints
+        REGULATORY,   // RBI/SEBI/DPDPA/ISO examination findings with hard deadlines
+        AUTOMATED     // scanner alerts, SIEM, KRI breaches, continuous monitoring
     }
 
     public enum Severity {

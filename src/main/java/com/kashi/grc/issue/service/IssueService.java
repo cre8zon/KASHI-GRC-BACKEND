@@ -309,26 +309,25 @@ public class IssueService {
         // when triage is called. In that case we skip advance to avoid double-advancing.
         if (newStatus == Issue.Status.TRIAGED) {
             if (issue.getAcknowledgedAt() == null) issue.setAcknowledgedAt(LocalDateTime.now());
-            // Only advance if still on Step 1 (auto-complete may have already moved to Step 2)
-            advanceWorkflowTaskIfOnStep(issue, userId, "Triaged via issue action", 1);
+            advanceWorkflowTask(issue, userId, "Triaged via issue action");
         }
         if (newStatus == Issue.Status.IN_PROGRESS) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Owner acknowledged and started remediation", 2);
+            advanceWorkflowTask(issue, userId, "Owner acknowledged and started remediation");
         }
         if (newStatus == Issue.Status.PENDING_REVIEW) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for review", 3);
+            advanceWorkflowTask(issue, userId, "Submitted for review");
         }
         if (newStatus == Issue.Status.PENDING_VALIDATION) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for validation", 4);
+            advanceWorkflowTask(issue, userId, "Submitted for validation");
         }
         if (newStatus == Issue.Status.RESOLVED) {
             issue.setRemediatedAt(LocalDateTime.now());
-            advanceWorkflowTaskIfOnStep(issue, userId, "Remediation validated", 5);
+            advanceWorkflowTask(issue, userId, "Remediation validated");
         }
         if (newStatus == Issue.Status.CLOSED || newStatus == Issue.Status.ACCEPTED_RISK) {
             issue.setClosedAt(LocalDateTime.now());
             issue.setClosedBy(userId);
-            advanceWorkflowTaskIfOnStep(issue, userId, "Issue closed", 6);
+            advanceWorkflowTask(issue, userId, "Issue closed");
         }
 
 
@@ -592,36 +591,13 @@ public class IssueService {
         }
     }
 
-    private void advanceWorkflowTaskIfOnStep(Issue issue, Long userId, String remarks, int expectedStepOrder) {
-        if (issue.getWorkflowInstanceId() == null) {
-            log.warn("[ISSUE-WF] workflowInstanceId is NULL | issueId={}", issue.getId());
-            return;
-        }
-        try {
-            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
-                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
-            if (wfInst == null || wfInst.getCurrentStepId() == null) {
-                log.warn("[ISSUE-WF] No active step | instanceId={}", issue.getWorkflowInstanceId());
-                return;
-            }
-            // Check actual step order from the StepInstance snapshot
-            com.kashi.grc.workflow.domain.StepInstance currentSI =
-                    stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
-            if (currentSI == null) return;
-            int actualOrder = currentSI.getSnapStepOrder() != null ? currentSI.getSnapStepOrder() : -1;
-            log.info("[ISSUE-WF] advanceWorkflowTaskIfOnStep | issueId={} | expectedStep={} | actualStep={} | remarks={}",
-                    issue.getId(), expectedStepOrder, actualOrder, remarks);
-            if (actualOrder != expectedStepOrder) {
-                log.info("[ISSUE-WF] Skipping advance — currentStep={} != expectedStep={} (likely auto-completed already)",
-                        actualOrder, expectedStepOrder);
-                return;
-            }
-            advanceWorkflowTask(issue, userId, remarks);
-        } catch (Exception e) {
-            log.warn("[ISSUE-WF] advanceWorkflowTaskIfOnStep error | issueId={} | {}", issue.getId(), e.getMessage(), e);
-        }
-    }
-
+    /**
+     * Advances the current workflow step by approving the first PENDING task.
+     * Does NOT check step order — advances whatever step is currently active.
+     * The status transition (TRIAGED, IN_PROGRESS, etc.) already guarantees
+     * we are on the right step — no hardcoded step numbers needed.
+     * Guard: skips silently if no workflow is running or no PENDING task exists.
+     */
     private void advanceWorkflowTask(Issue issue, Long userId, String remarks) {
         log.info("[ISSUE-WF] advanceWorkflowTask | issueId={} | wfInstanceId={} | remarks={}",
                 issue.getId(), issue.getWorkflowInstanceId(), remarks);
@@ -685,12 +661,12 @@ public class IssueService {
         // Use override if provided; otherwise look up default for issueType
         Long workflowId = overrideWorkflowId;
         if (workflowId == null) {
-            // Fall back to any active ISSUE workflow — works regardless of workflow name.
-            workflowId = workflowRepository
-                    .findByTenantIdIsNullAndEntityTypeAndIsActiveTrue("ISSUE")
-                    .stream().findFirst()
-                    .map(w -> w.getId())
-                    .orElse(null);
+            // No workflowId provided — this should not happen in normal flow since
+            // the issue create form has a workflowId LOOKUP field and escalateToIssue
+            // sets it explicitly. Log a warning and skip workflow start.
+            log.warn("[ISSUE] workflowId is null for issueId={} issueType={} — workflow not started. "
+                            + "Ensure workflowId is set on IssueRequest (create form hidden field or API caller).",
+                    issue.getId(), issue.getIssueType());
         }
 
         if (workflowId == null) {

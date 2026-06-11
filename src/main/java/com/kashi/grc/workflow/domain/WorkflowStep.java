@@ -142,6 +142,22 @@ public class WorkflowStep extends BaseEntity {
     @Column(name = "step_ui_override_json", columnDefinition = "JSON")
     private String stepUiOverrideJson;
 
+    /**
+     * SOD rules for this step — JSON array of rule objects.
+     * Evaluated at actor resolution time by WorkflowEngineService.
+     *
+     * Supported rule types:
+     *   EXCLUDE_ENTITY_OWNER   — entity owner cannot act (cannot validate own work)
+     *   EXCLUDE_PREVIOUS_ACTOR — whoever acted on the previous step cannot act here
+     *   EXCLUDE_ROLE           — users with a specific roleId cannot act here
+     *
+     * Example:
+     *   [{"type":"EXCLUDE_ENTITY_OWNER","reason":"Cannot validate own remediation"},
+     *    {"type":"EXCLUDE_PREVIOUS_ACTOR","reason":"Four-eyes principle"}]
+     */
+    @Column(name = "sod_rules_json", columnDefinition = "JSON")
+    private String sodRulesJson;
+
     // ── Migration SQL ─────────────────────────────────────────────────────────
     // ALTER TABLE workflow_steps
     //   ADD COLUMN step_ui_override_json JSON NULL

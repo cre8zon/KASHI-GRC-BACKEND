@@ -1940,6 +1940,7 @@ public class WorkflowEngineService {
                 .snapNavKey(step.getNavKey())
                 .snapAssignerNavKey(step.getAssignerNavKey())
                 .snapUiOverrideJson(step.getStepUiOverrideJson())
+                .snapSodRulesJson(step.getSodRulesJson())
                 .build();
         stepInstanceRepository.save(si);
 
@@ -2286,6 +2287,11 @@ public class WorkflowEngineService {
                     seenUids.addAll(uids);
                 }
 
+                // ── SOD: Segregation of Duties ───────────────────────────────────
+                // Driven by snap_sod_rules_json — no hardcoding in engine.
+                // Add new rule types here as the platform evolves.
+                evaluateSodRules(si, instance, seenUids);
+
                 // Create exactly ONE task per unique user — regardless of how many roles matched
                 for (Long uid : seenUids) {
                     TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, null);
@@ -2514,6 +2520,63 @@ public class WorkflowEngineService {
                     performedBy, reason);
             log.info("[WORKFLOW] Step AWAITING_ASSIGNMENT → IN_PROGRESS | stepInstanceId={} | reason='{}'",
                     si.getId(), reason);
+        }
+    }
+
+    /**
+     * Evaluates SOD rules from snap_sod_rules_json and removes excluded user IDs from seenUids.
+     * Called during ROLE_BASED actor resolution in assignTasksForStep.
+     *
+     * Supported rule types:
+     *   EXCLUDE_ENTITY_OWNER   — removes the entity owner (e.g. issue.ownerId)
+     *   EXCLUDE_PREVIOUS_ACTOR — removes whoever acted on the immediately preceding step
+     *   EXCLUDE_ROLE           — removes all users holding a specific role (roleId field required)
+     */
+    private void evaluateSodRules(StepInstance si, WorkflowInstance instance,
+                                  java.util.Set<Long> seenUids) {
+        String rulesJson = si.getSnapSodRulesJson();
+        if (rulesJson == null || rulesJson.isBlank()) return;
+        try {
+            com.fasterxml.jackson.databind.JsonNode rules =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(rulesJson);
+            if (!rules.isArray()) return;
+            for (com.fasterxml.jackson.databind.JsonNode rule : rules) {
+                String type = rule.path("type").asText("");
+                switch (type) {
+                    case "EXCLUDE_ENTITY_OWNER" -> {
+                        Long ownerId = entityResolverRegistry.resolveOwnerId(instance);
+                        if (ownerId != null && seenUids.remove(ownerId)) {
+                            log.info("[WORKFLOW-SOD] EXCLUDE_ENTITY_OWNER: removed userId={} from step '{}'",
+                                    ownerId, si.getSnapName());
+                        }
+                    }
+                    case "EXCLUDE_PREVIOUS_ACTOR" -> {
+                        Long prevActor = getPreviousStepActor(instance);
+                        if (prevActor != null && seenUids.remove(prevActor)) {
+                            log.info("[WORKFLOW-SOD] EXCLUDE_PREVIOUS_ACTOR: removed userId={} from step '{}'",
+                                    prevActor, si.getSnapName());
+                        }
+                    }
+                    case "EXCLUDE_ROLE" -> {
+                        long roleId = rule.path("roleId").asLong(0);
+                        if (roleId > 0) {
+                            List<Long> roleUsers = dbRepository.findUserIdsByRoleAndTenant(
+                                    roleId, instance.getTenantId());
+                            roleUsers.forEach(uid -> {
+                                if (seenUids.remove(uid)) {
+                                    log.info("[WORKFLOW-SOD] EXCLUDE_ROLE roleId={}: removed userId={} from step '{}'",
+                                            roleId, uid, si.getSnapName());
+                                }
+                            });
+                        }
+                    }
+                    default -> log.warn("[WORKFLOW-SOD] Unknown SOD rule type '{}' on step '{}' — ignored",
+                            type, si.getSnapName());
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[WORKFLOW-SOD] Failed to parse sod_rules_json on step '{}': {}",
+                    si.getSnapName(), e.getMessage());
         }
     }
 
