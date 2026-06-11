@@ -66,6 +66,17 @@ public class AuditEngagementService {
 
         String ref = buildEngagementRef(tenantId);
 
+        // Deduplication guard — reject rapid double-clicks (same name+template within 60 seconds)
+        // CHECK BEFORE SAVE so we don't create then throw and leave orphan rows
+        boolean duplicate = engagementRepository
+                .existsByTenantIdAndNameAndTemplateIdAndCreatedAtAfter(
+                        tenantId, req.getName(), req.getTemplateId(),
+                        LocalDateTime.now().minusSeconds(60));
+        if (duplicate) {
+            throw new BusinessException("DUPLICATE_ENGAGEMENT",
+                    "This engagement was just created — please wait a moment before trying again");
+        }
+
         AuditEngagement engagement = AuditEngagement.builder()
                 .engagementRef(ref)
                 .projectId(req.getProjectId())
@@ -85,15 +96,6 @@ public class AuditEngagementService {
                 .build();
 
         engagementRepository.save(engagement);
-        // Deduplication guard — reject rapid double-clicks (same name+template within 60 seconds)
-        boolean duplicate = engagementRepository
-                .existsByTenantIdAndNameAndTemplateIdAndCreatedAtAfter(
-                        tenantId, req.getName(), req.getTemplateId(),
-                        LocalDateTime.now().minusSeconds(60));
-        if (duplicate) {
-            throw new BusinessException("DUPLICATE_ENGAGEMENT",
-                    "This engagement was just created — please wait a moment before trying again");
-        }
 
         log.info("[AUDIT] Created | ref={} | type={} | tenantId={}", ref, engagement.getAuditType(), tenantId);
 
@@ -199,19 +201,24 @@ public class AuditEngagementService {
         sectionInstanceRepository.save(section);
 
         if (cascadeToChildren) {
+            // Cascade auditor assignment down to all descendant SECTIONS only.
+            // Controls are NOT assigned here — the section's assigned auditor
+            // will explicitly assign themselves (or another auditor) to specific
+            // controls via assignAuditorToControl(). This allows:
+            //   - Lead auditor assigns Section A to Rohit
+            //   - Rohit assigns CC6.1, CC6.2 to himself
+            //   - Rohit assigns CC6.3 to Kavya (sub-specialist)
+            // Controls that are never explicitly assigned fall back to the
+            // section's assignedAuditorId in AuditWorkflowActorResolver.
             List<AuditSectionInstance> descendants =
                     sectionInstanceRepository.findAllDescendants(sectionInstanceId, section.getPath());
             for (AuditSectionInstance child : descendants) {
                 child.setAssignedAuditorId(auditorId);
                 sectionInstanceRepository.save(child);
             }
-            List<AuditControlInstance> controls =
-                    controlInstanceRepository.findByEngagementIdAndSectionPathStartingWith(
-                            engagementId, section.getPath());
-            for (AuditControlInstance ctrl : controls) {
-                ctrl.setAssignedAuditorId(auditorId);
-                controlInstanceRepository.save(ctrl);
-            }
+            // NOTE: control cascade deliberately removed.
+            // Controls inherit section auditor implicitly via AuditWorkflowActorResolver
+            // until explicitly overridden by assignAuditorToControl().
         }
 
         if (auditorId != null) {

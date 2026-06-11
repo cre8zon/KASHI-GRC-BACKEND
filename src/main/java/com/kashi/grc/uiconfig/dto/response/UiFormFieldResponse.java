@@ -37,4 +37,6 @@ public class UiFormFieldResponse {
     private String  currencyCode;
     /** TAG: comma-separated autocomplete suggestions */
     private String  tagSuggestions;
+    /** Pre-populated value; for hidden fields, the submitted payload value */
+    private String  defaultValue;
 }

@@ -61,4 +61,11 @@ public class IssueEntityResolver implements WorkflowEntityResolver {
                 })
                 .orElse(null);
     }
+
+    @Override
+    public String resolveEntityTitle(WorkflowInstance instance) {
+        return issueRepository.findById(instance.getEntityId())
+                .map(issue -> issue.getTitle())
+                .orElse(null);
+    }
 }

@@ -100,4 +100,15 @@ public class WorkflowEntityResolverRegistry {
     public boolean supports(String entityType) {
         return byEntityType.containsKey(entityType);
     }
+    public String resolveEntityTitle(WorkflowInstance instance) {
+        if (instance == null || instance.getEntityType() == null) return null;
+        WorkflowEntityResolver resolver = byEntityType.get(instance.getEntityType());
+        if (resolver == null) return null;
+        try { return resolver.resolveEntityTitle(instance); }
+        catch (Exception e) {
+            log.warn("[ENTITY-RESOLVER] resolveEntityTitle threw for instanceId={}: {}", instance.getId(), e.getMessage());
+            return null;
+        }
+    }
+
 }

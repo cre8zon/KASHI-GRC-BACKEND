@@ -27,4 +27,7 @@ public interface AuditFindingRepository extends JpaRepository<AuditFinding, Long
     long countByTenantId(Long tenantId);
 
     boolean existsByFindingRefAndTenantId(String findingRef, Long tenantId);
+
+    // ── ADDED: supports GET /v1/issues/{id}/linked-findings ──────────────────
+    List<AuditFinding> findByLinkedIssueIdAndTenantId(Long linkedIssueId, Long tenantId);
 }

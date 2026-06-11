@@ -1,16 +1,15 @@
 package com.kashi.grc.integration.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.kashi.grc.evidence.domain.EvidenceLink;
 import com.kashi.grc.evidence.domain.EvidenceRecord;
-import com.kashi.grc.evidence.repository.EvidenceLinkRepository;
 import com.kashi.grc.evidence.repository.EvidenceRecordRepository;
 import com.kashi.grc.evidence.service.EvidenceReuseEngine;
 import com.kashi.grc.integration.domain.IntegrationConfig;
 import com.kashi.grc.integration.domain.IntegrationRun;
+import com.kashi.grc.integration.domain.TenantIntegrationCheck;
 import com.kashi.grc.integration.repository.IntegrationConfigRepository;
-import com.kashi.grc.integration.repository.IntegrationCheckConfigRepository;
 import com.kashi.grc.integration.repository.IntegrationRunRepository;
+import com.kashi.grc.integration.repository.TenantIntegrationCheckRepository;
 import com.kashi.grc.integration.spi.IntegrationCheck;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -24,83 +23,87 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * IntegrationRunner — scheduled orchestrator for automated evidence collection.
+ * IntegrationRunner — scheduled orchestrator for automated compliance evidence collection.
  *
- * Runs hourly; each check determines its own frequency (HOURLY | DAILY | WEEKLY | MONTHLY).
- * The runner skips checks where nextRunAt is in the future.
+ * Runs hourly; each TenantIntegrationCheck determines its own frequency via nextRunAt.
  *
- * Flow for each check:
- *   1. Load IntegrationConfig (auth) for this tenant
- *   2. Find IntegrationCheck @Component by checkKey
- *   3. Run the check → CheckResult
- *   4. Create EvidenceRecord (collectionType=AUTOMATED)
- *   5. Create EvidenceLink:
- *        PASS  → AUTOMATION_VERIFIED (propagated to all matching test/control instances)
- *        FAIL  → PENDING_REVIEW (auditor must document exception)
- *   6. Update AuditTestInstance.testResult if check maps to a test
- *   7. Create IntegrationRun (immutable history)
+ * ── THREE-LAYER ISOLATION ─────────────────────────────────────────────────────
+ * Reads from TenantIntegrationCheck (tenant-owned instances) instead of the global
+ * IntegrationCheckConfig library. This means:
+ *   - Tenant-specific checkConfigJson and passCriteriaJson are used
+ *   - Changes to the global library don't affect running tenants
+ *   - Each tenant can have different frequency, config, and pass threshold
+ *     for the same check
+ *
+ * ── RESULT ROUTING ────────────────────────────────────────────────────────────
+ * After each run:
+ *   1. EvidenceReuseEngine.propagateAutomated() handles AUDIT_CONTROL_INSTANCE,
+ *      ASSESSMENT_QUESTION_INSTANCE, and MANUAL AuditTestInstance tag matching.
+ *   2. EngagementIntegrationSnapshotService.recordResult() handles precise routing
+ *      to AUTOMATED AuditTestInstance rows via checkKey -> testInstanceId mapping
+ *      established at engagement snapshot time.
+ *   3. TenantIntegrationCheck.lastRunStatus/lastRunAt updated for dashboard.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class IntegrationRunner {
 
-    private final List<IntegrationCheck>            checks;         // Spring injects all @Component implementations
-    private final IntegrationConfigRepository       configRepo;
-    private final IntegrationCheckConfigRepository  checkConfigRepo;
-    private final IntegrationRunRepository          runRepo;
-    private final EvidenceRecordRepository          evidenceRecordRepo;
-    private final EvidenceLinkRepository            evidenceLinkRepo;
-    private final EvidenceReuseEngine               reuseEngine;
-    private final ObjectMapper                      objectMapper;
+    private final List<IntegrationCheck>               checks;
+    private final IntegrationConfigRepository          configRepo;
+    private final TenantIntegrationCheckRepository     tenantCheckRepo;
+    private final IntegrationRunRepository             runRepo;
+    private final EvidenceRecordRepository             evidenceRecordRepo;
+    private final EvidenceReuseEngine                  reuseEngine;
+    private final ObjectMapper                         objectMapper;
+    private final EngagementIntegrationSnapshotService engagementSnapshotService;
 
-    /** Runs every hour. Each check decides its own frequency via nextRunAt. */
     @Scheduled(fixedRate = 3_600_000)
     public void runScheduled() {
         log.info("[INTEGRATION-RUNNER] Starting scheduled run");
         LocalDateTime now = LocalDateTime.now();
 
-        // Build map of checkKey → implementation for fast lookup
         Map<String, IntegrationCheck> checkMap = checks.stream()
                 .collect(Collectors.toMap(IntegrationCheck::checkKey, Function.identity(), (a, b) -> a));
 
-        // Find all active integration configs across all tenants
         List<IntegrationConfig> activeConfigs = configRepo.findByIsActiveTrue();
 
         for (IntegrationConfig config : activeConfigs) {
-            // Find all checks for this integration
-            checkConfigRepo
-                    .findByIntegrationKeyAndIsActiveTrue(config.getIntegrationKey())
-                    .forEach(checkConfig -> {
-                        // Skip if not due yet
-                        if (checkConfig.getNextRunAt() != null && checkConfig.getNextRunAt().isAfter(now)) {
+            tenantCheckRepo
+                    .findByIntegrationKeyAndTenantIdAndIsActiveTrue(
+                            config.getIntegrationKey(), config.getTenantId())
+                    .forEach(tenantCheck -> {
+                        if (tenantCheck.getNextRunAt() != null
+                                && tenantCheck.getNextRunAt().isAfter(now)) {
                             return;
                         }
-                        IntegrationCheck impl = checkMap.get(checkConfig.getCheckKey());
+                        IntegrationCheck impl = checkMap.get(tenantCheck.getCheckKey());
                         if (impl == null) {
-                            log.warn("[INTEGRATION-RUNNER] No implementation for checkKey={}", checkConfig.getCheckKey());
+                            log.warn("[INTEGRATION-RUNNER] No implementation for checkKey={}",
+                                    tenantCheck.getCheckKey());
                             return;
                         }
                         try {
-                            runCheck(config, checkConfig, impl);
+                            runCheck(config, tenantCheck, impl);
                         } catch (Exception e) {
-                            log.error("[INTEGRATION-RUNNER] Unexpected error | checkKey={} | tenantId={}: {}",
-                                    checkConfig.getCheckKey(), config.getTenantId(), e.getMessage());
+                            log.error("[INTEGRATION-RUNNER] Error | checkKey={} tenantId={}: {}",
+                                    tenantCheck.getCheckKey(), config.getTenantId(), e.getMessage());
                         }
                     });
         }
         log.info("[INTEGRATION-RUNNER] Scheduled run complete");
     }
 
-    /** Manual trigger — called from IntegrationController */
     @Transactional
     public IntegrationRun triggerManual(Long configId, String checkKey) {
         IntegrationConfig config = configRepo.findById(configId)
                 .orElseThrow(() -> new IllegalArgumentException("IntegrationConfig not found: " + configId));
 
-        var checkConfig = checkConfigRepo.findByIntegrationKeyAndCheckKey(
-                        config.getIntegrationKey(), checkKey)
-                .orElseThrow(() -> new IllegalArgumentException("Check not found: " + checkKey));
+        TenantIntegrationCheck tenantCheck = tenantCheckRepo
+                .findByTenantIdAndIntegrationKeyAndCheckKey(
+                        config.getTenantId(), config.getIntegrationKey(), checkKey)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "TenantIntegrationCheck not found: " + checkKey));
 
         Map<String, IntegrationCheck> checkMap = checks.stream()
                 .collect(Collectors.toMap(IntegrationCheck::checkKey, Function.identity(), (a, b) -> a));
@@ -108,41 +111,42 @@ public class IntegrationRunner {
         IntegrationCheck impl = checkMap.get(checkKey);
         if (impl == null) throw new IllegalStateException("No implementation for checkKey: " + checkKey);
 
-        return runCheck(config, checkConfig, impl);
+        return runCheck(config, tenantCheck, impl);
     }
 
     @Transactional
     protected IntegrationRun runCheck(IntegrationConfig config,
-                                      com.kashi.grc.integration.domain.IntegrationCheckConfig checkConfig,
+                                      TenantIntegrationCheck tenantCheck,
                                       IntegrationCheck impl) {
         long startMs = System.currentTimeMillis();
         LocalDateTime runAt = LocalDateTime.now();
         Long tenantId = config.getTenantId();
 
-        log.info("[INTEGRATION] Running | checkKey={} | tenantId={}", checkConfig.getCheckKey(), tenantId);
+        log.info("[INTEGRATION] Running | checkKey={} | tenantId={}", tenantCheck.getCheckKey(), tenantId);
 
-        // Decrypt auth config (implement AES-256 decryption in production)
         String decryptedAuth = decryptAuthConfig(config.getAuthConfig());
 
         IntegrationCheck.CheckResult result;
         try {
-            result = impl.run(decryptedAuth, checkConfig.getCheckConfigJson());
+            result = impl.run(decryptedAuth, tenantCheck.getCheckConfigJson());
         } catch (Exception e) {
-            result = IntegrationCheck.CheckResult.error("Unexpected error: " + e.getMessage(), checkConfig.getControlTag());
-            log.error("[INTEGRATION] Check threw exception | checkKey={}: {}", checkConfig.getCheckKey(), e.getMessage());
+            result = IntegrationCheck.CheckResult.error(
+                    "Unexpected error: " + e.getMessage(), tenantCheck.getControlTag());
+            log.error("[INTEGRATION] Check threw exception | checkKey={}: {}",
+                    tenantCheck.getCheckKey(), e.getMessage());
         }
 
         int durationMs = (int)(System.currentTimeMillis() - startMs);
-        boolean isPass  = result.result() == IntegrationCheck.Result.PASS;
-        String status   = result.result() == IntegrationCheck.Result.ERROR ? "FAILURE" : "SUCCESS";
+        boolean isPass = result.result() == IntegrationCheck.Result.PASS;
+        String status  = result.result() == IntegrationCheck.Result.ERROR ? "FAILURE" : "SUCCESS";
 
-        // Create EvidenceRecord
         EvidenceRecord record = EvidenceRecord.builder()
                 .tenantId(tenantId)
                 .title(result.evidenceTitle() + " — " + runAt.toLocalDate())
-                .controlTag(result.controlTag() != null ? result.controlTag().toUpperCase() : checkConfig.getControlTag())
+                .controlTag(result.controlTag() != null
+                        ? result.controlTag().toUpperCase() : tenantCheck.getControlTag())
                 .collectionType(EvidenceRecord.CollectionType.AUTOMATED)
-                .integrationKey(checkConfig.getCheckKey())
+                .integrationKey(tenantCheck.getCheckKey())
                 .rawPayload(result.rawPayload())
                 .automationResult(isPass
                         ? EvidenceRecord.AutomationResult.PASS
@@ -151,38 +155,51 @@ public class IntegrationRunner {
                           : EvidenceRecord.AutomationResult.FAIL)
                 .automationMessage(result.summary())
                 .collectedAt(runAt)
-                .runFrequency(checkConfig.getRunFrequency())
-                .nextRunAt(calculateNextRunAt(runAt, checkConfig.getRunFrequency()))
+                .runFrequency(tenantCheck.getRunFrequency())
+                .nextRunAt(calculateNextRunAt(runAt, tenantCheck.getRunFrequency()))
                 .validFrom(runAt)
-                .validUntil(calculateValidUntil(runAt, checkConfig.getRunFrequency()))
+                .validUntil(calculateValidUntil(runAt, tenantCheck.getRunFrequency()))
                 .uploadedAt(runAt)
                 .linkCount(0)
                 .build();
         evidenceRecordRepo.save(record);
 
-        // Propagate via EvidenceReuseEngine — creates EvidenceLinks on matching entities
-        // PASS → AUTOMATION_VERIFIED links, FAIL → PENDING_REVIEW links
+        // Tag-based propagation for AUDIT_CONTROL_INSTANCE, ASSESSMENT_QUESTION_INSTANCE,
+        // and MANUAL/HYBRID AuditTestInstance rows (AUTOMATED test instances excluded
+        // from AuditTestEvidenceMatcher — handled below).
         if (record.getControlTag() != null && result.result() != IntegrationCheck.Result.ERROR) {
             reuseEngine.propagateAutomated(record.getId(), isPass);
         }
 
-        // Update nextRunAt on the check config
-        checkConfig.setNextRunAt(record.getNextRunAt());
-        checkConfig.setLastRunAt(runAt);
-        checkConfig.setLastRunStatus(isPass ? "PASS" : "FAIL");
-        checkConfigRepo.save(checkConfig);
+        // Precise checkKey-based routing to AUTOMATED AuditTestInstance rows
+        if (result.result() != IntegrationCheck.Result.ERROR) {
+            try {
+                engagementSnapshotService.recordResult(
+                        tenantCheck.getCheckKey(), tenantId, isPass,
+                        result.summary(), record.getId(), null);
+            } catch (Exception e) {
+                log.error("[INTEGRATION] Failed to record engagement snapshot result | checkKey={}: {}",
+                        tenantCheck.getCheckKey(), e.getMessage());
+            }
+        }
 
-        // Update integration config last run
+        // Update tenant check instance for dashboard display
+        tenantCheck.setNextRunAt(calculateNextRunAt(runAt, tenantCheck.getRunFrequency()));
+        tenantCheck.setLastRunAt(runAt);
+        tenantCheck.setLastRunStatus(isPass ? "PASS" : "FAIL");
+        tenantCheck.setLastRunSummary(result.summary());
+        tenantCheck.setTotalRunCount(tenantCheck.getTotalRunCount() + 1);
+        tenantCheckRepo.save(tenantCheck);
+
         config.setLastRunAt(runAt);
         config.setLastRunStatus(status);
         configRepo.save(config);
 
-        // Create immutable run record
         IntegrationRun run = IntegrationRun.builder()
                 .tenantId(tenantId)
                 .integrationConfigId(config.getId())
-                .checkKey(checkConfig.getCheckKey())
-                .controlTag(checkConfig.getControlTag())
+                .checkKey(tenantCheck.getCheckKey())
+                .controlTag(tenantCheck.getControlTag())
                 .runAt(runAt)
                 .status(status)
                 .result(result.result().name())
@@ -194,12 +211,11 @@ public class IntegrationRunner {
                 .build();
         runRepo.save(run);
 
-        // Update EvidenceRecord with its run ID
         record.setIntegrationRunId(run.getId());
         evidenceRecordRepo.save(record);
 
         log.info("[INTEGRATION] Done | checkKey={} | result={} | durationMs={} | tenantId={}",
-                checkConfig.getCheckKey(), result.result(), durationMs, tenantId);
+                tenantCheck.getCheckKey(), result.result(), durationMs, tenantId);
 
         return run;
     }
@@ -216,7 +232,6 @@ public class IntegrationRunner {
     }
 
     private LocalDateTime calculateValidUntil(LocalDateTime from, String frequency) {
-        // Evidence is valid for 2× the frequency period to avoid gaps during re-runs
         return switch ((frequency != null ? frequency : "DAILY").toUpperCase()) {
             case "HOURLY"  -> from.plusHours(2);
             case "DAILY"   -> from.plusDays(2);
@@ -226,9 +241,8 @@ public class IntegrationRunner {
         };
     }
 
-    /** Placeholder — implement AES-256 decryption using your key management service */
     private String decryptAuthConfig(String encrypted) {
         // TODO: integrate with AWS KMS / Azure Key Vault / HashiCorp Vault
-        return encrypted; // plaintext in dev, encrypted in prod
+        return encrypted;
     }
 }

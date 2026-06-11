@@ -48,6 +48,25 @@ public interface AuditControlInstanceRepository extends JpaRepository<AuditContr
 
     List<AuditControlInstance> findByEngagementIdAndAssignedAuditorId(Long engagementId, Long auditorId);
 
+    /**
+     * Finds all controls under sections that have been assigned to the given auditor.
+     * Used as fallback in AuditControlSectionItemRegistrar when controls have no
+     * direct assignedAuditorId (after cascade-fix where section assignment no longer
+     * cascades to controls).
+     */
+    @Query("""
+        SELECT c FROM AuditControlInstance c
+        WHERE c.engagementId = :engagementId
+          AND c.sectionPath IN (
+              SELECT s.path FROM AuditSectionInstance s
+              WHERE s.engagementId = :engagementId
+                AND s.assignedAuditorId = :auditorId
+          )
+    """)
+    List<AuditControlInstance> findByEngagementIdAndSectionAuditorId(
+            @Param("engagementId") Long engagementId,
+            @Param("auditorId") Long auditorId);
+
     List<AuditControlInstance> findByEngagementIdAndAuditeeAssignedUserId(Long engagementId, Long auditeeUserId);
 
     /**
@@ -127,4 +146,24 @@ public interface AuditControlInstanceRepository extends JpaRepository<AuditContr
     List<AuditControlInstance> findByTenantId(Long tenantId);
 
     List<AuditControlInstance> findByTenantIdOrderByControlCodeSnapshotAsc(Long tenantId);
+
+    // ── ADDED: per-result count for syncEngagementScore() ────────────────────
+
+    /**
+     * Count control instances in an engagement with a specific testResult.
+     * Used by AuditTestPolicySnapshotService.syncEngagementScore() to populate
+     * AuditEngagement.passedControls, failedControls, notApplicableControls.
+     */
+    long countByEngagementIdAndTestResult(Long engagementId, AuditControlInstance.TestResult testResult);
+
+    /**
+     * Count controls that have been evaluated (any result except NOT_TESTED).
+     * Used by syncEngagementScore() to populate AuditEngagement.testedControls.
+     */
+    @Query("""
+        SELECT COUNT(c) FROM AuditControlInstance c
+        WHERE c.engagementId = :engagementId
+          AND c.testResult != com.kashi.grc.audit.domain.AuditControlInstance$TestResult.NOT_TESTED
+    """)
+    long countTestedByEngagementId(@Param("engagementId") Long engagementId);
 }

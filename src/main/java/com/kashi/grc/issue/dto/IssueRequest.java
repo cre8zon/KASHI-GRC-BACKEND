@@ -1,10 +1,12 @@
 package com.kashi.grc.issue.dto;
 
 import com.kashi.grc.issue.domain.Issue;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import lombok.Data;
 
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -47,7 +49,22 @@ public class IssueRequest {
     // ── SLA ───────────────────────────────────────────────────────────────────
 
     /** Explicit due date — if null, computed from severity SLA matrix by service */
+    /** Accepts date-only (yyyy-MM-dd) or datetime — date picker sends date-only strings */
+    @JsonDeserialize(using = FlexibleDateDeserializer.class)
     private LocalDateTime dueAt;
+
+    /** Deserializes both 'yyyy-MM-dd' and 'yyyy-MM-ddTHH:mm:ss' into LocalDateTime */
+    public static class FlexibleDateDeserializer extends com.fasterxml.jackson.databind.deser.std.StdDeserializer<LocalDateTime> {
+        public FlexibleDateDeserializer() { super(LocalDateTime.class); }
+        @Override
+        public LocalDateTime deserialize(com.fasterxml.jackson.core.JsonParser p,
+                                         com.fasterxml.jackson.databind.DeserializationContext ctx) throws java.io.IOException {
+            String s = p.getText();
+            if (s == null || s.isBlank()) return null;
+            if (s.length() == 10) return LocalDate.parse(s).atStartOfDay(); // yyyy-MM-dd
+            return LocalDateTime.parse(s);  // yyyy-MM-ddTHH:mm:ss
+        }
+    }
 
     // ── Framework ─────────────────────────────────────────────────────────────
 

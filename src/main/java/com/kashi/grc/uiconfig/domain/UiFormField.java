@@ -124,6 +124,14 @@ public class UiFormField extends BaseEntity {
     private String tagSuggestions;
 
     /**
+     * Default value pre-populated into the field.
+     * For hidden fields (isVisible=false) this is the value submitted in the payload.
+     * e.g. workflowId hidden field with defaultValue="15"
+     */
+    @Column(name = "default_value", length = 500)
+    private String defaultValue;
+
+    /**
      * For TEXTAREA and JSON_EDITOR types: number of visible rows.
      * Defaults to 3 for TEXTAREA, 8 for JSON_EDITOR if null.
      */
@@ -214,7 +222,8 @@ public class UiFormField extends BaseEntity {
       ADD COLUMN lookup_entity_type  VARCHAR(100)   NULL COMMENT 'For LOOKUP: entity type to search',
       ADD COLUMN lookup_api_path     VARCHAR(255)   NULL COMMENT 'For LOOKUP: search API endpoint',
       ADD COLUMN tag_suggestions     TEXT           NULL COMMENT 'For TAG: comma-sep suggestions',
-      ADD COLUMN rows_count          INT            NULL COMMENT 'For TEXTAREA/JSON_EDITOR: row count';
+      ADD COLUMN rows_count          INT            NULL COMMENT 'For TEXTAREA/JSON_EDITOR: row count',
+      ADD COLUMN default_value        VARCHAR(500)   NULL COMMENT 'Pre-populated value; for hidden fields, the submitted payload value';
 
     -- Extend field_type enum (MySQL — add new values at end to keep ordinals stable):
     ALTER TABLE ui_form_fields

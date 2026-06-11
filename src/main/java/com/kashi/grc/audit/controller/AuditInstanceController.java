@@ -15,6 +15,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.time.LocalDateTime;
+import java.time.Year;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -42,6 +43,8 @@ public class AuditInstanceController {
     private final AuditPolicyInstanceControlMappingRepository policyCtrlMappingRepo;
     private final AuditTestPolicySnapshotService             snapshotService;
     private final UtilityService                            utilityService;
+    // ADDED
+    private final AuditFindingRepository                    findingRepo;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROL INSTANCES — /v1/audit/control-instances/{id}
@@ -360,6 +363,40 @@ public class AuditInstanceController {
         if (body.containsKey("auditorNotes")) policy.setAuditorNotes(body.get("auditorNotes"));
         policyRepo.save(policy);
 
+        // ADDED: auto-create a finding for each linked control when policy is INADEQUATE
+        if (policy.getReviewResult() == AuditPolicyInstance.ReviewResult.INADEQUATE) {
+            policyCtrlMappingRepo.findByPolicyInstanceId(id).forEach(mapping -> {
+                String autoTitle = "Policy gap: " + policy.getTitleSnapshot();
+                boolean alreadyExists = findingRepo
+                        .findByControlInstanceIdAndTenantId(mapping.getControlInstanceId(), ctx.getTenantId())
+                        .stream()
+                        .anyMatch(f -> autoTitle.equals(f.getTitle())
+                                && f.getStatus() != AuditFinding.Status.CLOSED
+                                && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
+                if (alreadyExists) return;
+
+                AuditFinding autoFinding = AuditFinding.builder()
+                        .tenantId(ctx.getTenantId())
+                        .findingRef(generateFindingRef(ctx.getTenantId()))
+                        .engagementId(policy.getEngagementId())
+                        .controlInstanceId(mapping.getControlInstanceId())
+                        .title(autoTitle)
+                        .description("Policy '" + policy.getTitleSnapshot() + "' v"
+                                + policy.getVersionSnapshot() + " reviewed as INADEQUATE.")
+                        .severity(AuditFinding.Severity.MEDIUM)
+                        .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
+                        .status(AuditFinding.Status.OPEN)
+                        .frameworkRef(policy.getFrameworkRefsSnapshot())
+                        .raisedBy(ctx.getId())
+                        .raisedAt(LocalDateTime.now())
+                        .build();
+                findingRepo.save(autoFinding);
+                log.info("[POLICY-INSTANCE] Auto-finding raised | policyInstanceId={} findingId={} controlId={}",
+                        id, autoFinding.getId(), mapping.getControlInstanceId());
+            });
+            snapshotService.syncEngagementScore(policy.getEngagementId(), ctx.getTenantId());
+        }
+
         log.info("[POLICY-INSTANCE] Reviewed | id={} | result={}", id, policy.getReviewResult());
         return ResponseEntity.ok(ApiResponse.success());
     }
@@ -471,5 +508,15 @@ public class AuditInstanceController {
         m.put("sectionBreadcrumbSnapshot",c.getSectionBreadcrumbSnapshot());
         m.put("sectionInstanceId",       c.getSectionInstanceId());
         return m;
+    }
+
+    // ADDED: collision-safe finding ref generator (mirrors AuditFindingController.generateRef)
+    private String generateFindingRef(Long tenantId) {
+        long count = findingRepo.countByTenantId(tenantId) + 1;
+        String candidate = String.format("FND-%d-%04d", Year.now().getValue(), count);
+        while (findingRepo.existsByFindingRefAndTenantId(candidate, tenantId)) {
+            candidate = String.format("FND-%d-%04d", Year.now().getValue(), ++count);
+        }
+        return candidate;
     }
 }

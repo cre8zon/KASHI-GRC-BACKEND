@@ -27,4 +27,8 @@ public interface AuditTestInstanceRepository extends JpaRepository<AuditTestInst
                                                           @Param("tenantId") Long tenantId);
 
     List<AuditTestInstance> findByTenantIdOrderByTestNameSnapshotAsc(Long tenantId);
+
+    // ── ADDED: indexed tenant+tag query used by AuditTestEvidenceMatcher ─────
+    // Replaces the previous findAll() + in-memory filter (full table scan).
+    List<AuditTestInstance> findByTenantIdAndControlTagSnapshot(Long tenantId, String controlTagSnapshot);
 }

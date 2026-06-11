@@ -74,19 +74,43 @@ public class AuditControlSectionItemRegistrar {
             return;
         }
 
-        // Load only control instances assigned to this specific auditee.
-        // event.assignedUserId() is the userId on the TaskInstance being registered.
-        // Using findByEngagementId (all controls) would register every control on
-        // every auditee's task — the auditee would see controls they never owned.
-        Long assignedAuditeeId = event.assignedUserId();
-        List<AuditControlInstance> controls = (assignedAuditeeId != null)
-                ? controlInstanceRepository.findByEngagementIdAndAuditeeAssignedUserId(
-                engagement.getId(), assignedAuditeeId)
-                : controlInstanceRepository.findByEngagementId(engagement.getId()); // fallback: no auditee filter
+        // Load control instances scoped to this specific task's assigned user.
+        // The field used depends on which side is doing the work:
+        //   EVIDENCE_UPLOADED  (Step 4, auditee side) → auditeeAssignedUserId
+        //   CONTROLS_EVALUATED (Step 5, auditor side) → assignedAuditorId
+        //                       (after cascade-fix, controls inherit section auditor
+        //                        via section path lookup as fallback)
+        Long assignedUserId = event.assignedUserId();
+        String sectionKey   = event.sectionKey();
+
+        List<AuditControlInstance> controls;
+        if ("CONTROLS_EVALUATED".equalsIgnoreCase(sectionKey)) {
+            // Auditor side — find controls assigned to this auditor
+            // If assignedAuditorId is not set (cascade removed), fall back to
+            // controls under this auditor's assigned sections
+            controls = (assignedUserId != null)
+                    ? controlInstanceRepository.findByEngagementIdAndAssignedAuditorId(
+                    engagement.getId(), assignedUserId)
+                    : controlInstanceRepository.findByEngagementId(engagement.getId());
+            if (controls.isEmpty() && assignedUserId != null) {
+                // Fallback: auditor assigned to sections — get all controls under those sections
+                log.info("[AUDIT-CTRL-REGISTRAR] No direct control assignments for auditorId={} — falling back to section-path lookup",
+                        assignedUserId);
+                controls = controlInstanceRepository
+                        .findByEngagementIdAndSectionAuditorId(engagement.getId(), assignedUserId);
+            }
+        } else {
+            // EVIDENCE_UPLOADED or any other auditee-side section key
+            controls = (assignedUserId != null)
+                    ? controlInstanceRepository.findByEngagementIdAndAuditeeAssignedUserId(
+                    engagement.getId(), assignedUserId)
+                    : controlInstanceRepository.findByEngagementId(engagement.getId());
+        }
 
         if (controls.isEmpty()) {
-            log.warn("[AUDIT-CTRL-REGISTRAR] No control instances for engagementId={} auditeeId={} — " +
-                    "either no assignments yet or snapshotTemplate() has not run", engagement.getId(), assignedAuditeeId);
+            log.warn("[AUDIT-CTRL-REGISTRAR] No control instances for engagementId={} userId={} sectionKey={} — " +
+                            "either no assignments yet or snapshotTemplate() has not run",
+                    engagement.getId(), assignedUserId, sectionKey);
             return;
         }
 
