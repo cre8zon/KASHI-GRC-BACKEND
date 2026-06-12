@@ -2221,19 +2221,27 @@ public class WorkflowEngineService {
                 log.info("[WORKFLOW] Step '{}' ENTITY_OWNER — 1 ACTOR task for owner userId={}",
                         si.getSnapName(), ownerId);
             } else {
-                // Owner not set yet — fall back to previous actor (e.g. whoever triaged in step 1)
+                // Owner not set — for AUTOMATED issues ingested by system, fall through to ROLE_BASED
+                // so GRC_MANAGER pool gets the triage task instead of the system user.
+                // For other cases fall back to previous actor or initiator.
                 Long previousActor = getPreviousStepActor(instance);
                 Long fallbackId = previousActor != null ? previousActor : instance.getInitiatedBy();
-                if (fallbackId != null) {
+                Long systemUid = instance.getInitiatedBy();
+                // If fallback resolves to the system/initiator and they are the same as
+                // the workflow initiator (automated ingest), skip to ROLE_BASED pool.
+                boolean fallbackIsSystemUser = fallbackId != null
+                        && fallbackId.equals(systemUid)
+                        && previousActor == null; // no real human acted before
+                if (fallbackId != null && !fallbackIsSystemUser) {
                     TaskInstance t = createTask(si, fallbackId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     actorTaskCount++;
                     log.warn("[WORKFLOW] Step '{}' ENTITY_OWNER — owner not set, fell back to userId={}",
                             si.getSnapName(), fallbackId);
                 } else {
-                    log.warn("[WORKFLOW] Step '{}' ENTITY_OWNER — owner and fallback both null, falling back to ROLE_BASED",
+                    log.warn("[WORKFLOW] Step '{}' ENTITY_OWNER — owner not set or fallback is system user, falling back to ROLE_BASED pool",
                             si.getSnapName());
-                    actorResolution = ActorResolution.ROLE_BASED; // fall through
+                    actorResolution = ActorResolution.ROLE_BASED; // fall through to role pool
                 }
             }
         }
