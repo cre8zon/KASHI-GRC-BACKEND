@@ -79,6 +79,9 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
-        return "OPTIONS".equalsIgnoreCase(request.getMethod());
+        // Skip JWT for OPTIONS preflight and ingest endpoint (uses X-Ingest-Token)
+        if ("OPTIONS".equalsIgnoreCase(request.getMethod())) return true;
+        String path = request.getRequestURI();
+        return path.equals("/v1/issues/ingest");
     }
 }

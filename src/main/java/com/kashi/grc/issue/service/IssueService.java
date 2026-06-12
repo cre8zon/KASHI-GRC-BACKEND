@@ -63,6 +63,7 @@ public class IssueService {
     private final NotificationService                                notificationService;
     private final EmailSenderService                                 emailSenderService;
     private final UserRepository                                     userRepository;
+    private final com.kashi.grc.common.repository.DbRepository       dbRepository;
     private final ObjectMapper             objectMapper;
 
     /**
@@ -166,7 +167,33 @@ public class IssueService {
      *   - Notifies GRC Manager pool
      */
     @Transactional
+    /**
+     * Resolves the "system" user for a given tenant — used as createdBy/initiator
+     * for automated ingestion. Multi-tenant safe: each tenant's own ORG_ADMIN (or
+     * ORG_OWNER if no admin exists) is used as the system actor, not a single
+     * global hardcoded user.
+     * Falls back to app.system.userId (global config) only if the tenant has
+     * neither ORG_ADMIN nor ORG_OWNER.
+     */
+    private Long resolveSystemUserId(Long tenantId) {
+        List<Long> orgAdmins = dbRepository.findUserIdsByRoleAndTenant(8L, tenantId); // ORG_ADMIN
+        if (!orgAdmins.isEmpty()) {
+            return orgAdmins.get(0);
+        }
+        List<Long> orgOwners = dbRepository.findUserIdsByRoleAndTenant(7L, tenantId); // ORG_OWNER
+        if (!orgOwners.isEmpty()) {
+            log.info("[ISSUE-INGEST] No ORG_ADMIN for tenantId={} — using ORG_OWNER as system user", tenantId);
+            return orgOwners.get(0);
+        }
+        log.warn("[ISSUE-INGEST] No ORG_ADMIN or ORG_OWNER found for tenantId={} — falling back to app.system.userId={}",
+                tenantId, systemUserId);
+        return systemUserId;
+    }
+
     public IssueResponse ingest(IssueIngestRequest req, Long tenantId) {
+        // Resolve tenant-scoped system user (each tenant's own ORG_ADMIN)
+        Long tenantSystemUserId = resolveSystemUserId(tenantId);
+
         // Deduplication check
         Optional<Issue> existing = issueRepository.findByTenantIdAndExternalSourceAndExternalId(
                 tenantId, req.getSource().toUpperCase(), req.getExternalId());
@@ -195,7 +222,7 @@ public class IssueService {
                 .cvssScore(req.getCvssScore())
                 .sourceDescription(req.getAffectedAsset())
                 .raisedBySide("SYSTEM")
-                .createdBy(systemUserId)
+                .createdBy(tenantSystemUserId)
                 .dueAt(computeDueAt(severity))
                 .frameworkRef(req.getFrameworkRef())
                 .build();
@@ -205,10 +232,14 @@ public class IssueService {
                 ref, req.getSource(), req.getExternalId(), severity, tenantId);
 
         // Auto-start AUTOMATED workflow
-        startWorkflowIfConfigured(issue, req.getWorkflowId(), systemUserId, tenantId);
+        startWorkflowIfConfigured(issue, req.getWorkflowId(), tenantSystemUserId, tenantId);
+
+        // If Step 1 (and possibly Step 2) auto-completed, sync issue status to TRIAGED
+        // so the UI shows the correct action buttons (Start Remediation, not Triage).
+        syncStatusAfterWorkflowStart(issue, tenantSystemUserId, tenantId);
 
         // Notify GRC Manager group — pool-assigned triage
-        notificationService.send(systemUserId, "ISSUE_AUTOMATED_INGEST",
+        notificationService.send(tenantSystemUserId, "ISSUE_AUTOMATED_INGEST",
                 "[AUTO] New " + severity + " issue from " + req.getSource() + ": " + req.getTitle(),
                 "ISSUE", issue.getId());
 
@@ -255,7 +286,7 @@ public class IssueService {
     // ─────────────────────────────────────────────────────────────────────────
 
     @Transactional
-    public IssueResponse update(Long id, IssueRequest req, Long tenantId) {
+    public IssueResponse update(Long id, IssueRequest req, Long userId, Long tenantId) {
         Issue issue = issueRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
         if (!issue.getTenantId().equals(tenantId))
@@ -265,6 +296,13 @@ public class IssueService {
         if (req.getDescription()         != null) issue.setDescription(req.getDescription());
         if (req.getSeverity()            != null) issue.setSeverity(req.getSeverity());
         if (req.getCategory()            != null) issue.setCategory(req.getCategory());
+        // Capture old values BEFORE mutation, for generic advanceOnFieldSet check below.
+        // Only fields that are realistically used as "fill this to advance" triggers
+        // need to be captured — extend this map as new advanceOnFieldSet use cases arise.
+        java.util.Map<String, Object> oldValues = java.util.Map.of(
+                "ownerId", java.util.Optional.ofNullable(issue.getOwnerId())
+        );
+
         if (req.getOwnerId()             != null) issue.setOwnerId(req.getOwnerId());
         if (req.getDueAt()               != null) issue.setDueAt(req.getDueAt());
         if (req.getFrameworkRef()        != null) issue.setFrameworkRef(req.getFrameworkRef());
@@ -283,12 +321,59 @@ public class IssueService {
         // ── Remediation fields ───────────────────────────────────────────────
         if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
         if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
+        if (req.getRemediatedAt()        != null) issue.setRemediatedAt(req.getRemediatedAt());
+        if (req.getValidatedAt()         != null) issue.setValidatedAt(req.getValidatedAt());
         if (req.getAcceptedRisk()        != null) issue.setAcceptedRisk(req.getAcceptedRisk());
         if (req.getAcceptedRiskNote()    != null) issue.setAcceptedRiskNote(req.getAcceptedRiskNote());
         if (req.getClosureSummary()      != null) issue.setClosureSummary(req.getClosureSummary());
 
         issueRepository.save(issue);
+
+        // ── Generic advanceOnFieldSet ───────────────────────────────────────
+        // Steps can declare in step_ui_override_json: {"advanceOnFieldSet": "ownerId"}
+        // When that field transitions null → non-null in this update, the current
+        // PENDING task on this step is auto-approved, advancing the workflow.
+        // Add more cases to newValues/oldValues as new "fill X to advance" steps appear —
+        // no further engine changes needed, just one SQL line per step.
+        if (issue.getWorkflowInstanceId() != null) {
+            String advanceField = getAdvanceOnFieldSet(issue);
+            if (advanceField != null) {
+                java.util.Map<String, Object> newValues = java.util.Map.of(
+                        "ownerId", java.util.Optional.ofNullable(issue.getOwnerId())
+                );
+                Object oldVal = ((java.util.Optional<?>) oldValues.getOrDefault(advanceField, java.util.Optional.empty())).orElse(null);
+                Object newVal = ((java.util.Optional<?>) newValues.getOrDefault(advanceField, java.util.Optional.empty())).orElse(null);
+                if (oldVal == null && newVal != null) {
+                    log.info("[ISSUE-WF] advanceOnFieldSet '{}' transitioned null -> {} | issueId={}",
+                            advanceField, newVal, issue.getId());
+                    advanceWorkflowTask(issue, userId, advanceField + " set");
+                }
+            }
+        }
+
         return toResponse(issue, tenantId);
+    }
+
+    /**
+     * Reads the snap_ui_override_json of the issue's current step instance and
+     * returns its "advanceOnFieldSet" value, or null if not configured / not on a step.
+     */
+    private String getAdvanceOnFieldSet(Issue issue) {
+        try {
+            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
+                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+            if (wfInst == null || wfInst.getCurrentStepId() == null) return null;
+            com.kashi.grc.workflow.domain.StepInstance si =
+                    stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
+            if (si == null || si.getSnapUiOverrideJson() == null) return null;
+            com.fasterxml.jackson.databind.JsonNode node =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(si.getSnapUiOverrideJson());
+            com.fasterxml.jackson.databind.JsonNode field = node.get("advanceOnFieldSet");
+            return (field != null && !field.isNull()) ? field.asText() : null;
+        } catch (Exception e) {
+            log.warn("[ISSUE-WF] Failed to read advanceOnFieldSet for issueId={}: {}", issue.getId(), e.getMessage());
+            return null;
+        }
     }
 
     @Transactional
@@ -307,26 +392,25 @@ public class IssueService {
         // when triage is called. In that case we skip advance to avoid double-advancing.
         if (newStatus == Issue.Status.TRIAGED) {
             if (issue.getAcknowledgedAt() == null) issue.setAcknowledgedAt(LocalDateTime.now());
-            // Only advance if still on Step 1 (auto-complete may have already moved to Step 2)
-            advanceWorkflowTaskIfOnStep(issue, userId, "Triaged via issue action", 1);
+            advanceWorkflowTask(issue, userId, "Triaged via issue action");
         }
         if (newStatus == Issue.Status.IN_PROGRESS) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Owner acknowledged and started remediation", 2);
+            advanceWorkflowTask(issue, userId, "Owner acknowledged and started remediation");
         }
         if (newStatus == Issue.Status.PENDING_REVIEW) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for review", 3);
+            advanceWorkflowTask(issue, userId, "Submitted for review");
         }
         if (newStatus == Issue.Status.PENDING_VALIDATION) {
-            advanceWorkflowTaskIfOnStep(issue, userId, "Submitted for validation", 4);
+            advanceWorkflowTask(issue, userId, "Submitted for validation");
         }
         if (newStatus == Issue.Status.RESOLVED) {
             issue.setRemediatedAt(LocalDateTime.now());
-            advanceWorkflowTaskIfOnStep(issue, userId, "Remediation validated", 5);
+            advanceWorkflowTask(issue, userId, "Remediation validated");
         }
         if (newStatus == Issue.Status.CLOSED || newStatus == Issue.Status.ACCEPTED_RISK) {
             issue.setClosedAt(LocalDateTime.now());
             issue.setClosedBy(userId);
-            advanceWorkflowTaskIfOnStep(issue, userId, "Issue closed", 6);
+            advanceWorkflowTask(issue, userId, "Issue closed");
         }
 
 
@@ -590,36 +674,13 @@ public class IssueService {
         }
     }
 
-    private void advanceWorkflowTaskIfOnStep(Issue issue, Long userId, String remarks, int expectedStepOrder) {
-        if (issue.getWorkflowInstanceId() == null) {
-            log.warn("[ISSUE-WF] workflowInstanceId is NULL | issueId={}", issue.getId());
-            return;
-        }
-        try {
-            com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
-                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
-            if (wfInst == null || wfInst.getCurrentStepId() == null) {
-                log.warn("[ISSUE-WF] No active step | instanceId={}", issue.getWorkflowInstanceId());
-                return;
-            }
-            // Check actual step order from the StepInstance snapshot
-            com.kashi.grc.workflow.domain.StepInstance currentSI =
-                    stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
-            if (currentSI == null) return;
-            int actualOrder = currentSI.getSnapStepOrder() != null ? currentSI.getSnapStepOrder() : -1;
-            log.info("[ISSUE-WF] advanceWorkflowTaskIfOnStep | issueId={} | expectedStep={} | actualStep={} | remarks={}",
-                    issue.getId(), expectedStepOrder, actualOrder, remarks);
-            if (actualOrder != expectedStepOrder) {
-                log.info("[ISSUE-WF] Skipping advance — currentStep={} != expectedStep={} (likely auto-completed already)",
-                        actualOrder, expectedStepOrder);
-                return;
-            }
-            advanceWorkflowTask(issue, userId, remarks);
-        } catch (Exception e) {
-            log.warn("[ISSUE-WF] advanceWorkflowTaskIfOnStep error | issueId={} | {}", issue.getId(), e.getMessage(), e);
-        }
-    }
-
+    /**
+     * Advances the current workflow step by approving the first PENDING task.
+     * Does NOT check step order — advances whatever step is currently active.
+     * The status transition (TRIAGED, IN_PROGRESS, etc.) already guarantees
+     * we are on the right step — no hardcoded step numbers needed.
+     * Guard: skips silently if no workflow is running or no PENDING task exists.
+     */
     private void advanceWorkflowTask(Issue issue, Long userId, String remarks) {
         log.info("[ISSUE-WF] advanceWorkflowTask | issueId={} | wfInstanceId={} | remarks={}",
                 issue.getId(), issue.getWorkflowInstanceId(), remarks);
@@ -683,12 +744,12 @@ public class IssueService {
         // Use override if provided; otherwise look up default for issueType
         Long workflowId = overrideWorkflowId;
         if (workflowId == null) {
-            // Fall back to any active ISSUE workflow — works regardless of workflow name.
-            workflowId = workflowRepository
-                    .findByTenantIdIsNullAndEntityTypeAndIsActiveTrue("ISSUE")
-                    .stream().findFirst()
-                    .map(w -> w.getId())
-                    .orElse(null);
+            // No workflowId provided — this should not happen in normal flow since
+            // the issue create form has a workflowId LOOKUP field and escalateToIssue
+            // sets it explicitly. Log a warning and skip workflow start.
+            log.warn("[ISSUE] workflowId is null for issueId={} issueType={} — workflow not started. "
+                            + "Ensure workflowId is set on IssueRequest (create form hidden field or API caller).",
+                    issue.getId(), issue.getIssueType());
         }
 
         if (workflowId == null) {
@@ -779,7 +840,11 @@ public class IssueService {
         String ownerName = null;
         if (i.getOwnerId() != null) {
             ownerName = userRepository.findById(i.getOwnerId())
-                    .map(User::getFullName).orElse(null);
+                    .map(u -> {
+                        String full = u.getFullName();
+                        // getFullName() returns " " when both names are null — use email as fallback
+                        return (full != null && !full.isBlank()) ? full : u.getEmail();
+                    }).orElse(null);
         }
 
         // Compute slaDueInHours
@@ -817,6 +882,7 @@ public class IssueService {
                 .updatedAt(i.getUpdatedAt())
                 .acknowledgedAt(i.getAcknowledgedAt())
                 .remediatedAt(i.getRemediatedAt())
+                .validatedAt(i.getValidatedAt())
                 .closedAt(i.getClosedAt())
                 .rcaMethod(i.getRcaMethod())
                 .rootCauseCategory(i.getRootCauseCategory())

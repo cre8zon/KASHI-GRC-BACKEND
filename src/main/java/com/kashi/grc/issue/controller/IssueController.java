@@ -141,8 +141,8 @@ public class IssueController {
     public ResponseEntity<ApiResponse<IssueResponse>> update(
             @PathVariable Long id,
             @RequestBody IssueRequest req) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        return ResponseEntity.ok(ApiResponse.success(issueService.update(id, req, tenantId)));
+        var ctx = utilityService.getLoggedInDataContext();
+        return ResponseEntity.ok(ApiResponse.success(issueService.update(id, req, ctx.getId(), ctx.getTenantId())));
     }
 
     // ── Status update ─────────────────────────────────────────────────────────

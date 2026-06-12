@@ -60,6 +60,7 @@ public class IssueResponse {
     private LocalDateTime updatedAt;
     private LocalDateTime acknowledgedAt;
     private LocalDateTime remediatedAt;
+    private LocalDateTime validatedAt;
     private LocalDateTime closedAt;
     private Long           closedBy;
 
@@ -69,12 +70,14 @@ public class IssueResponse {
     private String  immediateCause;
     private String  rootCause;
     private String  contributingFactors;  // JSON array string
+    @com.fasterxml.jackson.annotation.JsonProperty("isSystemic")
     private boolean isSystemic;
     private String  rcaJson;              // legacy blob — kept for compatibility
 
     // ── Remediation ───────────────────────────────────────────────────────────
     private String  remediationPlan;
     private String  remediationType;
+    @com.fasterxml.jackson.annotation.JsonProperty("acceptedRisk")
     private boolean acceptedRisk;
     private String  acceptedRiskNote;
     private String  closureSummary;

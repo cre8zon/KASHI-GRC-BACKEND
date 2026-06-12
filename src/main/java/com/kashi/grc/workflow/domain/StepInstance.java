@@ -154,6 +154,13 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_ui_override_json", columnDefinition = "JSON")
     private String snapUiOverrideJson;
 
+    /**
+     * Snapshot of WorkflowStep.sodRulesJson at the time this step instance was created.
+     * Blueprint changes after step creation do not affect in-flight instances.
+     */
+    @Column(name = "snap_sod_rules_json", columnDefinition = "JSON")
+    private String snapSodRulesJson;
+
     // ── Migration SQL ─────────────────────────────────────────────────────────
     // ALTER TABLE step_instances
     //   ADD COLUMN snap_ui_override_json JSON NULL

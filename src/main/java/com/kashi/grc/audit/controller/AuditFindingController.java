@@ -350,7 +350,12 @@ public class AuditFindingController {
         req.setSourceEntityId(finding.getId());
         req.setFrameworkRef(finding.getFrameworkRef());
         req.setOwnerId(finding.getOwnerId());
-        req.setWorkflowId(15L);
+        // workflowId from request body — caller decides which workflow to use.
+        // Defaults to null; IssueService will log a warning if not provided.
+        // The escalate-to-issue UI should pass the correct workflowId for EXTERNAL issues.
+        if (body != null && body.get("workflowId") instanceof Number n) {
+            req.setWorkflowId(n.longValue());
+        }
 
         IssueResponse issueResponse = issueService.create(req, userId, tenantId);
 
