@@ -208,7 +208,7 @@ public class AuditSectionService {
                         .build()
         );
 
-        // Build instance path
+        // Build instance path — requires the generated ID, so one update save needed
         String path = (parentPath == null || parentPath.equals("/"))
                 ? "/" + instance.getId() + "/"
                 : parentPath + instance.getId() + "/";
@@ -239,31 +239,40 @@ public class AuditSectionService {
         List<AuditSectionControlMapping> mappings =
                 controlMappingRepository.findBySectionIdOrderByOrderNoAsc(libSection.getId());
 
+        if (mappings.isEmpty()) return;
+
+        // Batch all control lookups and builds, then saveAll in one round-trip
+        List<Long> controlIds = mappings.stream()
+                .map(AuditSectionControlMapping::getControlId).toList();
+        Map<Long, AuditControl> controlMap = controlRepository.findAllById(controlIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AuditControl::getId, c -> c));
+
+        List<AuditControlInstance> toSave = new ArrayList<>();
         for (AuditSectionControlMapping mapping : mappings) {
-            AuditControl control = controlRepository.findById(mapping.getControlId()).orElse(null);
+            AuditControl control = controlMap.get(mapping.getControlId());
             if (control == null) continue;
 
-            controlInstanceRepository.save(
-                    AuditControlInstance.builder()
-                            .tenantId(tenantId)
-                            .engagementId(engagementId)
-                            .sectionInstanceId(sectionInstance.getId())
-                            .sectionPath(sectionInstance.getPath())         // for subtree queries
-                            .originalControlId(control.getId())
-                            .controlNameSnapshot(control.getName())
-                            .controlCodeSnapshot(control.getControlCode())
-                            .descriptionSnapshot(control.getDescription())
-                            .testTypeSnapshot(control.getTestType().name())
-                            .frameworkRefSnapshot(control.getFrameworkRef())
-                            .controlTagSnapshot(control.getControlTag())    // ISOLATION: snapshot
-                            .sectionBreadcrumbSnapshot(buildBreadcrumb(sectionInstance))
-                            .weight(mapping.getWeight())
-                            .isMandatory(mapping.isMandatory())
-                            .orderNo(mapping.getOrderNo())
-                            .testResult(AuditControlInstance.TestResult.NOT_TESTED)
-                            .build()
-            );
+            toSave.add(AuditControlInstance.builder()
+                    .tenantId(tenantId)
+                    .engagementId(engagementId)
+                    .sectionInstanceId(sectionInstance.getId())
+                    .sectionPath(sectionInstance.getPath())
+                    .originalControlId(control.getId())
+                    .controlNameSnapshot(control.getName())
+                    .controlCodeSnapshot(control.getControlCode())
+                    .descriptionSnapshot(control.getDescription())
+                    .testTypeSnapshot(control.getTestType().name())
+                    .frameworkRefSnapshot(control.getFrameworkRef())
+                    .controlTagSnapshot(control.getControlTag())
+                    .sectionBreadcrumbSnapshot(buildBreadcrumb(sectionInstance))
+                    .weight(mapping.getWeight())
+                    .isMandatory(mapping.isMandatory())
+                    .orderNo(mapping.getOrderNo())
+                    .testResult(AuditControlInstance.TestResult.NOT_TESTED)
+                    .build());
         }
+
+        controlInstanceRepository.saveAll(toSave);
     }
 
     // ══════════════════════════════════════════════════════════════════════

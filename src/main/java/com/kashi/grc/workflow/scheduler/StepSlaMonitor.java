@@ -1,6 +1,7 @@
 package com.kashi.grc.workflow.scheduler;
 
 import com.kashi.grc.notification.service.NotificationService;
+import com.kashi.grc.workflow.service.WorkflowEngineService;
 import com.kashi.grc.workflow.domain.StepInstance;
 import com.kashi.grc.workflow.domain.TaskInstance;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
@@ -74,6 +75,7 @@ public class StepSlaMonitor {
     private final WorkflowStepAssignerRoleRepository stepAssignerRoleRepository;
     private final DbRepository                  dbRepository;
     private final NotificationService           notificationService;
+    private final WorkflowEngineService         workflowEngineService;
 
     // ── CONCERN 1: Re-attempt UNASSIGNED steps ────────────────────────────────
 
@@ -256,6 +258,17 @@ public class StepSlaMonitor {
         }
 
         log.info("[SLA-MONITOR] SLA sweep complete | escalated={} | autoSkipped={}", escalated, autoSkipped);
+    }
+
+    /**
+     * Retry stuck SYSTEM steps every 5 minutes.
+     * Handles cases where automated action returned false on step creation
+     * (e.g. backend restarted mid-execution, or action conditions not yet met).
+     */
+    @Scheduled(fixedDelay = 5 * 60 * 1000)  // 5 minutes
+    @Transactional
+    public void retryStuckSystemSteps() {
+        workflowEngineService.retryStuckSystemSteps();
     }
 
     // ── Helper ────────────────────────────────────────────────────────────────

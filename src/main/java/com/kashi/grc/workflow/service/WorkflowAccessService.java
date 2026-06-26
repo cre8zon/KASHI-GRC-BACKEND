@@ -17,6 +17,7 @@ import com.kashi.grc.workflow.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import com.kashi.grc.audit.repository.AuditEngagementRepository;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -72,6 +73,9 @@ public class WorkflowAccessService {
     private final UserPermissionOverrideRepository   userPermissionOverrideRepository;
     private final SodRuleRepository                  sodRuleRepository;
     private final ObjectMapper                       objectMapper;
+    private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
+    // For AUDIT_ENGAGEMENT → resolve via parent AUDIT_PROJECT workflow instance
+    private final AuditEngagementRepository auditEngagementRepository;
 
     // ── Default workflow actions available per task role ──────────────────────
 
@@ -131,7 +135,8 @@ public class WorkflowAccessService {
         return mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
                 si.getSnapName(),
                 si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
-                Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()));
+                Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()),
+                taskId);
     }
 
     /**
@@ -151,25 +156,70 @@ public class WorkflowAccessService {
         StepUiOverride stepOverride = new StepUiOverride();
         String activeStepAction = null;
         String activeStepLabel  = null;
+        boolean canAct = false;
+        List<String> availableActions = null;
+        Long activeTaskId = null;
+        Long activeStepInstanceId = null;
+
         if (entityId != null) {
             Optional<WorkflowInstance> activeInstance = instanceRepository
                     .findActiveByEntityTypeAndEntityId(entityType, entityId);
+
+            // AUDIT_ENGAGEMENT has no own workflow instance — it inherits from AUDIT_PROJECT.
+            // When no instance is found for the engagement, look up via projectInstanceId
+            // (the workflow is registered as entityType=AUDIT_PROJECT, entityId=projectInstanceId).
+            if (activeInstance.isEmpty() && "AUDIT_ENGAGEMENT".equals(entityType)) {
+                activeInstance = auditEngagementRepository.findById(entityId)
+                        .filter(e -> e.getProjectInstanceId() != null)
+                        .flatMap(e -> instanceRepository
+                                .findActiveByEntityTypeAndEntityId("AUDIT_PROJECT", e.getProjectInstanceId()));
+                log.debug("[ACCESS] AUDIT_ENGAGEMENT {} has no own WF instance — delegating to projectInstance", entityId);
+            }
             if (activeInstance.isPresent()) {
                 sodViolations = evaluateSod(user, activeInstance.get().getId(),
                         entityType, resolvedPermissions);
-                // Apply the active step's UI override even without a taskId.
-                // This ensures step-scoped permissionOverrides (e.g. hiding the
-                // auditor picker on non-assignment steps) work when the user
-                // navigates directly to the entity page rather than via a task URL.
+
                 List<StepInstance> activeSteps = stepInstanceRepository
                         .findByWorkflowInstanceIdAndStatus(
                                 activeInstance.get().getId(), StepStatus.IN_PROGRESS);
+
                 if (!activeSteps.isEmpty()) {
                     StepInstance currentStep = activeSteps.get(0);
+                    activeStepInstanceId = currentStep.getId();
                     stepOverride     = parseOverride(currentStep.getSnapUiOverrideJson());
                     activeStepAction = currentStep.getSnapStepAction() != null
                             ? currentStep.getSnapStepAction().name() : null;
                     activeStepLabel  = currentStep.getSnapName();
+
+                    // ── Check if user can act on this step ──────────────────
+                    // Path A: user has an open task (PENDING or IN_PROGRESS)
+                    var openStatuses = List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS);
+                    var openTasks = taskInstanceRepository
+                            .findByStepInstanceId(currentStep.getId()).stream()
+                            .filter(t -> user.getId().equals(t.getAssignedUserId())
+                                    && openStatuses.contains(t.getStatus()))
+                            .findFirst();
+
+                    if (openTasks.isPresent()) {
+                        canAct = true;
+                        activeTaskId = openTasks.get().getId();
+                        AccessContext minimalBase = AccessContext.builder()
+                                .mode("EDIT")
+                                .canView(true).canEdit(true).canAct(true)
+                                .taskRole(TaskRole.ACTOR)
+                                .stepAction(activeStepAction)
+                                .build();
+                        availableActions = resolveAvailableActions(minimalBase, stepOverride, sodViolations);
+
+                    } else {
+                        // Path B: no task, but user has workflow:step:override permission.
+                        // They can approve/advance the step directly without a task.
+                        if (resolvedPermissions.contains("workflow:step:override")) {
+                            canAct = true;
+                            // No taskId — frontend sends stepInstanceId to override endpoint
+                            availableActions = List.of("APPROVE", "REJECT", "SEND_BACK");
+                        }
+                    }
                 }
             }
         }
@@ -189,14 +239,18 @@ public class WorkflowAccessService {
                 .mode(canView ? "VIEW" : "DENIED")
                 .canView(canView)
                 .canEdit(canEdit && sodViolations.stream().noneMatch(v -> "HARD".equals(v.getConflictType())))
-                .canAct(false)   // no active task
+                .canAct(canAct)
+                .taskId(activeTaskId)
+                .stepInstanceId(activeStepInstanceId)
                 .stepAction(activeStepAction)
                 .stepLabel(activeStepLabel)
+                .availableActions(availableActions)
                 .visibleTabs(nullIfEmpty(stepOverride.getVisibleTabs()))
                 .hiddenTabs(nullIfEmpty(stepOverride.getHiddenTabs()))
+                .editableTabs(nullIfEmpty(stepOverride.getEditableTabs()))
                 .permissions(effectivePermissions)
                 .sodViolations(sodViolations.isEmpty() ? null : sodViolations)
-                .autoCompleteActorOnSubmit(false)  // no active task in module view
+                .autoCompleteActorOnSubmit(false)
                 .build();
     }
 
@@ -233,7 +287,14 @@ public class WorkflowAccessService {
                     && task.getStepInstanceId().equals(si.getId())
                     && (task.getStatus() == TaskStatus.PENDING
                     || task.getStatus() == TaskStatus.IN_PROGRESS)) {
-                return AccessContext.edit(task.getTaskRole(), stepStatus, workflowStatus);
+                AccessContext base = AccessContext.edit(task.getTaskRole(), stepStatus, workflowStatus);
+                return AccessContext.builder()
+                        .mode(base.getMode()).canView(base.isCanView())
+                        .canEdit(base.isCanEdit()).canAct(base.isCanAct())
+                        .taskRole(base.getTaskRole()).stepStatus(base.getStepStatus())
+                        .workflowStatus(base.getWorkflowStatus())
+                        .taskId(taskId)
+                        .build();
             }
 
             // Delegated — read-only
@@ -275,9 +336,26 @@ public class WorkflowAccessService {
      * Layer 2: Explicit PermissionGrant rows (granted=true adds, granted=false removes)
      * Layer 3: UserPermissionOverride rows (wins over both; active + not expired only)
      */
-    private List<String> resolvePermissions(User user) {
+    private static final ThreadLocal<List<String>> REQUEST_PERMISSION_CACHE = new ThreadLocal<>();
 
-        // Layer 1: permissions from role_permissions (already loaded via entity graph)
+    /** Called by UtilityService.clearRequestCache() after every HTTP request. */
+    public static void clearPermissionCache() {
+        REQUEST_PERMISSION_CACHE.remove();
+    }
+
+    private List<String> resolvePermissions(User user) {
+        // Cache within the HTTP request — view-context may be called multiple times
+        // (once for module context, once for task context). The 3 DB queries
+        // (role perms, grants, overrides) only need to run once per request.
+        List<String> cached = REQUEST_PERMISSION_CACHE.get();
+        if (cached != null) return cached;
+
+        List<String> resolved = computePermissions(user);
+        REQUEST_PERMISSION_CACHE.set(resolved);
+        return resolved;
+    }
+
+    private List<String> computePermissions(User user) {        // Layer 1: permissions from role_permissions (already loaded via entity graph)
         Set<String> perms = user.getRoles().stream()
                 .flatMap(role -> role.getPermissions().stream())
                 .map(Permission::getCode)
@@ -462,13 +540,23 @@ public class WorkflowAccessService {
                                        List<String> permissions, List<String> availableActions,
                                        List<AccessContext.SodViolation> sodViolations,
                                        String stepLabel, String stepAction,
-                                       boolean snapAutoCompleteActorOnSubmit) {
+                                       boolean snapAutoCompleteActorOnSubmit,
+                                       Long taskInstanceId) {
+        // Check if this task has compound sections — if so, hide COMPLETE_STEP button.
+        // Works for ANY module, not just AUDIT_PROJECT.
+        // Hide COMPLETE_STEP only when there are REQUIRED sections not yet completed.
+        // Optional sections (snapRequired=false) like FINDINGS_REMEDIATED on Step 8
+        // track progress informationally but must not block manual completion.
+        boolean hasSections = taskInstanceId != null
+                && !taskSectionCompletionRepository.findIncompleteRequired(taskInstanceId).isEmpty();
+
         return AccessContext.builder()
                 // ── Existing fields (from mode resolution) ────────────────────
                 .mode(base.getMode())
                 .canView(base.isCanView())
                 .canEdit(base.isCanEdit() && sodViolations.stream().noneMatch(v -> "HARD".equals(v.getConflictType())))
                 .canAct(base.isCanAct())
+                .taskId(taskInstanceId)
                 .taskRole(base.getTaskRole())
                 .stepStatus(base.getStepStatus())
                 .workflowStatus(base.getWorkflowStatus())
@@ -478,6 +566,7 @@ public class WorkflowAccessService {
                 .stepAction(stepAction)
                 // ── Field visibility (from step override) ─────────────────────
                 .editableFields(nullIfEmpty(override.getEditableFields()))
+                .editableTabs(nullIfEmpty(override.getEditableTabs()))
                 .readOnlyFields(nullIfEmpty(override.getReadOnlyFields()))
                 .hiddenFields(nullIfEmpty(override.getHiddenFields()))
                 // ── Tab visibility (from step override) ───────────────────────
@@ -493,6 +582,7 @@ public class WorkflowAccessService {
                         base.isCanAct()
                                 && "ACTOR".equals(base.getTaskRole())
                                 && Boolean.TRUE.equals(snapAutoCompleteActorOnSubmit))
+                .hasSections(hasSections)
                 .build();
     }
 
@@ -529,6 +619,8 @@ public class WorkflowAccessService {
         private List<String> visibleTabs;
         /** Explicitly hidden tabs */
         private List<String> hiddenTabs;
+        /** When non-empty: only these form tabs are editable (others shown read-only) */
+        private List<String> editableTabs;
         /** When non-empty: only these fields are editable */
         private List<String> editableFields;
         /** Always read-only at this step */

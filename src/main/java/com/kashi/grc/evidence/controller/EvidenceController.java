@@ -71,13 +71,13 @@ public class EvidenceController {
 
     @GetMapping
     @Operation(summary = "List evidence records for this tenant",
-               description = "Filter by controlTag to see all evidence for a specific tag.")
+            description = "Filter by controlTag to see all evidence for a specific tag.")
     public ResponseEntity<ApiResponse<List<EvidenceRecordResponse>>> list(
             @RequestParam(required = false) String controlTag) {
 
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.ok(ApiResponse.success(
-            service.listForTenant(ctx.getTenantId(), controlTag)));
+                service.listForTenant(ctx.getTenantId(), controlTag)));
     }
 
     @GetMapping("/{id}")
@@ -91,21 +91,34 @@ public class EvidenceController {
 
     @GetMapping("/links")
     @Operation(summary = "Get all evidence links for a specific entity",
-               description = "Pass entityType and entityId as query params. " +
-                             "Used by control detail, question detail, and issue detail pages " +
-                             "to show what evidence satisfies this entity.")
+            description = "Pass entityType and entityId as query params. " +
+                    "Used by control detail, question detail, and issue detail pages " +
+                    "to show what evidence satisfies this entity.")
     public ResponseEntity<ApiResponse<List<EvidenceLinkResponse>>> getLinksForEntity(
             @RequestParam String entityType,
             @RequestParam Long   entityId) {
 
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.ok(ApiResponse.success(
-            service.getLinksForEntity(entityType, entityId, ctx.getTenantId())));
+                service.getLinksForEntity(entityType, entityId, ctx.getTenantId())));
+    }
+
+    @GetMapping("/links/test/{testInstanceId}/control-evidence")
+    @Operation(summary = "Trace which control evidence was used to evaluate a test",
+            description = "Returns control-level evidence links that share the same underlying " +
+                    "evidence record as evidence linked to this test — i.e. what document(s) " +
+                    "the auditor relied on when recording this test's result.")
+    public ResponseEntity<ApiResponse<List<EvidenceLinkResponse>>> getControlEvidenceUsedByTest(
+            @PathVariable Long testInstanceId) {
+
+        var ctx = utilityService.getLoggedInDataContext();
+        return ResponseEntity.ok(ApiResponse.success(
+                service.getControlEvidenceUsedByTest(testInstanceId, ctx.getTenantId())));
     }
 
     @GetMapping("/links/pending")
     @Operation(summary = "Get all PENDING_REVIEW auto-linked evidence for this tenant",
-               description = "Used by the evidence review inbox and notification badge.")
+            description = "Used by the evidence review inbox and notification badge.")
     public ResponseEntity<ApiResponse<List<EvidenceLinkResponse>>> getPendingReview() {
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.ok(ApiResponse.success(service.getPendingReview(ctx.getTenantId())));
@@ -113,27 +126,27 @@ public class EvidenceController {
 
     @PostMapping("/{id}/links")
     @Operation(summary = "Manually link evidence to a target entity",
-               description = "Creates an immediately ACCEPTED link — no review needed for manual links.")
+            description = "Creates an immediately ACCEPTED link — no review needed for manual links.")
     public ResponseEntity<ApiResponse<EvidenceLinkResponse>> manualLink(
             @PathVariable Long id,
             @Valid @RequestBody ManualEvidenceLinkRequest req) {
 
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(
-            service.manualLink(id, req, ctx.getId(), ctx.getTenantId())));
+                service.manualLink(id, req, ctx.getId(), ctx.getTenantId())));
     }
 
     @PatchMapping("/links/{linkId}/review")
     @Operation(summary = "Accept or reject an auto-linked evidence",
-               description = "Called by auditor/reviewer from the control detail page. " +
-                             "ACCEPT = evidence satisfies this control. REJECT = it does not.")
+            description = "Called by auditor/reviewer from the control detail page. " +
+                    "ACCEPT = evidence satisfies this control. REJECT = it does not.")
     public ResponseEntity<ApiResponse<EvidenceLinkResponse>> reviewLink(
             @PathVariable Long linkId,
             @Valid @RequestBody EvidenceLinkReviewRequest req) {
 
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.ok(ApiResponse.success(
-            service.reviewLink(linkId, req, ctx.getId(), ctx.getTenantId())));
+                service.reviewLink(linkId, req, ctx.getId(), ctx.getTenantId())));
     }
 
     @GetMapping("/stats")
@@ -141,8 +154,8 @@ public class EvidenceController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> stats() {
         var ctx = utilityService.getLoggedInDataContext();
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-            "tenantId",      ctx.getTenantId(),
-            "pendingReview", service.getPendingReview(ctx.getTenantId()).size()
+                "tenantId",      ctx.getTenantId(),
+                "pendingReview", service.getPendingReview(ctx.getTenantId()).size()
         )));
     }
 }

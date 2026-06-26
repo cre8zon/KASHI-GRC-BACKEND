@@ -1,5 +1,8 @@
 package com.kashi.grc.issue.workflow;
 
+import com.kashi.grc.audit.domain.AuditFinding;
+import com.kashi.grc.audit.repository.AuditFindingRepository;
+import com.kashi.grc.audit.service.AuditTestPolicySnapshotService;
 import com.kashi.grc.issue.domain.Issue;
 import com.kashi.grc.issue.repository.IssueRepository;
 import com.kashi.grc.workflow.automation.AutomatedActionContext;
@@ -47,7 +50,9 @@ import java.time.LocalDateTime;
 @RequiredArgsConstructor
 public class CloseIssueAction implements AutomatedActionHandler {
 
-    private final IssueRepository issueRepository;
+    private final IssueRepository                issueRepository;
+    private final AuditFindingRepository         findingRepository;
+    private final AuditTestPolicySnapshotService snapshotService;
 
     @Override
     public String actionKey() {
@@ -100,6 +105,28 @@ public class CloseIssueAction implements AutomatedActionHandler {
 
         log.info("[CLOSE_ISSUE] Done | issueId={} | issueRef={} | closedBy={}",
                 issue.getId(), issue.getIssueRef(), closedBy);
+
+        // Close linked AuditFinding if this issue was escalated from one
+        if ("AUDIT_FINDING".equals(issue.getSourceEntityType())
+                && issue.getSourceEntityId() != null) {
+            findingRepository.findById(issue.getSourceEntityId()).ifPresent(finding -> {
+                if (finding.getStatus() != AuditFinding.Status.CLOSED
+                        && finding.getStatus() != AuditFinding.Status.ACCEPTED_RISK) {
+                    finding.setStatus(AuditFinding.Status.CLOSED);
+                    finding.setClosedAt(LocalDateTime.now());
+                    finding.setClosedBy(closedBy);
+                    findingRepository.save(finding);
+                    log.info("[CLOSE_ISSUE] Linked finding closed | findingId={} findingRef={}",
+                            finding.getId(), finding.getFindingRef());
+                    try {
+                        snapshotService.syncEngagementScore(finding.getEngagementId(), tenantId);
+                    } catch (Exception ex) {
+                        log.warn("[CLOSE_ISSUE] Score sync failed for engagementId={} — {}",
+                                finding.getEngagementId(), ex.getMessage());
+                    }
+                }
+            });
+        }
 
         return true;
     }

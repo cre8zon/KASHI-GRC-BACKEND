@@ -11,6 +11,7 @@ import java.time.LocalDateTime;
 @Data
 public class AuditEngagementRequest {
     private Long   projectId;  // nullable — standalone engagement without project
+    private Long   projectInstanceId; // set by createProjectInstance cascade — bypasses findByOriginalProjectId lookup
     @NotBlank private String name;
     private String  description;
     private Long    templateId;

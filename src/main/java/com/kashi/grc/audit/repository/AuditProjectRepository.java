@@ -21,9 +21,6 @@ public interface AuditProjectRepository extends JpaRepository<AuditProject, Long
     /** Org-scoped find by id — used by engagement service to validate project ownership */
     Optional<AuditProject> findByTenantIdAndId(Long tenantId, Long id);
 
-    /** Find by id regardless of tenant — used by Platform Admin */
-    Optional<AuditProject> findById(Long id);
-
     /** Count for ref generation — counts global + tenant projects */
     long countByTenantIdIsNullOrTenantId(Long tenantId);
 }

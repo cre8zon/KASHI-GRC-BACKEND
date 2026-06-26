@@ -9,4 +9,7 @@ public interface VendorAssessmentCycleRepository extends JpaRepository<VendorAss
     long countByVendorId(Long vendorId);
     // Direct lookup by workflow instance — O(1) instead of load-all-then-filter
     java.util.Optional<VendorAssessmentCycle> findByWorkflowInstanceId(Long workflowInstanceId);
+
+    /** Batch lookup — avoids N×2 DB calls in getPendingTasksForUser */
+    java.util.List<VendorAssessmentCycle> findByWorkflowInstanceIdIn(java.util.Collection<Long> workflowInstanceIds);
 }

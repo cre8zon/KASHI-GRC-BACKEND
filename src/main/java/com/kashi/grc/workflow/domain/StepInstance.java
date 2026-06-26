@@ -107,6 +107,14 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_step_action", length = 50)
     private StepAction snapStepAction;
 
+    /** Snapshot of WorkflowStep.assignableSide — which side appears in the assignment dropdown */
+    @Column(name = "snap_assignable_side", length = 50)
+    private String snapAssignableSide;
+
+    /** Snapshot of WorkflowStep.assignableRoleId — which role filters the assignment dropdown */
+    @Column(name = "snap_assignable_role_id")
+    private Long snapAssignableRoleId;
+
     /**
      * Snapshot of WorkflowStep.navKey — the nav table key for ACTOR tasks.
      * Carried through to TaskInstanceResponse so the frontend resolves the route

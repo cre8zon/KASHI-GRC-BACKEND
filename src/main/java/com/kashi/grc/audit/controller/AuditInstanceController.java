@@ -7,6 +7,9 @@ import com.kashi.grc.audit.service.AuditTestPolicySnapshotService;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.util.UtilityService;
+import com.kashi.grc.issue.domain.Issue;
+import com.kashi.grc.issue.dto.IssueRequest;
+import com.kashi.grc.issue.service.IssueService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -43,8 +46,8 @@ public class AuditInstanceController {
     private final AuditPolicyInstanceControlMappingRepository policyCtrlMappingRepo;
     private final AuditTestPolicySnapshotService             snapshotService;
     private final UtilityService                            utilityService;
-    // ADDED
     private final AuditFindingRepository                    findingRepo;
+    private final IssueService                              issueService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROL INSTANCES — /v1/audit/control-instances/{id}
@@ -76,7 +79,6 @@ public class AuditInstanceController {
             row.put("isRequired",         m.isRequired());
             row.put("orderNo",            m.getOrderNo());
             row.put("mappingNoteSnapshot",m.getMappingNoteSnapshot());
-            // Enrich with test instance data
             testRepo.findById(m.getTestInstanceId()).ifPresent(t -> {
                 row.put("testNameSnapshot",        t.getTestNameSnapshot());
                 row.put("testRefSnapshot",         t.getTestRefSnapshot());
@@ -132,13 +134,19 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
+        if (ctrl.getAssignedAuditorId() != null &&
+                !ctrl.getAssignedAuditorId().equals(ctx.getId())) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "CONTROL_NOT_ASSIGNED",
+                    "You are not the assigned auditor for this control");
+        }
+
         ctrl.setTestResult(req.getTestResult());
         if (req.getTestNotes() != null) ctrl.setTestNotes(req.getTestNotes());
-        ctrl.setTestedAt(java.time.LocalDateTime.now());
+        ctrl.setTestedAt(LocalDateTime.now());
         ctrl.setTestedBy(ctx.getId());
         controlRepo.save(ctrl);
-        // Cascade to section completion tracking
-        log.info("[CTRL-INST] Test result set | id={} result={}", id, req.getTestResult());
+        log.info("[CTRL-INST] Test result set | id={} result={} by={}", id, req.getTestResult(), ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(buildControlMap(ctrl)));
     }
 
@@ -162,8 +170,16 @@ public class AuditInstanceController {
         var ctx  = utilityService.getLoggedInDataContext();
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
+
+        if (ctrl.getAuditeeAssignedUserId() != null &&
+                !ctrl.getAuditeeAssignedUserId().equals(ctx.getId())) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "CONTROL_NOT_ASSIGNED",
+                    "You are not the assigned auditee for this control");
+        }
+
         ctrl.setAuditeeEvidenceSubmitted(true);
-        ctrl.setAuditeeEvidenceSubmittedAt(java.time.LocalDateTime.now());
+        ctrl.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
         controlRepo.save(ctrl);
         return ResponseEntity.ok(ApiResponse.success());
     }
@@ -175,6 +191,7 @@ public class AuditInstanceController {
     @GetMapping("/v1/audit/test-instances/{id}")
     @Operation(summary = "Get test instance by ID — flat response for UMP overview tab")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getTestInstance(@PathVariable Long id) {
+        var ctx  = utilityService.getLoggedInDataContext();
         var test = testRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", id));
 
@@ -203,6 +220,13 @@ public class AuditInstanceController {
         result.put("automationRunAt",         test.getAutomationRunAt());
         result.put("affectedControlCount",    test.getAffectedControlCount());
         result.put("snapshottedAt",           test.getSnapshottedAt());
+
+        List<Long> controlIds = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id);
+        boolean isAssigned = !controlIds.isEmpty() &&
+                controlRepo.findAllById(controlIds).stream()
+                        .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
+                                || c.getAssignedAuditorId() == null);
+        result.put("isAssignedToCurrentUser", isAssigned);
 
         return ResponseEntity.ok(ApiResponse.success(result));
     }
@@ -246,6 +270,23 @@ public class AuditInstanceController {
         var test = testRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", id));
 
+        boolean hasAssignPermission = ctx.getRoles().stream()
+                .flatMap(r -> r.getPermissions().stream())
+                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
+        if (!hasAssignPermission) {
+            List<Long> controlInstanceIds = ctrlTestMappingRepo
+                    .findControlInstanceIdsByTestInstanceId(id);
+            boolean isAssigned = !controlInstanceIds.isEmpty() &&
+                    controlRepo.findAllById(controlInstanceIds).stream()
+                            .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
+                                    || c.getAssignedAuditorId() == null);
+            if (!isAssigned) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "TEST_NOT_ASSIGNED",
+                        "You are not assigned to any control mapped to this test");
+            }
+        }
+
         AuditTestInstance.TestResult newResult =
                 AuditTestInstance.TestResult.valueOf(body.get("testResult"));
 
@@ -253,19 +294,13 @@ public class AuditInstanceController {
         test.setRunAt(LocalDateTime.now());
         test.setRunByUserId(ctx.getId());
         test.setRunBySystem(false);
-        if (body.containsKey("testerNotes"))   test.setTesterNotes(body.get("testerNotes"));
-        if (body.containsKey("failureDetail")) test.setFailureDetail(body.get("failureDetail"));
+        if (body.containsKey("testerNotes"))     test.setTesterNotes(body.get("testerNotes"));
+        if (body.containsKey("failureDetail"))   test.setFailureDetail(body.get("failureDetail"));
         if (body.containsKey("exceptionReason")) test.setExceptionReason(body.get("exceptionReason"));
         testRepo.save(test);
 
-        // Cascade — re-derive result for all control instances linked to this test.
-        // cascadeDeriveControlResults() handles the full derivation logic:
-        //   any required test FAIL → INEFFECTIVE
-        //   all required tests PASS → EFFECTIVE
-        //   no tests run yet → unchanged
         snapshotService.cascadeDeriveControlResults(id, ctx.getTenantId());
 
-        // Update affected control count on the test instance
         int affectedCount = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id).size();
         test.setAffectedControlCount(affectedCount);
         testRepo.save(test);
@@ -315,6 +350,15 @@ public class AuditInstanceController {
         result.put("auditorNotes",            policy.getAuditorNotes());
         result.put("snapshottedAt",           policy.getSnapshottedAt());
 
+        var ctx2 = utilityService.getLoggedInDataContext();
+        List<Long> policyControlIds = policyCtrlMappingRepo.findByPolicyInstanceId(id)
+                .stream().map(m -> m.getControlInstanceId()).toList();
+        boolean isPolicyAssigned = !policyControlIds.isEmpty() &&
+                controlRepo.findAllById(policyControlIds).stream()
+                        .anyMatch(c -> ctx2.getId().equals(c.getAssignedAuditorId())
+                                || c.getAssignedAuditorId() == null);
+        result.put("isAssignedToCurrentUser", isPolicyAssigned);
+
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
@@ -356,6 +400,23 @@ public class AuditInstanceController {
         var policy = policyRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", id));
 
+        boolean hasAssignPermission = ctx.getRoles().stream()
+                .flatMap(r -> r.getPermissions().stream())
+                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
+        if (!hasAssignPermission) {
+            List<Long> controlInstanceIds = policyCtrlMappingRepo.findByPolicyInstanceId(id)
+                    .stream().map(m -> m.getControlInstanceId()).toList();
+            boolean isAssigned = !controlInstanceIds.isEmpty() &&
+                    controlRepo.findAllById(controlInstanceIds).stream()
+                            .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
+                                    || c.getAssignedAuditorId() == null);
+            if (!isAssigned) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "POLICY_NOT_ASSIGNED",
+                        "You are not assigned to any control mapped to this policy");
+            }
+        }
+
         policy.setReviewResult(
                 AuditPolicyInstance.ReviewResult.valueOf(body.get("reviewResult")));
         policy.setReviewedById(ctx.getId());
@@ -363,23 +424,23 @@ public class AuditInstanceController {
         if (body.containsKey("auditorNotes")) policy.setAuditorNotes(body.get("auditorNotes"));
         policyRepo.save(policy);
 
-        // ADDED: auto-create a finding for each linked control when policy is INADEQUATE
+        // One finding per policy (not per control) when INADEQUATE.
+        // The policy owner is responsible for remediation — not the individual control auditees.
         if (policy.getReviewResult() == AuditPolicyInstance.ReviewResult.INADEQUATE) {
-            policyCtrlMappingRepo.findByPolicyInstanceId(id).forEach(mapping -> {
-                String autoTitle = "Policy gap: " + policy.getTitleSnapshot();
-                boolean alreadyExists = findingRepo
-                        .findByControlInstanceIdAndTenantId(mapping.getControlInstanceId(), ctx.getTenantId())
-                        .stream()
-                        .anyMatch(f -> autoTitle.equals(f.getTitle())
-                                && f.getStatus() != AuditFinding.Status.CLOSED
-                                && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
-                if (alreadyExists) return;
+            String autoTitle = "Policy gap: " + policy.getTitleSnapshot();
+            boolean alreadyExists = findingRepo
+                    .findByEngagementIdAndTenantId(policy.getEngagementId(), ctx.getTenantId())
+                    .stream()
+                    .anyMatch(f -> autoTitle.equals(f.getTitle())
+                            && f.getStatus() != AuditFinding.Status.CLOSED
+                            && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
 
+            if (!alreadyExists) {
                 AuditFinding autoFinding = AuditFinding.builder()
                         .tenantId(ctx.getTenantId())
                         .findingRef(generateFindingRef(ctx.getTenantId()))
                         .engagementId(policy.getEngagementId())
-                        .controlInstanceId(mapping.getControlInstanceId())
+                        .controlInstanceId(null)  // policy-level finding, not tied to one control
                         .title(autoTitle)
                         .description("Policy '" + policy.getTitleSnapshot() + "' v"
                                 + policy.getVersionSnapshot() + " reviewed as INADEQUATE.")
@@ -387,13 +448,17 @@ public class AuditInstanceController {
                         .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
                         .status(AuditFinding.Status.OPEN)
                         .frameworkRef(policy.getFrameworkRefsSnapshot())
+                        .ownerId(policy.getOwnerIdSnapshot())  // policy owner remediates policy gaps
                         .raisedBy(ctx.getId())
                         .raisedAt(LocalDateTime.now())
                         .build();
                 findingRepo.save(autoFinding);
-                log.info("[POLICY-INSTANCE] Auto-finding raised | policyInstanceId={} findingId={} controlId={}",
-                        id, autoFinding.getId(), mapping.getControlInstanceId());
-            });
+                log.info("[POLICY-INSTANCE] Auto-finding raised | policyInstanceId={} findingRef={}",
+                        id, autoFinding.getFindingRef());
+
+                autoEscalateToIssue(autoFinding, ctx.getId(), ctx.getTenantId());
+            }
+
             snapshotService.syncEngagementScore(policy.getEngagementId(), ctx.getTenantId());
         }
 
@@ -484,33 +549,62 @@ public class AuditInstanceController {
 
     private Map<String, Object> buildControlMap(AuditControlInstance c) {
         Map<String, Object> m = new LinkedHashMap<>();
-        m.put("id",                      c.getId());
-        m.put("engagementId",            c.getEngagementId());
-        m.put("controlCodeSnapshot",     c.getControlCodeSnapshot());
-        m.put("controlNameSnapshot",     c.getControlNameSnapshot());
-        m.put("descriptionSnapshot",     c.getDescriptionSnapshot());
-        m.put("testProcedureSnapshot",   c.getTestProcedure());
-        m.put("evidenceGuidanceSnapshot",null);   // not stored on control instance
-        m.put("controlTagSnapshot",      c.getControlTagSnapshot());
-        m.put("testTypeSnapshot",        c.getTestTypeSnapshot());
-        m.put("frameworkRefSnapshot",    c.getFrameworkRefSnapshot());
-        m.put("testResult",              c.getTestResult());
-        m.put("testNotes",               c.getTestNotes());
-        m.put("testNotes",               c.getTestNotes());
-        m.put("assignedAuditorId",       c.getAssignedAuditorId());
-        m.put("auditeeAssignedUserId",   c.getAuditeeAssignedUserId());
-        m.put("auditeeEvidenceSubmitted",   c.isAuditeeEvidenceSubmitted());
-        m.put("evidenceSubmittedAt",         c.getAuditeeEvidenceSubmittedAt());
-        m.put("testedAt",                c.getTestedAt());
-        m.put("testedBy",                c.getTestedBy());
-        m.put("findingLinked",           c.isFindingLinked());
-        m.put("findingIssueId",          c.getFindingIssueId());
+        m.put("id",                       c.getId());
+        m.put("engagementId",             c.getEngagementId());
+        m.put("controlCodeSnapshot",      c.getControlCodeSnapshot());
+        m.put("controlNameSnapshot",      c.getControlNameSnapshot());
+        m.put("descriptionSnapshot",      c.getDescriptionSnapshot());
+        m.put("testProcedureSnapshot",    c.getTestProcedure());
+        m.put("evidenceGuidanceSnapshot", null);
+        m.put("controlTagSnapshot",       c.getControlTagSnapshot());
+        m.put("testTypeSnapshot",         c.getTestTypeSnapshot());
+        m.put("frameworkRefSnapshot",     c.getFrameworkRefSnapshot());
+        m.put("testResult",               c.getTestResult());
+        m.put("testNotes",                c.getTestNotes());
+        m.put("assignedAuditorId",        c.getAssignedAuditorId());
+        m.put("auditeeAssignedUserId",    c.getAuditeeAssignedUserId());
+        m.put("auditeeEvidenceSubmitted", c.isAuditeeEvidenceSubmitted());
+        m.put("evidenceSubmittedAt",      c.getAuditeeEvidenceSubmittedAt());
+        m.put("testedAt",                 c.getTestedAt());
+        m.put("testedBy",                 c.getTestedBy());
+        m.put("findingLinked",            c.isFindingLinked());
+        m.put("findingIssueId",           c.getFindingIssueId());
         m.put("sectionBreadcrumbSnapshot",c.getSectionBreadcrumbSnapshot());
-        m.put("sectionInstanceId",       c.getSectionInstanceId());
+        m.put("sectionInstanceId",        c.getSectionInstanceId());
         return m;
     }
 
-    // ADDED: collision-safe finding ref generator (mirrors AuditFindingController.generateRef)
+    /**
+     * Auto-escalate a finding to Issue Management using workflow 15.
+     * Step 1 (ENTITY_CREATOR + auto_complete_actor_on_submit=1) completes immediately on creation.
+     * Step 2 (ENTITY_OWNER) lands in the owner's task inbox.
+     * Wrapped in try-catch so a workflow config issue never breaks the parent operation.
+     */
+    private void autoEscalateToIssue(AuditFinding finding, Long createdBy, Long tenantId) {
+        try {
+            IssueRequest req = new IssueRequest();
+            req.setTitle(finding.getTitle());
+            req.setDescription(finding.getDescription());
+            req.setIssueType(Issue.IssueType.INTERNAL);
+            req.setSeverity(Issue.Severity.MEDIUM);
+            req.setSourceModule("AUDIT");
+            req.setSourceEntityType("AUDIT_FINDING");
+            req.setSourceEntityId(finding.getId());
+            req.setFrameworkRef(finding.getFrameworkRef());
+            req.setOwnerId(finding.getOwnerId());
+            req.setWorkflowId(15L);  // Issue Remediation Lifecycle
+            var issueResp = issueService.create(req, createdBy, tenantId);
+            finding.setLinkedIssueId(issueResp.getId());
+            findingRepo.save(finding);
+            log.info("[AUDIT-FINDING] Auto-escalated to issue | findingId={} issueId={} issueRef={}",
+                    finding.getId(), issueResp.getId(), issueResp.getIssueRef());
+        } catch (Exception ex) {
+            log.warn("[AUDIT-FINDING] Auto-escalate failed for finding {} — {}",
+                    finding.getId(), ex.getMessage());
+        }
+    }
+
+    /** Collision-safe finding ref generator */
     private String generateFindingRef(Long tenantId) {
         long count = findingRepo.countByTenantId(tenantId) + 1;
         String candidate = String.format("FND-%d-%04d", Year.now().getValue(), count);

@@ -36,9 +36,9 @@ public class IssueEntityResolver implements WorkflowEntityResolver {
 
     @Override
     public Long resolveArtifactId(WorkflowInstance instance) {
-        boolean exists = issueRepository.existsById(instance.getEntityId());
-        log.debug("[ISSUE-RESOLVER] issueId={} exists={}", instance.getEntityId(), exists);
-        return exists ? instance.getEntityId() : null;
+        // entityId IS the issueId — no DB call needed
+        log.debug("[ISSUE-RESOLVER] issueId={}", instance.getEntityId());
+        return instance.getEntityId();
     }
 
     /**

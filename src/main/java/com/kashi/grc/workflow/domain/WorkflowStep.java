@@ -79,6 +79,22 @@ public class WorkflowStep extends BaseEntity {
     private ActorResolution actorResolution = ActorResolution.ROLE_BASED;
 
     /**
+     * For ASSIGNMENT_SCOPED steps: which side of users appears in the assignment dropdown.
+     * e.g. "AUDITOR" → auditor-side picker, "AUDITEE" → auditee-side picker.
+     * null = no picker restriction by side.
+     */
+    @Column(name = "assignable_side", length = 50)
+    private String assignableSide;
+
+    /**
+     * For ASSIGNMENT_SCOPED steps: which specific role_id to filter the picker by.
+     * When set, only users with this role appear in the dropdown.
+     * null = all users of the assignable_side.
+     */
+    @Column(name = "assignable_role_id")
+    private Long assignableRoleId;
+
+    /**
      * If true, the resolved assigner can redirect the task to a specific person.
      * Defaults true for flexibility.
      */

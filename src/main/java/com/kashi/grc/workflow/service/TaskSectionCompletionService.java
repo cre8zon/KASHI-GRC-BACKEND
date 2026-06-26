@@ -467,7 +467,32 @@ public class TaskSectionCompletionService {
     // CASE 3: auto-complete item-tracked section
     // ════════════════════════════════════════════════════════════════
 
+    /**
+     * Completes a section item identified by its domain entity ID (itemRefId)
+     * rather than the internal task_section_items PK.
+     * Used by ProjectEngagementsTab after assigning a lead auditor — the frontend
+     * knows the engagementId but not the internal item PK.
+     */
     @Transactional
+    public void completeItemByRef(Long taskInstanceId, String sectionKey, Long itemRefId, Long completedBy) {
+        TaskSectionItem item = itemRepository
+                .findByTaskInstanceIdAndSectionKeyAndItemRefId(taskInstanceId, sectionKey, itemRefId)
+                .orElse(null);
+
+        if (item == null) {
+            log.warn("[CASE3-BY-REF] No item found for taskId={} sectionKey={} itemRefId={} — skipping",
+                    taskInstanceId, sectionKey, itemRefId);
+            return;
+        }
+
+        if ("COMPLETED".equals(item.getStatus())) {
+            log.debug("[CASE3-BY-REF] Item {} already completed — skipping", item.getId());
+            return;
+        }
+
+        completeItem(taskInstanceId, sectionKey, item.getId(), completedBy, null, null, null, null);
+    }
+
     public void autoCompleteItemTrackedSection(Long taskInstanceId, String sectionKey, Long completedBy) {
         TaskInstance task = taskInstanceRepository.findById(taskInstanceId).orElse(null);
         if (task == null) {

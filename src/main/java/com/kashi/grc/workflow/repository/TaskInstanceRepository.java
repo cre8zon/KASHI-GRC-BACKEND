@@ -119,4 +119,18 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
     List<TaskInstance> findActorTasksForInstance(
             @Param("instanceId") Long workflowInstanceId,
             @Param("userId")     Long userId);
+
+    /**
+     * Single query replacing three separate findByAssignedUserIdAndStatus calls.
+     * Fetches PENDING + IN_PROGRESS + DELEGATED in one round-trip.
+     */
+    @Query("""
+        SELECT t FROM TaskInstance t
+        WHERE t.assignedUserId = :userId
+          AND t.status IN :statuses
+    """)
+    List<TaskInstance> findByAssignedUserIdAndStatusIn(
+            @Param("userId") Long userId,
+            @Param("statuses") java.util.Collection<TaskStatus> statuses);
+
 }

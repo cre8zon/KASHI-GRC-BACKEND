@@ -46,27 +46,27 @@ public class EvidenceService {
     @Transactional
     public EvidenceRecordResponse create(EvidenceRecordRequest req, Long uploadedBy, Long tenantId) {
         EvidenceRecord record = EvidenceRecord.builder()
-            .tenantId(tenantId)
-            .title(req.getTitle())
-            .description(req.getDescription())
-            .controlTag(req.getControlTag() != null
-                ? req.getControlTag().toUpperCase().trim() : null)
-            .fileUrl(req.getFileUrl())
-            .fileName(req.getFileName())
-            .fileSizeBytes(req.getFileSizeBytes())
-            .mimeType(req.getMimeType())
-            .validFrom(req.getValidFrom() != null ? req.getValidFrom() : LocalDateTime.now())
-            .validUntil(req.getValidUntil())
-            .sourceEntityType(req.getSourceEntityType())
-            .sourceEntityId(req.getSourceEntityId())
-            .uploadedBy(uploadedBy)
-            .uploadedAt(LocalDateTime.now())
-            .linkCount(0)
-            .build();
+                .tenantId(tenantId)
+                .title(req.getTitle())
+                .description(req.getDescription())
+                .controlTag(req.getControlTag() != null
+                        ? req.getControlTag().toUpperCase().trim() : null)
+                .fileUrl(req.getFileUrl())
+                .fileName(req.getFileName())
+                .fileSizeBytes(req.getFileSizeBytes())
+                .mimeType(req.getMimeType())
+                .validFrom(req.getValidFrom() != null ? req.getValidFrom() : LocalDateTime.now())
+                .validUntil(req.getValidUntil())
+                .sourceEntityType(req.getSourceEntityType())
+                .sourceEntityId(req.getSourceEntityId())
+                .uploadedBy(uploadedBy)
+                .uploadedAt(LocalDateTime.now())
+                .linkCount(0)
+                .build();
 
         recordRepository.save(record);
         log.info("[EVIDENCE] Created recordId={} tag={} tenantId={}", record.getId(),
-            record.getControlTag(), tenantId);
+                record.getControlTag(), tenantId);
 
         // Trigger async propagation — non-blocking
         if (record.getControlTag() != null) {
@@ -80,15 +80,15 @@ public class EvidenceService {
 
     public List<EvidenceRecordResponse> listForTenant(Long tenantId, String controlTag) {
         List<EvidenceRecord> records = controlTag != null && !controlTag.isBlank()
-            ? recordRepository.findByTenantIdAndControlTag(tenantId, controlTag)
-            : recordRepository.findByTenantId(tenantId);
+                ? recordRepository.findByTenantIdAndControlTag(tenantId, controlTag)
+                : recordRepository.findByTenantId(tenantId);
 
         return records.stream().map(r -> toRecordResponse(r, null)).collect(Collectors.toList());
     }
 
     public EvidenceRecordResponse getById(Long id, Long tenantId) {
         EvidenceRecord record = recordRepository.findById(id)
-            .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", id));
+                .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", id));
 
         List<EvidenceLink> links = linkRepository.findByEvidenceRecordIdAndTenantId(id, tenantId);
         return toRecordResponse(record, links);
@@ -101,10 +101,21 @@ public class EvidenceService {
      */
     public List<EvidenceLinkResponse> getLinksForEntity(String entityType, Long entityId, Long tenantId) {
         return linkRepository
-            .findByTargetEntityTypeAndTargetEntityIdAndTenantId(entityType, entityId, tenantId)
-            .stream()
-            .map(this::toLinkResponse)
-            .collect(Collectors.toList());
+                .findByTargetEntityTypeAndTargetEntityIdAndTenantId(entityType, entityId, tenantId)
+                .stream()
+                .map(this::toLinkResponse)
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Traceability: given a test instance, find which control-level evidence
+     * was used to evaluate it (shared evidenceRecordId between the test's
+     * evidence link and a control's evidence link). Used by the test detail
+     * page to show "Evidence used:" referencing the originating control evidence.
+     */
+    public List<EvidenceLinkResponse> getControlEvidenceUsedByTest(Long testInstanceId, Long tenantId) {
+        return linkRepository.findControlEvidenceUsedByTest(testInstanceId, tenantId)
+                .stream().map(this::toLinkResponse).collect(Collectors.toList());
     }
 
     /**
@@ -113,7 +124,7 @@ public class EvidenceService {
      */
     public List<EvidenceLinkResponse> getPendingReview(Long tenantId) {
         return linkRepository.findPendingReviewForTenant(tenantId)
-            .stream().map(this::toLinkResponse).collect(Collectors.toList());
+                .stream().map(this::toLinkResponse).collect(Collectors.toList());
     }
 
     // ── REVIEW ────────────────────────────────────────────────────────────────
@@ -127,7 +138,7 @@ public class EvidenceService {
             reuseEngine.rejectLink(linkId, reviewedBy, req.getNote(), tenantId);
         }
         EvidenceLink link = linkRepository.findByIdAndTenantId(linkId, tenantId)
-            .orElseThrow(() -> new ResourceNotFoundException("EvidenceLink", linkId));
+                .orElseThrow(() -> new ResourceNotFoundException("EvidenceLink", linkId));
         return toLinkResponse(link);
     }
 
@@ -138,31 +149,31 @@ public class EvidenceService {
                                            Long linkedBy, Long tenantId) {
         // Verify the record belongs to this tenant
         recordRepository.findById(evidenceRecordId)
-            .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", evidenceRecordId));
+                .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", evidenceRecordId));
 
         // Idempotent — if link already exists, return it
         if (linkRepository.existsByEvidenceRecordIdAndTargetEntityTypeAndTargetEntityId(
                 evidenceRecordId, req.getTargetEntityType(), req.getTargetEntityId())) {
             return linkRepository
-                .findByTargetEntityTypeAndTargetEntityIdAndTenantId(
-                    req.getTargetEntityType(), req.getTargetEntityId(), tenantId)
-                .stream().filter(l -> l.getEvidenceRecordId().equals(evidenceRecordId))
-                .findFirst().map(this::toLinkResponse).orElseThrow();
+                    .findByTargetEntityTypeAndTargetEntityIdAndTenantId(
+                            req.getTargetEntityType(), req.getTargetEntityId(), tenantId)
+                    .stream().filter(l -> l.getEvidenceRecordId().equals(evidenceRecordId))
+                    .findFirst().map(this::toLinkResponse).orElseThrow();
         }
 
         EvidenceLink link = EvidenceLink.builder()
-            .evidenceRecordId(evidenceRecordId)
-            .targetEntityType(req.getTargetEntityType())
-            .targetEntityId(req.getTargetEntityId())
-            .tenantId(tenantId)
-            .status(EvidenceLink.Status.ACCEPTED)  // manual links are immediately accepted
-            .autoLinked(false)
-            .reviewerNote(req.getNote())
-            .linkedAt(LocalDateTime.now())
-            .linkedBy(linkedBy)
-            .reviewedBy(linkedBy)
-            .reviewedAt(LocalDateTime.now())
-            .build();
+                .evidenceRecordId(evidenceRecordId)
+                .targetEntityType(req.getTargetEntityType())
+                .targetEntityId(req.getTargetEntityId())
+                .tenantId(tenantId)
+                .status(EvidenceLink.Status.ACCEPTED)  // manual links are immediately accepted
+                .autoLinked(false)
+                .reviewerNote(req.getNote())
+                .linkedAt(LocalDateTime.now())
+                .linkedBy(linkedBy)
+                .reviewedBy(linkedBy)
+                .reviewedAt(LocalDateTime.now())
+                .build();
 
         linkRepository.save(link);
 
@@ -173,7 +184,7 @@ public class EvidenceService {
         });
 
         log.info("[EVIDENCE] Manual link created | recordId={} → {}:{}",
-            evidenceRecordId, req.getTargetEntityType(), req.getTargetEntityId());
+                evidenceRecordId, req.getTargetEntityType(), req.getTargetEntityId());
 
         return toLinkResponse(link);
     }
@@ -182,44 +193,44 @@ public class EvidenceService {
 
     private EvidenceRecordResponse toRecordResponse(EvidenceRecord r, List<EvidenceLink> links) {
         return EvidenceRecordResponse.builder()
-            .id(r.getId())
-            .tenantId(r.getTenantId())
-            .title(r.getTitle())
-            .description(r.getDescription())
-            .controlTag(r.getControlTag())
-            .fileUrl(r.getFileUrl())
-            .fileName(r.getFileName())
-            .fileSizeBytes(r.getFileSizeBytes())
-            .mimeType(r.getMimeType())
-            .validFrom(r.getValidFrom())
-            .validUntil(r.getValidUntil())
-            .expired(r.isExpired())
-            .sourceEntityType(r.getSourceEntityType())
-            .sourceEntityId(r.getSourceEntityId())
-            .uploadedBy(r.getUploadedBy())
-            .uploadedAt(r.getUploadedAt())
-            .linkCount(r.getLinkCount())
-            .createdAt(r.getCreatedAt())
-            .updatedAt(r.getUpdatedAt())
-            .links(links != null
-                ? links.stream().map(this::toLinkResponse).collect(Collectors.toList())
-                : null)
-            .build();
+                .id(r.getId())
+                .tenantId(r.getTenantId())
+                .title(r.getTitle())
+                .description(r.getDescription())
+                .controlTag(r.getControlTag())
+                .fileUrl(r.getFileUrl())
+                .fileName(r.getFileName())
+                .fileSizeBytes(r.getFileSizeBytes())
+                .mimeType(r.getMimeType())
+                .validFrom(r.getValidFrom())
+                .validUntil(r.getValidUntil())
+                .expired(r.isExpired())
+                .sourceEntityType(r.getSourceEntityType())
+                .sourceEntityId(r.getSourceEntityId())
+                .uploadedBy(r.getUploadedBy())
+                .uploadedAt(r.getUploadedAt())
+                .linkCount(r.getLinkCount())
+                .createdAt(r.getCreatedAt())
+                .updatedAt(r.getUpdatedAt())
+                .links(links != null
+                        ? links.stream().map(this::toLinkResponse).collect(Collectors.toList())
+                        : null)
+                .build();
     }
 
     private EvidenceLinkResponse toLinkResponse(EvidenceLink l) {
         return EvidenceLinkResponse.builder()
-            .id(l.getId())
-            .evidenceRecordId(l.getEvidenceRecordId())
-            .targetEntityType(l.getTargetEntityType())
-            .targetEntityId(l.getTargetEntityId())
-            .status(l.getStatus())
-            .autoLinked(l.isAutoLinked())
-            .matchedTagSnapshot(l.getMatchedTagSnapshot())
-            .reviewedBy(l.getReviewedBy())
-            .reviewedAt(l.getReviewedAt())
-            .reviewerNote(l.getReviewerNote())
-            .linkedAt(l.getLinkedAt())
-            .build();
+                .id(l.getId())
+                .evidenceRecordId(l.getEvidenceRecordId())
+                .targetEntityType(l.getTargetEntityType())
+                .targetEntityId(l.getTargetEntityId())
+                .status(l.getStatus())
+                .autoLinked(l.isAutoLinked())
+                .matchedTagSnapshot(l.getMatchedTagSnapshot())
+                .reviewedBy(l.getReviewedBy())
+                .reviewedAt(l.getReviewedAt())
+                .reviewerNote(l.getReviewerNote())
+                .linkedAt(l.getLinkedAt())
+                .build();
     }
 }

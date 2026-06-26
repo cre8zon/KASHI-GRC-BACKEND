@@ -1,5 +1,6 @@
 package com.kashi.grc.workflow.spi;
 
+import com.kashi.grc.workflow.domain.StepInstance;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
 
 /**
@@ -8,74 +9,62 @@ import com.kashi.grc.workflow.domain.WorkflowInstance;
  *
  * The engine calls this at task-response-time to resolve the primary artifact
  * ID linked to a workflow instance. The frontend uses this ID to build the
- * route to the correct page.
+ * route to the correct page (combined with the step's navKey).
  *
  * ── ADDING A NEW MODULE ───────────────────────────────────────────────────────
- *
  * 1. Create a @Component implementing this interface in your module.
- * 2. Return your module's entityType() string (must match what the workflow
- *    blueprint uses as entityType, e.g. "AUDIT", "RISK", "POLICY").
- * 3. Implement resolveArtifactId() to look up your artifact from the instance.
- * 4. Add entries to the frontend WORKFLOW_ROUTES config for your entityType.
+ * 2. Return your module's entityType() string.
+ * 3. Implement resolveArtifactId() to return the correct artifact ID.
  *
- * Zero changes to WorkflowEngineService, TaskInbox, or any other shared code.
+ * ── STEP-AWARE ROUTING ────────────────────────────────────────────────────────
+ * Some workflows route different steps to different entity pages.
+ * Example: WF16 (Audit Project Lifecycle) governs an AuditProjectInstance,
+ * but Steps 3-8 work on individual AuditEngagements.
  *
- * ── EXAMPLE ──────────────────────────────────────────────────────────────────
- *
- * {@code
- * @Component
- * public class AuditEntityResolver implements WorkflowEntityResolver {
- *     @Override public String entityType() { return "AUDIT"; }
- *
- *     @Override
- *     public Long resolveArtifactId(WorkflowInstance instance) {
- *         return engagementRepository
- *             .findByWorkflowInstanceId(instance.getId())
- *             .map(AuditEngagement::getId)
- *             .orElse(null);
- *     }
- * }
- * }
+ * Override resolveArtifactId(instance, stepInstance, assignedUserId) to return
+ * the correct artifact based on the active step and assigned user.
+ * Default falls back through the chain: (instance, si, userId) → (instance, si) → (instance).
  */
 public interface WorkflowEntityResolver {
 
-    /**
-     * The entityType string this resolver handles.
-     * Must match WorkflowInstance.entityType exactly (case-sensitive).
-     * e.g. "VENDOR", "AUDIT", "RISK", "POLICY", "CONTRACT"
-     */
+    /** The entityType string this resolver handles (case-sensitive). */
     String entityType();
 
     /**
-     * Given a workflow instance, returns the primary artifact ID for this
-     * entity type. Returns null if no artifact exists yet (e.g. automated
-     * action hasn't fired yet, or this step doesn't have an artifact).
-     *
-     * @param instance the active workflow instance
-     * @return artifact ID (e.g. assessmentId, engagementId) or null
+     * Basic resolution — returns the primary artifact ID for this workflow instance.
+     * Used when no step context is available.
      */
     Long resolveArtifactId(WorkflowInstance instance);
 
     /**
-     * Resolves the owner user ID for the entity linked to this workflow instance.
-     * Used by the engine when actorResolution = ENTITY_OWNER to assign tasks to
-     * exactly the user who owns the entity — not a pool of role holders.
-     *
-     * Default implementation returns null — override in resolvers for entities
-     * that have an owner field (Issue.ownerId, Policy.ownerId, Risk.ownerId, etc.)
-     *
-     * Falls back to PREVIOUS_ACTOR then ROLE_BASED when null.
-     *
-     * @param instance the active workflow instance
-     * @return userId of the entity owner, or null if not set / not applicable
+     * Step-aware resolution — override when different steps route to different pages.
+     * Default falls back to resolveArtifactId(instance).
+     */
+    default Long resolveArtifactId(WorkflowInstance instance, StepInstance stepInstance) {
+        return resolveArtifactId(instance);
+    }
+
+    /**
+     * Step-and-user-aware resolution — override when artifact depends on both
+     * step AND which user owns the task (e.g. each lead auditor routes to their
+     * own engagement, not just any engagement under the project).
+     * Default falls back to resolveArtifactId(instance, stepInstance).
+     */
+    default Long resolveArtifactId(WorkflowInstance instance, StepInstance stepInstance, Long assignedUserId) {
+        return resolveArtifactId(instance, stepInstance);
+    }
+
+    /**
+     * Resolves the owner user ID for ENTITY_OWNER actor resolution.
+     * Default returns null — override for entities with an owner field.
      */
     default Long resolveOwnerId(WorkflowInstance instance) {
         return null;
     }
 
     /**
-     * Resolves a human-readable title for the entity (e.g. Issue title, Policy name).
-     * Used by the task inbox to show context without a separate API call.
+     * Resolves a human-readable title for the entity.
+     * Used by the task inbox for display without extra API calls.
      * Default returns null — override in module resolvers.
      */
     default String resolveEntityTitle(WorkflowInstance instance) {

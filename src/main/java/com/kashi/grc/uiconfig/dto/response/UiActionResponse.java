@@ -19,5 +19,6 @@ public class UiActionResponse {
     private boolean requiresConfirmation;
     private String  confirmationMessage;
     private boolean requiresRemarks;
+    private boolean requiresAssignment;
     private Integer sortOrder;
 }

@@ -84,7 +84,8 @@ public class EntityComment extends TenantAwareEntity {
         AUDIT_CONTROL_INSTANCE,
         AUDIT_TEST,
         AUDIT_POLICY,
-        AUDIT_TEMPLATE
+        AUDIT_TEMPLATE,
+        AUDIT_PROJECT
     }
 
     public enum CommentType {

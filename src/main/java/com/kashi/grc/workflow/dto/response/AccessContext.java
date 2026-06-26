@@ -85,6 +85,11 @@ public class AccessContext {
     /** EDIT | OBSERVER | COMPLETED | DENIED */
     private String   mode;
 
+    /** Populated by resolveForModule when user has a pending task at the active step.
+     *  Allows frontend to show action buttons without needing task URL params. */
+    private Long     taskId;
+    private Long     stepInstanceId;
+
     private boolean  canView;
     private boolean  canEdit;
     private boolean  canAct;
@@ -113,6 +118,9 @@ public class AccessContext {
      * Null/empty = all fields editable (subject to canEdit).
      */
     private List<String> editableFields;
+
+    /** When non-empty, ONLY these form tabs are editable — others shown read-only */
+    private List<String> editableTabs;
 
     /**
      * Always read-only at this step, regardless of canEdit.
@@ -172,6 +180,14 @@ public class AccessContext {
      * SOFT conflicts show a warning; user must document an exception to proceed.
      */
     private List<SodViolation> sodViolations;
+
+    /**
+     * True when the current task has compound sections (task_section_completions rows).
+     * When true, step completion is driven by section/item gates automatically —
+     * the COMPLETE_STEP button should be hidden to prevent premature APPROVE calls.
+     * False = simple task, COMPLETE_STEP button is correct.
+     */
+    private boolean hasSections;
 
     // ── Nested types ──────────────────────────────────────────────────────────
 
