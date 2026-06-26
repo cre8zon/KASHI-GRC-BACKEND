@@ -156,6 +156,8 @@ public interface AuditControlInstanceRepository extends JpaRepository<AuditContr
      */
     long countByEngagementIdAndTestResult(Long engagementId, AuditControlInstance.TestResult testResult);
 
+    long countByEngagementIdAndAuditeeEvidenceSubmitted(Long engagementId, boolean submitted);
+
     /**
      * Count controls that have been evaluated (any result except NOT_TESTED).
      * Used by syncEngagementScore() to populate AuditEngagement.testedControls.

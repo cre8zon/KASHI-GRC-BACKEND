@@ -63,6 +63,8 @@ public class UtilityService {
      */
     public static void clearRequestCache() {
         REQUEST_USER_CACHE.remove();
+        com.kashi.grc.workflow.service.WorkflowAccessService.clearPermissionCache();
+        com.kashi.grc.uiconfig.service.UiConfigServiceImpl.clearScreenConfigCache();
     }
 
     public PageDetails getpageDetails(Map<String, String> allParams) {

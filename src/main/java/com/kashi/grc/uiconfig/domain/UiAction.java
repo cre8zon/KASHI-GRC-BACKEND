@@ -85,6 +85,13 @@ public class UiAction extends BaseEntity {
     @Builder.Default
     private Boolean requiresConfirmation = false;
 
+    /** When true, action is only available to users assigned to this specific entity instance.
+     *  Frontend checks entity.isAssignedToCurrentUser (returned by GET endpoint).
+     *  No hardcoding of action keys — set per-action in ui_actions table. */
+    @Column(name = "requires_assignment")
+    @Builder.Default
+    private Boolean requiresAssignment = false;
+
     @Column(name = "confirmation_message", columnDefinition = "TEXT")
     private String confirmationMessage;
 

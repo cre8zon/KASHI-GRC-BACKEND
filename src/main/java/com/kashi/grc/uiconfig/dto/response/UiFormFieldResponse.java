@@ -1,6 +1,7 @@
 package com.kashi.grc.uiconfig.dto.response;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import lombok.Builder;
 import lombok.Data;
 
@@ -13,6 +14,7 @@ public class UiFormFieldResponse {
     private String  label;
     private String  placeholder;
     private String  helperText;
+    @JsonProperty("isRequired")
     private boolean isRequired;
     private Integer sortOrder;
     private String  optionsComponentKey;

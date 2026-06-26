@@ -74,6 +74,8 @@ public class WorkflowInstanceController {
     private final DbRepository          dbRepository;
     private final UtilityService        utilityService;
     private final WorkflowAccessService accessService;
+    // Change 1: roleRepository for eligible-users side/role filtering
+    private final com.kashi.grc.usermanagement.repository.RoleRepository roleRepository;
 
     // ══════════════════════════════════════════════════════════════
     // INSTANCE MANAGEMENT
@@ -214,6 +216,32 @@ public class WorkflowInstanceController {
 
         WorkflowInstanceResponse response = service.performAction(req, performedBy);
         log.info("[WF-TASK] Action done | {} | taskId={} | instanceStatus={}", req.getActionType(), req.getTaskInstanceId(), response.getStatus());
+
+        return ResponseEntity.ok(ApiResponse.success(response));
+    }
+
+    /**
+     * POST /v1/workflow-instances/steps/{stepInstanceId}/override
+     *
+     * Step override action — advances a step without requiring a task.
+     * Requires workflow:step:override permission (checked via @PreAuthorize or service layer).
+     * Used by users with override authority (e.g. lead auditor advancing step 5 manually).
+     */
+    @PostMapping("/steps/{stepInstanceId}/override")
+    @Operation(summary = "Override-advance a step without a task (requires workflow:step:override permission)")
+    public ResponseEntity<ApiResponse<WorkflowInstanceResponse>> overrideStep(
+            @PathVariable Long stepInstanceId,
+            @RequestBody(required = false) java.util.Map<String, Object> body) {
+
+        Long performedBy = utilityService.getLoggedInDataContext().getId();
+        String action  = body != null && body.get("action")  != null ? body.get("action").toString()  : "APPROVE";
+        String remarks = body != null && body.get("remarks") != null ? body.get("remarks").toString() : null;
+
+        log.info("[WF-STEP] OVERRIDE {} | stepInstanceId={} | performedBy={}", action, stepInstanceId, performedBy);
+
+        WorkflowInstanceResponse response = service.overrideAdvanceStep(stepInstanceId, action, remarks, performedBy);
+
+        log.info("[WF-STEP] Override done | stepInstanceId={} | instanceStatus={}", stepInstanceId, response.getStatus());
 
         return ResponseEntity.ok(ApiResponse.success(response));
     }
@@ -440,5 +468,97 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getProgress(@PathVariable Long id) {
         log.debug("[WF-PROGRESS] GET | instanceId={}", id);
         return ResponseEntity.ok(ApiResponse.success(service.getInstanceProgress(id)));
+    }
+
+    /**
+     * GET /v1/workflow-instances/steps/{stepInstanceId}/eligible-users
+     *
+     * Returns users eligible to be ASSIGNED at this step.
+     *
+     * Two modes driven by step config (workflow_steps.assignable_side / assignable_role_id):
+     *
+     * Mode 1 — snapAssignableSide is set (section/control assignment pattern):
+     *   The actor assigns users to do work WITHIN this step.
+     *   e.g. Step 3: Lead Auditor picks Auditor IIs for section assignment.
+     *   If snapAssignableRoleId is also set, further narrows to that specific role.
+     *
+     * Mode 2 — snapAssignableSide is null (ASSIGN-to-next-step pattern):
+     *   Returns the NEXT step's actor roles — who will DO the next step.
+     *   e.g. Step 2: GRC Manager picks a Lead Auditor who will own Step 3.
+     *   Original behavior — unchanged.
+     */
+    @GetMapping("/steps/{stepInstanceId}/eligible-users")
+    @Operation(summary = "Users eligible to be assigned at this step")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getEligibleUsers(
+            @PathVariable Long stepInstanceId) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // 1. Load current step instance
+        com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
+        if (si == null) return ResponseEntity.notFound().build();
+
+        // ── Mode 1: assignableSide configured on the step ─────────────────────
+        if (si.getSnapAssignableSide() != null) {
+            try {
+                com.kashi.grc.usermanagement.domain.RoleSide roleSide =
+                        com.kashi.grc.usermanagement.domain.RoleSide.valueOf(
+                                si.getSnapAssignableSide().toUpperCase());
+                List<Long> roleIds;
+                if (si.getSnapAssignableRoleId() != null) {
+                    roleIds = List.of(si.getSnapAssignableRoleId());
+                } else {
+                    roleIds = roleRepository.findAllForTenantBySide(tenantId, roleSide)
+                            .stream().map(r -> r.getId()).toList();
+                }
+                if (roleIds.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
+                List<Map<String, Object>> users = service.getUsersByRoles(roleIds, tenantId);
+                log.info("[WF-ELIGIBLE] stepInstanceId={} assignableSide={} assignableRoleId={} → {} users",
+                        stepInstanceId, si.getSnapAssignableSide(), si.getSnapAssignableRoleId(), users.size());
+                return ResponseEntity.ok(ApiResponse.success(users));
+            } catch (IllegalArgumentException e) {
+                log.warn("[WF-ELIGIBLE] Invalid snapAssignableSide: {}", si.getSnapAssignableSide());
+            }
+        }
+
+        // ── Mode 2: next step's actor roles (original behavior) ───────────────
+        // 2. Find the NEXT step's actor roles via service
+        // (service has access to instanceRepository and workflowStepRepository)
+        var nextStepOpt = service.getNextStep(si);
+        if (nextStepOpt.isEmpty()) {
+            // No next step or snapStepOrder missing — fall back to current step
+            return eligibleFromStep(si.getStepId(), tenantId, stepInstanceId);
+        }
+
+        Long nextStepId = nextStepOpt.get().getId();
+
+        // 3. Get actor roles of the NEXT step — these are the people being assigned
+        List<com.kashi.grc.workflow.domain.WorkflowStepRole> nextActorRoles =
+                service.getStepActorRoles(nextStepId);
+
+        if (nextActorRoles.isEmpty()) {
+            log.debug("[WF-ELIGIBLE] Next step {} has no actor roles (ENTITY_OWNER or ASSIGNMENT_SCOPED)", nextStepId);
+            return ResponseEntity.ok(ApiResponse.success(List.of()));
+        }
+
+        List<Long> roleIds = nextActorRoles.stream()
+                .map(com.kashi.grc.workflow.domain.WorkflowStepRole::getRoleId)
+                .distinct().toList();
+
+        List<Map<String, Object>> users = service.getUsersByRoles(roleIds, tenantId);
+
+        log.debug("[WF-ELIGIBLE] stepInstanceId={} currentOrder={} → nextStepId={} roleIds={} → {} users",
+                stepInstanceId, si.getSnapStepOrder(), nextStepId, roleIds, users.size());
+
+        return ResponseEntity.ok(ApiResponse.success(users));
+    }
+
+    /** Helper — get eligible users from the current step's actor roles (fallback). */
+    private ResponseEntity<ApiResponse<List<Map<String, Object>>>> eligibleFromStep(
+            Long stepId, Long tenantId, Long stepInstanceId) {
+        var roles = service.getStepActorRoles(stepId);
+        if (roles.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
+        var roleIds = roles.stream().map(r -> r.getRoleId()).distinct().toList();
+        return ResponseEntity.ok(ApiResponse.success(service.getUsersByRoles(roleIds, tenantId)));
     }
 }

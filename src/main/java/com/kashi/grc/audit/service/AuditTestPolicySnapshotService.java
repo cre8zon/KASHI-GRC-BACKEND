@@ -2,12 +2,18 @@ package com.kashi.grc.audit.service;
 
 import com.kashi.grc.audit.domain.*;
 import com.kashi.grc.audit.repository.*;
+import com.kashi.grc.issue.domain.Issue;
+import com.kashi.grc.issue.dto.IssueRequest;
+import com.kashi.grc.issue.service.IssueService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.time.Year;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -59,6 +65,17 @@ public class AuditTestPolicySnapshotService {
     // ── ADDED: needed by syncEngagementScore() ────────────────────────────────
     private final AuditEngagementRepository                    engagementRepository;
     private final AuditFindingRepository                       findingRepository;
+
+    // ── ADDED: auto-escalate findings to Issue Management ─────────────────────
+    // @Lazy breaks the circular dependency:
+    // AuditTestPolicySnapshotService → IssueService → WorkflowEngineService
+    //   → AutomatedActionRegistry → CloseIssueAction → AuditTestPolicySnapshotService
+    private IssueService issueService;
+
+    @Autowired
+    public void setIssueService(@Lazy IssueService issueService) {
+        this.issueService = issueService;
+    }
 
     // ── ADDED: creates engagement-scoped integration snapshots after test snapshotting ──
     private final com.kashi.grc.integration.service.EngagementIntegrationSnapshotService engagementIntegrationSnapshotService;
@@ -135,37 +152,43 @@ public class AuditTestPolicySnapshotService {
                 .map(AuditControlTestMapping::getTestId)
                 .collect(Collectors.toSet());
 
-        // Snapshot each unique test → one AuditTestInstance per test
+        // Batch-load all tests in one query
+        Map<Long, AuditTest> testMap = testRepository.findAllById(uniqueTestIds)
+                .stream().collect(Collectors.toMap(AuditTest::getId, t -> t));
+
+        // Build all test instances in memory, saveAll in one round-trip
         Map<Long, Long> testIdToInstanceId = new HashMap<>();
+        List<AuditTestInstance> testInstancesToSave = new ArrayList<>();
         for (Long testId : uniqueTestIds) {
-            testRepository.findById(testId).ifPresent(test -> {
-                AuditTestInstance instance = AuditTestInstance.builder()
-                        .originalTestId(test.getId())
-                        .engagementId(engagementId)
-                        .tenantId(tenantId)
-                        .testNameSnapshot(test.getName())
-                        .testRefSnapshot(test.getTestRef())
-                        .descriptionSnapshot(test.getDescription())
-                        .testProcedureSnapshot(test.getTestProcedure())
-                        .evidenceGuidanceSnapshot(test.getEvidenceGuidance())
-                        .frameworkRefSnapshot(test.getFrameworkRef())
-                        .controlTagSnapshot(test.getControlTag())
-                        .automationTypeSnapshot(test.getAutomationType() != null
-                                ? test.getAutomationType().name() : "MANUAL")
-                        .automationKeySnapshot(test.getAutomationKey())
-                        .frequencySnapshot(test.getFrequency() != null
-                                ? test.getFrequency().name() : "ANNUAL")
-                        .testResult(AuditTestInstance.TestResult.NOT_RUN)
-                        .snapshottedAt(LocalDateTime.now())
-                        .build();
-                testInstanceRepository.save(instance);
-                testIdToInstanceId.put(testId, instance.getId());
-                log.debug("[AUDIT-SNAPSHOT] Snapshotted test | testId={} instanceId={}",
-                        testId, instance.getId());
-            });
+            AuditTest test = testMap.get(testId);
+            if (test == null) continue;
+            testInstancesToSave.add(AuditTestInstance.builder()
+                    .originalTestId(test.getId())
+                    .engagementId(engagementId)
+                    .tenantId(tenantId)
+                    .testNameSnapshot(test.getName())
+                    .testRefSnapshot(test.getTestRef())
+                    .descriptionSnapshot(test.getDescription())
+                    .testProcedureSnapshot(test.getTestProcedure())
+                    .evidenceGuidanceSnapshot(test.getEvidenceGuidance())
+                    .frameworkRefSnapshot(test.getFrameworkRef())
+                    .controlTagSnapshot(test.getControlTag())
+                    .automationTypeSnapshot(test.getAutomationType() != null
+                            ? test.getAutomationType().name() : "MANUAL")
+                    .automationKeySnapshot(test.getAutomationKey())
+                    .frequencySnapshot(test.getFrequency() != null
+                            ? test.getFrequency().name() : "ANNUAL")
+                    .testResult(AuditTestInstance.TestResult.NOT_RUN)
+                    .snapshottedAt(LocalDateTime.now())
+                    .build());
+        }
+        List<AuditTestInstance> savedInstances = testInstanceRepository.saveAll(testInstancesToSave);
+        for (AuditTestInstance saved : savedInstances) {
+            testIdToInstanceId.put(saved.getOriginalTestId(), saved.getId());
         }
 
-        // Create runtime mappings: controlInstance ↔ testInstance
+        // Create runtime mappings in batch
+        List<AuditControlInstanceTestMapping> mappingsToSave = new ArrayList<>();
         for (AuditControlTestMapping mapping : allMappings) {
             Long controlInstanceId = originalToInstanceId.get(mapping.getControlId());
             Long testInstanceId    = testIdToInstanceId.get(mapping.getTestId());
@@ -176,7 +199,7 @@ public class AuditTestPolicySnapshotService {
                 continue;
             }
 
-            AuditControlInstanceTestMapping runtimeMapping = AuditControlInstanceTestMapping.builder()
+            mappingsToSave.add(AuditControlInstanceTestMapping.builder()
                     .controlInstanceId(controlInstanceId)
                     .testInstanceId(testInstanceId)
                     .engagementId(engagementId)
@@ -186,9 +209,9 @@ public class AuditTestPolicySnapshotService {
                     .mappingNoteSnapshot(mapping.getMappingNote())
                     .originalControlId(mapping.getControlId())
                     .originalTestId(mapping.getTestId())
-                    .build();
-            controlInstanceTestMappingRepository.save(runtimeMapping);
+                    .build());
         }
+        controlInstanceTestMappingRepository.saveAll(mappingsToSave);
 
         log.info("[AUDIT-SNAPSHOT] Snapshotted {} test instances, {} mappings | engagementId={}",
                 testIdToInstanceId.size(), allMappings.size(), engagementId);
@@ -215,56 +238,61 @@ public class AuditTestPolicySnapshotService {
                 .map(AuditPolicyControlMapping::getPolicyId)
                 .collect(Collectors.toSet());
 
-        // Only snapshot APPROVED policies — draft policies are not yet in effect
-        Map<Long, Long> policyIdToInstanceId = new HashMap<>();
-        for (Long policyId : uniquePolicyIds) {
-            policyRepository.findById(policyId).ifPresent(policy -> {
-                // Skip non-approved policies — they shouldn't be evaluated in an audit
-                if (policy.getStatus() != AuditPolicy.PolicyStatus.APPROVED &&
-                        policy.getStatus() != AuditPolicy.PolicyStatus.UNDER_REVIEW) {
-                    log.debug("[AUDIT-SNAPSHOT] Skipping policy {} — status={}",
-                            policyId, policy.getStatus());
-                    return;
-                }
+        // Batch-load all policies in one query
+        Map<Long, AuditPolicy> policyMap = policyRepository.findAllById(uniquePolicyIds)
+                .stream().collect(Collectors.toMap(AuditPolicy::getId, p -> p));
 
-                AuditPolicyInstance instance = AuditPolicyInstance.builder()
-                        .originalPolicyId(policy.getId())
-                        .engagementId(engagementId)
-                        .tenantId(tenantId)
-                        .titleSnapshot(policy.getTitle())
-                        .policyRefSnapshot(policy.getPolicyRef())
-                        .versionSnapshot(policy.getVersion())
-                        .descriptionSnapshot(policy.getDescription())
-                        .contentTypeSnapshot(policy.getContentType() != null
-                                ? policy.getContentType().name() : "RICH_TEXT")
-                        .contentBodySnapshot(policy.getContentBody())
-                        .evidenceRecordIdSnapshot(policy.getEvidenceRecordId())
-                        .externalUrlSnapshot(policy.getExternalUrl())
-                        .ownerIdSnapshot(policy.getOwnerId())
-                        .approvedAtSnapshot(policy.getApprovedAt())
-                        .effectiveDateSnapshot(policy.getEffectiveDate())
-                        .nextReviewDateSnapshot(policy.getNextReviewDate())
-                        .policyStatusSnapshot(policy.getStatus().name())
-                        .controlTagsSnapshot(policy.getControlTags())
-                        .frameworkRefsSnapshot(policy.getFrameworkRefs())
-                        .reviewResult(AuditPolicyInstance.ReviewResult.NOT_REVIEWED)
-                        .snapshottedAt(LocalDateTime.now())
-                        .build();
-                policyInstanceRepository.save(instance);
-                policyIdToInstanceId.put(policyId, instance.getId());
-                log.debug("[AUDIT-SNAPSHOT] Snapshotted policy | policyId={} instanceId={}",
-                        policyId, instance.getId());
-            });
+        // Build approved policy instances in memory, saveAll in one round-trip
+        Map<Long, Long> policyIdToInstanceId = new HashMap<>();
+        List<AuditPolicyInstance> policyInstancesToSave = new ArrayList<>();
+        List<Long> policyIdsToSave = new ArrayList<>();
+        for (Long policyId : uniquePolicyIds) {
+            AuditPolicy policy = policyMap.get(policyId);
+            if (policy == null) continue;
+            if (policy.getStatus() != AuditPolicy.PolicyStatus.APPROVED &&
+                    policy.getStatus() != AuditPolicy.PolicyStatus.UNDER_REVIEW) {
+                log.debug("[AUDIT-SNAPSHOT] Skipping policy {} — status={}", policyId, policy.getStatus());
+                continue;
+            }
+            policyInstancesToSave.add(AuditPolicyInstance.builder()
+                    .originalPolicyId(policy.getId())
+                    .engagementId(engagementId)
+                    .tenantId(tenantId)
+                    .titleSnapshot(policy.getTitle())
+                    .policyRefSnapshot(policy.getPolicyRef())
+                    .versionSnapshot(policy.getVersion())
+                    .descriptionSnapshot(policy.getDescription())
+                    .contentTypeSnapshot(policy.getContentType() != null
+                            ? policy.getContentType().name() : "RICH_TEXT")
+                    .contentBodySnapshot(policy.getContentBody())
+                    .evidenceRecordIdSnapshot(policy.getEvidenceRecordId())
+                    .externalUrlSnapshot(policy.getExternalUrl())
+                    .ownerIdSnapshot(policy.getOwnerId())
+                    .approvedAtSnapshot(policy.getApprovedAt())
+                    .effectiveDateSnapshot(policy.getEffectiveDate())
+                    .nextReviewDateSnapshot(policy.getNextReviewDate())
+                    .policyStatusSnapshot(policy.getStatus().name())
+                    .controlTagsSnapshot(policy.getControlTags())
+                    .frameworkRefsSnapshot(policy.getFrameworkRefs())
+                    .reviewResult(AuditPolicyInstance.ReviewResult.NOT_REVIEWED)
+                    .snapshottedAt(LocalDateTime.now())
+                    .build());
+            policyIdsToSave.add(policyId);
+        }
+        List<AuditPolicyInstance> savedPolicies = policyInstanceRepository.saveAll(policyInstancesToSave);
+        for (int i = 0; i < savedPolicies.size(); i++) {
+            policyIdToInstanceId.put(policyIdsToSave.get(i), savedPolicies.get(i).getId());
         }
 
-        // Create runtime mappings: policyInstance ↔ controlInstance
+        // Create runtime mappings in batch
+        List<AuditPolicyInstanceControlMapping> policyMappingsToSave = new ArrayList<>();
         for (AuditPolicyControlMapping mapping : allMappings) {
             Long controlInstanceId = originalToInstanceId.get(mapping.getControlId());
             Long policyInstanceId  = policyIdToInstanceId.get(mapping.getPolicyId());
 
             if (controlInstanceId == null || policyInstanceId == null) continue;
 
-            AuditPolicyInstanceControlMapping runtimeMapping = AuditPolicyInstanceControlMapping.builder()
+            policyMappingsToSave.add(AuditPolicyInstanceControlMapping.builder()
                     .policyInstanceId(policyInstanceId)
                     .controlInstanceId(controlInstanceId)
                     .engagementId(engagementId)
@@ -274,9 +302,9 @@ public class AuditTestPolicySnapshotService {
                     .mappingNoteSnapshot(mapping.getMappingNote())
                     .originalPolicyId(mapping.getPolicyId())
                     .originalControlId(mapping.getControlId())
-                    .build();
-            policyInstanceControlMappingRepository.save(runtimeMapping);
+                    .build());
         }
+        policyInstanceControlMappingRepository.saveAll(policyMappingsToSave);
 
         log.info("[AUDIT-SNAPSHOT] Snapshotted {} policy instances, {} mappings | engagementId={}",
                 policyIdToInstanceId.size(), allMappings.size(), engagementId);
@@ -342,8 +370,45 @@ public class AuditTestPolicySnapshotService {
                     control.setTestResult(derived);
                     controlInstanceRepository.save(control);
                     log.debug("[AUDIT-DERIVE] Control {} → {}", controlInstanceId, derived);
+
+                    // Auto-raise a finding when a control becomes INEFFECTIVE due to test FAIL.
+                    // Only raise if no open finding already exists for this control.
+                    if (derived == AuditControlInstance.TestResult.INEFFECTIVE) {
+                        boolean alreadyOpen = findingRepository
+                                .findByControlInstanceIdAndTenantId(controlInstanceId, tenantId)
+                                .stream()
+                                .anyMatch(f -> f.getStatus() != AuditFinding.Status.CLOSED
+                                        && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
+                        if (!alreadyOpen) {
+                            String ref = generateFindingRef(tenantId);
+                            AuditFinding finding = AuditFinding.builder()
+                                    .tenantId(tenantId)
+                                    .findingRef(ref)
+                                    .engagementId(control.getEngagementId())
+                                    .controlInstanceId(controlInstanceId)
+                                    .title("Control failed: " + control.getControlCodeSnapshot()
+                                            + " — " + control.getControlNameSnapshot())
+                                    .description("Test result cascaded to INEFFECTIVE for control "
+                                            + control.getControlCodeSnapshot() + ".")
+                                    .severity(AuditFinding.Severity.MEDIUM)
+                                    .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
+                                    .status(AuditFinding.Status.OPEN)
+                                    .frameworkRef(control.getFrameworkRefSnapshot())
+                                    .ownerId(control.getAuditeeAssignedUserId())
+                                    .raisedBy(control.getAssignedAuditorId() != null
+                                            ? control.getAssignedAuditorId()
+                                            : control.getTestedBy() != null
+                                              ? control.getTestedBy()
+                                              : tenantId)
+                                    .raisedAt(LocalDateTime.now())
+                                    .build();
+                            findingRepository.save(finding);
+                            log.info("[AUDIT-DERIVE] Auto-finding raised | controlInstanceId={} findingRef={}",
+                                    controlInstanceId, ref);
+                            autoEscalateToIssue(finding, tenantId);
+                        }
+                    }
                 }
-                // ADDED: collect the engagement so we sync score after the loop
                 touchedEngagementIds.add(control.getEngagementId());
             });
         }
@@ -397,5 +462,40 @@ public class AuditTestPolicySnapshotService {
             log.info("[AUDIT-SCORE] Synced | engagementId={} total={} tested={} passed={} failed={} openFindings={}",
                     engagementId, total, tested, passed, failed, openFindings);
         });
+    }
+
+    // ── Helper — auto-escalate a finding to Issue Management ─────────────────
+    private void autoEscalateToIssue(AuditFinding finding, Long tenantId) {
+        try {
+            IssueRequest req = new IssueRequest();
+            req.setTitle(finding.getTitle());
+            req.setDescription(finding.getDescription());
+            req.setIssueType(Issue.IssueType.INTERNAL);
+            req.setSeverity(Issue.Severity.MEDIUM);
+            req.setSourceModule("AUDIT");
+            req.setSourceEntityType("AUDIT_FINDING");
+            req.setSourceEntityId(finding.getId());
+            req.setFrameworkRef(finding.getFrameworkRef());
+            req.setOwnerId(finding.getOwnerId());
+            req.setWorkflowId(15L); // Issue Remediation Lifecycle
+            var issueResp = issueService.create(req, finding.getRaisedBy(), tenantId);
+            finding.setLinkedIssueId(issueResp.getId());
+            findingRepository.save(finding);
+            log.info("[AUDIT-DERIVE] Auto-escalated to issue | findingId={} issueId={}",
+                    finding.getId(), issueResp.getId());
+        } catch (Exception ex) {
+            log.warn("[AUDIT-DERIVE] Auto-escalate failed for finding {} — {}",
+                    finding.getId(), ex.getMessage());
+        }
+    }
+
+    // ── Helper — collision-safe finding ref ───────────────────────────────────
+    private String generateFindingRef(Long tenantId) {
+        long count = findingRepository.countByTenantId(tenantId) + 1;
+        String candidate = String.format("FND-%d-%04d", Year.now().getValue(), count);
+        while (findingRepository.existsByFindingRefAndTenantId(candidate, tenantId)) {
+            candidate = String.format("FND-%d-%04d", Year.now().getValue(), ++count);
+        }
+        return candidate;
     }
 }

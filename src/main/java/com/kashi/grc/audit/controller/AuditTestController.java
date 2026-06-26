@@ -55,6 +55,8 @@ public class AuditTestController {
     private final AuditControlInstanceTestMappingRepository controlInstanceTestMappingRepository;
     private final AuditTestPolicySnapshotService            snapshotService;
     private final UtilityService                            utilityService;
+    private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepository;
+    private final com.kashi.grc.audit.repository.AuditControlInstanceRepository controlInstanceRepository;
 
     // ══════════════════════════════════════════════════════════════════════════
     // LIBRARY — TESTS CRUD
@@ -321,6 +323,28 @@ public class AuditTestController {
 
         AuditTestInstance instance = testInstanceRepository.findById(testInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", testInstanceId));
+
+        // Evidence must exist on the control(s) this test belongs to before recording
+        // a result — same rule as the direct control-level test-result endpoint
+        // (AuditEngagementService.recordTestResult). A test's result ultimately
+        // derives the control's result via cascadeDeriveControlResults below, so
+        // this is the path that actually needs the gate enforced in real usage.
+        List<Long> linkedControlIds = controlInstanceTestMappingRepository
+                .findControlInstanceIdsByTestInstanceId(testInstanceId);
+        for (Long controlId : linkedControlIds) {
+            AuditControlInstance control = controlInstanceRepository.findById(controlId).orElse(null);
+            boolean hasEvidence = control != null && (
+                    control.isAuditeeEvidenceSubmitted()
+                            || evidenceLinkRepository.countAcceptedForEntity(
+                            "AUDIT_CONTROL_INSTANCE", controlId) > 0
+            );
+            if (!hasEvidence) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "EVIDENCE_NOT_SUBMITTED",
+                        "Evidence has not been submitted for the control this test belongs to. " +
+                                "The auditee must upload evidence before the auditor can record a test result.");
+            }
+        }
 
         instance.setTestResult(AuditTestInstance.TestResult.valueOf(req.getTestResult()));
         instance.setTesterNotes(req.getTesterNotes());

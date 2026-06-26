@@ -12,4 +12,6 @@ public class AuditProjectRequest {
     private Long      ownerId;
     private LocalDate plannedStart;
     private LocalDate plannedEnd;
+    /** User-selected workflow for the project lifecycle (e.g. Audit Project Lifecycle, id=16) */
+    private Long      workflowId;
 }

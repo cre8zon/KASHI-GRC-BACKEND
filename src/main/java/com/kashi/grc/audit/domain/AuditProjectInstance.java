@@ -60,6 +60,14 @@ public class AuditProjectInstance extends TenantAwareEntity {
     @Column(name = "project_ref_snapshot", length = 30)
     private String projectRefSnapshot;
 
+    /**
+     * Unique ref for THIS running instance — format: {projectRef}-RUN-{seq}
+     * e.g. PROJ-2026-0001-RUN-1 (first run), PROJ-2026-0001-RUN-2 (second annual run)
+     * Distinct from projectRefSnapshot which is the library project ref.
+     */
+    @Column(name = "instance_ref", length = 50)
+    private String instanceRef;
+
     @Column(name = "description_snapshot", columnDefinition = "TEXT")
     private String descriptionSnapshot;
 
@@ -91,4 +99,57 @@ public class AuditProjectInstance extends TenantAwareEntity {
 
     @Column(name = "workflow_instance_id")
     private Long workflowInstanceId;
+
+    // ── Step 11: Cross-Framework Consolidation ────────────────────────────────
+    @Column(name = "cross_framework_notes", columnDefinition = "TEXT")
+    private String crossFrameworkNotes;
+
+    @Column(name = "programme_risk", length = 30)
+    private String programmeRisk;          // LOW | MEDIUM | HIGH | CRITICAL
+
+    // ── Step 12: Management Response ──────────────────────────────────────────
+    @Column(name = "management_response", columnDefinition = "TEXT")
+    private String managementResponse;
+
+    @Column(name = "acceptance_of_findings", length = 30)
+    private String acceptanceOfFindings;   // ACCEPTED | PARTIAL | REJECTED
+
+    @Column(name = "corrective_actions", columnDefinition = "TEXT")
+    private String correctiveActions;
+
+    @Column(name = "committed_closure_date")
+    private LocalDate committedClosureDate;
+
+    // ── Step 13: Executive Sign-off ───────────────────────────────────────────
+    @Column(name = "executive_sign_off", columnDefinition = "TEXT")
+    private String executiveSignOff;
+
+    @Column(name = "programme_outcome", length = 30)
+    private String programmeOutcome;       // CLEAN | QUALIFIED | ADVERSE
+
+    @Column(name = "closure_statement", columnDefinition = "TEXT")
+    private String closureStatement;
+
+    @Column(name = "next_audit_due")
+    private LocalDate nextAuditDue;
+
+    @Column(name = "signed_off_by")
+    private Long signedOffBy;
+
+    @Column(name = "signed_off_at")
+    private LocalDateTime signedOffAt;
+
+    /**
+     * Live status of this RUNNING project instance — distinct from
+     * statusAtSnapshot (which is frozen at creation time).
+     * PLANNING  → instance row created but workflow 16 not yet started
+     *             (e.g. ensureProjectInstance() ran via an earlier engagement
+     *             start, but POST /project-instances full start hasn't fired)
+     * IN_PROGRESS → workflow 16 started, governs all engagements
+     * COMPLETED   → workflow 16 reached Auto-Close (Step 11 signed off)
+     * Drives audit_project_status badge on audit_project_list/_detail.
+     */
+    @Column(name = "status", length = 20)
+    @Builder.Default
+    private String status = "PLANNING";
 }

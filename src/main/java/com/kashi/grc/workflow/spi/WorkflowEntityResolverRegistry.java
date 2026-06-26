@@ -1,5 +1,6 @@
 package com.kashi.grc.workflow.spi;
 
+import com.kashi.grc.workflow.domain.StepInstance;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
 import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
@@ -71,6 +72,39 @@ public class WorkflowEntityResolverRegistry {
     }
 
     /**
+     * Step-and-user-aware artifact resolution.
+     */
+    public Long resolveArtifactId(WorkflowInstance instance, StepInstance stepInstance, Long assignedUserId) {
+        if (instance == null || instance.getEntityType() == null) return null;
+        WorkflowEntityResolver resolver = byEntityType.get(instance.getEntityType());
+        if (resolver == null) return null;
+        try {
+            return resolver.resolveArtifactId(instance, stepInstance, assignedUserId);
+        } catch (Exception e) {
+            log.warn("[ENTITY-RESOLVER] User-aware resolver threw for instanceId={}: {}",
+                    instance.getId(), e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     if (instance == null || instance.getEntityType() == null) return null;
+     WorkflowEntityResolver resolver = byEntityType.get(instance.getEntityType());
+     if (resolver == null) return null;
+     try {
+     Long artifactId = resolver.resolveArtifactId(instance, stepInstance);
+     log.debug("[ENTITY-RESOLVER] Step-aware artifactId={} for entityType='{}' step='{}'",
+     artifactId, instance.getEntityType(),
+     stepInstance != null ? stepInstance.getSnapName() : "null");
+     return artifactId;
+     } catch (Exception e) {
+     log.warn("[ENTITY-RESOLVER] Step-aware resolver threw for instanceId={}: {}",
+     instance.getId(), e.getMessage());
+     return null;
+     }
+     }
+
+     /**
      * Resolves the owner user ID for the entity linked to a workflow instance.
      * Delegates to the registered resolver for the instance's entityType.
      * Returns null if no resolver exists or resolver returns null.

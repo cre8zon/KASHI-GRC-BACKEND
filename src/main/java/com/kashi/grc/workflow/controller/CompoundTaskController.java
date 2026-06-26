@@ -77,6 +77,24 @@ public class CompoundTaskController {
         return ApiResponse.success(null);
     }
 
+    /**
+     * POST /v1/compound-tasks/{taskInstanceId}/sections/{sectionKey}/items/by-ref/{itemRefId}/complete
+     *
+     * Completes an item identified by its domain entity ID (e.g. engagementId)
+     * rather than the internal task_section_items.id.
+     * Used by ProjectEngagementsTab after assigning a lead auditor — the frontend
+     * knows the engagementId but not the internal item PK.
+     */
+    @PostMapping("/{taskInstanceId}/sections/{sectionKey}/items/by-ref/{itemRefId}/complete")
+    public ApiResponse<Void> completeItemByRef(
+            @PathVariable Long taskInstanceId,
+            @PathVariable String sectionKey,
+            @PathVariable Long itemRefId) {
+        Long userId = securityHelper.userId();
+        sectionService.completeItemByRef(taskInstanceId, sectionKey, itemRefId, userId);
+        return ApiResponse.success(null);
+    }
+
     // ── Case 2: section-level assignment ──────────────────────────
 
     @PostMapping("/{taskInstanceId}/sections/{sectionKey}/assign")

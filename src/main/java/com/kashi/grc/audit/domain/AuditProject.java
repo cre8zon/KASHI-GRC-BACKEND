@@ -7,26 +7,24 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 
 /**
- * AuditProject — top-level container for audit engagements.
+ * AuditProject — library-level programme template.
  *
- * Extends GlobalOrTenantEntity so both Platform Admin and org users can create projects:
- *   tenantId = null  → global project (Platform Admin) — visible to all orgs
- *   tenantId = X     → tenant-private project (Org) — visible only to that org
+ * PUBLISH STATUS (publishStatus):
+ *   DRAFT     → platform admin working on it, never shown to org LOOKUP
+ *   PUBLISHED → visible to orgs (subject to visibility rules)
  *
- * This mirrors the same pattern as AuditTemplate, AuditSection, AuditControl.
- *
- * One project can have multiple engagements (e.g. multiple frameworks audited
- * as part of the same programme).
- *
- * projectRef: human-readable reference, e.g. PROJ-2026-0001
- * ownerId: CAE (Chief Audit Executive) or Audit Manager who owns this programme
+ * VISIBILITY (visibility):
+ *   GLOBAL    → shown to ALL orgs
+ *   PLATFORM  → platform admin internal only, not shown to any org
+ *   SPECIFIC  → shown only to tenants in audit_project_tenant_access table
  */
 @Entity
 @Table(name = "audit_projects",
         indexes = {
-                @Index(name = "idx_audit_proj_tenant", columnList = "tenant_id"),
-                @Index(name = "idx_audit_proj_status", columnList = "status"),
-                @Index(name = "idx_audit_proj_owner",  columnList = "owner_id")
+                @Index(name = "idx_audit_proj_tenant",  columnList = "tenant_id"),
+                @Index(name = "idx_audit_proj_status",  columnList = "status"),
+                @Index(name = "idx_audit_proj_publish", columnList = "publish_status"),
+                @Index(name = "idx_audit_proj_owner",   columnList = "owner_id")
         }
 )
 @Getter @Setter
@@ -48,10 +46,22 @@ public class AuditProject extends GlobalOrTenantEntity {
     @Builder.Default
     private Status status = Status.PLANNING;
 
-    @Column(name = "owner_id")
-    private Long ownerId;   // CAE / Audit Manager
+    /** Library publish status — controls org visibility */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "publish_status", nullable = false, length = 20)
+    @Builder.Default
+    private PublishStatus publishStatus = PublishStatus.DRAFT;
 
-    @Column(name = "created_by", nullable = false)
+    /** Visibility scope */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "visibility", nullable = false, length = 20)
+    @Builder.Default
+    private Visibility visibility = Visibility.GLOBAL;
+
+    @Column(name = "owner_id")
+    private Long ownerId;
+
+    @Column(name = "created_by")
     private Long createdBy;
 
     @Column(name = "planned_start")
@@ -66,15 +76,20 @@ public class AuditProject extends GlobalOrTenantEntity {
     @Column(name = "actual_end")
     private LocalDateTime actualEnd;
 
-    /** Workflow for the project lifecycle itself (optional) */
     @Column(name = "workflow_instance_id")
     private Long workflowInstanceId;
 
     public enum Status {
-        PLANNING,
-        IN_PROGRESS,
-        ON_HOLD,
-        COMPLETED,
-        CANCELLED
+        PLANNING, IN_PROGRESS, ON_HOLD, COMPLETED, CANCELLED
+    }
+
+    public enum PublishStatus {
+        DRAFT, PUBLISHED
+    }
+
+    public enum Visibility {
+        GLOBAL,    // all orgs
+        PLATFORM,  // platform admin only
+        SPECIFIC   // only tenants in audit_project_tenant_access
     }
 }

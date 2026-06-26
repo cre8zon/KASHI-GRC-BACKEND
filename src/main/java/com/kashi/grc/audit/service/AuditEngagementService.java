@@ -6,6 +6,8 @@ import com.kashi.grc.audit.dto.response.*;
 import com.kashi.grc.audit.repository.*;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
+import com.kashi.grc.evidence.repository.EvidenceLinkRepository;
+import com.kashi.grc.document.repository.DocumentLinkRepository;
 import com.kashi.grc.notification.service.NotificationService;
 import com.kashi.grc.workflow.dto.request.StartWorkflowRequest;
 import com.kashi.grc.workflow.dto.response.WorkflowInstanceResponse;
@@ -15,6 +17,7 @@ import com.kashi.grc.workflow.enums.TaskStatus;
 import com.kashi.grc.workflow.event.TaskSectionEvent;
 import com.kashi.grc.workflow.repository.StepInstanceRepository;
 import com.kashi.grc.workflow.repository.TaskInstanceRepository;
+import com.kashi.grc.workflow.repository.TaskSectionCompletionRepository;
 import com.kashi.grc.workflow.repository.WorkflowInstanceRepository;
 import com.kashi.grc.workflow.repository.WorkflowRepository;
 import com.kashi.grc.workflow.service.WorkflowEngineService;
@@ -52,15 +55,33 @@ public class AuditEngagementService {
     // FIX: use ApplicationEventPublisher + TaskSectionEvent instead of calling
     // sectionCompletionService.onSectionEvent() directly — the service method
     // takes a TaskSectionEvent record, not separate parameters.
+    private final TaskSectionCompletionRepository           taskSectionCompletionRepository;
     private final ApplicationEventPublisher                 eventPublisher;
+    private final EvidenceLinkRepository evidenceLinkRepository;
+    private final DocumentLinkRepository documentLinkRepository;
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
     @Transactional
     public AuditEngagementResponse create(AuditEngagementRequest req, Long createdBy, Long tenantId) {
-        // Project is optional — standalone engagement without project is supported
+        return create(req, createdBy, tenantId, true);
+    }
+
+    /**
+     * @param startWorkflow if false, skips startWorkflowIfConfigured() — used when this
+     *                       engagement is being cascaded as part of a project-level
+     *                       "Start Project" action, where a single workflow-16 instance
+     *                       governs ALL engagements in the project. Workflow 14 (per-
+     *                       engagement) must NOT start in that case.
+     */
+    public AuditEngagementResponse create(AuditEngagementRequest req, Long createdBy, Long tenantId, boolean startWorkflow) {
+        // Project is optional — standalone engagement without project is supported.
+        // findByTenantIdAndId() only matches tenant-owned projects and misses GLOBAL
+        // projects (tenantId=NULL in DB). Use findById() + explicit filter instead so
+        // org users can create engagements under a global library project (e.g. id=3).
         if (req.getProjectId() != null) {
-            projectRepository.findByTenantIdAndId(tenantId, req.getProjectId())
+            projectRepository.findById(req.getProjectId())
+                    .filter(p -> p.getTenantId() == null || p.getTenantId().equals(tenantId))
                     .orElseThrow(() -> new ResourceNotFoundException("AuditProject", req.getProjectId()));
         }
 
@@ -86,7 +107,14 @@ public class AuditEngagementService {
                 .templateId(req.getTemplateId())
                 .frameworkRef(req.getFrameworkRef())
                 .auditType(req.getAuditType() != null ? req.getAuditType() : AuditTemplate.AuditType.INTERNAL)
-                .status(AuditEngagement.Status.PLANNING)
+                // Project-governed engagements (projectInstanceId set) start as FIELDWORK
+                // since the project workflow (WF16) governs their lifecycle — they should
+                // never show the individual "Activate" button (which checks for PLANNING).
+                // FIELDWORK is the status that activate() would set anyway.
+                // Standalone engagements start as PLANNING and require individual activation.
+                .status(req.getProjectInstanceId() != null
+                        ? AuditEngagement.Status.FIELDWORK
+                        : AuditEngagement.Status.PLANNING)
                 .leadAuditorId(req.getLeadAuditorId())
                 .ownerId(req.getOwnerId() != null ? req.getOwnerId() : createdBy)
                 .createdBy(createdBy)
@@ -99,14 +127,30 @@ public class AuditEngagementService {
 
         log.info("[AUDIT] Created | ref={} | type={} | tenantId={}", ref, engagement.getAuditType(), tenantId);
 
-        // Snapshot project — create once per project, reuse for subsequent engagements
+        // Link engagement to a project instance.
+        //
+        // FAST PATH (createProjectInstance cascade): controller pre-creates the AuditProjectInstance
+        // and passes its id via req.projectInstanceId — use it directly. This is the ONLY valid
+        // path for programme-level engagements. Multiple runs of the same project (2026, 2027…)
+        // each create their own AuditProjectInstance first, then cascade N engagements under it.
+        //
+        // STANDALONE PATH (direct POST /v1/audit/engagements with a projectId but no instance):
+        // Not used in the current project-instance flow, but kept for backwards compatibility.
+        // Creates a fresh instance — never tries to find an existing one, since there can be
+        // many instances per project and there is no way to know which one to attach to.
         if (req.getProjectId() != null) {
-            AuditProjectInstance projInst = projectInstanceRepository
-                    .findByOriginalProjectId(req.getProjectId())
-                    .orElseGet(() -> {
-                        AuditProject project = projectRepository.findById(req.getProjectId())
-                                .orElseThrow(() -> new ResourceNotFoundException("AuditProject", req.getProjectId()));
-                        AuditProjectInstance inst = AuditProjectInstance.builder()
+            AuditProjectInstance projInst;
+            if (req.getProjectInstanceId() != null) {
+                // Fast path — instance already created by the controller, use it directly
+                projInst = projectInstanceRepository.findById(req.getProjectInstanceId())
+                        .orElseThrow(() -> new ResourceNotFoundException("AuditProjectInstance", req.getProjectInstanceId()));
+            } else {
+                // Standalone path — create a fresh instance (never query for an existing one;
+                // multiple instances per project are valid and there is no unique one to reuse)
+                AuditProject project = projectRepository.findById(req.getProjectId())
+                        .orElseThrow(() -> new ResourceNotFoundException("AuditProject", req.getProjectId()));
+                projInst = projectInstanceRepository.save(
+                        AuditProjectInstance.builder()
                                 .originalProjectId(project.getId())
                                 .tenantId(tenantId)
                                 .projectNameSnapshot(project.getName())
@@ -118,19 +162,22 @@ public class AuditEngagementService {
                                 .statusAtSnapshot(project.getStatus() != null ? project.getStatus().name() : "ACTIVE")
                                 .snapshottedAt(LocalDateTime.now())
                                 .snapshottedBy(createdBy)
-                                .build();
-                        return projectInstanceRepository.save(inst);
-                    });
+                                .build());
+            }
             engagement.setProjectInstanceId(projInst.getId());
             engagementRepository.save(engagement);
-            log.info("[AUDIT] Project snapshotted | projectInstanceId={}", projInst.getId());
+            log.info("[AUDIT] Project instance linked | projectInstanceId={}", projInst.getId());
         }
 
         if (req.getTemplateId() != null) {
             snapshotTemplate(engagement, req.getTemplateId(), tenantId);
         }
 
-        startWorkflowIfConfigured(engagement, req.getWorkflowId(), createdBy, tenantId);
+        if (startWorkflow) {
+            startWorkflowIfConfigured(engagement, req.getWorkflowId(), createdBy, tenantId);
+        } else {
+            log.info("[AUDIT] Skipping per-engagement workflow start (project-governed) | engagementId={}", engagement.getId());
+        }
 
         if (req.getLeadAuditorId() != null) {
             notificationService.send(req.getLeadAuditorId(), "AUDIT_ENGAGEMENT_ASSIGNED",
@@ -191,6 +238,11 @@ public class AuditEngagementService {
     @Transactional
     public void assignSection(Long engagementId, Long sectionInstanceId,
                               Long auditorId, boolean cascadeToChildren, Long tenantId) {
+        assignSection(engagementId, sectionInstanceId, auditorId, cascadeToChildren, tenantId, null);
+    }
+
+    public void assignSection(Long engagementId, Long sectionInstanceId,
+                              Long auditorId, boolean cascadeToChildren, Long tenantId, Long performedBy) {
         AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditSectionInstance", sectionInstanceId));
 
@@ -210,15 +262,16 @@ public class AuditEngagementService {
             //   - Rohit assigns CC6.3 to Kavya (sub-specialist)
             // Controls that are never explicitly assigned fall back to the
             // section's assignedAuditorId in AuditWorkflowActorResolver.
+            // NOTE: saving children directly here — NOT calling assignSection() recursively
+            // to avoid firing the workflow gate event once per child, which would
+            // complete the gate prematurely on the first child and advance the workflow
+            // before all sections are actually assigned.
             List<AuditSectionInstance> descendants =
                     sectionInstanceRepository.findAllDescendants(sectionInstanceId, section.getPath());
             for (AuditSectionInstance child : descendants) {
                 child.setAssignedAuditorId(auditorId);
                 sectionInstanceRepository.save(child);
             }
-            // NOTE: control cascade deliberately removed.
-            // Controls inherit section auditor implicitly via AuditWorkflowActorResolver
-            // until explicitly overridden by assignAuditorToControl().
         }
 
         if (auditorId != null) {
@@ -227,9 +280,12 @@ public class AuditEngagementService {
                     "AUDIT_SECTION_INSTANCE", sectionInstanceId);
         }
 
-        // Advance compound section gate in Step 2 (SECTIONS_ASSIGNED_AUDITOR)
-        fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR",
-                sectionInstanceId, engagementId, auditorId != null ? auditorId : 0L);
+        // Only fire the gate event when actually assigning (not unassigning).
+        // Unassign (auditorId=null) should never advance the workflow gate.
+        if (auditorId != null && performedBy != null) {
+            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR",
+                    sectionInstanceId, engagementId, performedBy);
+        }
 
         log.info("[AUDIT] Section assigned | sectionInstanceId={} | auditorId={} | cascade={}",
                 sectionInstanceId, auditorId, cascadeToChildren);
@@ -259,6 +315,12 @@ public class AuditEngagementService {
     public void assignAuditeeToSection(Long engagementId, Long sectionInstanceId,
                                        Long auditeeUserId, boolean cascadeToChildren,
                                        Long tenantId) {
+        assignAuditeeToSection(engagementId, sectionInstanceId, auditeeUserId, cascadeToChildren, tenantId, null);
+    }
+
+    public void assignAuditeeToSection(Long engagementId, Long sectionInstanceId,
+                                       Long auditeeUserId, boolean cascadeToChildren,
+                                       Long tenantId, Long performedBy) {
         AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditSectionInstance", sectionInstanceId));
 
@@ -269,21 +331,27 @@ public class AuditEngagementService {
         sectionInstanceRepository.save(section);
 
         if (cascadeToChildren) {
-            // Cascade to all descendant section nodes
+            // Cascade auditee assignment down to all descendant SECTIONS only.
+            // Controls are NOT assigned here — the section's assigned auditee
+            // will explicitly assign themselves (or another auditee) to specific
+            // controls via assignAuditeeToControl(). Mirrors assignSection()'s
+            // auditor-side pattern: section-level assignment establishes who owns
+            // the section; control-level assignment is a separate, later, individual
+            // act performed by that section owner. This was previously inconsistent —
+            // this method cascaded to controls while assignSection() deliberately did
+            // not, silently bypassing the intended per-control assignment step on the
+            // auditee side only.
             List<AuditSectionInstance> descendants =
                     sectionInstanceRepository.findAllDescendants(sectionInstanceId, section.getPath());
             for (AuditSectionInstance child : descendants) {
                 child.setAuditeeAssignedUserId(auditeeUserId);
                 sectionInstanceRepository.save(child);
             }
-            // Cascade to all controls under this section subtree
-            List<AuditControlInstance> controls =
-                    controlInstanceRepository.findByEngagementIdAndSectionPathStartingWith(
-                            engagementId, section.getPath());
-            for (AuditControlInstance ctrl : controls) {
-                ctrl.setAuditeeAssignedUserId(auditeeUserId);
-                controlInstanceRepository.save(ctrl);
-            }
+            // NOTE: control cascade deliberately removed — see assignSection() for
+            // the matching auditor-side rationale. Controls inherit the section's
+            // auditee implicitly via AuditWorkflowActorResolver /
+            // AuditProjectWorkflowActorResolver until explicitly overridden by
+            // assignAuditeeToControl().
         }
 
         if (auditeeUserId != null) {
@@ -292,9 +360,11 @@ public class AuditEngagementService {
                     "AUDIT_SECTION_INSTANCE", sectionInstanceId);
         }
 
-        // Advance compound section gate in Step 3 (SECTIONS_ASSIGNED_AUDITEE)
-        fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE",
-                sectionInstanceId, engagementId, auditeeUserId != null ? auditeeUserId : 0L);
+        // Only fire when actually assigning (not unassigning), and actor is the performer not the assignee.
+        if (auditeeUserId != null && performedBy != null) {
+            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE",
+                    sectionInstanceId, engagementId, performedBy);
+        }
 
         log.info("[AUDIT] Auditee assigned to section | sectionInstanceId={} | auditeeUserId={} | cascade={}",
                 sectionInstanceId, auditeeUserId, cascadeToChildren);
@@ -344,12 +414,118 @@ public class AuditEngagementService {
         control.setAssignedAuditorId(auditorId);
         controlInstanceRepository.save(control);
 
-        // Fire section completion event for compound section gate
-        // (Step 2 blueprint section CONTROLS_ASSIGNED tracks these)
         fireControlSectionEvent("CONTROLS_ASSIGNED", controlInstanceId, engagementId, auditorId);
 
         log.info("[AUDIT-ENG-SERVICE] Auditor assigned | controlInstanceId={} | auditorId={}",
                 controlInstanceId, auditorId);
+    }
+
+    /**
+     * Bulk-assigns auditor and/or auditee to multiple controls in a single call.
+     *
+     * Source: either an explicit list of controlIds, or all controls under a
+     * sectionInstanceId (and its descendants, via their sectionInstanceId FK).
+     * If both are provided, controlIds takes precedence.
+     *
+     * Used when a section owner has 50-100 controls and wants to delegate them
+     * without N individual PUT calls. All controls are validated to belong to
+     * the engagement before assignment. Events are fired per-control as normal.
+     *
+     * @return count of controls actually updated
+     */
+    @Transactional
+    public int bulkAssignControls(Long engagementId,
+                                  com.kashi.grc.audit.dto.request.BulkControlAssignRequest req,
+                                  Long actorId, Long tenantId) {
+        // Resolve the target controls
+        List<AuditControlInstance> controls;
+        if (req.getControlIds() != null && !req.getControlIds().isEmpty()) {
+            controls = controlInstanceRepository.findAllById(req.getControlIds());
+        } else if (req.getSectionInstanceId() != null) {
+            controls = controlInstanceRepository
+                    .findBySectionInstanceIdOrderByOrderNoAsc(req.getSectionInstanceId());
+        } else {
+            throw new BusinessException("MISSING_TARGET",
+                    "Either controlIds or sectionInstanceId must be provided");
+        }
+
+        // Safety: all must belong to this engagement
+        List<AuditControlInstance> owned = controls.stream()
+                .filter(c -> c.getEngagementId().equals(engagementId))
+                .toList();
+        if (owned.size() < controls.size()) {
+            log.warn("[AUDIT-ENG-SERVICE] bulkAssign: {} control(s) skipped — wrong engagement",
+                    controls.size() - owned.size());
+        }
+
+        int updated = 0;
+        for (AuditControlInstance ctrl : owned) {
+            boolean changed = false;
+            if (req.getAuditorUserId() != null) {
+                ctrl.setAssignedAuditorId(req.getAuditorUserId());
+                changed = true;
+            }
+            if (req.getAuditeeUserId() != null) {
+                ctrl.setAuditeeAssignedUserId(req.getAuditeeUserId());
+                if (req.getEvidenceDueDate() != null)
+                    ctrl.setEvidenceDueDate(req.getEvidenceDueDate());
+                changed = true;
+            }
+            if (changed) {
+                controlInstanceRepository.save(ctrl);
+                if (req.getAuditorUserId() != null)
+                    fireControlSectionEvent("CONTROLS_ASSIGNED", ctrl.getId(), engagementId, actorId);
+                updated++;
+            }
+        }
+
+        log.info("[AUDIT-ENG-SERVICE] Bulk assign | engagementId={} | updated={}/{} | " +
+                        "auditorId={} | auditeeId={}",
+                engagementId, updated, owned.size(),
+                req.getAuditorUserId(), req.getAuditeeUserId());
+        return updated;
+    }
+
+    /**
+     * Sends a control back to the auditee for additional evidence.
+     * Called by section auditors during Evidence Review (Step 7) when uploaded
+     * evidence is insufficient or incorrect.
+     *
+     * Resets auditeeEvidenceSubmitted=false so the auditee can re-upload
+     * and re-submit. Sends a notification to the assigned auditee.
+     */
+    @Transactional
+    public void sendBackControlEvidence(Long engagementId, Long controlInstanceId,
+                                        String reason, Long sentBackBy, Long tenantId) {
+        AuditControlInstance control = controlInstanceRepository.findById(controlInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", controlInstanceId));
+
+        if (!control.getEngagementId().equals(engagementId))
+            throw new BusinessException("CONTROL_MISMATCH", "Control does not belong to this engagement");
+
+        // Reset submission flag so auditee can re-upload
+        control.setAuditeeEvidenceSubmitted(false);
+        control.setAuditeeEvidenceSubmittedAt(null);
+        controlInstanceRepository.save(control);
+
+        // Notify the assigned auditee
+        Long auditeeId = control.getAuditeeAssignedUserId();
+        if (auditeeId == null) {
+            // Fall back to section-level auditee
+            AuditSectionInstance section = control.getSectionInstanceId() != null
+                    ? sectionInstanceRepository.findById(control.getSectionInstanceId()).orElse(null)
+                    : null;
+            if (section != null) auditeeId = section.getAuditeeAssignedUserId();
+        }
+        if (auditeeId != null) {
+            String msg = "Evidence for control '" + control.getControlNameSnapshot() + "' was sent back for revision"
+                    + (reason != null && !reason.isBlank() ? ": " + reason : ". Please re-upload and resubmit.");
+            notificationService.send(auditeeId, "AUDIT_EVIDENCE_SENT_BACK", msg,
+                    "AUDIT_CONTROL_INSTANCE", controlInstanceId);
+        }
+
+        log.info("[AUDIT-ENG-SERVICE] Control sent back for evidence | controlInstanceId={} | by={} | reason={}",
+                controlInstanceId, sentBackBy, reason);
     }
 
     public void submitControlEvidence(Long engagementId, Long controlInstanceId,
@@ -362,15 +538,143 @@ public class AuditEngagementService {
             throw new BusinessException("CONTROL_MISMATCH",
                     "Control does not belong to this engagement");
 
+        // Section ownership check — submitter must be the assigned auditee of this control's
+        // parent section (or explicitly assigned to this control). Prevents Vikram from
+        // submitting evidence for controls in Anita's sections.
+        if (submittedBy != null) {
+            AuditSectionInstance parentSection = control.getSectionInstanceId() != null
+                    ? sectionInstanceRepository.findById(control.getSectionInstanceId()).orElse(null)
+                    : null;
+            boolean isControlOwner   = submittedBy.equals(control.getAuditeeAssignedUserId());
+            boolean isSectionOwner   = parentSection != null
+                    && submittedBy.equals(parentSection.getAuditeeAssignedUserId());
+            boolean isEngagementOwner = engagementRepository.findById(engagementId)
+                    .map(e -> submittedBy.equals(e.getLeadAuditorId())
+                            || submittedBy.equals(e.getOwnerId()))
+                    .orElse(false);
+            if (!isControlOwner && !isSectionOwner && !isEngagementOwner) {
+                throw new BusinessException("NOT_EVIDENCE_OWNER",
+                        "You are not assigned as evidence owner for this control or its section");
+            }
+        }
+
+        // Require at least one uploaded document OR automated evidence before allowing submit
+        boolean hasManualDocs = !documentLinkRepository
+                .findAllActiveByEntity("AUDIT_CONTROL_INSTANCE", controlInstanceId).isEmpty();
+        boolean hasAutomatedEvidence = evidenceLinkRepository
+                .countAcceptedForEntity("AUDIT_CONTROL_INSTANCE", controlInstanceId) > 0;
+        if (!hasManualDocs && !hasAutomatedEvidence) {
+            throw new BusinessException("NO_EVIDENCE",
+                    "Please upload at least one evidence file before submitting.");
+        }
+
         control.setAuditeeEvidenceSubmitted(true);
         control.setAuditeeEvidenceSubmittedAt(java.time.LocalDateTime.now());
         controlInstanceRepository.save(control);
 
-        // Fire section completion — advances compound section gate in workflow step
+        // Auto-submit parent section when all its controls have evidence submitted.
+        // Auditees don't manually submit sections — it happens automatically when
+        // they finish uploading evidence for all controls in their section.
+        autoSubmitSectionIfComplete(control.getSectionInstanceId(), engagementId, submittedBy);
+
+        // Fire section event for engagement-level workflow (WF14 SOC2 Type II)
         fireControlSectionEvent("EVIDENCE_UPLOADED", controlInstanceId, engagementId, submittedBy);
+
+        // Note: Step 5 (Evidence Submission) advances via manual APPROVE by lead auditor,
+        // not by auto-gate. This allows partial evidence submission — auditors can
+        // proceed to review even if not all 41 controls have evidence yet.
 
         log.info("[AUDIT-ENG-SERVICE] Evidence submitted | controlInstanceId={} | by={}",
                 controlInstanceId, submittedBy);
+    }
+
+    /**
+     * Fires a project-level section completion event when ALL controls in a
+     * project-governed engagement have evidence submitted.
+     * Advances the Evidence Submission step (WF16 Step 5) section gate so the
+     * step auto-approves once all engagements in the programme are fully evidenced.
+     */
+    /**
+     * Auto-submits a section when ALL controls within it have evidence submitted.
+     * Called after each control evidence submission — no-op until the last control is done.
+     * This removes the need for auditees to manually click "Submit section".
+     */
+    private void autoSubmitSectionIfComplete(Long sectionInstanceId, Long engagementId, Long submittedBy) {
+        if (sectionInstanceId == null) return;
+        try {
+            AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId).orElse(null);
+            if (section == null || section.getSubmittedAt() != null) return; // already submitted
+
+            // Check all controls in this section have evidence
+            List<AuditControlInstance> sectionControls =
+                    controlInstanceRepository.findBySectionInstanceIdOrderByOrderNoAsc(sectionInstanceId);
+            if (sectionControls.isEmpty()) return;
+
+            boolean allDone = sectionControls.stream()
+                    .allMatch(AuditControlInstance::isAuditeeEvidenceSubmitted);
+            if (!allDone) return;
+
+            // All controls done — auto-submit the section
+            LocalDateTime now = LocalDateTime.now();
+            section.setSubmittedAt(now);
+            section.setSubmittedBy(submittedBy);
+            if (section.getAuditeeSubmittedAt() == null) section.setAuditeeSubmittedAt(now);
+            sectionInstanceRepository.save(section);
+
+            log.info("[AUDIT-ENG-SERVICE] Section auto-submitted | sectionInstanceId={} | engagementId={} | by={}",
+                    sectionInstanceId, engagementId, submittedBy);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Section auto-submit failed (non-fatal) | sectionInstanceId={} | {}",
+                    sectionInstanceId, ex.getMessage());
+        }
+    }
+
+    private void fireProjectEvidenceCompleteEvent(AuditEngagement engagement,
+                                                  Long engagementId,
+                                                  Long submittedBy) {
+        try {
+            List<AuditControlInstance> allControls =
+                    controlInstanceRepository.findByEngagementId(engagementId);
+            if (allControls.isEmpty()) return;
+
+            long submittedCount = allControls.stream()
+                    .filter(AuditControlInstance::isAuditeeEvidenceSubmitted)
+                    .count();
+            log.info("[AUDIT-ENG-SERVICE] Evidence progress | engagementId={} | {}/{} controls submitted",
+                    engagementId, submittedCount, allControls.size());
+            if (submittedCount < allControls.size()) return;
+
+            AuditProjectInstance projectInstance = projectInstanceRepository
+                    .findById(engagement.getProjectInstanceId()).orElse(null);
+            if (projectInstance == null || projectInstance.getWorkflowInstanceId() == null) return;
+
+            var activeSteps = stepInstanceRepository
+                    .findByWorkflowInstanceIdAndStatus(
+                            projectInstance.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
+            if (activeSteps.isEmpty()) return;
+
+            var stepInstance = activeSteps.get(0);
+            var actorTask = taskInstanceRepository
+                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                    .stream().filter(t -> t.getTaskRole() == TaskRole.ACTOR).findFirst()
+                    .or(() -> taskInstanceRepository
+                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                            .stream().filter(t -> t.getTaskRole() == TaskRole.ACTOR).findFirst());
+            if (actorTask.isEmpty()) return;
+
+            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                    "EVIDENCE_UPLOADED",
+                    actorTask.get().getId(),
+                    submittedBy,
+                    "AUDIT_ENGAGEMENT_INSTANCE",
+                    engagementId
+            ));
+            log.info("[AUDIT-ENG-SERVICE] Project evidence complete | engagementId={} | projectInstanceId={} | taskId={}",
+                    engagementId, engagement.getProjectInstanceId(), actorTask.get().getId());
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Project evidence event failed (non-fatal) | engagementId={} | {}",
+                    engagementId, ex.getMessage());
+        }
     }
 
     // ── CONTROL TEST RESULT ───────────────────────────────────────────────────
@@ -384,6 +688,18 @@ public class AuditEngagementService {
 
         if (!control.getEngagementId().equals(engagementId))
             throw new BusinessException("CONTROL_MISMATCH", "Control does not belong to this engagement");
+
+        // Evidence must exist before recording a test result.
+        // Checks both the legacy boolean flag AND the evidence_links table
+        // (which covers both MANUAL uploaded files and AUTOMATED integration evidence).
+        boolean hasEvidence = control.isAuditeeEvidenceSubmitted()
+                || evidenceLinkRepository.countAcceptedForEntity(
+                "AUDIT_CONTROL_INSTANCE", controlInstanceId) > 0;
+        if (!hasEvidence) {
+            throw new BusinessException("EVIDENCE_NOT_SUBMITTED",
+                    "Evidence has not been submitted for this control. " +
+                            "The auditee must upload and submit evidence before the auditor can record a test result.");
+        }
 
         control.setTestResult(req.getTestResult());
         control.setTestNotes(req.getTestNotes());
@@ -419,9 +735,42 @@ public class AuditEngagementService {
         if (section.getSubmittedAt() != null)
             throw new BusinessException("SECTION_ALREADY_SUBMITTED", "Section already submitted");
 
+        // ── Workflow step guard ───────────────────────────────────────────────
+        // Section submission is only valid during Evidence Submission (Step 5).
+        // Reject submissions if the project workflow is not at that step.
+        // This prevents the test runner or direct API calls from submitting
+        // sections out of order (e.g. before sections are assigned in Step 3).
+        AuditEngagement engagement = engagementRepository.findById(engagementId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", engagementId));
+        if (engagement.getProjectInstanceId() != null) {
+            AuditProjectInstance proj = projectInstanceRepository
+                    .findById(engagement.getProjectInstanceId()).orElse(null);
+            if (proj != null && proj.getWorkflowInstanceId() != null) {
+                var activeSteps = stepInstanceRepository.findByWorkflowInstanceIdAndStatus(
+                        proj.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
+                boolean atEvidenceStep = activeSteps.stream().anyMatch(si ->
+                        si.getSnapName() != null &&
+                                si.getSnapName().toLowerCase().contains("evidence submission"));
+                if (!atEvidenceStep) {
+                    throw new BusinessException("SECTION_SUBMIT_NOT_ALLOWED",
+                            "Section submission is only allowed during the Evidence Submission step. " +
+                                    "Current workflow step does not permit this action.");
+                }
+            }
+        }
+        // ── end workflow step guard ───────────────────────────────────────────
+
         LocalDateTime now = LocalDateTime.now();
         section.setSubmittedAt(now);
         section.setSubmittedBy(submittedBy);
+        // Also set auditeeSubmittedAt — the field MonitorProjectEngagementsAction
+        // uses to determine whether this section's evidence is ready for control
+        // evaluation. submittedAt and auditeeSubmittedAt represent the same user
+        // action (auditee marking their section done) from two perspectives:
+        // submittedAt = the section is locked from further auditee edits
+        // auditeeSubmittedAt = the monitor readiness check's signal
+        if (section.getAuditeeSubmittedAt() == null)
+            section.setAuditeeSubmittedAt(now);
         sectionInstanceRepository.save(section);
 
         if (cascadeToChildren) {
@@ -431,6 +780,8 @@ public class AuditEngagementService {
                 if (child.getSubmittedAt() == null) {
                     child.setSubmittedAt(now);
                     child.setSubmittedBy(submittedBy);
+                    if (child.getAuditeeSubmittedAt() == null)
+                        child.setAuditeeSubmittedAt(now);
                     sectionInstanceRepository.save(child);
                 }
             }
@@ -517,6 +868,111 @@ public class AuditEngagementService {
      * The actorUserId is the ACTOR who performed the assignment (lead auditor),
      * not the assignee — the lead auditor's task is the one that needs to advance.
      */
+    /**
+     * Fires a simple (non-item-tracking) section completion event on the active
+     * step of the project's workflow instance. Used by Steps 11-13 on audit_project_detail.
+     *
+     * @param projectInstanceId  The running AuditProjectInstance id (e.g. 42)
+     * @param completionEvent    Must match wss.completion_event (e.g. "CONSOLIDATION_COMPLETE")
+     * @param actorUserId        The user performing the action
+     */
+    public void fireProjectSectionEvent(Long projectInstanceId, String completionEvent, Long actorUserId) {
+        try {
+            var projInst = projectInstanceRepository.findById(projectInstanceId).orElse(null);
+            if (projInst == null || projInst.getWorkflowInstanceId() == null) return;
+
+            Long workflowInstanceId = projInst.getWorkflowInstanceId();
+            var activeSteps = stepInstanceRepository
+                    .findByWorkflowInstanceIdAndStatus(workflowInstanceId, StepStatus.IN_PROGRESS);
+            if (activeSteps.isEmpty()) return;
+
+            var stepInstance = activeSteps.get(0);
+            var actorTask = taskInstanceRepository
+                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                    .stream()
+                    .filter(t -> actorUserId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                    .findFirst()
+                    .or(() -> taskInstanceRepository
+                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                            .stream()
+                            .filter(t -> actorUserId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                            .findFirst());
+
+            if (actorTask.isEmpty()) {
+                log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
+                        "skipping '{}' event", actorUserId, stepInstance.getId(), completionEvent);
+                return;
+            }
+
+            Long taskId = actorTask.get().getId();
+            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                    completionEvent, taskId, actorUserId, null, null
+            ));
+            log.info("[AUDIT-ENG-SERVICE] Project section event fired | event='{}' | projectInstanceId={} | taskId={} | by={}",
+                    completionEvent, projectInstanceId, taskId, actorUserId);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Project section event '{}' failed (non-fatal) | projectInstanceId={} | {}",
+                    completionEvent, projectInstanceId, ex.getMessage());
+        }
+    }
+
+    /**
+     * Fires the DRAFT_REPORTS_REVIEWED section completion event for an engagement.
+     * Called by submitReportReview() — each save marks this engagement's item as done.
+     * Idempotent: subsequent saves on already-completed items are no-ops.
+     * Once all engagements under the project are reviewed, hasSections=false
+     * and the Complete Step button becomes available to the auditor.
+     */
+    public void fireDraftReportReviewedEvent(Long engagementId, Long actorUserId) {
+        try {
+            AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
+            if (engagement == null) return;
+
+            Long workflowInstanceId = engagement.getWorkflowInstanceId();
+            if (workflowInstanceId == null && engagement.getProjectInstanceId() != null) {
+                var projInst = projectInstanceRepository.findById(engagement.getProjectInstanceId()).orElse(null);
+                if (projInst != null) workflowInstanceId = projInst.getWorkflowInstanceId();
+            }
+            if (workflowInstanceId == null) return;
+
+            var activeSteps = stepInstanceRepository
+                    .findByWorkflowInstanceIdAndStatus(workflowInstanceId, StepStatus.IN_PROGRESS);
+            if (activeSteps.isEmpty()) return;
+
+            var stepInstance = activeSteps.get(0);
+            var actorTask = taskInstanceRepository
+                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                    .stream()
+                    .filter(t -> actorUserId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                    .findFirst()
+                    .or(() -> taskInstanceRepository
+                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                            .stream()
+                            .filter(t -> actorUserId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                            .findFirst());
+
+            if (actorTask.isEmpty()) {
+                log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
+                        "skipping DRAFT_REPORTS_REVIEWED event", actorUserId, stepInstance.getId());
+                return;
+            }
+
+            Long taskId = actorTask.get().getId();
+            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                    "DRAFT_REPORTS_REVIEWED",
+                    taskId,
+                    actorUserId,
+                    "AUDIT_ENGAGEMENT_INSTANCE",
+                    engagementId
+            ));
+            log.info("[AUDIT-ENG-SERVICE] DRAFT_REPORTS_REVIEWED fired | engagementId={} | taskId={} | by={}",
+                    engagementId, taskId, actorUserId);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] DRAFT_REPORTS_REVIEWED event failed (non-fatal) | engagementId={} | {}",
+                    engagementId, ex.getMessage());
+        }
+    }
+
     private void fireSectionAssignmentEvent(String completionEvent,
                                             Long sectionInstanceId,
                                             Long engagementId,
@@ -524,14 +980,28 @@ public class AuditEngagementService {
         if (actorUserId == null || actorUserId == 0L) return;
         try {
             AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
-            if (engagement == null || engagement.getWorkflowInstanceId() == null) {
+            if (engagement == null) return;
+
+            // Resolve the workflow instance to use:
+            // 1. Engagement has its own workflow (WF14 individual lifecycle) → use it
+            // 2. Engagement is project-governed (projectInstanceId set, no own workflow) →
+            //    fall back to the project's workflow instance (WF16)
+            Long workflowInstanceId = engagement.getWorkflowInstanceId();
+            if (workflowInstanceId == null && engagement.getProjectInstanceId() != null) {
+                var projInst = projectInstanceRepository
+                        .findById(engagement.getProjectInstanceId()).orElse(null);
+                if (projInst != null) {
+                    workflowInstanceId = projInst.getWorkflowInstanceId();
+                }
+            }
+            if (workflowInstanceId == null) {
                 log.debug("[AUDIT-ENG-SERVICE] No workflow instance for engagementId={} — " +
                         "skipping section assignment event '{}'", engagementId, completionEvent);
                 return;
             }
             var activeSteps = stepInstanceRepository
                     .findByWorkflowInstanceIdAndStatus(
-                            engagement.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
+                            workflowInstanceId, StepStatus.IN_PROGRESS);
             if (activeSteps.isEmpty()) return;
             var stepInstance = activeSteps.get(0);
             var actorTask = taskInstanceRepository
@@ -551,16 +1021,34 @@ public class AuditEngagementService {
                         "skipping section event '{}'", actorUserId, stepInstance.getId(), completionEvent);
                 return;
             }
+            // Resolve the taskId and completionEvent NOW — before publishing.
+            // Publishing the event may cause the workflow to advance (Step N → Step N+1)
+            // within the same thread. If this method is called again (e.g. cascade loop),
+            // a second lookup would find Step N+1's task and fire the wrong event.
+            // By capturing taskId and resolvedEvent before publish, we pin to the right task.
+            Long taskId = actorTask.get().getId();
+            var registeredSections = taskSectionCompletionRepository
+                    .findByTaskInstanceIdOrderBySnapSectionOrderAsc(taskId);
+            String resolvedEvent = registeredSections.stream()
+                    .map(sc -> sc.getSnapCompletionEvent())
+                    .filter(e -> e != null && !e.isBlank())
+                    .findFirst()
+                    .orElse(completionEvent); // fallback to caller-provided event
+
+            log.info("[AUDIT-ENG-SERVICE] Section assignment event firing | event='{}' | " +
+                            "sectionInstanceId={} | taskId={} | actorUserId={}",
+                    resolvedEvent, sectionInstanceId, taskId, actorUserId);
+
             eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    completionEvent,
-                    actorTask.get().getId(),
+                    resolvedEvent,
+                    taskId,
                     actorUserId,
                     "AUDIT_SECTION_INSTANCE",
                     sectionInstanceId
             ));
             log.info("[AUDIT-ENG-SERVICE] Section assignment event fired | event='{}' | " +
                             "sectionInstanceId={} | taskInstanceId={} | actorUserId={}",
-                    completionEvent, sectionInstanceId, actorTask.get().getId(), actorUserId);
+                    resolvedEvent, sectionInstanceId, taskId, actorUserId);
         } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] Section assignment event '{}' failed (non-fatal) | " +
                     "sectionInstanceId={} | {}", completionEvent, sectionInstanceId, ex.getMessage());
@@ -697,6 +1185,8 @@ public class AuditEngagementService {
                 .auditType(e.getAuditType()).status(e.getStatus()).frameworkRef(e.getFrameworkRef())
                 .leadAuditorId(e.getLeadAuditorId()).ownerId(e.getOwnerId())
                 .totalControls(e.getTotalControls()).testedControls(e.getTestedControls())
+                .submittedControls((int) controlInstanceRepository
+                        .countByEngagementIdAndAuditeeEvidenceSubmitted(e.getId(), true))
                 .passedControls(e.getPassedControls()).failedControls(e.getFailedControls())
                 .openFindingCount(e.getOpenFindingCount()).workflowInstanceId(e.getWorkflowInstanceId())
                 .createdAt(e.getCreatedAt()).updatedAt(e.getUpdatedAt())

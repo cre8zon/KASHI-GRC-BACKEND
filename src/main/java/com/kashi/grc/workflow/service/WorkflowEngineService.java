@@ -121,9 +121,12 @@ public class WorkflowEngineService {
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
     private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
+    private final com.kashi.grc.workflow.repository.TaskSectionItemRepository       taskSectionItemRepository;
 
-    // ══════════════════════════════════════════════════════════════
-    // BLUEPRINT MANAGEMENT — Platform Admin only (logic unchanged)
+    // Vendor repositories — used only in getPendingTasksForUser for batch artifactId resolution
+    // (avoids N×2 per-instance DB calls that caused 75s response times on the inbox)
+    private final com.kashi.grc.assessment.repository.VendorAssessmentCycleRepository vendorAssessmentCycleRepository;
+    private final com.kashi.grc.assessment.repository.VendorAssessmentRepository      vendorAssessmentRepository;
     // ══════════════════════════════════════════════════════════════
 
     @Transactional
@@ -1104,11 +1107,10 @@ public class WorkflowEngineService {
         long t0 = System.currentTimeMillis();
         log.info("[WORKFLOW-TASK] Fetching pending tasks | userId={}", userId);
 
-        // ── Step 1: load active tasks (3 status queries) ──────────────────────
-        List<TaskInstance> allActiveTasks = new ArrayList<>();
-        allActiveTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.PENDING));
-        allActiveTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.IN_PROGRESS));
-        allActiveTasks.addAll(taskInstanceRepository.findByAssignedUserIdAndStatus(userId, TaskStatus.DELEGATED));
+        // ── Step 1: load active tasks — single query with IN clause ──────────
+        List<TaskInstance> allActiveTasks = taskInstanceRepository
+                .findByAssignedUserIdAndStatusIn(userId,
+                        List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS, TaskStatus.DELEGATED));
         if (allActiveTasks.isEmpty()) {
             log.info("[WORKFLOW-TASK] No active tasks | userId={} | {}ms", userId, System.currentTimeMillis() - t0);
             return List.of();
@@ -1147,22 +1149,74 @@ public class WorkflowEngineService {
         Map<Long, Workflow> workflowMap = workflowRepository.findAllById(workflowIds)
                 .stream().collect(java.util.stream.Collectors.toMap(Workflow::getId, w -> w));
 
-        // ── Step 6: resolve artifacts + entity titles per entityType (batched per type) ──
-        // Group instances by entityType, resolve all artifactIds + titles in one shot per type
+        // ── Step 6: resolve artifactIds and entity titles — ZERO per-instance DB calls ──
+        //
+        // The biggest performance problem: calling entityResolverRegistry.resolveArtifactId()
+        // per instance fires 1-2 DB queries per instance (VendorAssessmentEntityResolver
+        // does 2 queries; IssueEntityResolver does 1 existence check). With 37 tasks this
+        // caused 75+ second response times.
+        //
+        // Fast path: for all entity types where artifactId === entityId (AUDIT_ENGAGEMENT,
+        // AUDIT_PROJECT, AUDIT_POLICY, ISSUE), skip the resolver entirely. For VENDOR
+        // (where artifactId is an assessmentId, not the vendorId), do a single bulk query.
         Map<Long, Long>   artifactIds   = new java.util.HashMap<>();
         Map<Long, String> entityTitles  = new java.util.HashMap<>();
-        for (WorkflowInstance wi : instanceMap.values()) {
-            try {
-                Long aid = entityResolverRegistry.resolveArtifactId(wi);
-                if (aid != null) artifactIds.put(wi.getId(), aid);
-            } catch (Exception e) {
-                log.debug("[WORKFLOW-TASK] resolveArtifactId failed | instanceId={}", wi.getId());
-            }
-            try {
-                String title = entityResolverRegistry.resolveEntityTitle(wi);
-                if (title != null) entityTitles.put(wi.getId(), title);
-            } catch (Exception e) {
-                log.debug("[WORKFLOW-TASK] resolveEntityTitle failed | instanceId={}", wi.getId());
+
+        // Partition by entityType
+        Map<String, List<WorkflowInstance>> byType = instanceMap.values().stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        wi -> wi.getEntityType() != null ? wi.getEntityType() : "UNKNOWN"));
+
+        // ── Generic artifact resolution via registered resolvers ─────────────────
+        // No hardcoded entity type names. Each module registers a WorkflowEntityResolver.
+        // If a resolver exists for the entity type, use it for the bulk fallback map.
+        // Per-task step+user-aware resolution happens in Step 7 via the three-arg call.
+        // For entity types with no resolver (currently only VENDOR), the legacy
+        // batch-load path below handles it. Once a VendorEntityResolver is registered,
+        // the default branch below can be removed entirely.
+        for (Map.Entry<String, List<WorkflowInstance>> entry : byType.entrySet()) {
+            String entityType = entry.getKey();
+            List<WorkflowInstance> typeInstances = entry.getValue();
+
+            if (entityResolverRegistry.supports(entityType)) {
+                // Resolver registered — call single-arg for the bulk fallback map.
+                // Step 7 will override with step+user-aware resolution per task.
+                for (WorkflowInstance wi : typeInstances) {
+                    Long resolved = entityResolverRegistry.resolveArtifactId(wi);
+                    artifactIds.put(wi.getId(), resolved != null ? resolved : wi.getEntityId());
+                }
+            } else {
+                // No resolver registered — legacy VENDOR batch-load path.
+                // TODO: extract to VendorWorkflowEntityResolver @Component to eliminate this.
+                Set<Long> wfIds = typeInstances.stream()
+                        .map(WorkflowInstance::getId)
+                        .collect(java.util.stream.Collectors.toSet());
+                try {
+                    var cycles = vendorAssessmentCycleRepository.findByWorkflowInstanceIdIn(wfIds);
+                    Set<Long> cycleIds = cycles.stream()
+                            .map(c -> c.getId())
+                            .collect(java.util.stream.Collectors.toSet());
+                    var assessments = vendorAssessmentRepository.findByCycleIdIn(cycleIds);
+                    Map<Long, Long> cycleToAssessment = assessments.stream()
+                            .collect(java.util.stream.Collectors.toMap(
+                                    a -> a.getCycleId(), a -> a.getId(),
+                                    (a, b) -> a));
+                    Map<Long, Long> wfToAssessment = cycles.stream()
+                            .filter(c -> cycleToAssessment.containsKey(c.getId()))
+                            .collect(java.util.stream.Collectors.toMap(
+                                    c -> c.getWorkflowInstanceId(),
+                                    c -> cycleToAssessment.get(c.getId()),
+                                    (a, b) -> a));
+                    for (WorkflowInstance wi : typeInstances) {
+                        Long aid = wfToAssessment.getOrDefault(wi.getId(), wi.getEntityId());
+                        artifactIds.put(wi.getId(), aid);
+                    }
+                } catch (Exception e) {
+                    log.warn("[WORKFLOW-TASK] Batch resolution failed — using entityId fallback: {}", e.getMessage());
+                    for (WorkflowInstance wi : typeInstances) {
+                        artifactIds.put(wi.getId(), wi.getEntityId());
+                    }
+                }
             }
         }
 
@@ -1171,7 +1225,18 @@ public class WorkflowEngineService {
             StepInstance si        = stepMap.get(t.getStepInstanceId());
             WorkflowInstance wi    = si != null ? instanceMap.get(si.getWorkflowInstanceId()) : null;
             Workflow workflow       = wi != null ? workflowMap.get(wi.getWorkflowId()) : null;
-            Long artifactId        = wi != null ? artifactIds.get(wi.getId()) : null;
+            // Always use the step-aware three-arg resolver — entity-type-agnostic.
+            // Each WorkflowEntityResolver implementation decides how to resolve artifactId
+            // for its own entity type and step. The engine has no knowledge of modules.
+            // VENDOR artifactIds pre-loaded above are used as fallback when resolver throws.
+            Long artifactId;
+            try {
+                artifactId = wi != null
+                        ? entityResolverRegistry.resolveArtifactId(wi, si, t.getAssignedUserId())
+                        : null;
+            } catch (Exception ex) {
+                artifactId = wi != null ? artifactIds.get(wi.getId()) : null;
+            }
             String entityTitle     = wi != null ? entityTitles.get(wi.getId()) : null;
 
             TaskRole taskRole = t.getTaskRole() != null ? t.getTaskRole() : TaskRole.ACTOR;
@@ -1214,7 +1279,10 @@ public class WorkflowEngineService {
                     .artifactId(artifactId)
                     .entityTitle(entityTitle)
                     .build();
-        }).toList();
+        }).sorted(java.util.Comparator.comparing(
+                TaskInstanceResponse::getAssignedAt,
+                java.util.Comparator.nullsLast(java.util.Comparator.reverseOrder())
+        )).toList();
 
         log.info("[WORKFLOW-TASK] Returning {} tasks | userId={} | {}ms",
                 result.size(), userId, System.currentTimeMillis() - t0);
@@ -1315,7 +1383,141 @@ public class WorkflowEngineService {
      * CHANGED: now transitions the step from AWAITING_ASSIGNMENT → IN_PROGRESS
      * when the first task is created on a gated step.
      */
+    /**
+     * Advances a step directly without requiring a task.
+     * Used by users with workflow:step:override permission (e.g. lead auditor).
+     * Records the override in history and publishes step events.
+     */
+    /**
+     * Retries all stuck IN_PROGRESS SYSTEM steps whose automated action was not
+     * executed (e.g. because the action handler returned false on creation, or the
+     * backend was restarted mid-execution). Called by StepSlaMonitor every 5 minutes.
+     */
     @Transactional
+    public void retryStuckSystemSteps() {
+        List<StepInstance> stuckSteps = stepInstanceRepository
+                .findByStatus(StepStatus.IN_PROGRESS).stream()
+                .filter(s -> "SYSTEM".equals(s.getSnapSide()))
+                .toList();
+
+        for (StepInstance si : stuckSteps) {
+            try {
+                WorkflowStep step = stepRepository.findById(si.getStepId()).orElse(null);
+                if (step == null || step.getAutomatedAction() == null) continue;
+
+                WorkflowInstance instance = instanceRepository
+                        .findById(si.getWorkflowInstanceId()).orElse(null);
+                if (instance == null) continue;
+
+                com.kashi.grc.workflow.automation.AutomatedActionContext ctx =
+                        com.kashi.grc.workflow.automation.AutomatedActionContext.builder()
+                                .workflowInstance(instance)
+                                .step(step)
+                                .stepInstance(si)
+                                .tenantId(instance.getTenantId())
+                                .initiatedBy(instance.getInitiatedBy())
+                                .build();
+
+                Optional<Boolean> result = automatedActionRegistry.dispatch(step.getAutomatedAction(), ctx);
+
+                if (result.isPresent() && Boolean.TRUE.equals(result.get())) {
+                    completeStep(si, StepStatus.APPROVED,
+                            "Auto-approved by " + step.getAutomatedAction() + " (retry)");
+                    recordHistory(instance, si, null, "STEP_AUTO_APPROVED",
+                            StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
+                            instance.getInitiatedBy(),
+                            "Retry: automated action '" + step.getAutomatedAction() + "' completed");
+                    eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                            instance.getId(), si.getId(), si.getSnapName(), "APPROVED",
+                            instance.getInitiatedBy()));
+                    stepRepository.findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                                    instance.getWorkflowId(), si.getSnapStepOrder())
+                            .ifPresent(nextStep -> {
+                                StepInstance nextSI = createStepInstance(instance, nextStep);
+                                instance.setCurrentStepId(nextSI.getId());
+                                instanceRepository.save(instance);
+                                assignTasksForStep(nextSI, nextStep, instance);
+                                log.info("[WORKFLOW-RETRY] Advanced | instanceId={} | to='{}'",
+                                        instance.getId(), nextStep.getName());
+                            });
+                } else {
+                    log.debug("[WORKFLOW-RETRY] System step still not ready | stepInstanceId={} | action={}",
+                            si.getId(), step.getAutomatedAction());
+                }
+            } catch (Exception e) {
+                log.error("[WORKFLOW-RETRY] Error retrying stepInstanceId={} | {}", si.getId(), e.getMessage(), e);
+            }
+        }
+    }
+
+    public WorkflowInstanceResponse overrideAdvanceStep(Long stepInstanceId, String action,
+                                                        String remarks, Long performedBy) {
+        StepInstance si = stepInstanceRepository.findById(stepInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", stepInstanceId));
+
+        if (si.getStatus() != StepStatus.IN_PROGRESS) {
+            throw new BusinessException("STEP_NOT_ACTIVE",
+                    "Step is not currently active — cannot override.");
+        }
+
+        WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));
+
+        StepStatus newStatus = "REJECT".equalsIgnoreCase(action)
+                ? StepStatus.REJECTED : StepStatus.APPROVED;
+
+        String overrideNote = "Step override by userId=" + performedBy
+                + (remarks != null && !remarks.isBlank() ? ": " + remarks : "");
+
+        // Expire all pending tasks on this step
+        expirePendingTasks(si, null);
+
+        // Complete the step
+        completeStep(si, newStatus, overrideNote);
+
+        recordHistory(instance, si, null, "STEP_OVERRIDE",
+                StepStatus.IN_PROGRESS.name(), newStatus.name(),
+                performedBy, overrideNote);
+
+        eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                instance.getId(), si.getId(), si.getSnapName(), newStatus.name(), performedBy));
+
+        log.info("[WORKFLOW-OVERRIDE] Step {} | stepInstanceId={} | by={}",
+                newStatus, stepInstanceId, performedBy);
+
+        if (newStatus == StepStatus.APPROVED) {
+            // Advance to next step
+            Optional<WorkflowStep> nextStep = stepRepository
+                    .findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
+                            instance.getWorkflowId(), si.getSnapStepOrder());
+            if (nextStep.isPresent()) {
+                Long prevCurrentStepId = instance.getCurrentStepId();
+                StepInstance newSI = createStepInstance(instance, nextStep.get());
+                if (instance.getCurrentStepId() == null ||
+                        instance.getCurrentStepId().equals(prevCurrentStepId)) {
+                    instance.setCurrentStepId(newSI.getId());
+                    instanceRepository.save(instance);
+                }
+                assignTasksForStep(newSI, nextStep.get(), instance);
+                recordHistory(instance, newSI, null, "STEP_STARTED",
+                        null, newSI.getStatus().name(), performedBy,
+                        "Moved to: " + nextStep.get().getName());
+                eventPublisher.publishEvent(new WorkflowEvent.StepAdvanced(
+                        instance.getId(), newSI.getId(), nextStep.get().getName(),
+                        nextStep.get().getStepOrder(), newSI.getStatus().name(), performedBy));
+                log.info("[WORKFLOW-OVERRIDE] Advanced | instanceId={} | to='{}'",
+                        instance.getId(), nextStep.get().getName());
+            } else {
+                instance.setStatus(WorkflowStatus.COMPLETED);
+                instance.setCurrentStepId(null);
+                instanceRepository.save(instance);
+                log.info("[WORKFLOW-OVERRIDE] Workflow COMPLETED | instanceId={}", instance.getId());
+            }
+        }
+
+        return buildInstanceResponse(instance);
+    }
+
     public TaskInstanceResponse assignTaskToUser(Long stepInstanceId, Long userId, Long assignedBy) {
         log.info("[WORKFLOW-TASK] Manual assignment | stepInstanceId={} | userId={} | assignedBy={}",
                 stepInstanceId, userId, assignedBy);
@@ -1451,35 +1653,53 @@ public class WorkflowEngineService {
         Map<Long, List<StepInstance>> instancesByStepId = stepInstances.stream()
                 .collect(Collectors.groupingBy(StepInstance::getStepId));
 
+        // ── Bulk-load to eliminate N+1 queries ────────────────────────────────
+        List<Long> allStepIds = blueprintSteps.stream().map(WorkflowStep::getId).toList();
+        List<Long> allStepInstanceIds = stepInstances.stream().map(StepInstance::getId).toList();
+
+        Map<Long, List<Long>> roleIdsByStepId = stepRoleRepository.findByStepIdIn(allStepIds)
+                .stream()
+                .collect(Collectors.groupingBy(
+                        WorkflowStepRole::getStepId,
+                        Collectors.mapping(WorkflowStepRole::getRoleId, Collectors.toList())));
+
+        List<TaskInstance> allTasks = allStepInstanceIds.isEmpty()
+                ? List.of()
+                : taskInstanceRepository.findByStepInstanceIdIn(allStepInstanceIds);
+
+        Map<Long, List<TaskInstance>> tasksByStepInstanceId = allTasks.stream()
+                .collect(Collectors.groupingBy(TaskInstance::getStepInstanceId));
+
+        Set<Long> allUserIds = allTasks.stream()
+                .flatMap(t -> java.util.stream.Stream.of(t.getAssignedUserId(), t.getDelegatedToUserId()))
+                .filter(id -> id != null)
+                .collect(java.util.stream.Collectors.toSet());
+        Map<Long, String> globalUserNameMap = userRepository.findAllById(allUserIds).stream()
+                .collect(java.util.stream.Collectors.toMap(
+                        com.kashi.grc.usermanagement.domain.User::getId,
+                        u -> {
+                            String fn = u.getFirstName() != null ? u.getFirstName() : "";
+                            String ln = u.getLastName()  != null ? u.getLastName()  : "";
+                            String full = (fn + " " + ln).trim();
+                            return full.isEmpty() ? u.getEmail() : full;
+                        }));
+        // ── end bulk-load ─────────────────────────────────────────────────────
+
         List<Map<String, Object>> progress = new ArrayList<>();
 
         for (WorkflowStep step : blueprintSteps) {
             List<StepInstance> instances_for_step =
                     instancesByStepId.getOrDefault(step.getId(), List.of());
 
-            // Role IDs from blueprint join table (structural config — acceptable blueprint read)
-            List<Long> roleIds = stepRoleRepository.findByStepId(step.getId())
-                    .stream().map(WorkflowStepRole::getRoleId).toList();
+            // Role IDs from bulk-loaded map — no per-step DB query
+            List<Long> roleIds = roleIdsByStepId.getOrDefault(step.getId(), List.of());
 
             // Build per-iteration data for this step
             List<Map<String, Object>> iterations = new ArrayList<>();
             for (StepInstance si : instances_for_step) {
-                List<TaskInstance> tasks = taskInstanceRepository.findByStepInstanceId(si.getId());
-
-                // Bulk-load user names for all tasks in this step instance in ONE query
-                Set<Long> userIds = tasks.stream()
-                        .flatMap(t -> java.util.stream.Stream.of(t.getAssignedUserId(), t.getDelegatedToUserId()))
-                        .filter(id -> id != null)
-                        .collect(java.util.stream.Collectors.toSet());
-                Map<Long, String> userNameMap = userRepository.findAllById(userIds).stream()
-                        .collect(java.util.stream.Collectors.toMap(
-                                com.kashi.grc.usermanagement.domain.User::getId,
-                                u -> {
-                                    String fn = u.getFirstName() != null ? u.getFirstName() : "";
-                                    String ln = u.getLastName()  != null ? u.getLastName()  : "";
-                                    String full = (fn + " " + ln).trim();
-                                    return full.isEmpty() ? u.getEmail() : full;
-                                }));
+                // Use bulk-loaded map — zero per-step-instance DB queries
+                List<TaskInstance> tasks = tasksByStepInstanceId.getOrDefault(si.getId(), List.of());
+                Map<Long, String> userNameMap = globalUserNameMap;
 
                 List<Map<String, Object>> taskDetails = tasks.stream().map(t -> {
                     String userName       = userNameMap.getOrDefault(t.getAssignedUserId(),
@@ -1553,6 +1773,7 @@ public class WorkflowEngineService {
 
             Map<String, Object> stepProgress = new LinkedHashMap<>();
             stepProgress.put("stepId",          step.getId());
+            stepProgress.put("stepInstanceId",  latestSI != null ? latestSI.getId() : null);
             stepProgress.put("stepName",        displayName);
             stepProgress.put("stepOrder",       displayOrder);
             stepProgress.put("side",            displaySide);
@@ -1941,6 +2162,8 @@ public class WorkflowEngineService {
                 .snapAssignerNavKey(step.getAssignerNavKey())
                 .snapUiOverrideJson(step.getStepUiOverrideJson())
                 .snapSodRulesJson(step.getSodRulesJson())
+                .snapAssignableSide(step.getAssignableSide())
+                .snapAssignableRoleId(step.getAssignableRoleId())
                 .build();
         stepInstanceRepository.save(si);
 
@@ -2002,7 +2225,17 @@ public class WorkflowEngineService {
                                 }
                         );
             } else {
-                log.warn("[WORKFLOW-AUTO] Action '{}' failed or no handler — step '{}' stays IN_PROGRESS | instanceId={}",
+                // BUGFIX: this branch previously only logged "step stays IN_PROGRESS"
+                // without actually setting that status — SYSTEM steps were left at
+                // their initial AWAITING_ASSIGNMENT status forever when the automated
+                // action returned false/empty (e.g. MonitorProjectEngagementsAction
+                // returning false because not all engagements are ready yet).
+                // assignTasksForStep() does nothing for SYSTEM steps (early return),
+                // so nothing downstream was ever fixing this either — the step had
+                // no path forward except a manual DB update.
+                si.setStatus(StepStatus.IN_PROGRESS);
+                stepInstanceRepository.save(si);
+                log.warn("[WORKFLOW-AUTO] Action '{}' failed or no handler — step '{}' set to IN_PROGRESS | instanceId={}",
                         step.getAutomatedAction(), step.getName(), instance.getId());
             }
         }
@@ -2249,6 +2482,33 @@ public class WorkflowEngineService {
         if (actorResolution == ActorResolution.ASSIGNMENT_SCOPED) {
             // Ask the domain resolver for the specifically-assigned users
             List<Long> assignedUserIds = actorResolverRegistry.resolve(instance, si);
+
+            // OPTIONAL role filter: if this step has actor roles configured
+            // (workflow_step_actor_roles — the SAME table ROLE_BASED steps use),
+            // narrow the assignment-scoped candidates to only those who currently
+            // hold one of those roles. This guards against stale assignments —
+            // e.g. a user was recorded as a section's auditor, then their role
+            // was changed/revoked, and they should no longer receive the task.
+            //
+            // Fully data-driven and optional: a step with NO actor roles configured
+            // (the common case today) behaves exactly as before — no filtering.
+            // To enable the filter for a step, just add rows to
+            // workflow_step_actor_roles for it, same as configuring ROLE_BASED.
+            if (!assignedUserIds.isEmpty() && !actorRoles.isEmpty()) {
+                Set<Long> roleEligibleUserIds = new java.util.HashSet<>();
+                for (WorkflowStepRole ar : actorRoles) {
+                    roleEligibleUserIds.addAll(
+                            dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId));
+                }
+                List<Long> beforeFilter = assignedUserIds;
+                assignedUserIds = assignedUserIds.stream()
+                        .filter(roleEligibleUserIds::contains)
+                        .toList();
+                log.info("[WORKFLOW] Step '{}' ASSIGNMENT_SCOPED role filter applied | " +
+                                "before={} | after={} | configured roles={}",
+                        si.getSnapName(), beforeFilter.size(), assignedUserIds.size(), actorRoles.size());
+            }
+
             if (!assignedUserIds.isEmpty()) {
                 for (Long uid : assignedUserIds) {
                     TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
@@ -2497,7 +2757,9 @@ public class WorkflowEngineService {
                 si.getId(), task.getId(), userId, stepName,
                 wi != null ? wi.getEntityType() : null,
                 wi != null ? wi.getEntityId() : null,
-                artifactId, resolvedSide, resolvedAction,
+                artifactId,
+                si.getSnapNavKey(),
+                resolvedSide, resolvedAction,
                 role != null ? role.name() : "ACTOR"
         ));
 
@@ -2848,6 +3110,7 @@ public class WorkflowEngineService {
         return TaskInstanceResponse.builder()
                 .id(t.getId()).stepInstanceId(t.getStepInstanceId())
                 .assignedUserId(t.getAssignedUserId()).status(t.getStatus())
+                .taskRole(t.getTaskRole())
                 .actedAt(t.getActedAt()).dueAt(t.getDueAt()).remarks(t.getRemarks())
                 .delegatedToUserId(t.getDelegatedToUserId())
                 .reassignedFromUserId(t.getReassignedFromUserId())
@@ -2890,7 +3153,9 @@ public class WorkflowEngineService {
                 ? workflowRepository.findById(wi.getWorkflowId()).orElse(null) : null;
 
         // ── Artifact resolution — pluggable, zero hardcoding ─────────────────
-        Long artifactId = wi != null ? entityResolverRegistry.resolveArtifactId(wi) : null;
+        // Step-aware: some workflows route different steps to different entity pages
+        // (e.g. WF16 routes engagement steps to the engagement page, not project page)
+        Long artifactId = wi != null ? entityResolverRegistry.resolveArtifactId(wi, si, t.getAssignedUserId()) : null;
         String entityTitle = wi != null ? entityResolverRegistry.resolveEntityTitle(wi) : null;
 
         // ── Routing fields — derived from taskRole ────────────────────────────
@@ -3105,6 +3370,7 @@ public class WorkflowEngineService {
                 wi != null ? wi.getEntityType() : null,
                 wi != null ? wi.getEntityId() : null,
                 artifactId,
+                effectiveNavKey,
                 si.getSnapSide(),
                 si.getSnapStepAction() != null ? si.getSnapStepAction().name() : "FILL",
                 role.name()
@@ -3411,6 +3677,15 @@ public class WorkflowEngineService {
                 // → step_instances.id). Deleting step instances without clearing
                 // their children throws a DataIntegrityViolationException.
                 for (StepInstance ds : subsequentSteps) {
+                    // Delete task_section_items (FK: task_section_items.step_instance_id → step_instances.id)
+                    List<com.kashi.grc.workflow.domain.TaskSectionItem> tsi =
+                            taskSectionItemRepository.findByStepInstanceId(ds.getId());
+                    if (!tsi.isEmpty()) {
+                        taskSectionItemRepository.deleteAll(tsi);
+                        log.info("[WF-ADMIN] RESET-TASK rollback | deleted {} task_section_item(s) for stepInstanceId={}",
+                                tsi.size(), ds.getId());
+                    }
+                    // Delete task_section_completions (FK: task_section_completions.step_instance_id → step_instances.id)
                     List<TaskSectionCompletion> tsc =
                             taskSectionCompletionRepository.findByStepInstanceId(ds.getId());
                     if (!tsc.isEmpty()) {
@@ -3438,6 +3713,100 @@ public class WorkflowEngineService {
                 "previousStatus", previousStatus,
                 "sectionsReset",  sections.size()
         );
+    }
+
+    // ── Eligible users for a step — used by the assign UI ─────────────────────
+
+    public StepInstance getStepInstance(Long stepInstanceId) {
+        return stepInstanceRepository.findById(stepInstanceId).orElse(null);
+    }
+
+    /**
+     * Returns the next WorkflowStep after the given step instance,
+     * based on snapStepOrder + 1 within the same workflow.
+     * Returns empty if the step instance has no snapStepOrder or no next step exists.
+     */
+    public java.util.Optional<WorkflowStep> getNextStep(StepInstance si) {
+        if (si.getSnapStepOrder() == null) return java.util.Optional.empty();
+        return instanceRepository.findById(si.getWorkflowInstanceId())
+                .flatMap(wi -> stepRepository
+                        .findByWorkflowIdAndStepOrder(wi.getWorkflowId(), si.getSnapStepOrder() + 1));
+    }
+
+    /**
+     * Walks forward from the given step instance to find the next step that has
+     * actor roles configured. Walks up to 3 steps forward.
+     * Used by eligible-users endpoint for ASSIGN-to-next-step pattern.
+     */
+    public List<WorkflowStepRole> getEligibleActorRoles(StepInstance si) {
+        var nextStepOpt = getNextStep(si);
+        if (nextStepOpt.isEmpty()) return getStepActorRoles(si.getStepId());
+
+        List<WorkflowStepRole> roles = getStepActorRoles(nextStepOpt.get().getId());
+        if (!roles.isEmpty()) return roles;
+
+        if (si.getSnapStepOrder() == null) return List.of();
+        // Walk forward up to 3 more steps
+        return instanceRepository.findById(si.getWorkflowInstanceId())
+                .map(wi -> {
+                    int order = si.getSnapStepOrder() + 1;
+                    for (int i = 0; i < 3; i++) {
+                        order++;
+                        var further = stepRepository.findByWorkflowIdAndStepOrder(wi.getWorkflowId(), order);
+                        if (further.isEmpty()) break;
+                        List<WorkflowStepRole> r = getStepActorRoles(further.get().getId());
+                        if (!r.isEmpty()) return r;
+                    }
+                    return List.<WorkflowStepRole>of();
+                })
+                .orElse(List.of());
+    }
+
+    public List<WorkflowStepRole> getStepActorRoles(Long stepId) {
+        return stepRoleRepository.findByStepId(stepId);
+    }
+
+    /**
+     * Returns users who have any of the given roles, scoped to the tenant.
+     * Deduplicates by userId so users with multiple matching roles appear once.
+     */
+    public List<Map<String, Object>> getUsersByRoles(List<Long> roleIds, Long tenantId) {
+        // Find distinct userIds who have any of these roles in this tenant
+        // Also track which roleId each user was found under (for roleName/side in response)
+        java.util.Map<Long, Long> userToRole = new java.util.LinkedHashMap<>();
+        for (Long roleId : roleIds) {
+            for (Long userId : dbRepository.findUserIdsByRoleAndTenant(roleId, tenantId)) {
+                userToRole.putIfAbsent(userId, roleId); // first matching role wins
+            }
+        }
+        if (userToRole.isEmpty()) return List.of();
+
+        // Build a roleId → Role map for name/side lookup
+        java.util.Map<Long, com.kashi.grc.usermanagement.domain.Role> roleMap =
+                roleRepository.findAllById(roleIds).stream()
+                        .collect(java.util.stream.Collectors.toMap(
+                                com.kashi.grc.usermanagement.domain.Role::getId,
+                                r -> r));
+
+        // Load user details for those ids
+        return userRepository.findAllById(userToRole.keySet()).stream()
+                .filter(u -> !u.isDeleted())
+                .map(u -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",        u.getId());
+                    m.put("firstName", u.getFirstName());
+                    m.put("lastName",  u.getLastName());
+                    m.put("email",     u.getEmail());
+                    m.put("fullName",  u.getFirstName() + " " + u.getLastName());
+                    // Include role name and side so frontend can filter/display correctly
+                    com.kashi.grc.usermanagement.domain.Role role = roleMap.get(userToRole.get(u.getId()));
+                    if (role != null) {
+                        m.put("roleName", role.getName());
+                        m.put("side",     role.getSide() != null ? role.getSide().name() : null);
+                    }
+                    return m;
+                })
+                .toList();
     }
 
 }

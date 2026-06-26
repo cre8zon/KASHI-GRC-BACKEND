@@ -102,11 +102,11 @@ public class GenerateAuditReportAction implements AutomatedActionHandler {
                 controlInstanceRepository.findByEngagementId(engagementId);
 
         long totalControls   = controls.size();
-        long effective       = controls.stream().filter(c -> "EFFECTIVE".equals(c.getTestResult())).count();
-        long partiallyEff    = controls.stream().filter(c -> "PARTIALLY_EFFECTIVE".equals(c.getTestResult())).count();
-        long ineffective     = controls.stream().filter(c -> "INEFFECTIVE".equals(c.getTestResult())).count();
+        long effective       = controls.stream().filter(c -> AuditControlInstance.TestResult.EFFECTIVE        == c.getTestResult()).count();
+        long partiallyEff    = controls.stream().filter(c -> AuditControlInstance.TestResult.PARTIALLY_EFFECTIVE == c.getTestResult()).count();
+        long ineffective     = controls.stream().filter(c -> AuditControlInstance.TestResult.INEFFECTIVE      == c.getTestResult()).count();
         long notTested       = controls.stream().filter(c -> c.getTestResult() == null
-                || "NOT_TESTED".equals(c.getTestResult())).count();
+                || AuditControlInstance.TestResult.NOT_TESTED == c.getTestResult()).count();
         double passRate      = totalControls > 0
                 ? Math.round((effective * 10000.0) / totalControls) / 100.0
                 : 0.0;

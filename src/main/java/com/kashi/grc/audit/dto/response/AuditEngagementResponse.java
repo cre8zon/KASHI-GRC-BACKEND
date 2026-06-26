@@ -25,6 +25,7 @@ public class AuditEngagementResponse {
     private Long   ownerId;
     private Integer totalControls;
     private Integer testedControls;
+    private Integer submittedControls;
     private Integer passedControls;
     private Integer failedControls;
     private Integer openFindingCount;

@@ -70,10 +70,20 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     // ── Screen Config ─────────────────────────────────────────────
 
+    // ── Per-request caches — cleared by UtilityService.clearRequestCache() ──
+    // Feature flags and layout are identical across all screen config calls
+    // within the same request — no need to re-query for _header, _tab_overview etc.
+    private static final ThreadLocal<Map<String, Boolean>>        FEATURE_FLAG_CACHE = new ThreadLocal<>();
+    private static final ThreadLocal<Map<String, LayoutResponse>> LAYOUT_CACHE       = new ThreadLocal<>();
+
+    public static void clearScreenConfigCache() {
+        FEATURE_FLAG_CACHE.remove();
+        LAYOUT_CACHE.remove();
+    }
+
     @Override
     @Transactional(readOnly = true)
     public ScreenConfigResponse getScreenConfig(String screenKey) {
-        // Single call — result cached in ThreadLocal for this request
         User currentUser = utilityService.getLoggedInDataContext();
         Long tenantId    = currentUser.getTenantId();
 
@@ -81,29 +91,56 @@ public class UiConfigServiceImpl implements UiConfigService {
         List<UiComponent> components = componentRepository
                 .findByScreenForTenant(screenKey, tenantId);
 
+        // Batch-fetch ALL options for this screen's components in ONE query
+        // instead of one query per component (N+1 fix)
+        Map<String, List<UiOption>> optionsByKey = Collections.emptyMap();
+        if (!components.isEmpty()) {
+            List<String> componentKeys = components.stream()
+                    .filter(UiComponent::isVisible)
+                    .map(UiComponent::getComponentKey)
+                    .toList();
+            if (!componentKeys.isEmpty()) {
+                optionsByKey = optionRepository
+                        .findByComponentKeysAndTenant(componentKeys, tenantId)
+                        .stream()
+                        .collect(Collectors.groupingBy(
+                                o -> o.getComponent().getComponentKey()));
+            }
+        }
+
         Map<String, UiComponentResponse> componentMap = new LinkedHashMap<>();
         for (UiComponent c : components) {
             if (!c.isVisible()) continue;
-            List<UiOption> options = optionRepository
-                    .findByComponentKeyAndTenant(c.getComponentKey(), tenantId);
+            List<UiOption> options = optionsByKey.getOrDefault(c.getComponentKey(), List.of());
             componentMap.put(c.getComponentKey(), toComponentResponse(c, options));
         }
 
-        // Layout — tenant override takes priority over global
-        LayoutResponse layout = layoutRepository
-                .findByLayoutKeyAndTenantId(screenKey, tenantId)
-                .or(() -> layoutRepository.findByLayoutKeyAndTenantIdIsNull(screenKey))
-                .map(this::toLayoutResponse)
-                .orElse(null);
+        // Layout — cache per request (same tenant layout repeated across _header, _tab_overview etc.)
+        Map<String, LayoutResponse> layoutCache = LAYOUT_CACHE.get();
+        if (layoutCache == null) { layoutCache = new HashMap<>(); LAYOUT_CACHE.set(layoutCache); }
+        LayoutResponse layout = layoutCache.computeIfAbsent(screenKey, key ->
+                layoutRepository.findByLayoutKeyAndTenantId(key, tenantId)
+                        .or(() -> layoutRepository.findByLayoutKeyAndTenantIdIsNull(key))
+                        .map(this::toLayoutResponse)
+                        .orElse(null));
 
         // Actions visible to this user
         List<UiActionResponse> actions = getActions(screenKey, null);
+
+        // Feature flags — cache per request (identical for all screen keys in same request)
+        Map<String, Boolean> flags = FEATURE_FLAG_CACHE.get();
+        if (flags == null) {
+            flags = featureFlagRepository.findEnabledForTenant(tenantId).stream()
+                    .collect(Collectors.toMap(FeatureFlag::getFlagKey, FeatureFlag::isEnabled,
+                            (global, tenant) -> tenant));
+            FEATURE_FLAG_CACHE.set(flags);
+        }
 
         return ScreenConfigResponse.builder()
                 .components(componentMap)
                 .layout(layout)
                 .actions(actions)
-                .featureFlags(getEnabledFeatureFlags())
+                .featureFlags(flags)
                 .build();
     }
 
@@ -288,9 +325,14 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     private boolean isNavVisible(UiNavigation item,
                                  Set<String> sides, Set<String> perms) {
-        if (item.getRequiredPermission() != null
-                && !item.getRequiredPermission().isBlank()
-                && !perms.contains(item.getRequiredPermission())) return false;
+        // required_permission supports comma-separated OR logic (same pattern as allowed_sides).
+        // e.g. "audit:engagement:read,audit:engagement:read-limited" → visible if user has either.
+        if (item.getRequiredPermission() != null && !item.getRequiredPermission().isBlank()) {
+            boolean hasAny = Arrays.stream(item.getRequiredPermission().split(","))
+                    .map(String::trim)
+                    .anyMatch(perms::contains);
+            if (!hasAny) return false;
+        }
 
         if (item.getAllowedSides() != null && !item.getAllowedSides().isBlank()) {
             Set<String> allowed = Arrays.stream(item.getAllowedSides().split(","))
@@ -302,9 +344,12 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     private boolean isActionVisible(UiAction a, Set<String> sides,
                                     Set<String> perms, String entityStatus) {
-        if (a.getRequiredPermission() != null
-                && !a.getRequiredPermission().isBlank()
-                && !perms.contains(a.getRequiredPermission())) return false;
+        if (a.getRequiredPermission() != null && !a.getRequiredPermission().isBlank()) {
+            boolean hasAny = Arrays.stream(a.getRequiredPermission().split(","))
+                    .map(String::trim)
+                    .anyMatch(perms::contains);
+            if (!hasAny) return false;
+        }
         if (a.getAllowedSides() != null && !a.getAllowedSides().isBlank()) {
             Set<String> allowed = Arrays.stream(a.getAllowedSides().split(","))
                     .map(String::trim).collect(Collectors.toSet());
@@ -317,8 +362,12 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     private boolean isWidgetVisible(DashboardWidget w,
                                     Set<String> sides, Set<String> perms) {
-        if (w.getRequiredPermission() != null
-                && !perms.contains(w.getRequiredPermission())) return false;
+        if (w.getRequiredPermission() != null && !w.getRequiredPermission().isBlank()) {
+            boolean hasAny = Arrays.stream(w.getRequiredPermission().split(","))
+                    .map(String::trim)
+                    .anyMatch(perms::contains);
+            if (!hasAny) return false;
+        }
         if (w.getAllowedSidesJson() != null && !w.getAllowedSidesJson().isBlank()) {
             return sides.stream()
                     .anyMatch(s -> w.getAllowedSidesJson().contains("\"" + s + "\""));
@@ -402,7 +451,9 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .allowedStatusesJson(a.getAllowedStatusesJson())
                 .requiresConfirmation(a.getRequiresConfirmation())
                 .confirmationMessage(a.getConfirmationMessage())
-                .requiresRemarks(a.getRequiresRemarks()).sortOrder(a.getSortOrder())
+                .requiresRemarks(a.getRequiresRemarks())
+                .requiresAssignment(Boolean.TRUE.equals(a.getRequiresAssignment()))
+                .sortOrder(a.getSortOrder())
                 .build();
     }
 

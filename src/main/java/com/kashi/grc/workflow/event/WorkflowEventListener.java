@@ -44,6 +44,7 @@ public class WorkflowEventListener {
         payload.put("entityType",         event.entityType());
         payload.put("entityId",           event.entityId());
         payload.put("artifactId",         event.artifactId());
+        payload.put("navKey",             event.navKey());
         payload.put("resolvedStepSide",   event.resolvedStepSide());
         payload.put("resolvedStepAction", event.resolvedStepAction());
         payload.put("taskRole",           event.taskRole());

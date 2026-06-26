@@ -155,6 +155,25 @@ public class AuditEngagement extends TenantAwareEntity {
     @Column(name = "overall_rating", length = 30)
     private String overallRating;  // EFFECTIVE | PARTIALLY_EFFECTIVE | INEFFECTIVE | NOT_RATED
 
+    // ── Step 9: Draft Report Review ───────────────────────────────────────────
+    @Column(name = "audit_opinion", length = 30)
+    private String auditOpinion;       // UNQUALIFIED | QUALIFIED | ADVERSE | DISCLAIMER
+
+    @Column(name = "executive_summary", columnDefinition = "TEXT")
+    private String executiveSummary;
+
+    @Column(name = "review_comments", columnDefinition = "TEXT")
+    private String reviewComments;
+
+    @Column(name = "scope_limitations", columnDefinition = "TEXT")
+    private String scopeLimitations;
+
+    @Column(name = "reviewed_at")
+    private LocalDateTime reviewedAt;
+
+    @Column(name = "reviewed_by")
+    private Long reviewedBy;
+
     @Column(name = "open_finding_count")
     @Builder.Default
     private Integer openFindingCount = 0;

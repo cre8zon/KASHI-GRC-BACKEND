@@ -32,6 +32,7 @@ public sealed interface WorkflowEvent
             String entityType,
             Long   entityId,
             Long   artifactId,
+            String navKey,
             String resolvedStepSide,
             String resolvedStepAction,
             String taskRole

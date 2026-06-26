@@ -10,4 +10,7 @@ public interface VendorAssessmentRepository extends JpaRepository<VendorAssessme
     Optional<VendorAssessment> findByIdAndTenantId(Long id, Long tenantId);
     List<VendorAssessment> findByVendorId(Long vendorId);
     List<VendorAssessment> findByCycleId(Long cycleId);
+
+    /** Batch lookup — avoids N×2 DB calls in getPendingTasksForUser */
+    List<VendorAssessment> findByCycleIdIn(java.util.Collection<Long> cycleIds);
 }

@@ -9,6 +9,8 @@ import java.util.List; import java.util.Optional;
 public interface AuditEngagementRepository extends JpaRepository<AuditEngagement, Long>,
         JpaSpecificationExecutor<AuditEngagement> {
     List<AuditEngagement> findByProjectId(Long projectId);
+
+    List<AuditEngagement> findByProjectInstanceId(Long projectInstanceId);
     boolean existsByTenantIdAndNameAndTemplateIdAndCreatedAtAfter(Long tenantId, String name, Long templateId, java.time.LocalDateTime after);
     List<AuditEngagement> findByTenantId(Long tenantId);
     Optional<AuditEngagement> findByTenantIdAndWorkflowInstanceId(Long tenantId, Long workflowInstanceId);
