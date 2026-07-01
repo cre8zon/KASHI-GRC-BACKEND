@@ -16,7 +16,10 @@ public interface AuditProjectInstanceRepository extends JpaRepository<AuditProje
     long countByOriginalProjectIdAndTenantId(Long originalProjectId, Long tenantId);
 
     /** All project instances for a tenant — backs GET /v1/audit/project-instances */
-    java.util.List<AuditProjectInstance> findByTenantId(Long tenantId);
+    java.util.List<AuditProjectInstance> findByTenantIdOrderByIdDesc(Long tenantId);
 
     java.util.Optional<AuditProjectInstance> findByTenantIdAndId(Long tenantId, Long id);
+
+    /** Used by AuditSectionItemRegistrar to resolve project from WF16 workflow instance */
+    java.util.Optional<AuditProjectInstance> findByWorkflowInstanceId(Long workflowInstanceId);
 }

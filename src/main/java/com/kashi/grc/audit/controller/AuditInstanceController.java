@@ -48,6 +48,7 @@ public class AuditInstanceController {
     private final UtilityService                            utilityService;
     private final AuditFindingRepository                    findingRepo;
     private final IssueService                              issueService;
+    private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepo;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROL INSTANCES — /v1/audit/control-instances/{id}
@@ -198,6 +199,13 @@ public class AuditInstanceController {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id",                      test.getId());
         result.put("engagementId",            test.getEngagementId());
+        // Breadcrumb support — parent engagement name for generic breadcrumb
+        if (test.getEngagementId() != null) {
+            engagementRepo.findById(test.getEngagementId()).ifPresent(eng -> {
+                result.put("engagementName", eng.getName());
+                result.put("engagementRef",  eng.getEngagementRef());
+            });
+        }
         result.put("originalTestId",          test.getOriginalTestId());
         result.put("testNameSnapshot",        test.getTestNameSnapshot());
         result.put("testRefSnapshot",         test.getTestRefSnapshot());
@@ -328,6 +336,13 @@ public class AuditInstanceController {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id",                      policy.getId());
         result.put("engagementId",            policy.getEngagementId());
+        // Breadcrumb support — parent engagement name for generic breadcrumb
+        if (policy.getEngagementId() != null) {
+            engagementRepo.findById(policy.getEngagementId()).ifPresent(eng -> {
+                result.put("engagementName", eng.getName());
+                result.put("engagementRef",  eng.getEngagementRef());
+            });
+        }
         result.put("originalPolicyId",        policy.getOriginalPolicyId());
         result.put("titleSnapshot",           policy.getTitleSnapshot());
         result.put("policyRefSnapshot",       policy.getPolicyRefSnapshot());
@@ -551,6 +566,13 @@ public class AuditInstanceController {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",                       c.getId());
         m.put("engagementId",             c.getEngagementId());
+        // Breadcrumb support
+        if (c.getEngagementId() != null) {
+            engagementRepo.findById(c.getEngagementId()).ifPresent(eng -> {
+                m.put("engagementName", eng.getName());
+                m.put("engagementRef",  eng.getEngagementRef());
+            });
+        }
         m.put("controlCodeSnapshot",      c.getControlCodeSnapshot());
         m.put("controlNameSnapshot",      c.getControlNameSnapshot());
         m.put("descriptionSnapshot",      c.getDescriptionSnapshot());

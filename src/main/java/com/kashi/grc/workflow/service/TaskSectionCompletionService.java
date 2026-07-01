@@ -493,6 +493,42 @@ public class TaskSectionCompletionService {
         completeItem(taskInstanceId, sectionKey, item.getId(), completedBy, null, null, null, null);
     }
 
+    /**
+     * Resets a single tracked item back to PENDING when an assignment is cleared.
+     * Also re-opens the parent section gate (completed=false) so the step cannot
+     * auto-approve until all items are re-completed.
+     */
+    public void uncompleteItemByRef(Long taskInstanceId, String sectionKey, Long itemRefId) {
+        TaskSectionItem item = itemRepository
+                .findByTaskInstanceIdAndSectionKeyAndItemRefId(taskInstanceId, sectionKey, itemRefId)
+                .orElse(null);
+        if (item == null) return;
+
+        if ("PENDING".equals(item.getStatus())) {
+            log.debug("[CASE3-UNDO] Item {} already PENDING — skipping", item.getId());
+            return;
+        }
+
+        item.setStatus("PENDING");
+        itemRepository.save(item);
+
+        // Re-open the section gate — step cannot complete until all items are re-done
+        completionRepository.findByTaskInstanceIdAndSnapSectionKey(taskInstanceId, sectionKey)
+                .ifPresent(sc -> {
+                    if (sc.isCompleted()) {
+                        sc.setCompleted(false);
+                        sc.setCompletedAt(null);
+                        sc.setCompletedBy(null);
+                        completionRepository.save(sc);
+                        log.info("[CASE3-UNDO] Section gate re-opened | taskId={} | sectionKey={} | itemRefId={}",
+                                taskInstanceId, sectionKey, itemRefId);
+                    }
+                });
+
+        log.info("[CASE3-UNDO] Item reset to PENDING | taskId={} | sectionKey={} | itemRefId={}",
+                taskInstanceId, sectionKey, itemRefId);
+    }
+
     public void autoCompleteItemTrackedSection(Long taskInstanceId, String sectionKey, Long completedBy) {
         TaskInstance task = taskInstanceRepository.findById(taskInstanceId).orElse(null);
         if (task == null) {

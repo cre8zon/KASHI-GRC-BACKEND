@@ -3595,6 +3595,17 @@ public class WorkflowEngineService {
         taskSectionCompletionRepository.saveAll(sections);
         log.info("[WF-ADMIN] RESET-TASK | {} section gate(s) re-armed for taskId={}", sections.size(), taskId);
 
+        // Also clear task_section_items for the reset task itself — items from the
+        // previous run may have status=DONE. The SectionItemsNeededEvent re-fire
+        // below will re-register them fresh so they start at NOT_DONE.
+        List<com.kashi.grc.workflow.domain.TaskSectionItem> existingItems =
+                taskSectionItemRepository.findByStepInstanceId(si.getId());
+        if (!existingItems.isEmpty()) {
+            taskSectionItemRepository.deleteAll(existingItems);
+            log.info("[WF-ADMIN] RESET-TASK | cleared {} task_section_item(s) for re-registration | taskId={}",
+                    existingItems.size(), taskId);
+        }
+
         // 3. Revert step to IN_PROGRESS if it was already APPROVED.
         // Capture whether the step was reverted — used in step 4 to decide
         // whether downstream steps need to be rolled back.
@@ -3677,6 +3688,16 @@ public class WorkflowEngineService {
                 // → step_instances.id). Deleting step instances without clearing
                 // their children throws a DataIntegrityViolationException.
                 for (StepInstance ds : subsequentSteps) {
+                    // Delete workflow_task_actions FIRST (FK: workflow_task_actions.task_instance_id
+                    // → task_instances.id). Task action audit rows must be cleared before the
+                    // task_instances themselves can be removed via the step_instances cascade.
+                    List<com.kashi.grc.workflow.domain.WorkflowTaskAction> wta =
+                            actionRepository.findByStepInstanceIdOrderByPerformedAtAsc(ds.getId());
+                    if (!wta.isEmpty()) {
+                        actionRepository.deleteAll(wta);
+                        log.info("[WF-ADMIN] RESET-TASK rollback | deleted {} workflow_task_action(s) for stepInstanceId={}",
+                                wta.size(), ds.getId());
+                    }
                     // Delete task_section_items (FK: task_section_items.step_instance_id → step_instances.id)
                     List<com.kashi.grc.workflow.domain.TaskSectionItem> tsi =
                             taskSectionItemRepository.findByStepInstanceId(ds.getId());
@@ -3699,6 +3720,34 @@ public class WorkflowEngineService {
 
                 log.info("[WF-ADMIN] RESET-TASK | rolled back {} downstream step(s), expired {} task(s) | instanceId={} | requestedRollback=true",
                         subsequentSteps.size(), expiredCount, instanceId);
+            }
+        }
+
+        // Re-fire SectionItemsNeededEvent AFTER rollback so items are not deleted
+        // by the downstream rollback above. Items registered before rollback were
+        // immediately deleted when downstream step_instances were removed.
+        Long wfInstanceId = si.getWorkflowInstanceId();
+        Long wfTenantId = instanceRepository.findById(wfInstanceId)
+                .map(wi -> wi.getTenantId()).orElse(null);
+        if (wfTenantId != null) {
+            for (TaskSectionCompletion sc : sections) {
+                if (sc.isSnapTracksItems() && sc.getSnapItemRefType() != null) {
+                    eventPublisher.publishEvent(new com.kashi.grc.workflow.event.SectionItemsNeededEvent(
+                            task.getId(),
+                            si.getId(),
+                            wfInstanceId,
+                            wfTenantId,
+                            sc.getSnapSectionKey(),
+                            sc.getSnapItemRefType(),
+                            sc.getSnapSectionScreenKey(),
+                            sc.getSnapItemScreenKey(),
+                            sc.getSnapSectionUiJson(),
+                            task.getAssignedUserId()
+                    ));
+                    log.info("[WF-ADMIN] RESET-TASK | re-fired SectionItemsNeededEvent (post-rollback) | " +
+                                    "sectionKey={} | itemRefType={} | taskId={}",
+                            sc.getSnapSectionKey(), sc.getSnapItemRefType(), task.getId());
+                }
             }
         }
 
