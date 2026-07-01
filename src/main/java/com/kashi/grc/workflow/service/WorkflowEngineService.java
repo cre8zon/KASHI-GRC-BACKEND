@@ -712,13 +712,17 @@ public class WorkflowEngineService {
         if (stepComplete) {
             // ── Concurrent-advance guard ──────────────────────────────────────
             // Re-read the step status from the DB after acquiring the lock.
-            // If another transaction already completed this step (status != IN_PROGRESS),
-            // skip the advance entirely — creating a second next-step instance would
-            // produce the duplicate "+N revisits" bug on all future workflow instances.
+            // If another transaction already completed this step (status is a terminal
+            // approval/rejection), skip the advance to avoid duplicate next-step instances.
+            // SLA_BREACHED is NOT terminal — it means the SLA timer expired but the step
+            // is still running. Allow advance through SLA_BREACHED so late approvals work.
             StepStatus freshStatus = stepInstanceRepository.findById(stepInstance.getId())
                     .map(StepInstance::getStatus)
                     .orElse(StepStatus.IN_PROGRESS);
-            if (freshStatus != StepStatus.IN_PROGRESS) {
+            boolean alreadyTerminated = freshStatus == StepStatus.APPROVED
+                    || freshStatus == StepStatus.REJECTED
+                    || freshStatus == StepStatus.SKIPPED;
+            if (alreadyTerminated) {
                 log.warn("[WORKFLOW-ACTION] Step already advanced by concurrent approval — skipping duplicate advance | stepInstanceId={} | freshStatus={}",
                         stepInstance.getId(), freshStatus);
                 return buildInstanceResponse(instance);
@@ -2561,8 +2565,19 @@ public class WorkflowEngineService {
                 evaluateSodRules(si, instance, seenUids);
 
                 // Create exactly ONE task per unique user — regardless of how many roles matched
+                // actorRoleName: use the LAST matched role name for the user.
+                // For users with a single role (the common case) this is always correct.
+                // For multi-role users, the last matching role wins — acceptable since the
+                // frontend view map covers all expected role names.
+                String lastRoleName = null;
+                for (WorkflowStepRole ar2 : actorRoles) {
+                    String rn = roleRepository.findById(ar2.getRoleId())
+                            .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
+                    if (rn != null) lastRoleName = rn;
+                }
+                final String resolvedRoleName = lastRoleName;
                 for (Long uid : seenUids) {
-                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, null);
+                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, resolvedRoleName);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     actorTaskCount++;
                 }

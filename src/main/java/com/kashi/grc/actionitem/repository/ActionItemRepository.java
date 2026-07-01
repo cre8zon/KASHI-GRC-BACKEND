@@ -36,4 +36,18 @@ public interface ActionItemRepository
             "AND a.status IN ('OPEN', 'IN_PROGRESS', 'PENDING_REVIEW', 'PENDING_VALIDATION')")
     boolean existsOpenForEntity(@Param("entityTypeStr") String entityTypeStr,
                                 @Param("entityId") Long entityId);
+
+    /**
+     * Check if a user has any action item on questions within a given assessment.
+     * Used to grant contributor read access to the assessment detail page.
+     */
+    @Query("""
+        SELECT COUNT(a) > 0 FROM ActionItem a
+        JOIN AssessmentQuestionInstance qi ON qi.id = a.entityId
+        WHERE a.assignedTo = :userId
+          AND qi.assessmentId = :assessmentId
+          AND CAST(a.entityType AS string) = 'QUESTION_RESPONSE'
+        """)
+    boolean existsByAssignedToAndAssessmentId(@Param("userId") Long userId,
+                                              @Param("assessmentId") Long assessmentId);
 }
