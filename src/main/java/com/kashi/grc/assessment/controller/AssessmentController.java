@@ -3089,6 +3089,13 @@ public class AssessmentController {
         boolean hasParticipated = taskInstanceRepository.existsByUserIdAndWorkflowInstanceId(
                 userId, workflowInstanceId);
 
+        // Contributors are assigned via action items (not workflow tasks).
+        // If the user has any CONTRIBUTOR_ASSIGNMENT action item on this assessment,
+        // grant read access so they can view the assessment detail page.
+        if (!hasParticipated) {
+            hasParticipated = actionItemRepository.existsByAssignedToAndAssessmentId(userId, assessment.getId());
+        }
+
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",
                     userId, assessment.getId(), action);

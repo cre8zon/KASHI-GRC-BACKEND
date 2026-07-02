@@ -87,15 +87,50 @@ public class AuditProjectEngagementItemRegistrar {
         }
 
         Long projectInstanceId = wfInstance.getEntityId();
+        Long assignedUserId    = event.assignedUserId();
+        String sectionKey      = event.sectionKey();
 
-        List<AuditEngagement> engagements = engagementRepository.findByProjectInstanceId(projectInstanceId);
+        List<AuditEngagement> allEngagements = engagementRepository.findByProjectInstanceId(projectInstanceId);
 
-        if (engagements.isEmpty()) {
-            log.warn("[PROJECT-ENG-REGISTRAR] No engagements found for projectInstanceId={} " +
-                            "— POST /v1/audit/project-instances must run before workflow 16 reaches this step",
+        if (allEngagements.isEmpty()) {
+            log.warn("[PROJECT-ENG-REGISTRAR] No engagements found for projectInstanceId={} — skipping",
                     projectInstanceId);
             return;
         }
+
+        // Scope items to the task's assigned user's engagements:
+        //
+        // Step 2 (ENGAGEMENTS_LEAD_ASSIGNED): The ENTITY_OWNER (project creator) has
+        // ONE task and is responsible for assigning ALL engagements — register all.
+        //
+        // Steps 3, 4, 9 (ENGAGEMENTS_ONBOARDED / EVIDENCE_OWNERS_ASSIGNED /
+        // DRAFT_REPORTS_REVIEWED): Each lead auditor gets their own task scoped to
+        // their engagements. Register only engagements where leadAuditorId matches
+        // the task's assignedUserId — so Sneha's task tracks Sneha's engagements
+        // and Rohit's task tracks Rohit's engagements independently.
+        //
+        // Fallback: if no engagements match the assigned user (e.g. lead auditors not
+        // yet set, or single-lead project) register all engagements so the step is
+        // not stuck with 0 items.
+        List<AuditEngagement> engagements;
+        boolean isEntityOwnerStep = "ENGAGEMENTS_LEAD_ASSIGNED".equalsIgnoreCase(sectionKey);
+
+        if (isEntityOwnerStep || assignedUserId == null) {
+            engagements = allEngagements;
+        } else {
+            engagements = allEngagements.stream()
+                    .filter(e -> assignedUserId.equals(e.getLeadAuditorId()))
+                    .toList();
+            if (engagements.isEmpty()) {
+                log.warn("[PROJECT-ENG-REGISTRAR] No engagements with leadAuditorId={} for projectInstanceId={} " +
+                                "sectionKey={} — falling back to all engagements",
+                        assignedUserId, projectInstanceId, sectionKey);
+                engagements = allEngagements;
+            }
+        }
+
+        log.info("[PROJECT-ENG-REGISTRAR] Scoped to {} of {} engagement(s) | assignedUserId={} | sectionKey={}",
+                engagements.size(), allEngagements.size(), assignedUserId, sectionKey);
 
         List<TaskSectionCompletionService.ItemRegistration> registrations = engagements.stream()
                 .map(e -> new TaskSectionCompletionService.ItemRegistration(

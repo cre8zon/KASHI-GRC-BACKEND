@@ -56,6 +56,7 @@ public class AuditEngagementService {
     // sectionCompletionService.onSectionEvent() directly — the service method
     // takes a TaskSectionEvent record, not separate parameters.
     private final TaskSectionCompletionRepository           taskSectionCompletionRepository;
+    private final com.kashi.grc.workflow.service.TaskSectionCompletionService taskSectionCompletionService;
     private final ApplicationEventPublisher                 eventPublisher;
     private final EvidenceLinkRepository evidenceLinkRepository;
     private final DocumentLinkRepository documentLinkRepository;
@@ -280,11 +281,42 @@ public class AuditEngagementService {
                     "AUDIT_SECTION_INSTANCE", sectionInstanceId);
         }
 
-        // Only fire the gate event when actually assigning (not unassigning).
-        // Unassign (auditorId=null) should never advance the workflow gate.
+        // Also set auditor on the root ancestor (depth=0) if cascading, so no section
+        // is left unassigned. The cascade goes downward only — without this the root
+        // category node itself would have assignedAuditorId=null.
+        if (cascadeToChildren && auditorId != null) {
+            AuditSectionInstance root = section;
+            while (root.getParentInstanceId() != null) {
+                root = sectionInstanceRepository.findById(root.getParentInstanceId()).orElse(null);
+                if (root == null) break;
+            }
+            if (root != null && root.getAssignedAuditorId() == null) {
+                root.setAssignedAuditorId(auditorId);
+                sectionInstanceRepository.save(root);
+            }
+        }
+
+        // Fire ENGAGEMENTS_ONBOARDED once ALL sections of this engagement
+        // (every depth) have an auditor assigned — no section left unassigned.
+        // When unassigning (auditorId=null), reset the engagement item so the gate re-opens.
         if (auditorId != null && performedBy != null) {
-            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR",
-                    sectionInstanceId, engagementId, performedBy);
+            List<AuditSectionInstance> allSections =
+                    sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId);
+            boolean allAssigned = !allSections.isEmpty()
+                    && allSections.stream().allMatch(s -> s.getAssignedAuditorId() != null);
+            if (allAssigned) {
+                AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+                if (eng != null && eng.getProjectInstanceId() != null) {
+                    fireProjectSectionEvent(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED",
+                            engagementId, performedBy);
+                }
+            }
+        } else if (auditorId == null && performedBy != null) {
+            // Unassign — reset the item so step cannot auto-complete with unassigned sections
+            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+            if (eng != null && eng.getProjectInstanceId() != null) {
+                uncompleteEngagementItem(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED", engagementId);
+            }
         }
 
         log.info("[AUDIT] Section assigned | sectionInstanceId={} | auditorId={} | cascade={}",
@@ -360,10 +392,39 @@ public class AuditEngagementService {
                     "AUDIT_SECTION_INSTANCE", sectionInstanceId);
         }
 
-        // Only fire when actually assigning (not unassigning), and actor is the performer not the assignee.
+        // Also set auditee on the root ancestor if cascading, so no section is left unassigned.
+        if (cascadeToChildren && auditeeUserId != null) {
+            AuditSectionInstance root = section;
+            while (root.getParentInstanceId() != null) {
+                root = sectionInstanceRepository.findById(root.getParentInstanceId()).orElse(null);
+                if (root == null) break;
+            }
+            if (root != null && root.getAuditeeAssignedUserId() == null) {
+                root.setAuditeeAssignedUserId(auditeeUserId);
+                sectionInstanceRepository.save(root);
+            }
+        }
+
+        // Fire EVIDENCE_OWNERS_ASSIGNED once ALL sections of this engagement
+        // have an auditee assigned — no section left unassigned.
+        // When unassigning (auditeeUserId=null), reset the engagement item so gate re-opens.
         if (auditeeUserId != null && performedBy != null) {
-            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE",
-                    sectionInstanceId, engagementId, performedBy);
+            List<AuditSectionInstance> allSections =
+                    sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId);
+            boolean allAssigned = !allSections.isEmpty()
+                    && allSections.stream().allMatch(s -> s.getAuditeeAssignedUserId() != null);
+            if (allAssigned) {
+                AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+                if (eng != null && eng.getProjectInstanceId() != null) {
+                    fireProjectSectionEvent(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED",
+                            engagementId, performedBy);
+                }
+            }
+        } else if (auditeeUserId == null && performedBy != null) {
+            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+            if (eng != null && eng.getProjectInstanceId() != null) {
+                uncompleteEngagementItem(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED", engagementId);
+            }
         }
 
         log.info("[AUDIT] Auditee assigned to section | sectionInstanceId={} | auditeeUserId={} | cascade={}",
@@ -876,7 +937,52 @@ public class AuditEngagementService {
      * @param completionEvent    Must match wss.completion_event (e.g. "CONSOLIDATION_COMPLETE")
      * @param actorUserId        The user performing the action
      */
+    /** Resets the per-engagement item back to PENDING when an assignment is cleared. */
+    public void uncompleteEngagementItem(Long projectInstanceId, String completionEvent, Long engagementId) {
+        try {
+            var projInst = projectInstanceRepository.findById(projectInstanceId).orElse(null);
+            if (projInst == null || projInst.getWorkflowInstanceId() == null) return;
+
+            var activeSteps = stepInstanceRepository
+                    .findByWorkflowInstanceIdAndStatus(projInst.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
+            if (activeSteps.isEmpty()) return;
+
+            var stepInstance = activeSteps.get(0);
+            // Find ANY actor task at this step — the item belongs to that task
+            var anyTask = taskInstanceRepository
+                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                    .stream().findFirst()
+                    .or(() -> taskInstanceRepository
+                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                            .stream().findFirst());
+            if (anyTask.isEmpty()) return;
+
+            Long taskId = anyTask.get().getId();
+            var matchedSection = taskSectionCompletionRepository
+                    .findByTaskInstanceIdAndSnapCompletionEvent(taskId, completionEvent).orElse(null);
+            if (matchedSection == null) return;
+
+            taskSectionCompletionService.uncompleteItemByRef(
+                    taskId, matchedSection.getSnapSectionKey(), engagementId);
+            log.info("[AUDIT-ENG-SERVICE] Engagement item reset | event='{}' | engagementId={} | taskId={}",
+                    completionEvent, engagementId, taskId);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] uncompleteEngagementItem failed (non-fatal) | event={} | eng={} | {}",
+                    completionEvent, engagementId, ex.getMessage());
+        }
+    }
+
+    /** Overload for non-item-tracked sections (Steps 11-13) */
     public void fireProjectSectionEvent(Long projectInstanceId, String completionEvent, Long actorUserId) {
+        fireProjectSectionEvent(projectInstanceId, completionEvent, null, actorUserId);
+    }
+
+    /**
+     * Item-tracked overload — when itemRefId is non-null, calls completeItemByRef()
+     * so only this one item is marked done. Used for ENGAGEMENTS_LEAD_ASSIGNED.
+     */
+    public void fireProjectSectionEvent(Long projectInstanceId, String completionEvent,
+                                        Long itemRefId, Long actorUserId) {
         try {
             var projInst = projectInstanceRepository.findById(projectInstanceId).orElse(null);
             if (projInst == null || projInst.getWorkflowInstanceId() == null) return;
@@ -884,9 +990,16 @@ public class AuditEngagementService {
             Long workflowInstanceId = projInst.getWorkflowInstanceId();
             var activeSteps = stepInstanceRepository
                     .findByWorkflowInstanceIdAndStatus(workflowInstanceId, StepStatus.IN_PROGRESS);
-            if (activeSteps.isEmpty()) return;
+            if (activeSteps.isEmpty()) {
+                log.warn("[AUDIT-ENG-SERVICE] fireProjectSectionEvent | no IN_PROGRESS step | event='{}' | projectInstanceId={}",
+                        completionEvent, projectInstanceId);
+                return;
+            }
 
             var stepInstance = activeSteps.get(0);
+            log.info("[AUDIT-ENG-SERVICE] fireProjectSectionEvent | event='{}' | stepInstanceId={} | actorUserId={} | itemRefId={}",
+                    completionEvent, stepInstance.getId(), actorUserId, itemRefId);
+
             var actorTask = taskInstanceRepository
                     .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
                     .stream()
@@ -899,19 +1012,34 @@ public class AuditEngagementService {
                             .findFirst());
 
             if (actorTask.isEmpty()) {
-                log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
+                log.warn("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
                         "skipping '{}' event", actorUserId, stepInstance.getId(), completionEvent);
                 return;
             }
 
             Long taskId = actorTask.get().getId();
-            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    completionEvent, taskId, actorUserId, null, null
-            ));
-            log.info("[AUDIT-ENG-SERVICE] Project section event fired | event='{}' | projectInstanceId={} | taskId={} | by={}",
-                    completionEvent, projectInstanceId, taskId, actorUserId);
+
+            if (itemRefId != null) {
+                var matchedSection = taskSectionCompletionRepository
+                        .findByTaskInstanceIdAndSnapCompletionEvent(taskId, completionEvent)
+                        .orElse(null);
+                if (matchedSection == null) {
+                    log.debug("[AUDIT-ENG-SERVICE] No section snapshotted with completionEvent=\'{}\' on taskId={} — skipping",
+                            completionEvent, taskId);
+                    return;
+                }
+                taskSectionCompletionService.completeItemByRef(
+                        taskId, matchedSection.getSnapSectionKey(), itemRefId, actorUserId);
+                log.info("[AUDIT-ENG-SERVICE] Project section item completed | event=\'{}\' | itemRefId={} | taskId={} | by={}",
+                        completionEvent, itemRefId, taskId, actorUserId);
+            } else {
+                eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                        completionEvent, taskId, actorUserId, null, null));
+                log.info("[AUDIT-ENG-SERVICE] Project section event fired | event=\'{}\' | projectInstanceId={} | taskId={} | by={}",
+                        completionEvent, projectInstanceId, taskId, actorUserId);
+            }
         } catch (Exception ex) {
-            log.warn("[AUDIT-ENG-SERVICE] Project section event '{}' failed (non-fatal) | projectInstanceId={} | {}",
+            log.warn("[AUDIT-ENG-SERVICE] Project section event \'{}\' failed (non-fatal) | projectInstanceId={} | {}",
                     completionEvent, projectInstanceId, ex.getMessage());
         }
     }
@@ -958,14 +1086,22 @@ public class AuditEngagementService {
             }
 
             Long taskId = actorTask.get().getId();
-            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    "DRAFT_REPORTS_REVIEWED",
-                    taskId,
-                    actorUserId,
-                    "AUDIT_ENGAGEMENT_INSTANCE",
-                    engagementId
-            ));
-            log.info("[AUDIT-ENG-SERVICE] DRAFT_REPORTS_REVIEWED fired | engagementId={} | taskId={} | by={}",
+
+            // Use item-tracked completion — one item per engagement. This is the
+            // same pattern as ENGAGEMENTS_ONBOARDED / EVIDENCE_OWNERS_ASSIGNED.
+            // The blanket sectionDone would close the gate on the first engagement's
+            // review, skipping remaining engagements.
+            var matchedSection = taskSectionCompletionRepository
+                    .findByTaskInstanceIdAndSnapCompletionEvent(taskId, "DRAFT_REPORTS_REVIEWED")
+                    .orElse(null);
+            if (matchedSection == null) {
+                log.warn("[AUDIT-ENG-SERVICE] No DRAFT_REPORTS_REVIEWED section snapshotted on taskId={} — skipping",
+                        taskId);
+                return;
+            }
+            taskSectionCompletionService.completeItemByRef(
+                    taskId, matchedSection.getSnapSectionKey(), engagementId, actorUserId);
+            log.info("[AUDIT-ENG-SERVICE] DRAFT_REPORTS_REVIEWED item completed | engagementId={} | taskId={} | by={}",
                     engagementId, taskId, actorUserId);
         } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] DRAFT_REPORTS_REVIEWED event failed (non-fatal) | engagementId={} | {}",
@@ -1021,34 +1157,48 @@ public class AuditEngagementService {
                         "skipping section event '{}'", actorUserId, stepInstance.getId(), completionEvent);
                 return;
             }
-            // Resolve the taskId and completionEvent NOW — before publishing.
-            // Publishing the event may cause the workflow to advance (Step N → Step N+1)
-            // within the same thread. If this method is called again (e.g. cascade loop),
-            // a second lookup would find Step N+1's task and fire the wrong event.
-            // By capturing taskId and resolvedEvent before publish, we pin to the right task.
+            // Resolve the taskId NOW — before completing the item.
+            // Completing the last item may cause the workflow to advance
+            // (Step N → Step N+1) within the same thread. If this method is
+            // called again (e.g. cascade loop), a second lookup would find
+            // Step N+1's task. By capturing taskId before completion, we pin
+            // to the right task.
             Long taskId = actorTask.get().getId();
-            var registeredSections = taskSectionCompletionRepository
-                    .findByTaskInstanceIdOrderBySnapSectionOrderAsc(taskId);
-            String resolvedEvent = registeredSections.stream()
-                    .map(sc -> sc.getSnapCompletionEvent())
-                    .filter(e -> e != null && !e.isBlank())
-                    .findFirst()
-                    .orElse(completionEvent); // fallback to caller-provided event
 
-            log.info("[AUDIT-ENG-SERVICE] Section assignment event firing | event='{}' | " +
-                            "sectionInstanceId={} | taskId={} | actorUserId={}",
-                    resolvedEvent, sectionInstanceId, taskId, actorUserId);
+            // Find the section snapshot that actually matches the completionEvent
+            // the caller asked for — NOT just the first registered section on this
+            // task. (Previously this picked registeredSections.get(0)'s event
+            // regardless of which gate the caller intended, which could complete
+            // the wrong section.)
+            var matchedSection = taskSectionCompletionRepository
+                    .findByTaskInstanceIdAndSnapCompletionEvent(taskId, completionEvent)
+                    .orElse(null);
+            if (matchedSection == null) {
+                log.debug("[AUDIT-ENG-SERVICE] No section snapshotted with completionEvent='{}' on taskId={} — skipping",
+                        completionEvent, taskId);
+                return;
+            }
 
-            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    resolvedEvent,
+            log.info("[AUDIT-ENG-SERVICE] Section item completing | event='{}' | sectionKey='{}' | " +
+                            "sectionInstanceId={} (itemRef) | taskId={} | actorUserId={}",
+                    completionEvent, matchedSection.getSnapSectionKey(), sectionInstanceId, taskId, actorUserId);
+
+            // tracks_items=1 on this section — sectionInstanceId is ONE of potentially
+            // many items (one per AUDIT_SECTION_INSTANCE across ALL engagements in the
+            // project). completeItemByRef() marks only this one item done; the section
+            // gate itself only flips to complete once every registered item is done.
+            // This is the fix for: assigning a section on engagement A was previously
+            // closing the whole gate via the blanket TaskSectionEvent, leaving sections
+            // on engagement B/C unassigned forever because the gate had already fired.
+            taskSectionCompletionService.completeItemByRef(
                     taskId,
-                    actorUserId,
-                    "AUDIT_SECTION_INSTANCE",
-                    sectionInstanceId
-            ));
-            log.info("[AUDIT-ENG-SERVICE] Section assignment event fired | event='{}' | " +
-                            "sectionInstanceId={} | taskInstanceId={} | actorUserId={}",
-                    resolvedEvent, sectionInstanceId, taskId, actorUserId);
+                    matchedSection.getSnapSectionKey(),
+                    sectionInstanceId,
+                    actorUserId
+            );
+
+            log.info("[AUDIT-ENG-SERVICE] Section item completed | event='{}' | sectionInstanceId={} | taskId={} | actorUserId={}",
+                    completionEvent, sectionInstanceId, taskId, actorUserId);
         } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] Section assignment event '{}' failed (non-fatal) | " +
                     "sectionInstanceId={} | {}", completionEvent, sectionInstanceId, ex.getMessage());

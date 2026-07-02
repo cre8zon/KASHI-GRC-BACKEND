@@ -712,13 +712,17 @@ public class WorkflowEngineService {
         if (stepComplete) {
             // ── Concurrent-advance guard ──────────────────────────────────────
             // Re-read the step status from the DB after acquiring the lock.
-            // If another transaction already completed this step (status != IN_PROGRESS),
-            // skip the advance entirely — creating a second next-step instance would
-            // produce the duplicate "+N revisits" bug on all future workflow instances.
+            // If another transaction already completed this step (status is a terminal
+            // approval/rejection), skip the advance to avoid duplicate next-step instances.
+            // SLA_BREACHED is NOT terminal — it means the SLA timer expired but the step
+            // is still running. Allow advance through SLA_BREACHED so late approvals work.
             StepStatus freshStatus = stepInstanceRepository.findById(stepInstance.getId())
                     .map(StepInstance::getStatus)
                     .orElse(StepStatus.IN_PROGRESS);
-            if (freshStatus != StepStatus.IN_PROGRESS) {
+            boolean alreadyTerminated = freshStatus == StepStatus.APPROVED
+                    || freshStatus == StepStatus.REJECTED
+                    || freshStatus == StepStatus.SKIPPED;
+            if (alreadyTerminated) {
                 log.warn("[WORKFLOW-ACTION] Step already advanced by concurrent approval — skipping duplicate advance | stepInstanceId={} | freshStatus={}",
                         stepInstance.getId(), freshStatus);
                 return buildInstanceResponse(instance);
@@ -2561,8 +2565,19 @@ public class WorkflowEngineService {
                 evaluateSodRules(si, instance, seenUids);
 
                 // Create exactly ONE task per unique user — regardless of how many roles matched
+                // actorRoleName: use the LAST matched role name for the user.
+                // For users with a single role (the common case) this is always correct.
+                // For multi-role users, the last matching role wins — acceptable since the
+                // frontend view map covers all expected role names.
+                String lastRoleName = null;
+                for (WorkflowStepRole ar2 : actorRoles) {
+                    String rn = roleRepository.findById(ar2.getRoleId())
+                            .map(com.kashi.grc.usermanagement.domain.Role::getName).orElse(null);
+                    if (rn != null) lastRoleName = rn;
+                }
+                final String resolvedRoleName = lastRoleName;
                 for (Long uid : seenUids) {
-                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, null);
+                    TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, resolvedRoleName);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     actorTaskCount++;
                 }
@@ -3595,6 +3610,17 @@ public class WorkflowEngineService {
         taskSectionCompletionRepository.saveAll(sections);
         log.info("[WF-ADMIN] RESET-TASK | {} section gate(s) re-armed for taskId={}", sections.size(), taskId);
 
+        // Also clear task_section_items for the reset task itself — items from the
+        // previous run may have status=DONE. The SectionItemsNeededEvent re-fire
+        // below will re-register them fresh so they start at NOT_DONE.
+        List<com.kashi.grc.workflow.domain.TaskSectionItem> existingItems =
+                taskSectionItemRepository.findByStepInstanceId(si.getId());
+        if (!existingItems.isEmpty()) {
+            taskSectionItemRepository.deleteAll(existingItems);
+            log.info("[WF-ADMIN] RESET-TASK | cleared {} task_section_item(s) for re-registration | taskId={}",
+                    existingItems.size(), taskId);
+        }
+
         // 3. Revert step to IN_PROGRESS if it was already APPROVED.
         // Capture whether the step was reverted — used in step 4 to decide
         // whether downstream steps need to be rolled back.
@@ -3677,6 +3703,16 @@ public class WorkflowEngineService {
                 // → step_instances.id). Deleting step instances without clearing
                 // their children throws a DataIntegrityViolationException.
                 for (StepInstance ds : subsequentSteps) {
+                    // Delete workflow_task_actions FIRST (FK: workflow_task_actions.task_instance_id
+                    // → task_instances.id). Task action audit rows must be cleared before the
+                    // task_instances themselves can be removed via the step_instances cascade.
+                    List<com.kashi.grc.workflow.domain.WorkflowTaskAction> wta =
+                            actionRepository.findByStepInstanceIdOrderByPerformedAtAsc(ds.getId());
+                    if (!wta.isEmpty()) {
+                        actionRepository.deleteAll(wta);
+                        log.info("[WF-ADMIN] RESET-TASK rollback | deleted {} workflow_task_action(s) for stepInstanceId={}",
+                                wta.size(), ds.getId());
+                    }
                     // Delete task_section_items (FK: task_section_items.step_instance_id → step_instances.id)
                     List<com.kashi.grc.workflow.domain.TaskSectionItem> tsi =
                             taskSectionItemRepository.findByStepInstanceId(ds.getId());
@@ -3699,6 +3735,34 @@ public class WorkflowEngineService {
 
                 log.info("[WF-ADMIN] RESET-TASK | rolled back {} downstream step(s), expired {} task(s) | instanceId={} | requestedRollback=true",
                         subsequentSteps.size(), expiredCount, instanceId);
+            }
+        }
+
+        // Re-fire SectionItemsNeededEvent AFTER rollback so items are not deleted
+        // by the downstream rollback above. Items registered before rollback were
+        // immediately deleted when downstream step_instances were removed.
+        Long wfInstanceId = si.getWorkflowInstanceId();
+        Long wfTenantId = instanceRepository.findById(wfInstanceId)
+                .map(wi -> wi.getTenantId()).orElse(null);
+        if (wfTenantId != null) {
+            for (TaskSectionCompletion sc : sections) {
+                if (sc.isSnapTracksItems() && sc.getSnapItemRefType() != null) {
+                    eventPublisher.publishEvent(new com.kashi.grc.workflow.event.SectionItemsNeededEvent(
+                            task.getId(),
+                            si.getId(),
+                            wfInstanceId,
+                            wfTenantId,
+                            sc.getSnapSectionKey(),
+                            sc.getSnapItemRefType(),
+                            sc.getSnapSectionScreenKey(),
+                            sc.getSnapItemScreenKey(),
+                            sc.getSnapSectionUiJson(),
+                            task.getAssignedUserId()
+                    ));
+                    log.info("[WF-ADMIN] RESET-TASK | re-fired SectionItemsNeededEvent (post-rollback) | " +
+                                    "sectionKey={} | itemRefType={} | taskId={}",
+                            sc.getSnapSectionKey(), sc.getSnapItemRefType(), task.getId());
+                }
             }
         }
 

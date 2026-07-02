@@ -76,6 +76,7 @@ public class WorkflowInstanceController {
     private final WorkflowAccessService accessService;
     // Change 1: roleRepository for eligible-users side/role filtering
     private final com.kashi.grc.usermanagement.repository.RoleRepository roleRepository;
+    private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepository;
 
     // ══════════════════════════════════════════════════════════════
     // INSTANCE MANAGEMENT
@@ -251,6 +252,50 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<List<TaskInstanceResponse>>> getPendingTasks(@PathVariable Long userId) {
         log.debug("[WF-TASK] GET PENDING | userId={}", userId);
         return ResponseEntity.ok(ApiResponse.success(service.getPendingTasksForUser(userId)));
+    }
+
+    @GetMapping("/tasks/my-next")
+    @Operation(summary = "After task completion — find current user's next pending task on the same entity or its parent project")
+    public ResponseEntity<ApiResponse<java.util.Map<String, Object>>> getMyNextTask(
+            @RequestParam String entityType,
+            @RequestParam Long entityId) {
+
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        log.debug("[WF-TASK] MY-NEXT | userId={} | entityType={} | entityId={}", userId, entityType, entityId);
+
+        List<TaskInstanceResponse> pending = service.getPendingTasksForUser(userId);
+
+        // 1. Direct match — task on this exact entity
+        var next = pending.stream()
+                .filter(t -> entityType.equals(t.getEntityType())
+                        && entityId.equals(t.getEntityId()))
+                .findFirst()
+                .orElse(null);
+
+        // 2. If this is an engagement page, also look for tasks on its parent project
+        if (next == null && "AUDIT_ENGAGEMENT".equals(entityType)) {
+            var eng = engagementRepository.findById(entityId).orElse(null);
+            if (eng != null && eng.getProjectInstanceId() != null) {
+                Long projectId = eng.getProjectInstanceId();
+                next = pending.stream()
+                        .filter(t -> "AUDIT_PROJECT".equals(t.getEntityType())
+                                && projectId.equals(t.getEntityId()))
+                        .findFirst()
+                        .orElse(null);
+            }
+        }
+
+        if (next == null) {
+            return ResponseEntity.ok(ApiResponse.success(java.util.Map.of()));
+        }
+
+        return ResponseEntity.ok(ApiResponse.success(java.util.Map.of(
+                "taskId",         next.getId(),
+                "stepInstanceId", next.getStepInstanceId(),
+                "stepName",       next.getStepName()   != null ? next.getStepName()   : "",
+                "navKey",         next.getNavKey()     != null ? next.getNavKey()     : "",
+                "artifactId",     next.getArtifactId() != null ? next.getArtifactId() : entityId
+        )));
     }
 
     @GetMapping("/tasks/user/{userId}/all")

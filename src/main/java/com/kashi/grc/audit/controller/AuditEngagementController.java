@@ -426,7 +426,7 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listProjectInstances() {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
-        List<AuditProjectInstance> instances = projectInstanceRepository.findByTenantId(tenantId);
+        List<AuditProjectInstance> instances = projectInstanceRepository.findByTenantIdOrderByIdDesc(tenantId);
 
         // Bulk-load workflow statuses to avoid N+1 per instance
         Set<Long> wfIds = instances.stream()
@@ -1131,6 +1131,26 @@ public class AuditEngagementController {
 
         engagementRepository.save(e);
         log.info("[AUDIT-ENG] Patched | id={} | fields={}", id, fields.keySet());
+
+        // When leadAuditorId is set (Step 2 — Assign Lead Auditors), fire the
+        // ENGAGEMENTS_LEAD_ASSIGNED section item completion so the per-engagement
+        // item gate closes. Once all engagements in the project have a lead auditor
+        // assigned, done==total and the step auto-approves.
+        if (fields.containsKey("leadAuditorId")) {
+            if (e.getLeadAuditorId() != null) {
+                Long performedBy = utilityService.getLoggedInDataContext().getId();
+                service.fireProjectSectionEvent(
+                        e.getProjectInstanceId(),
+                        "ENGAGEMENTS_LEAD_ASSIGNED",
+                        id,
+                        performedBy
+                );
+            } else {
+                // Cleared — re-open the item so gate doesn't auto-approve with null lead auditor
+                service.uncompleteEngagementItem(e.getProjectInstanceId(), "ENGAGEMENTS_LEAD_ASSIGNED", id);
+            }
+        }
+
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -1188,6 +1208,8 @@ public class AuditEngagementController {
                 snapshot.put("projectRefSnapshot",   inst.getProjectRefSnapshot());
                 snapshot.put("snapshottedAt",        inst.getSnapshottedAt());
                 result.put("projectSnapshot", snapshot);
+                // Flat alias for generic breadcrumb parentNameField resolution
+                result.put("projectName", inst.getProjectNameSnapshot());
             });
         }
 
