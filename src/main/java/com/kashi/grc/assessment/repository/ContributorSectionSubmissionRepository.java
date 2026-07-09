@@ -1,15 +1,13 @@
 package com.kashi.grc.assessment.repository;
-
 import com.kashi.grc.assessment.domain.ContributorSectionSubmission;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
-
 import java.util.List;
 import java.util.Optional;
 
+/** countDistinctSectionsWithAssignments lives in the Custom fragment (Criteria API). */
 public interface ContributorSectionSubmissionRepository
-        extends JpaRepository<ContributorSectionSubmission, Long> {
+        extends JpaRepository<ContributorSectionSubmission, Long>,
+        ContributorSectionSubmissionRepositoryCustom {
 
     Optional<ContributorSectionSubmission> findBySectionInstanceIdAndContributorUserId(
             Long sectionInstanceId, Long contributorUserId);
@@ -22,16 +20,5 @@ public interface ContributorSectionSubmissionRepository
     boolean existsBySectionInstanceIdAndContributorUserId(
             Long sectionInstanceId, Long contributorUserId);
 
-    /** Count how many section submissions exist for this contributor's task */
     long countByTaskInstanceId(Long taskInstanceId);
-
-    /**
-     * Count how many DISTINCT sections this contributor has questions in for this assessment.
-     * Used to check if all sections are submitted → auto-approve sub-task.
-     */
-    @Query("SELECT COUNT(DISTINCT q.sectionInstanceId) FROM AssessmentQuestionInstance q " +
-            "WHERE q.assessmentId = :assessmentId AND q.assignedUserId = :contributorUserId")
-    long countDistinctSectionsWithAssignments(
-            @Param("assessmentId") Long assessmentId,
-            @Param("contributorUserId") Long contributorUserId);
 }

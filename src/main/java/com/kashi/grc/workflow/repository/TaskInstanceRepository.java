@@ -4,16 +4,21 @@ import com.kashi.grc.workflow.domain.TaskInstance;
 import com.kashi.grc.workflow.enums.TaskRole;
 import com.kashi.grc.workflow.enums.TaskStatus;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
+/**
+ * Derived-name queries only. Workflow-instance-scoped lookups live in
+ * TaskInstanceRepositoryCustom, implemented via the JPA Criteria API.
+ * findByAssignedUserIdAndStatusIn needed no @Query at all — the method name
+ * is a valid derived query.
+ */
 @Repository
-public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long> {
+public interface TaskInstanceRepository
+        extends JpaRepository<TaskInstance, Long>, TaskInstanceRepositoryCustom {
 
     List<TaskInstance> findByStepInstanceId(Long stepInstanceId);
 
@@ -27,110 +32,21 @@ public interface TaskInstanceRepository extends JpaRepository<TaskInstance, Long
 
     long countByStepInstanceIdAndStatus(Long stepInstanceId, TaskStatus status);
 
-    /** Used by cancelInstance to expire ALL non-terminal tasks across multiple step instances */
     List<TaskInstance> findByStepInstanceIdIn(List<Long> stepInstanceIds);
 
-    /** Used by cancelInstance to expire only PENDING tasks (kept for backward compat) */
     List<TaskInstance> findByStepInstanceIdInAndStatus(List<Long> stepInstanceIds, TaskStatus status);
 
     Optional<TaskInstance> findByIdAndAssignedUserId(Long id, Long assignedUserId);
 
-    /**
-     * Count only ACTOR tasks on a step instance — used by isStepApprovalSatisfied.
-     * ASSIGNER tasks are excluded so approving/delegating from an assigner role
-     * does not accidentally satisfy the approval condition and advance the workflow.
-     */
     long countByStepInstanceIdAndTaskRole(Long stepInstanceId, TaskRole taskRole);
 
-    /**
-     * Count ACTOR tasks with a specific status — used by isStepApprovalSatisfied.
-     * Paired with countByStepInstanceIdAndTaskRole to compute the approval fraction.
-     */
     long countByStepInstanceIdAndTaskRoleAndStatus(Long stepInstanceId, TaskRole taskRole, TaskStatus status);
 
-    /**
-     * Count ACTOR tasks EXCLUDING a specific status.
-     * Used by isStepApprovalSatisfied to exclude REJECTED sub-tasks (e.g. contributor
-     * tasks closed by the responder when locking a section) from the approval denominator.
-     * Without this, REJECTED contributor tasks inflate `total` and permanently stall
-     * the ALL-approval gate even when all real responder tasks are approved.
-     */
     long countByStepInstanceIdAndTaskRoleAndStatusNot(Long stepInstanceId, TaskRole taskRole, TaskStatus status);
 
-    /**
-     * Check if a specific user already has a PENDING task on a step instance.
-     * Used by manual-assign to prevent duplicate tasks for the same user on the same step.
-     */
     boolean existsByStepInstanceIdAndAssignedUserIdAndStatus(
             Long stepInstanceId, Long assignedUserId, TaskStatus status);
 
-    /**
-     * Check if the user has an active task on a specific workflow instance — single JOIN query.
-     *
-     * Replaces the N+1 pattern in AssessmentController.assertUserHasActiveTask().
-     * All that is now a single EXISTS subquery — O(1) regardless of task count.
-     * The statuses collection is typically [PENDING, IN_PROGRESS].
-     */
-    @Query("""
-        SELECT COUNT(t) > 0 FROM TaskInstance t
-        JOIN StepInstance s ON s.id = t.stepInstanceId
-        WHERE t.assignedUserId      = :userId
-          AND s.workflowInstanceId  = :workflowInstanceId
-          AND t.status              IN :statuses
-        """)
-    boolean existsByUserIdAndWorkflowInstanceIdAndStatusIn(
-            @Param("userId")             Long userId,
-            @Param("workflowInstanceId") Long workflowInstanceId,
-            @Param("statuses")           Collection<TaskStatus> statuses);
-
-    /**
-     * Check if the user has EVER had any task on a specific workflow instance.
-     * Used for read-only access guard on COMPLETED assessments.
-     */
-    @Query("""
-        SELECT COUNT(t) > 0 FROM TaskInstance t
-        JOIN StepInstance s ON s.id = t.stepInstanceId
-        WHERE t.assignedUserId     = :userId
-          AND s.workflowInstanceId = :workflowInstanceId
-        """)
-    boolean existsByUserIdAndWorkflowInstanceId(
-            @Param("userId")             Long userId,
-            @Param("workflowInstanceId") Long workflowInstanceId);
-
-    /**
-     * Finds all completed ACTOR tasks for a specific user on a specific workflow instance.
-     *
-     * Used by WorkflowAccessService.evaluateSod() to determine which steps a user has
-     * already acted on — needed to detect if the user is now trying to act on a
-     * conflicting step (SoD violation: e.g. created a risk AND trying to approve it).
-     *
-     * Only ACTOR tasks are checked — ASSIGNER tasks don't represent the user doing the
-     * substantive work on the record. Only APPROVED and COMPLETED statuses mean the
-     * user has fully exercised their permissions on that step.
-     */
-    @Query("""
-        SELECT t FROM TaskInstance t
-        JOIN StepInstance s ON s.id = t.stepInstanceId
-        WHERE s.workflowInstanceId = :instanceId
-          AND t.assignedUserId     = :userId
-          AND t.taskRole           = 'ACTOR'
-          AND t.status             IN ('APPROVED', 'COMPLETED')
-        """)
-    List<TaskInstance> findActorTasksForInstance(
-            @Param("instanceId") Long workflowInstanceId,
-            @Param("userId")     Long userId);
-
-    /**
-     * Single query replacing three separate findByAssignedUserIdAndStatus calls.
-     * Fetches PENDING + IN_PROGRESS + DELEGATED in one round-trip.
-     */
-    @Query("""
-        SELECT t FROM TaskInstance t
-        WHERE t.assignedUserId = :userId
-          AND t.status IN :statuses
-    """)
-    List<TaskInstance> findByAssignedUserIdAndStatusIn(
-            @Param("userId") Long userId,
-            @Param("statuses") java.util.Collection<TaskStatus> statuses);
-
+    // Former @Query — the name alone derives "assignedUserId = ? AND status IN ?"
+    List<TaskInstance> findByAssignedUserIdAndStatusIn(Long userId, Collection<TaskStatus> statuses);
 }

@@ -1,26 +1,22 @@
 package com.kashi.grc.evidence.repository;
 
 import com.kashi.grc.evidence.domain.EvidenceRecord;
-import org.springframework.data.jpa.repository.*;
-import org.springframework.data.repository.query.Param;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.JpaSpecificationExecutor;
 import org.springframework.stereotype.Repository;
 
 import java.time.LocalDateTime;
 import java.util.List;
 
+/** countActiveByTenantAndTag lives in the Custom fragment (Criteria API). */
 @Repository
 public interface EvidenceRecordRepository extends JpaRepository<EvidenceRecord, Long>,
-        JpaSpecificationExecutor<EvidenceRecord> {
+        JpaSpecificationExecutor<EvidenceRecord>,
+        EvidenceRecordRepositoryCustom {
 
     List<EvidenceRecord> findByTenantIdAndControlTag(Long tenantId, String controlTag);
 
     List<EvidenceRecord> findByTenantId(Long tenantId);
 
     List<EvidenceRecord> findByExpiredFalseAndValidUntilBefore(LocalDateTime cutoff);
-
-    @Query("""
-        SELECT COUNT(e) FROM EvidenceRecord e
-        WHERE e.tenantId = :tenantId AND e.controlTag = :tag AND e.expired = false
-    """)
-    long countActiveByTenantAndTag(@Param("tenantId") Long tenantId, @Param("tag") String tag);
 }

@@ -1,15 +1,19 @@
 package com.kashi.grc.audit.repository;
 
 import com.kashi.grc.audit.domain.AuditControlInstance;
-import org.springframework.data.jpa.repository.*;
-import org.springframework.data.repository.query.Param;
+import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
 import java.util.List;
-import java.util.Map;
 
+/**
+ * Derived-name queries only. All former @Query methods live in
+ * AuditControlInstanceRepositoryCustom, implemented via the JPA Criteria API
+ * in AuditControlInstanceRepositoryImpl.
+ */
 @Repository
-public interface AuditControlInstanceRepository extends JpaRepository<AuditControlInstance, Long> {
+public interface AuditControlInstanceRepository
+        extends JpaRepository<AuditControlInstance, Long>, AuditControlInstanceRepositoryCustom {
 
     // ── Basic retrieval ───────────────────────────────────────────────────────
 
@@ -19,127 +23,13 @@ public interface AuditControlInstanceRepository extends JpaRepository<AuditContr
 
     long countByEngagementId(Long engagementId);
 
-    // ── Path-based subtree queries ────────────────────────────────────────────
-
-    @Query("""
-        SELECT c FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-          AND c.sectionPath LIKE CONCAT(:pathPrefix, '%')
-        ORDER BY c.sectionPath ASC, c.orderNo ASC
-    """)
-    List<AuditControlInstance> findByEngagementIdAndSectionPathStartingWith(
-            @Param("engagementId") Long engagementId,
-            @Param("pathPrefix") String pathPrefix
-    );
-
-    // ── Library reference ─────────────────────────────────────────────────────
-
-    @Query("""
-        SELECT c FROM AuditControlInstance c
-        WHERE c.sectionInstanceId IN (
-            SELECT s.id FROM AuditSectionInstance s WHERE s.originalSectionId = :originalSectionId
-        )
-    """)
-    List<AuditControlInstance> findBySectionInstanceId_OriginalSectionId(
-            @Param("originalSectionId") Long originalSectionId
-    );
-
     // ── Assignment ────────────────────────────────────────────────────────────
 
     List<AuditControlInstance> findByEngagementIdAndAssignedAuditorId(Long engagementId, Long auditorId);
 
-    /**
-     * Finds all controls under sections that have been assigned to the given auditor.
-     * Used as fallback in AuditControlSectionItemRegistrar when controls have no
-     * direct assignedAuditorId (after cascade-fix where section assignment no longer
-     * cascades to controls).
-     */
-    @Query("""
-        SELECT c FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-          AND c.sectionPath IN (
-              SELECT s.path FROM AuditSectionInstance s
-              WHERE s.engagementId = :engagementId
-                AND s.assignedAuditorId = :auditorId
-          )
-    """)
-    List<AuditControlInstance> findByEngagementIdAndSectionAuditorId(
-            @Param("engagementId") Long engagementId,
-            @Param("auditorId") Long auditorId);
-
     List<AuditControlInstance> findByEngagementIdAndAuditeeAssignedUserId(Long engagementId, Long auditeeUserId);
 
-    /**
-     * Distinct auditee user IDs who have been assigned at least one control in this engagement.
-     * Used by AuditEngagementStepListener to scope AUDITEE-side workflow tasks.
-     */
-    @Query("""
-        SELECT DISTINCT c.auditeeAssignedUserId FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-          AND c.auditeeAssignedUserId IS NOT NULL
-    """)
-    List<Long> findDistinctAssignedAuditeeIdsByEngagementId(@Param("engagementId") Long engagementId);
-
-    /**
-     * Controls approaching or past their evidence due date with unsubmitted evidence.
-     * Used by AuditEvidenceReminderScheduler — runs daily at 08:00.
-     * :deadline = LocalDate.now().plusDays(3)
-     */
-    @Query("""
-        SELECT c FROM AuditControlInstance c
-        WHERE c.auditeeAssignedUserId IS NOT NULL
-          AND c.auditeeEvidenceSubmitted = false
-          AND c.evidenceDueDate IS NOT NULL
-          AND c.evidenceDueDate <= :deadline
-    """)
-    List<AuditControlInstance> findDueForEvidenceReminder(@Param("deadline") java.time.LocalDate deadline);
-
-    // ── Evidence reuse engine — tag snapshot matching ─────────────────────────
-
-    /**
-     * Find all audit control instances across all engagements for a tenant
-     * that carry a specific controlTagSnapshot.
-     *
-     * Called by EvidenceReuseEngine.propagate() to auto-link uploaded evidence
-     * to all controls with the matching tag, regardless of which engagement they belong to.
-     *
-     * Returns id and assignedAuditorId so the engine can notify the responsible actor.
-     */
-    @Query("""
-        SELECT new map(c.id as id, c.assignedAuditorId as assignedAuditorId)
-        FROM AuditControlInstance c
-        WHERE c.engagementId IN (
-            SELECT e.id FROM AuditEngagement e WHERE e.tenantId = :tenantId
-        )
-        AND c.controlTagSnapshot = :tag
-    """)
-    List<Map<String, Object>> findByTenantIdAndControlTagSnapshot(
-            @Param("tenantId") Long tenantId,
-            @Param("tag") String tag
-    );
-
-    // ── Statistics ────────────────────────────────────────────────────────────
-
-    @Query("""
-        SELECT COUNT(c) FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-          AND c.testResult IS NOT NULL
-          AND c.testResult != 'NOT_TESTED'
-    """)
-    long countTestedByEngagement(@Param("engagementId") Long engagementId);
-
-    @Query("""
-        SELECT c.testResult, COUNT(c) FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-        GROUP BY c.testResult
-    """)
-    List<Object[]> countByResultForEngagement(@Param("engagementId") Long engagementId);
-
-    @Query("""
-        SELECT COUNT(c) FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId AND c.findingLinked = true
-    """)
-    long countFindingsLinkedByEngagement(@Param("engagementId") Long engagementId);
+    // ── Workflow / tenant lookups ─────────────────────────────────────────────
 
     boolean existsByEngagementIdAndWorkflowInstanceId(Long engagementId, Long workflowInstanceId);
 
@@ -147,25 +37,9 @@ public interface AuditControlInstanceRepository extends JpaRepository<AuditContr
 
     List<AuditControlInstance> findByTenantIdOrderByControlCodeSnapshotAsc(Long tenantId);
 
-    // ── ADDED: per-result count for syncEngagementScore() ────────────────────
+    // ── Per-result counts for syncEngagementScore() ───────────────────────────
 
-    /**
-     * Count control instances in an engagement with a specific testResult.
-     * Used by AuditTestPolicySnapshotService.syncEngagementScore() to populate
-     * AuditEngagement.passedControls, failedControls, notApplicableControls.
-     */
     long countByEngagementIdAndTestResult(Long engagementId, AuditControlInstance.TestResult testResult);
 
     long countByEngagementIdAndAuditeeEvidenceSubmitted(Long engagementId, boolean submitted);
-
-    /**
-     * Count controls that have been evaluated (any result except NOT_TESTED).
-     * Used by syncEngagementScore() to populate AuditEngagement.testedControls.
-     */
-    @Query("""
-        SELECT COUNT(c) FROM AuditControlInstance c
-        WHERE c.engagementId = :engagementId
-          AND c.testResult != com.kashi.grc.audit.domain.AuditControlInstance$TestResult.NOT_TESTED
-    """)
-    long countTestedByEngagementId(@Param("engagementId") Long engagementId);
 }
