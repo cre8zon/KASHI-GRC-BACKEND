@@ -1,22 +1,18 @@
 package com.kashi.grc.assessment.repository;
-
 import com.kashi.grc.assessment.domain.SectionQuestionMapping;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
-
 import java.util.Collection;
 import java.util.List;
 import java.util.Optional;
 
+/** countQuestionsForTemplate lives in the Custom fragment (Criteria API). */
 @Repository
-public interface SectionQuestionMappingRepository extends JpaRepository<SectionQuestionMapping, Long> {
+public interface SectionQuestionMappingRepository
+        extends JpaRepository<SectionQuestionMapping, Long>, SectionQuestionMappingRepositoryCustom {
 
     List<SectionQuestionMapping> findBySectionIdOrderByOrderNo(Long sectionId);
 
-    // Bulk variant — loads all question mappings for multiple sections in one query.
-    // Used by ExecuteAssessmentAction to replace N individual findBySectionId calls.
     List<SectionQuestionMapping> findBySectionIdInOrderByOrderNo(Collection<Long> sectionIds);
 
     List<SectionQuestionMapping> findByQuestionId(Long questionId);
@@ -27,8 +23,7 @@ public interface SectionQuestionMappingRepository extends JpaRepository<SectionQ
 
     void deleteBySectionId(Long sectionId);
 
-    /** Bulk variant — deletes all question mappings for multiple sections in one DELETE WHERE IN query. */
-    void deleteBySectionIdIn(java.util.Collection<Long> sectionIds);
+    void deleteBySectionIdIn(Collection<Long> sectionIds);
 
     void deleteBySectionIdAndQuestionId(Long sectionId, Long questionId);
 
@@ -36,20 +31,5 @@ public interface SectionQuestionMappingRepository extends JpaRepository<SectionQ
 
     void deleteByQuestionId(Long questionId);
 
-    /** Bulk variant — deletes all section mappings for multiple questions in one DELETE WHERE IN query. */
-    void deleteByQuestionIdIn(java.util.Collection<Long> questionIds);
-
-    /**
-     * Count all questions across every section in a template — single subquery.
-     * Used by publishTemplate() to validate question coverage without firing
-     * N individual countBySectionId calls (one per section).
-     */
-    @Query("""
-            SELECT COUNT(sqm) FROM SectionQuestionMapping sqm
-            WHERE sqm.sectionId IN (
-                SELECT tsm.sectionId FROM TemplateSectionMapping tsm
-                WHERE tsm.templateId = :templateId
-            )
-            """)
-    long countQuestionsForTemplate(@Param("templateId") Long templateId);
+    void deleteByQuestionIdIn(Collection<Long> questionIds);
 }
