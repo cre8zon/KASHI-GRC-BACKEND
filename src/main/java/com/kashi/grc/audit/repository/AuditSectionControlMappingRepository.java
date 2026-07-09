@@ -2,8 +2,6 @@ package com.kashi.grc.audit.repository;
 
 import com.kashi.grc.audit.domain.AuditSectionControlMapping;
 import org.springframework.data.jpa.repository.JpaRepository;
-import org.springframework.data.jpa.repository.Query;
-import org.springframework.data.repository.query.Param;
 import org.springframework.stereotype.Repository;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -30,8 +28,10 @@ public interface AuditSectionControlMappingRepository
     /**
      * Bulk-load all mappings for a set of section IDs in ONE query.
      * Used by getFullTemplate to avoid N+1 (one query per section node).
+     * The method name IS the query — Spring Data derives
+     * "WHERE sectionId IN :ids ORDER BY sectionId, orderNo" from it, making the
+     * former @Query annotation redundant.
      */
-    @Query("SELECT m FROM AuditSectionControlMapping m WHERE m.sectionId IN :sectionIds ORDER BY m.sectionId ASC, m.orderNo ASC")
     List<AuditSectionControlMapping> findBySectionIdInOrderBySectionIdAscOrderNoAsc(
-            @Param("sectionIds") Collection<Long> sectionIds);
+            Collection<Long> sectionIds);
 }
