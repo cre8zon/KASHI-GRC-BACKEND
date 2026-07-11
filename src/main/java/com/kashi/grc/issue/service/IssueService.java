@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ForbiddenException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
-import com.kashi.grc.common.service.EmailSenderService;
+import com.kashi.grc.common.service.MailService;
 import com.kashi.grc.issue.domain.Issue;
 import com.kashi.grc.issue.dto.IssueIngestRequest;
 import com.kashi.grc.issue.dto.IssueRequest;
@@ -61,7 +61,7 @@ public class IssueService {
     private final com.kashi.grc.workflow.repository.StepInstanceRepository  stepInstanceRepository;
     private final com.kashi.grc.workflow.repository.TaskInstanceRepository  taskInstanceRepository;
     private final NotificationService                                notificationService;
-    private final EmailSenderService                                 emailSenderService;
+    private final MailService                                        mailService;
     private final UserRepository                                     userRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
     private final ObjectMapper             objectMapper;
@@ -518,10 +518,11 @@ public class IssueService {
                 notificationService.send(issue.getOwnerId(), "ISSUE_SLA_BREACH", message,
                         "ISSUE", issue.getId());
                 userRepository.findById(issue.getOwnerId()).ifPresent(u ->
-                        emailSenderService.sendMail(
+                        mailService.sendRaw(
                                 "⚠ SLA Breach — Issue " + issue.getIssueRef(),
                                 buildEscalationEmailBody(issue, "owner"),
-                                "text/html", u.getEmail()
+                                "text/html", u.getEmail(),
+                                issue.getTenantId()
                         )
                 );
             }
