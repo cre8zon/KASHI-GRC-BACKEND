@@ -63,13 +63,34 @@ public class MailService {
      * when Kafka is enabled — this method just publishes and returns.
      */
     public void send(String templateName, String to, Map<String, String> variables) {
+        send(templateName, to, variables, TenantContext.getCurrentTenant());
+    }
+
+    /**
+     * Template send with EXPLICIT tenant — REQUIRED from Kafka consumers and
+     * schedulers (no request thread → no TenantContext), e.g.
+     * NotificationEmailConsumer passing the envelope's tenantId through.
+     */
+    public void send(String templateName, String to, Map<String, String> variables, Long tenantId) {
+        send(templateName, to, variables, tenantId, null);
+    }
+
+    /**
+     * Full variant with LINEAGE: sourceEventId = eventId of the event that
+     * caused this email (e.g. the notification fanout event). Travels in the
+     * payload and lands in email_log.source_event_id, enabling the
+     * delivery-audit join. Null = direct send, no lineage.
+     */
+    public void send(String templateName, String to, Map<String, String> variables,
+                     Long tenantId, String sourceEventId) {
         if (kafkaPublisher != null) {
             Map<String, Object> payload = new HashMap<>();
             payload.put("templateName", templateName);
             payload.put("to", to);
             payload.put("variables", variables);
+            if (sourceEventId != null) payload.put("sourceEventId", sourceEventId);
             kafkaPublisher.publish(KafkaTopics.EMAIL_REQUESTED,
-                    "EMAIL_TEMPLATE_REQUESTED", to, payload);
+                    "EMAIL_TEMPLATE_REQUESTED", to, payload, tenantId, null);
             return;
         }
         sendDirect(templateName, to, variables);
@@ -93,12 +114,19 @@ public class MailService {
      * (e.g. IssueService SLA escalation: pass issue.getTenantId()).
      */
     public void sendRaw(String subject, String body, String mimeType, String to, Long tenantId) {
+        sendRaw(subject, body, mimeType, to, tenantId, null);
+    }
+
+    /** Raw variant with lineage — see send(...) javadoc. */
+    public void sendRaw(String subject, String body, String mimeType, String to,
+                        Long tenantId, String sourceEventId) {
         if (kafkaPublisher != null) {
             Map<String, Object> payload = new HashMap<>();
             payload.put("subject", subject);
             payload.put("body", body);
             payload.put("mimeType", mimeType);
             payload.put("to", to);
+            if (sourceEventId != null) payload.put("sourceEventId", sourceEventId);
             kafkaPublisher.publish(KafkaTopics.EMAIL_REQUESTED,
                     "EMAIL_RAW_REQUESTED", to, payload, tenantId, null);
             return;

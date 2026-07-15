@@ -63,17 +63,29 @@ public class KafkaEventPublisher {
                 .payload(payload)
                 .build();
 
-        kafkaTemplate.send(topic, key, envelope).whenComplete((result, ex) -> {
-            if (ex != null) {
-                log.error("Kafka publish FAILED topic={} eventType={} eventId={} tenant={}: {}",
-                        topic, eventType, envelope.getEventId(), tenantId, ex.getMessage());
-            } else if (log.isDebugEnabled()) {
-                log.debug("Kafka published topic={} partition={} offset={} eventType={} eventId={}",
-                        topic,
-                        result.getRecordMetadata().partition(),
-                        result.getRecordMetadata().offset(),
-                        eventType, envelope.getEventId());
-            }
-        });
+        // CONTRACT: publish() NEVER throws. send() is async for delivery but
+        // can throw SYNCHRONOUSLY (metadata timeout when broker is down —
+        // capped at max.block.ms — serialization failure, lazy producer
+        // construction with bad config). Callers are business flows (comment
+        // save, task assignment, afterCommit hooks): a broken broker must
+        // degrade to "event lost + ERROR log", never to a failed user request.
+        // Loss-unacceptable events get the outbox pattern later, not throws.
+        try {
+            kafkaTemplate.send(topic, key, envelope).whenComplete((result, ex) -> {
+                if (ex != null) {
+                    log.error("Kafka publish FAILED topic={} eventType={} eventId={} tenant={}: {}",
+                            topic, eventType, envelope.getEventId(), tenantId, ex.getMessage());
+                } else if (log.isDebugEnabled()) {
+                    log.debug("Kafka published topic={} partition={} offset={} eventType={} eventId={}",
+                            topic,
+                            result.getRecordMetadata().partition(),
+                            result.getRecordMetadata().offset(),
+                            eventType, envelope.getEventId());
+                }
+            });
+        } catch (Exception e) {
+            log.error("Kafka publish FAILED (synchronous) topic={} eventType={} eventId={} tenant={}: {}",
+                    topic, eventType, envelope.getEventId(), tenantId, e.getMessage());
+        }
     }
 }

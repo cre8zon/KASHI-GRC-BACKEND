@@ -23,7 +23,8 @@ import java.time.LocalDateTime;
         uniqueConstraints = @UniqueConstraint(name = "uk_email_log_event_id", columnNames = "event_id"),
         indexes = {
                 @Index(name = "idx_email_log_tenant",    columnList = "tenant_id"),
-                @Index(name = "idx_email_log_recipient", columnList = "recipient")
+                @Index(name = "idx_email_log_recipient", columnList = "recipient"),
+                @Index(name = "idx_email_log_source",    columnList = "source_event_id")
         })
 @Getter
 @Setter
@@ -41,6 +42,16 @@ public class EmailLog {
     /** Envelope eventId — idempotency key. */
     @Column(name = "event_id", nullable = false, length = 36)
     private String eventId;
+
+    /**
+     * Lineage: eventId of the ORIGINATING event when this email was born
+     * from another Kafka event (e.g. the NOTIFICATION_EMAIL_REQUESTED
+     * fanout). NULL for direct sends. Join notification_dispatch_log
+     * .event_id = email_log.source_event_id for "every email this
+     * notification produced" — the delivery-audit query.
+     */
+    @Column(name = "source_event_id", length = 36)
+    private String sourceEventId;
 
     @Column(name = "tenant_id")
     private Long tenantId;

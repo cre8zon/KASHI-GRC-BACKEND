@@ -75,9 +75,14 @@ public class CommentService {
             } catch (Exception ignored) {}
             for (Long mentionedId : req.getMentionedUserIds()) {
                 if (!mentionedId.equals(userId)) {
+                    // Rich overload: actor enables ACTOR-audience email rules;
+                    // context becomes {{placeholder}} variables in templates.
                     notificationService.send(mentionedId, "MENTIONED_IN_COMMENT",
                             createdByName + " mentioned you: \"" + truncate(req.getCommentText(), 80) + "\"",
-                            req.getEntityType().name(), req.getEntityId());
+                            req.getEntityType().name(), req.getEntityId(),
+                            userId, Map.of(
+                                    "commenterName",  createdByName,
+                                    "commentPreview", truncate(req.getCommentText(), 80)));
                 }
             }
         }
@@ -92,7 +97,10 @@ public class CommentService {
                     String preview = createdByName + " commented: \"" + truncate(req.getCommentText(), 80) + "\"";
                     if (qi.getAssignedUserId() != null && !qi.getAssignedUserId().equals(userId)) {
                         notificationService.send(qi.getAssignedUserId(), "NEW_COMMENT",
-                                preview, "QUESTION_RESPONSE", qi.getId());
+                                preview, "QUESTION_RESPONSE", qi.getId(),
+                                userId, Map.of(
+                                        "commenterName",  createdByName,
+                                        "commentPreview", truncate(req.getCommentText(), 80)));
                     }
                 });
             } catch (Exception e) {

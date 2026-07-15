@@ -76,6 +76,12 @@ public class KafkaConfig {
         props.put(ProducerConfig.LINGER_MS_CONFIG, 5);          // tiny batching win
         props.put(ProducerConfig.REQUEST_TIMEOUT_MS_CONFIG, 15_000);
         props.put(ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 30_000);
+        // How long send() may BLOCK the calling thread on metadata fetch /
+        // full buffer. Default is 60s — a dead broker would hang request
+        // threads for a minute each and exhaust the Tomcat pool. 3s = fail
+        // fast; the failure is then swallowed+logged by KafkaEventPublisher.
+        // (Separate knob from the delivery >= linger + request constraint.)
+        props.put(ProducerConfig.MAX_BLOCK_MS_CONFIG, 3_000);
 
         DefaultKafkaProducerFactory<String, KafkaEventEnvelope> factory =
                 new DefaultKafkaProducerFactory<>(props);
@@ -164,6 +170,22 @@ public class KafkaConfig {
     @Bean
     public NewTopic emailTopicDlt() {
         return TopicBuilder.name(KafkaTopics.EMAIL_REQUESTED + ".DLT")
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic notificationEmailTopic() {
+        return TopicBuilder.name(KafkaTopics.NOTIFICATION_EMAIL)
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic notificationEmailTopicDlt() {
+        return TopicBuilder.name(KafkaTopics.NOTIFICATION_EMAIL + ".DLT")
                 .partitions(3)
                 .replicas(1)
                 .build();

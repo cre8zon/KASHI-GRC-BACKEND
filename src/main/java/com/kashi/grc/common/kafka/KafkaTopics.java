@@ -25,8 +25,18 @@ public final class KafkaTopics {
      */
     public static final String EMAIL_REQUESTED = "kashigrc.email.requested";
 
+    /**
+     * Notification email fanout — produced by NotificationService (single
+     * choke point for all 36 in-app notification call sites), consumed by
+     * NotificationEmailConsumer which resolves recipients + templates and
+     * chains per-recipient emails onto EMAIL_REQUESTED.
+     * Event types: NOTIFICATION_EMAIL_REQUESTED.
+     * Key: entityType:entityId (per-entity ordering), eventKey when absent.
+     * Consumer group: kashigrc-notification.
+     */
+    public static final String NOTIFICATION_EMAIL = "kashigrc.notification.email";
+
     // ── Future topics (declared when implemented) ─────────────────────
-    // public static final String NOTIFICATION_FANOUT = "kashigrc.notification.fanout";
     // public static final String WORKFLOW_EVENTS    = "kashigrc.workflow.events";
     // public static final String AUDIT_TRAIL        = "kashigrc.audit.trail";
 }

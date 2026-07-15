@@ -139,12 +139,16 @@ public class EmailEventConsumer {
     private void recordOutcome(KafkaEventEnvelope envelope, String to, String templateName,
                                String subject, EmailLog.Status status, String error) {
         try {
+            // Lineage: originating event (e.g. notification fanout) if present
+            String sourceEventId = envelope.getPayload() != null
+                    ? str(envelope.getPayload().get("sourceEventId")) : null;
             EmailLog logRow = emailLogRepository.findByEventId(envelope.getEventId())
                     .orElseGet(() -> EmailLog.builder()
                             .eventId(envelope.getEventId())
                             .tenantId(envelope.getTenantId())
                             .recipient(to != null ? to : "unknown")
                             .templateName(templateName)
+                            .sourceEventId(sourceEventId)
                             .attempts(0)
                             .build());
             logRow.setStatus(status);

@@ -513,18 +513,17 @@ public class IssueService {
             log.warn("[SLA-ESCALATION] BREACH | ref={} | severity={} | tenantId={}",
                     issue.getIssueRef(), issue.getSeverity(), issue.getTenantId());
 
-            // Notify issue owner
+            // Notify issue owner. Email now flows through the notification
+            // pipeline (sla-alert template rule) instead of a direct sendRaw —
+            // the old dual path double-emailed the owner once notifications
+            // gained email fanout. Pipeline adds preferences, dispatch log,
+            // and email_log lineage; context feeds template placeholders.
             if (issue.getOwnerId() != null) {
                 notificationService.send(issue.getOwnerId(), "ISSUE_SLA_BREACH", message,
-                        "ISSUE", issue.getId());
-                userRepository.findById(issue.getOwnerId()).ifPresent(u ->
-                        mailService.sendRaw(
-                                "⚠ SLA Breach — Issue " + issue.getIssueRef(),
-                                buildEscalationEmailBody(issue, "owner"),
-                                "text/html", u.getEmail(),
-                                issue.getTenantId()
-                        )
-                );
+                        "ISSUE", issue.getId(),
+                        null, java.util.Map.of(
+                                "issueRef", issue.getIssueRef() != null ? issue.getIssueRef() : "",
+                                "severity", String.valueOf(issue.getSeverity())));
             }
         }
 
