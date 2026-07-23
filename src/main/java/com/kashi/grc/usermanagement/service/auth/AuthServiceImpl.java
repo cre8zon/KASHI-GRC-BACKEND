@@ -23,9 +23,12 @@ import com.kashi.grc.usermanagement.exception.PasswordExpiredException;
 import com.kashi.grc.usermanagement.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.LocalDateTime;
 import java.util.List;
@@ -44,6 +47,9 @@ public class AuthServiceImpl implements AuthService {
     private final PasswordEncoder     passwordEncoder;
     private final JwtTokenProvider    tokenProvider;
     private final MailService         mailService;
+
+    @Value("${kashi.app.base-url:https://app.kashigrc.com}")
+    private String appBaseUrl;
 
     // ─────────────────────────────────────────────────────────────
     // LOGIN
@@ -171,7 +177,20 @@ public class AuthServiceImpl implements AuthService {
             user.setPasswordResetExpiry(DateTimeUtils.plusMinutes(Constants.RESET_TOKEN_TTL_MINS));
             userRepository.save(user);
             log.info("Password reset token issued for: {}", request.getEmail());
-            // TODO: Send email via MailService (spring-boot-starter-mail)
+
+            // Lane 1 (transactional/security) — direct MailService, deliberately
+            // bypasses notification rules/preferences. afterCommit so the email
+            // (or its kashigrc.email.requested event) never fires for a token
+            // that was rolled back.
+            final String toEmail   = user.getEmail();
+            final String firstName = user.getFirstName() != null ? user.getFirstName() : "there";
+            final String resetUrl  = appBaseUrl + "/auth/reset-password?token=" + token;
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    mailService.sendPasswordReset(toEmail, firstName, resetUrl);
+                }
+            });
         });
     }
 
