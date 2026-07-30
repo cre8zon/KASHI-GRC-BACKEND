@@ -134,7 +134,7 @@ public class UserServiceImpl implements UserService {
                 TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
                     @Override
                     public void afterCommit() {
-                        emailSenderService.sendMail(subject, content, mimeType, toEmail);
+                        mailService.sendRaw(subject, content, mimeType, toEmail);
                     }
                 });
             }

@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ForbiddenException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
-import com.kashi.grc.common.service.EmailSenderService;
+import com.kashi.grc.common.service.MailService;
 import com.kashi.grc.issue.domain.Issue;
 import com.kashi.grc.issue.dto.IssueIngestRequest;
 import com.kashi.grc.issue.dto.IssueRequest;
@@ -61,7 +61,7 @@ public class IssueService {
     private final com.kashi.grc.workflow.repository.StepInstanceRepository  stepInstanceRepository;
     private final com.kashi.grc.workflow.repository.TaskInstanceRepository  taskInstanceRepository;
     private final NotificationService                                notificationService;
-    private final EmailSenderService                                 emailSenderService;
+    private final MailService                                        mailService;
     private final UserRepository                                     userRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
     private final ObjectMapper             objectMapper;
@@ -513,17 +513,17 @@ public class IssueService {
             log.warn("[SLA-ESCALATION] BREACH | ref={} | severity={} | tenantId={}",
                     issue.getIssueRef(), issue.getSeverity(), issue.getTenantId());
 
-            // Notify issue owner
+            // Notify issue owner. Email now flows through the notification
+            // pipeline (sla-alert template rule) instead of a direct sendRaw —
+            // the old dual path double-emailed the owner once notifications
+            // gained email fanout. Pipeline adds preferences, dispatch log,
+            // and email_log lineage; context feeds template placeholders.
             if (issue.getOwnerId() != null) {
                 notificationService.send(issue.getOwnerId(), "ISSUE_SLA_BREACH", message,
-                        "ISSUE", issue.getId());
-                userRepository.findById(issue.getOwnerId()).ifPresent(u ->
-                        emailSenderService.sendMail(
-                                "⚠ SLA Breach — Issue " + issue.getIssueRef(),
-                                buildEscalationEmailBody(issue, "owner"),
-                                "text/html", u.getEmail()
-                        )
-                );
+                        "ISSUE", issue.getId(),
+                        null, java.util.Map.of(
+                                "issueRef", issue.getIssueRef() != null ? issue.getIssueRef() : "",
+                                "severity", String.valueOf(issue.getSeverity())));
             }
         }
 

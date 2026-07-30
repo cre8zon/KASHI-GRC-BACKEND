@@ -430,6 +430,15 @@ public class WorkflowEngineService {
                 instance.getId(), workflow.getName(), instance.getEntityId(),
                 instance.getEntityType(), initiatedBy));
 
+        // Notify the initiator that the workflow is running. Step-1 assignees
+        // are already notified per-task by createTask (TASK_ASSIGNMENT).
+        // Email fanout for both happens inside NotificationService (Kafka).
+        if (initiatedBy != null) {
+            notificationService.send(initiatedBy, "WORKFLOW_STARTED",
+                    "Workflow started: " + workflow.getName(),
+                    instance.getEntityType(), instance.getEntityId());
+        }
+
         log.info("[WORKFLOW-INSTANCE] Started successfully | instanceId={} | workflowName='{}' | firstStepStatus='{}'",
                 instance.getId(), workflow.getName(), stepInstance.getStatus());
         return buildInstanceResponse(instance);
@@ -2657,6 +2666,63 @@ public class WorkflowEngineService {
         // Step is IN_PROGRESS — both task sets are live
         si.setStatus(StepStatus.IN_PROGRESS);
         stepInstanceRepository.save(si);
+
+        // FYI notifications to configured step observers (dormant
+        // workflow_step_observer_roles table now live) — after tasks exist
+        // so actor/assigner users can be excluded from the FYI list.
+        notifyStepObservers(si, instance, tenantId);
+    }
+
+    /**
+     * Notifies users holding this step's OBSERVER roles that the step went
+     * active. Deliberately a separate eventKey (STEP_ACTIVATED_OBSERVER)
+     * rather than a new email audience: observers are true recipients of
+     * their own event type, which means (a) the email rule table can give
+     * them FYI-toned templates per eventKey with zero pipeline changes and
+     * (b) users can mute exactly this key in their notification preferences.
+     *
+     * Role→user resolution is tenant-wide (not side-filtered): observer
+     * roles are often deliberately cross-side — e.g. an ORGANIZATION
+     * compliance manager observing VENDOR assessment steps. The role's own
+     * membership already scopes who holds it.
+     *
+     * Best-effort: observer notification failure must never fail step
+     * activation.
+     */
+    private void notifyStepObservers(StepInstance si, WorkflowInstance instance, Long tenantId) {
+        try {
+            List<WorkflowStepObserverRole> observerRoles =
+                    stepObserverRoleRepository.findByStepId(si.getStepId());
+            if (observerRoles.isEmpty()) return;
+
+            // Users already working this step (ACTOR/ASSIGNER tasks) don't
+            // need an FYI about it.
+            java.util.Set<Long> taskedUserIds = taskInstanceRepository
+                    .findByStepInstanceId(si.getId()).stream()
+                    .map(TaskInstance::getAssignedUserId)
+                    .filter(java.util.Objects::nonNull)
+                    .collect(java.util.stream.Collectors.toSet());
+
+            List<Long> observerIds = observerRoles.stream()
+                    .flatMap(o -> dbRepository.findUserIdsByRoleAndTenant(o.getRoleId(), tenantId).stream())
+                    .distinct()
+                    .filter(uid -> !taskedUserIds.contains(uid))
+                    .toList();
+            if (observerIds.isEmpty()) return;
+
+            notificationService.sendToUsers(observerIds, "STEP_ACTIVATED_OBSERVER",
+                    "FYI: Step '" + si.getSnapName() + "' is now active on "
+                            + instance.getEntityType() + " #" + instance.getEntityId(),
+                    instance.getEntityType(), instance.getEntityId(),
+                    null, Map.of(
+                            "stepName", si.getSnapName() != null ? si.getSnapName() : "",
+                            "entityType", instance.getEntityType() != null ? instance.getEntityType() : ""));
+            log.info("[WORKFLOW] Step '{}' — {} observer(s) notified (STEP_ACTIVATED_OBSERVER)",
+                    si.getSnapName(), observerIds.size());
+        } catch (Exception e) {
+            log.warn("[WORKFLOW] Observer notification failed for step '{}': {}",
+                    si.getSnapName(), e.getMessage());
+        }
     }
 
     /**
