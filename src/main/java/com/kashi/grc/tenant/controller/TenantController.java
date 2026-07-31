@@ -39,6 +39,8 @@ public class TenantController {
     private final DbRepository     dbRepository;
     private final UtilityService   utilityService;
     private final MailService      mailService;
+    private final com.kashi.grc.uiconfig.repository.FeatureFlagRepository featureFlagRepository;
+    private final com.kashi.grc.uiconfig.service.FeatureEntitlementService featureEntitlementService;
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -53,6 +55,60 @@ public class TenantController {
                 .build();
         tenantRepository.save(t);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(toResponse(t)));
+    }
+
+    // ── FEATURE ENTITLEMENTS ──────────────────────────────────────
+    // The feature CATALOGUE = global rows (tenant_id IS NULL). A tenant is
+    // ENTITLED to a feature iff an explicit enabled row exists for it
+    // (tenant_id = X). This is Model B: absence = not licensed, one clean query
+    // answers "what does this tenant have". Global catalogue rows define what's
+    // licensable; they never themselves grant (they are seeded disabled).
+
+    @GetMapping("/{tenantId}/features")
+    @Operation(summary = "List the feature catalogue with this tenant's entitlement state")
+    public ResponseEntity<ApiResponse<java.util.List<Map<String, Object>>>> getTenantFeatures(
+            @PathVariable Long tenantId) {
+        // catalogue: global definitions
+        var catalogue = featureFlagRepository.findByTenantIdIsNull();
+        // this tenant's ACTIVE (non-soft-deleted) rows, keyed for quick lookup
+        var tenantRows = featureFlagRepository.findByTenantId(tenantId).stream()
+                .filter(f -> f.getDeletedAt() == null)
+                .collect(java.util.stream.Collectors.toMap(
+                        f -> f.getFlagKey(), f -> f, (a, b) -> a));
+
+        var out = new java.util.ArrayList<Map<String, Object>>();
+        for (var def : catalogue) {
+            if (def.getDeletedAt() != null) continue;   // skip retired catalogue rows
+            var row = tenantRows.get(def.getFlagKey());
+            String mode = def.getMode() != null ? def.getMode() : "GLOBAL";
+            boolean enabled = "LICENSED".equals(mode)
+                    ? (row != null && row.isEnabled())   // licensed: tenant row decides
+                    : def.isEnabled();                    // global: same for all tenants
+            var m = new java.util.LinkedHashMap<String, Object>();
+            m.put("flagKey",     def.getFlagKey());
+            m.put("description", def.getDescription());
+            m.put("mode",        mode);                   // GLOBAL or LICENSED
+            m.put("enabled",     enabled);
+            m.put("togglable",   "LICENSED".equals(mode)); // per-tenant toggle only in LICENSED
+            out.add(m);
+        }
+        return ResponseEntity.ok(ApiResponse.success(out));
+    }
+
+    @PutMapping("/{tenantId}/features/{flagKey}")
+    @Operation(summary = "Enable or disable a feature for a specific tenant")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setTenantFeature(
+            @PathVariable Long tenantId, @PathVariable String flagKey,
+            @RequestBody Map<String, Object> body) {
+        boolean enabled = Boolean.TRUE.equals(body.get("enabled"));
+        Long actor = utilityService.getLoggedInDataContext().getId();
+
+        // Routed through the service: valid only when the feature is LICENSED,
+        // and it maintains the soft-delete / single-active-row-set invariant.
+        featureEntitlementService.setTenant(flagKey, tenantId, enabled, actor);
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "flagKey", flagKey, "tenantId", tenantId, "enabled", enabled)));
     }
 
     // ── GET BY ID ─────────────────────────────────────────────────
@@ -104,6 +160,7 @@ public class TenantController {
 
     // ── GET OWNER ─────────────────────────────────────────────────
     @GetMapping("/{tenantId}/owner")
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @Operation(summary = "Get the primary owner (first ORGANIZATION user) for a tenant")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getTenantOwner(
             @PathVariable Long tenantId) {

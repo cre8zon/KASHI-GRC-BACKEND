@@ -37,11 +37,11 @@ import lombok.*;
  */
 @Entity
 @Table(name = "audit_controls",
-    indexes = {
-        @Index(name = "idx_audit_ctrl_tenant", columnList = "tenant_id"),
-        @Index(name = "idx_audit_ctrl_tag",    columnList = "control_tag"),
-        @Index(name = "idx_audit_ctrl_code",   columnList = "control_code")
-    }
+        indexes = {
+                @Index(name = "idx_audit_ctrl_tenant", columnList = "tenant_id"),
+                @Index(name = "idx_audit_ctrl_tag",    columnList = "control_tag"),
+                @Index(name = "idx_audit_ctrl_code",   columnList = "control_code")
+        }
 )
 @Getter @Setter
 @lombok.experimental.SuperBuilder
@@ -74,6 +74,18 @@ public class AuditControl extends GlobalOrTenantEntity {
      */
     @Column(name = "control_tag", length = 80)
     private String controlTag;
+
+    /**
+     * KashiLink / UCF: the common control this framework requirement implements.
+     * References common_controls.code — no FK, because the catalogue is global
+     * (tenant_id NULL) while this table can be tenant-scoped.
+     *
+     * This is what makes one artefact satisfy SOC 2, ISO 27001 and RBI ITGRC at
+     * once. control_tag remains for backward compatibility; once every row is
+     * mapped, the tag becomes derived from this rather than authored.
+     */
+    @Column(name = "common_control_code", length = 40)
+    private String commonControlCode;
 
     @Column(name = "created_by")
     private Long createdBy;

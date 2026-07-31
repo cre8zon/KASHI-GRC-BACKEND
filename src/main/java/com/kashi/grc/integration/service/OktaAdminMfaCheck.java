@@ -16,7 +16,10 @@ import java.util.stream.Collectors;
  * OktaAdminMfaCheck — verifies all Okta admin users have MFA enrolled.
  *
  * check_key: OKTA_ADMIN_MFA
- * control_tag: MFA_ADMIN
+ * control_tag: IAM-02.3   (catalogue leaf: MFA — privileged/admin accounts)
+ *              Legacy tag was MFA_ADMIN; realigned so automated evidence flows
+ *              through the Phase 3 expanded-set matcher to ISO A.8.5, SOC 2
+ *              CC6.1 and every other framework control mapped to IAM-02.3.
  * run_frequency: HOURLY
  *
  * Algorithm:
@@ -123,20 +126,20 @@ public class OktaAdminMfaCheck implements IntegrationCheck {
                         "All " + uniqueAdmins.size() + " admin users have MFA enrolled",
                         rawPayload,
                         "Okta Admin MFA Status",
-                        "MFA_ADMIN"
+                        "IAM-02.3"
                 );
             } else {
                 return CheckResult.fail(
                         noMfa.size() + " admin users missing MFA: " + String.join(", ", noMfa),
                         rawPayload,
                         "Okta Admin MFA Status",
-                        "MFA_ADMIN"
+                        "IAM-02.3"
                 );
             }
 
         } catch (Exception e) {
             log.error("[OKTA-MFA-CHECK] Failed: {}", e.getMessage());
-            return CheckResult.error("Okta API error: " + e.getMessage(), "MFA_ADMIN");
+            return CheckResult.error("Okta API error: " + e.getMessage(), "IAM-02.3");
         }
     }
 }

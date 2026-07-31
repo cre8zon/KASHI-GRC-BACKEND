@@ -144,6 +144,12 @@ public class AuditFindingController {
                                 AuditFinding.Severity.valueOf(allParams.get("severity").toUpperCase())));
                     if (allParams.containsKey("controlInstanceId"))
                         preds.add(cb.equal(root.get("controlInstanceId"), Long.parseLong(allParams.get("controlInstanceId"))));
+                    // frameworkRef scopes the SHARED findings list to one framework
+                    // (e.g. ISO27001) so a tenant reaching it via a framework-specific
+                    // nav row sees only that framework's findings.
+                    if (allParams.containsKey("frameworkRef")
+                            && !allParams.get("frameworkRef").isBlank())
+                        preds.add(cb.equal(root.get("frameworkRef"), allParams.get("frameworkRef")));
                     return preds;
                 },
                 (cb, root) -> Map.of(

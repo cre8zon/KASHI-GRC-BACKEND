@@ -62,6 +62,15 @@ public class UiNavigation extends GlobalOrTenantEntity {
     @Column(name = "required_permission", length = 255)
     private String requiredPermission;
 
+    /**
+     * Feature entitlement key. When set, this nav row (and the route it
+     * registers) is gated on the tenant having the feature enabled in
+     * feature_flags. NULL = no feature requirement (visible/accessible to all
+     * tenants, subject to permission and side). Managed from the Navigation page.
+     */
+    @Column(name = "required_feature", length = 100)
+    private String requiredFeature;
+
     @Column(name = "is_active")
     @Builder.Default
     private boolean isActive = true;

@@ -47,13 +47,13 @@ import java.time.LocalDateTime;
  */
 @Entity
 @Table(name = "audit_test_instances",
-    indexes = {
-        @Index(name = "idx_ati_engagement",  columnList = "engagement_id"),
-        @Index(name = "idx_ati_tenant",      columnList = "tenant_id"),
-        @Index(name = "idx_ati_original",    columnList = "original_test_id"),
-        @Index(name = "idx_ati_result",      columnList = "test_result"),
-        @Index(name = "idx_ati_tag",         columnList = "control_tag_snapshot")
-    }
+        indexes = {
+                @Index(name = "idx_ati_engagement",  columnList = "engagement_id"),
+                @Index(name = "idx_ati_tenant",      columnList = "tenant_id"),
+                @Index(name = "idx_ati_original",    columnList = "original_test_id"),
+                @Index(name = "idx_ati_result",      columnList = "test_result"),
+                @Index(name = "idx_ati_tag",         columnList = "control_tag_snapshot")
+        }
 )
 @Getter @Setter
 @lombok.experimental.SuperBuilder
@@ -95,6 +95,17 @@ public class AuditTestInstance extends TenantAwareEntity {
      */
     @Column(name = "control_tag_snapshot", length = 80)
     private String controlTagSnapshot;
+
+    /**
+     * Phase 3 (UCF): the frozen ancestry chain — 'IAM-02.3,IAM-02,IAM'.
+     * Written once at instantiation by TagExpansionService and never edited.
+     * The evidence matcher tests the uploaded tag for MEMBERSHIP in this set, so
+     * coarse evidence (tagged IAM-02) reaches a leaf-level control (IAM-02.3),
+     * while the reverse cannot happen. control_tag_snapshot is retained for the
+     * legacy exact-match path on instances created before Phase 3.
+     */
+    @Column(name = "matched_tags_snapshot", length = 500)
+    private String matchedTagsSnapshot;
 
     @Column(name = "automation_type_snapshot", length = 20)
     private String automationTypeSnapshot;   // "AUTOMATED" | "MANUAL" | "HYBRID"

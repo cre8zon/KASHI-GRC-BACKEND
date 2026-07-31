@@ -130,9 +130,8 @@ public class UiConfigServiceImpl implements UiConfigService {
         // Feature flags — cache per request (identical for all screen keys in same request)
         Map<String, Boolean> flags = FEATURE_FLAG_CACHE.get();
         if (flags == null) {
-            flags = featureFlagRepository.findEnabledForTenant(tenantId).stream()
-                    .collect(Collectors.toMap(FeatureFlag::getFlagKey, FeatureFlag::isEnabled,
-                            (global, tenant) -> tenant));
+            Set<String> enabledKeys = featureFlagRepository.resolveEnabledFeaturesForTenant(tenantId);
+            flags = enabledKeys.stream().collect(Collectors.toMap(k -> k, k -> Boolean.TRUE));
             FEATURE_FLAG_CACHE.set(flags);
         }
 
@@ -162,6 +161,10 @@ public class UiConfigServiceImpl implements UiConfigService {
         List<UiNavigation> all = navigationRepository.findAllForTenant(tenantId);
         log.info("[NAV] userId={} tenantId={} total={}", user.getId(), tenantId, all.size());
 
+        // Enabled feature keys for this tenant. A nav row whose required_feature
+        // is not enabled for the tenant is hidden (and not route-resolved).
+        Set<String> tenantFeatures = featureFlagRepository.resolveEnabledFeaturesForTenant(tenantId);
+
         // Filter by side/permission only — NOT by isActive.
         // isActive is returned in the response so the frontend can decide
         // what to show in the sidebar vs what to use only for route resolution.
@@ -169,7 +172,7 @@ public class UiConfigServiceImpl implements UiConfigService {
         // that the TaskInbox needs to resolve routes for "Open Task" buttons.
         List<UiNavigation> visible = all.stream()
                 .filter(item -> {
-                    boolean v = isNavVisible(item, userSides, userPermissions);
+                    boolean v = isNavVisible(item, userSides, userPermissions, tenantFeatures);
                     if ("module_issue".equals(item.getNavKey())) {
                         log.info("[NAV-DEBUG] module_issue: active={} sides='{}' requiredPerm='{}' userSides={} userPerms={} → visible={}",
                                 item.isActive(), item.getAllowedSides(), item.getRequiredPermission(),
@@ -314,17 +317,24 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     private Map<String, Boolean> getEnabledFeatureFlags() {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        return featureFlagRepository.findEnabledForTenant(tenantId).stream()
+        return featureFlagRepository.resolveEnabledFeaturesForTenant(tenantId).stream()
                 .collect(Collectors.toMap(
-                        FeatureFlag::getFlagKey,
-                        FeatureFlag::isEnabled,
+                        k -> k,
+                        k -> Boolean.TRUE,
                         (global, tenant) -> tenant)); // tenant row wins
     }
 
     // ── Visibility checks ─────────────────────────────────────────
 
     private boolean isNavVisible(UiNavigation item,
-                                 Set<String> sides, Set<String> perms) {
+                                 Set<String> sides, Set<String> perms, Set<String> features) {
+        // Feature entitlement first — cheapest, tenant-wide exclusion. A row with
+        // a required_feature the tenant lacks is neither shown nor route-resolved.
+        if (item.getRequiredFeature() != null && !item.getRequiredFeature().isBlank()
+                && !features.contains(item.getRequiredFeature())) {
+            return false;
+        }
+
         // required_permission supports comma-separated OR logic (same pattern as allowed_sides).
         // e.g. "audit:engagement:read,audit:engagement:read-limited" → visible if user has either.
         if (item.getRequiredPermission() != null && !item.getRequiredPermission().isBlank()) {
@@ -387,6 +397,7 @@ public class UiConfigServiceImpl implements UiConfigService {
                         .icon(i.getIcon()).route(i.getRoute()).parentKey(i.getParentKey())
                         .sortOrder(i.getSortOrder()).module(i.getModule())
                         .badgeCountEndpoint(i.getBadgeCountEndpoint())
+                        .requiredFeature(i.getRequiredFeature())
                         .isActive(i.isActive())
                         .children(buildNavTree(items, i.getNavKey()))
                         .build())

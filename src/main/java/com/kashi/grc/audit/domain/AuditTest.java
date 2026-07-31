@@ -92,6 +92,18 @@ public class AuditTest extends GlobalOrTenantEntity {
     @Column(name = "control_tag", length = 80)
     private String controlTag;
 
+    /**
+     * KashiLink / UCF: the common control this test verifies.
+     * References common_controls.code — no FK, because the catalogue is global
+     * (tenant_id NULL) while this table can be tenant-scoped.
+     *
+     * Note that AUTOMATED tests are still routed by automationKey rather than by
+     * tag: the catalogue distinguishes controls, not systems, so Okta MFA and
+     * AWS MFA both resolve to IAM-02.3 and cannot be told apart here.
+     */
+    @Column(name = "common_control_code", length = 40)
+    private String commonControlCode;
+
     // ── Automation ────────────────────────────────────────────────────────────
 
     @Enumerated(EnumType.STRING)

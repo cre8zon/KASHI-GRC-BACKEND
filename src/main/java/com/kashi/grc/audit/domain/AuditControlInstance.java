@@ -99,6 +99,17 @@ public class AuditControlInstance extends BaseEntity {
     @Column(name = "control_tag_snapshot", length = 80)
     private String controlTagSnapshot;
 
+    /**
+     * Phase 3 (UCF): the frozen ancestry chain — 'IAM-02.3,IAM-02,IAM'.
+     * Written once at instantiation by TagExpansionService and never edited.
+     * The evidence matcher tests the uploaded tag for MEMBERSHIP in this set, so
+     * coarse evidence (tagged IAM-02) reaches a leaf-level control (IAM-02.3),
+     * while the reverse cannot happen. control_tag_snapshot is retained for the
+     * legacy exact-match path on instances created before Phase 3.
+     */
+    @Column(name = "matched_tags_snapshot", length = 500)
+    private String matchedTagsSnapshot;
+
     @Column(name = "weight")
     private Double weight;
 

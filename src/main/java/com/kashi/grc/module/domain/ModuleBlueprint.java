@@ -203,6 +203,16 @@ public class ModuleBlueprint extends GlobalOrTenantEntity {
     @Column(name = "allowed_sides", length = 255)
     private String allowedSides;
 
+    /**
+     * Feature entitlement key. When set, this module's screens are blocked for
+     * any tenant that does not have the feature enabled in feature_flags — the
+     * by-type render endpoint returns 403 FEATURE_NOT_LICENSED and the frontend
+     * redirects. NULL = no feature gate (available to all tenants). Configured
+     * from the Module Blueprint admin (System only).
+     */
+    @Column(name = "required_feature", length = 100)
+    private String requiredFeature;
+
     @Column(name = "is_active", nullable = false)
     @Builder.Default
     private boolean isActive = true;

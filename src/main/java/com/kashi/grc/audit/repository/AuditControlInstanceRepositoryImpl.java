@@ -115,10 +115,27 @@ public class AuditControlInstanceRepositoryImpl implements AuditControlInstanceR
         Root<AuditEngagement> e = engagementIds.from(AuditEngagement.class);
         engagementIds.select(e.get("id")).where(cb.equal(e.get("tenantId"), tenantId));
 
-        cq.multiselect(c.get("id"), c.get("assignedAuditorId"))
+        // Phase 3: match the evidence tag as a MEMBER of the frozen expanded set.
+        // matched_tags_snapshot holds 'IAM-02.3,IAM-02,IAM', so evidence tagged
+        // with the leaf OR any ancestor links. Comma-wrapping makes it an exact
+        // member test. Instances predating Phase 3 have a null expanded set, so
+        // we OR in the legacy exact-match on control_tag_snapshot.
+        Expression<String> wrapped = cb.concat(cb.concat(
+                cb.literal(","), c.get("matchedTagsSnapshot")), cb.literal(","));
+
+        cq.multiselect(c.get("id"), c.get("assignedAuditorId"), c.get("engagementId"))
                 .where(
                         c.get("engagementId").in(engagementIds),
-                        cb.equal(c.get("controlTagSnapshot"), tag)
+                        cb.or(
+                                cb.and(
+                                        cb.isNotNull(c.get("matchedTagsSnapshot")),
+                                        cb.like(wrapped, "%," + tag + ",%")
+                                ),
+                                cb.and(
+                                        cb.isNull(c.get("matchedTagsSnapshot")),
+                                        cb.equal(c.get("controlTagSnapshot"), tag)
+                                )
+                        )
                 );
 
         return em.createQuery(cq).getResultList().stream()
@@ -126,6 +143,7 @@ public class AuditControlInstanceRepositoryImpl implements AuditControlInstanceR
                     Map<String, Object> m = new HashMap<>();
                     m.put("id", row[0]);
                     m.put("assignedAuditorId", row[1]);   // may be null — HashMap tolerates it
+                    m.put("engagementId", row[2]);        // KashiLink: engagement eligibility filter
                     return m;
                 })
                 .toList();

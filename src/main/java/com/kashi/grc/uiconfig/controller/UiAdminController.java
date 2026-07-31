@@ -88,6 +88,7 @@ public class UiAdminController {
     private final UiActionRepository        actionRepository;
     private final DashboardWidgetRepository widgetRepository;
     private final FeatureFlagRepository     featureFlagRepository;
+    private final com.kashi.grc.uiconfig.service.FeatureEntitlementService featureEntitlementService;
     private final TenantBrandingRepository  brandingRepository;
     private final DbRepository              dbRepository;
     private final UtilityService            utilityService;
@@ -107,6 +108,7 @@ public class UiAdminController {
                 .sortOrder(req.getSortOrder()).module(req.getModule())
                 .allowedSides(req.getAllowedSides()).minLevel(req.getMinLevel())
                 .requiredPermission(req.getRequiredPermission())
+                .requiredFeature(req.getRequiredFeature())
                 .isActive(req.isActive()).badgeCountEndpoint(req.getBadgeCountEndpoint())
                 .tenantId(tenantId)
                 .build();
@@ -142,6 +144,7 @@ public class UiAdminController {
                     m.put("allowedSides",         n.getAllowedSides()        != null ? n.getAllowedSides()        : "");
                     m.put("badgeCountEndpoint",   n.getBadgeCountEndpoint()  != null ? n.getBadgeCountEndpoint()  : "");
                     m.put("requiredPermission",   n.getRequiredPermission()  != null ? n.getRequiredPermission()  : "");
+                    m.put("requiredFeature",      n.getRequiredFeature()     != null ? n.getRequiredFeature()     : "");
                     return m;
                 })));
     }
@@ -161,6 +164,7 @@ public class UiAdminController {
         if (req.getAllowedSides()        != null) nav.setAllowedSides(req.getAllowedSides());
         if (req.getMinLevel()            != null) nav.setMinLevel(req.getMinLevel());
         if (req.getRequiredPermission()  != null) nav.setRequiredPermission(req.getRequiredPermission().isBlank()  ? null : req.getRequiredPermission());
+        if (req.getRequiredFeature()     != null) nav.setRequiredFeature(req.getRequiredFeature().isBlank()     ? null : req.getRequiredFeature());
         if (req.getBadgeCountEndpoint()  != null) nav.setBadgeCountEndpoint(req.getBadgeCountEndpoint().isBlank() ? null : req.getBadgeCountEndpoint());
         nav.setActive(req.isActive());
         navigationRepository.save(nav);
@@ -795,10 +799,13 @@ public class UiAdminController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> createFlag(
             @Valid @RequestBody FeatureFlagRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        // Blank allowed_sides_json -> NULL (empty string is invalid JSON in MySQL).
+        String createSides = (req.getAllowedSidesJson() == null || req.getAllowedSidesJson().isBlank())
+                ? null : req.getAllowedSidesJson();
         FeatureFlag flag = FeatureFlag.builder()
                 .flagKey(req.getFlagKey()).isEnabled(req.isEnabled())
                 .description(req.getDescription())
-                .allowedSidesJson(req.getAllowedSidesJson())
+                .allowedSidesJson(createSides)
                 .tenantId(tenantId)
                 .build();
         featureFlagRepository.save(flag);
@@ -819,9 +826,15 @@ public class UiAdminController {
                         cb.isNull(root.get("tenantId")),
                         cb.equal(root.get("tenantId"), tenantId))),
                 (cb, root) -> Map.of("flagkey", root.get("flagKey")),
-                f -> Map.of("id", f.getId(), "flagKey", f.getFlagKey(),
-                        "isEnabled", f.isEnabled(),
-                        "description", f.getDescription() != null ? f.getDescription() : ""))));
+                f -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id", f.getId());
+                    m.put("flagKey", f.getFlagKey());
+                    m.put("isEnabled", f.isEnabled());
+                    m.put("mode", f.getMode() != null ? f.getMode() : "GLOBAL");
+                    m.put("description", f.getDescription() != null ? f.getDescription() : "");
+                    return m;
+                })));
     }
 
     @PutMapping("/flags/{id}")
@@ -831,11 +844,39 @@ public class UiAdminController {
         FeatureFlag flag = featureFlagRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("FeatureFlag", id));
         if (req.getDescription()      != null) flag.setDescription(req.getDescription());
-        if (req.getAllowedSidesJson() != null) flag.setAllowedSidesJson(req.getAllowedSidesJson());
+        // allowed_sides_json is a MySQL JSON column: an empty string is NOT valid
+        // JSON and triggers 'Data truncation: The document is empty.'. Treat blank
+        // as NULL (meaning 'all sides'), and only set when non-blank.
+        if (req.getAllowedSidesJson() != null) {
+            String sides = req.getAllowedSidesJson().isBlank() ? null : req.getAllowedSidesJson();
+            flag.setAllowedSidesJson(sides);
+        }
         flag.setEnabled(req.isEnabled());
         featureFlagRepository.save(flag);
         return ResponseEntity.ok(ApiResponse.success(toMap("id", flag.getId(),
                 "flagKey", flag.getFlagKey(), "isEnabled", flag.isEnabled())));
+    }
+
+    /**
+     * Set a feature's entitlement MODE (GLOBAL or LICENSED). This is the explicit
+     * switch (industry pattern): GLOBAL = on/off for everyone via the global row;
+     * LICENSED = per-tenant grants (managed on the Tenant Details page). Moving to
+     * GLOBAL soft-deletes active tenant rows (history kept); moving to LICENSED
+     * makes the global row inert. Both directions are reversible.
+     */
+    @PutMapping("/flags/by-key/{flagKey}/mode")
+    @Operation(summary = "Set a feature's entitlement mode (GLOBAL / LICENSED)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> setFlagMode(
+            @PathVariable String flagKey, @RequestBody Map<String, Object> body) {
+        String mode = String.valueOf(body.getOrDefault("mode", "GLOBAL")).toUpperCase();
+        Long actor = utilityService.getLoggedInDataContext().getId();
+        if ("LICENSED".equals(mode)) {
+            featureEntitlementService.setLicensed(flagKey, actor);
+        } else {
+            boolean enabled = Boolean.TRUE.equals(body.get("enabled"));
+            featureEntitlementService.setGlobal(flagKey, enabled, actor);
+        }
+        return ResponseEntity.ok(ApiResponse.success(toMap("flagKey", flagKey, "mode", mode)));
     }
 
     @DeleteMapping("/flags/{id}")

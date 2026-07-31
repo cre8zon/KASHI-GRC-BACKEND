@@ -40,4 +40,23 @@ public class EvidenceLinkResponse {
     private String evidenceControlTag;
     private LocalDateTime evidenceValidUntil;
     private boolean evidenceExpired;
+
+    // ── KashiLink: parent-record fields the UI filters and renders on ────────
+    // The evidence tabs split links into "manual", "reused" and "integration
+    // checks". Without collectionType on the link the automated filter can
+    // never match, which is why that section always rendered empty.
+
+    private String evidenceFileName;
+
+    /** MANUAL | AUTOMATED | HYBRID */
+    private String collectionType;
+
+    /** PASS | FAIL | ERROR | NOT_RUN — null for manual evidence */
+    private String automationResult;
+
+    /** Human-readable integration result, e.g. "All 47 admin users have MFA enabled" */
+    private String automationMessage;
+
+    /** Integration run time — distinct from linkedAt */
+    private LocalDateTime collectedAt;
 }
