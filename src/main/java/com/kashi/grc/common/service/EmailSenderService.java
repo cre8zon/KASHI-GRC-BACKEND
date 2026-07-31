@@ -1,23 +1,30 @@
 package com.kashi.grc.common.service;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.activation.DataSource;
+import jakarta.mail.Message;
+import jakarta.mail.Session;
+import jakarta.mail.internet.InternetAddress;
+import jakarta.mail.internet.MimeBodyPart;
+import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.MimeMultipart;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import okhttp3.*;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
-import org.springframework.util.StreamUtils;
 import org.springframework.util.StringUtils;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.services.sesv2.SesV2Client;
+import software.amazon.awssdk.services.sesv2.model.*;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.util.*;
+import java.io.ByteArrayOutputStream;
+import java.util.Arrays;
+import java.util.List;
+import java.util.Properties;
 import java.util.stream.Collectors;
 
 /**
- * Low-level HTTP Email sender using Resend API.
+ * Low-level Email sender using AWS SES v2 SDK.
  * Do NOT call directly from business logic — use {@link MailService} instead
  * so subject/body come from DB templates (and sends flow through Kafka).
  *
@@ -30,22 +37,14 @@ import java.util.stream.Collectors;
  *  sendMailSync (same thread, THROWS on failure)
  *      Used by EmailEventConsumer. Must run on the Kafka listener thread
  *      and must propagate exceptions — that is what triggers the
- *      retry-with-backoff → dead-letter-topic machinery. Wrapping this
- *      in @Async or a try/catch would silently disable all retries.
+ *      retry-with-backoff → dead-letter-topic machinery.
  */
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class EmailSenderService {
 
-    private final OkHttpClient client = new OkHttpClient();
-    private final ObjectMapper mapper = new ObjectMapper();
-
-    @Value("${resend.api.key}")
-    private String apiKey;
-
-    @Value("${resend.base.url}")
-    private String resendUrl;
+    private final SesV2Client sesV2Client;
 
     @Value("${app.mail.from}")
     private String emailFrom;
@@ -54,90 +53,129 @@ public class EmailSenderService {
     private String emailFromName;
 
     /**
-     * Synchronous send using Resend API that PROPAGATES failures.
+     * Synchronous send using AWS SES API that PROPAGATES failures.
      * Called by EmailEventConsumer so Kafka's error handler can retry / DLT.
      *
-     * @throws MailDeliveryException on any HTTP or API payload failure
+     * @throws MailDeliveryException on any SES API failure
      */
     public void sendMailSync(String subject, String body, String mimeType, String email) {
-        sendMailWithAttachmentSync(email, subject, body, mimeType, null, null);
-    }
-
-    /**
-     * Core Synchronous send method handling standard mail & attachments via Resend API.
-     */
-    public void sendMailWithAttachmentSync(String email, String subject, String body,
-                                           String mimeType, DataSource attachment, String fileName) {
         try {
-            Map<String, Object> payload = new HashMap<>();
-
-            // Set 'from' field (Supports "Name <email@domain.com>" format if name is configured)
-            if (StringUtils.hasText(emailFromName)) {
-                payload.put("from", String.format("%s <%s>", emailFromName, emailFrom));
-            } else {
-                payload.put("from", emailFrom);
-            }
-
-            // Parse comma-separated emails into a List
-            List<String> recipients = Arrays.stream(email.split(","))
-                    .map(String::trim)
-                    .filter(StringUtils::hasText)
-                    .collect(Collectors.toList());
-
+            List<String> recipients = parseRecipients(email);
             if (recipients.isEmpty()) {
                 throw new MailDeliveryException("No valid recipient email address found", null);
             }
 
-            payload.put("to", recipients);
-            payload.put("subject", subject);
+            String formattedFrom = StringUtils.hasText(emailFromName)
+                    ? String.format("%s <%s>", emailFromName, emailFrom)
+                    : emailFrom;
 
+            Body bodyPayload;
             if ("text/html".equalsIgnoreCase(mimeType)) {
-                payload.put("html", body);
+                bodyPayload = Body.builder().html(Content.builder().data(body).build()).build();
             } else {
-                payload.put("text", body);
+                bodyPayload = Body.builder().text(Content.builder().data(body).build()).build();
             }
 
-            // Handle attachment via Resend JSON Payload (Base64 Encoded)
-            if (attachment != null) {
-                try (InputStream inputStream = attachment.getInputStream()) {
-                    byte[] bytes = StreamUtils.copyToByteArray(inputStream);
-                    String base64Content = Base64.getEncoder().encodeToString(bytes);
-
-                    Map<String, Object> attachmentMap = new HashMap<>();
-                    attachmentMap.put("filename", StringUtils.hasText(fileName) ? fileName : "attachment");
-                    attachmentMap.put("content", base64Content);
-
-                    payload.put("attachments", List.of(attachmentMap));
-                } catch (IOException e) {
-                    log.error("Failed to process attachment for email to {}", email, e);
-                    throw new MailDeliveryException("Failed to encode attachment", e);
-                }
-            }
-
-            RequestBody requestBody = RequestBody.create(
-                    mapper.writeValueAsString(payload),
-                    MediaType.parse("application/json")
-            );
-
-            Request request = new Request.Builder()
-                    .url(resendUrl)
-                    .addHeader("Authorization", "Bearer " + apiKey)
-                    .addHeader("Content-Type", "application/json")
-                    .post(requestBody)
+            SendEmailRequest request = SendEmailRequest.builder()
+                    .fromEmailAddress(formattedFrom)
+                    .destination(Destination.builder().toAddresses(recipients).build())
+                    .content(EmailContent.builder()
+                            .simple(software.amazon.awssdk.services.sesv2.model.Message.builder() // <-- Yahan fully qualified name use karein
+                                    .subject(Content.builder().data(subject).build())
+                                    .body(bodyPayload)
+                                    .build())
+                            .build())
                     .build();
 
-            try (Response response = client.newCall(request).execute()) {
-                if (!response.isSuccessful()) {
-                    String error = response.body() != null ? response.body().string() : "Unknown error";
-                    throw new MailDeliveryException("Resend API Error: " + error, null);
-                }
-                log.debug("Email sent successfully via Resend to {} — subject: {}", email, subject);
+            sesV2Client.sendEmail(request);
+            log.debug("Email sent successfully via AWS SES to {} — subject: {}", email, subject);
+
+        } catch (SesV2Exception e) {
+            log.error("AWS SES API Error while sending email to {}: {}", email, e.awsErrorDetails().errorMessage());
+            throw new MailDeliveryException("AWS SES Send Failed: " + e.awsErrorDetails().errorMessage(), e);
+        } catch (Exception e) {
+            log.error("Failed sending email via AWS SES to {}", email, e);
+            throw new MailDeliveryException("SES Send Failed", e);
+        }
+    }
+
+    /**
+     * Synchronous send for emails WITH ATTACHMENTS using Raw MIME message via AWS SES.
+     */
+    public void sendMailWithAttachmentSync(String email, String subject, String body,
+                                           String mimeType, DataSource attachment, String fileName) {
+        try {
+            List<String> recipients = parseRecipients(email);
+            if (recipients.isEmpty()) {
+                throw new MailDeliveryException("No valid recipient email address found", null);
             }
 
-        } catch (IOException e) {
-            log.error("Failed sending email via Resend to {}", email, e);
-            throw new MailDeliveryException("Resend HTTP request failed", e);
+            // Create MIME message
+            Session session = Session.getDefaultInstance(new Properties());
+            MimeMessage mimeMessage = new MimeMessage(session);
+
+            if (StringUtils.hasText(emailFromName)) {
+                mimeMessage.setFrom(new InternetAddress(emailFrom, emailFromName));
+            } else {
+                mimeMessage.setFrom(new InternetAddress(emailFrom));
+            }
+
+            for (String recipient : recipients) {
+                mimeMessage.addRecipient(Message.RecipientType.TO, new InternetAddress(recipient));
+            }
+            mimeMessage.setSubject(subject, "UTF-8");
+
+            // Multipart body setup
+            MimeMultipart multipart = new MimeMultipart("mixed");
+
+            // Text/HTML Part
+            MimeBodyPart bodyPart = new MimeBodyPart();
+            if ("text/html".equalsIgnoreCase(mimeType)) {
+                bodyPart.setContent(body, "text/html; charset=UTF-8");
+            } else {
+                bodyPart.setText(body, "UTF-8");
+            }
+            multipart.addBodyPart(bodyPart);
+
+            // Attachment Part
+            if (attachment != null) {
+                MimeBodyPart attachmentPart = new MimeBodyPart();
+                attachmentPart.setDataHandler(new jakarta.activation.DataHandler(attachment));
+                attachmentPart.setFileName(StringUtils.hasText(fileName) ? fileName : "attachment");
+                multipart.addBodyPart(attachmentPart);
+            }
+
+            mimeMessage.setContent(multipart);
+
+            // Convert MIME message to Raw SES Payload
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            mimeMessage.writeTo(outputStream);
+
+            SendEmailRequest request = SendEmailRequest.builder()
+                    .content(EmailContent.builder()
+                            .raw(RawMessage.builder()
+                                    .data(SdkBytes.fromByteArray(outputStream.toByteArray()))
+                                    .build())
+                            .build())
+                    .build();
+
+            sesV2Client.sendEmail(request);
+            log.debug("Email with attachment sent successfully via AWS SES to {}", email);
+
+        } catch (SesV2Exception e) {
+            log.error("AWS SES API Error while sending attachment email to {}: {}", email, e.awsErrorDetails().errorMessage());
+            throw new MailDeliveryException("AWS SES Attachment Send Failed: " + e.awsErrorDetails().errorMessage(), e);
+        } catch (Exception e) {
+            log.error("Failed to send email with attachment via AWS SES to {}", email, e);
+            throw new MailDeliveryException("SES Raw Email Send Failed", e);
         }
+    }
+
+    private List<String> parseRecipients(String email) {
+        return Arrays.stream(email.split(","))
+                .map(String::trim)
+                .filter(StringUtils::hasText)
+                .collect(Collectors.toList());
     }
 
     /** Unchecked wrapper so callers up the Kafka stack see a single exception type. */
