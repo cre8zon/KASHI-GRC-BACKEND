@@ -143,7 +143,7 @@ public class KafkaConfig {
         return new KafkaAdmin(Map.of("bootstrap.servers", bootstrapServers));
     }
 
-    @Bean
+  /*  @Bean
     public NewTopic testTopic() {
         return TopicBuilder.name(KafkaTopics.TEST)
                 .partitions(3)
@@ -189,5 +189,5 @@ public class KafkaConfig {
                 .partitions(3)
                 .replicas(1)
                 .build();
-    }
+    }*/
 }

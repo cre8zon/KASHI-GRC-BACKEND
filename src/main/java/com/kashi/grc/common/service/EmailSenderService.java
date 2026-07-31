@@ -1,22 +1,23 @@
 package com.kashi.grc.common.service;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.activation.DataSource;
-import jakarta.mail.MessagingException;
-import jakarta.mail.internet.MimeMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.mail.javamail.JavaMailSender;
-import org.springframework.mail.javamail.MimeMessageHelper;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StreamUtils;
 import org.springframework.util.StringUtils;
 
-import java.io.UnsupportedEncodingException;
-import java.util.Arrays;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.*;
+import java.util.stream.Collectors;
 
 /**
- * Low-level SMTP sender.
+ * Low-level HTTP Email sender using Resend API.
  * Do NOT call directly from business logic — use {@link MailService} instead
  * so subject/body come from DB templates (and sends flow through Kafka).
  *
@@ -37,38 +38,105 @@ import java.util.Arrays;
 @RequiredArgsConstructor
 public class EmailSenderService {
 
-    private final JavaMailSender javaMailSender;
+    private final OkHttpClient client = new OkHttpClient();
+    private final ObjectMapper mapper = new ObjectMapper();
 
-    @Value("${spring.mail.from:noreply@kashigrc.com}")
+    @Value("${resend.api.key}")
+    private String apiKey;
+
+    @Value("${resend.base.url}")
+    private String resendUrl;
+
+    @Value("${app.mail.from}")
     private String emailFrom;
 
-    @Value("${spring.mail.fromName:KashiGRC Platform}")
+    @Value("${app.mail.from.name:}")
     private String emailFromName;
 
     /**
-     * Synchronous send that PROPAGATES failures.
+     * Synchronous send using Resend API that PROPAGATES failures.
      * Called by EmailEventConsumer so Kafka's error handler can retry / DLT.
      *
-     * @throws MailDeliveryException on any SMTP/MIME failure
+     * @throws MailDeliveryException on any HTTP or API payload failure
      */
     public void sendMailSync(String subject, String body, String mimeType, String email) {
+        sendMailWithAttachmentSync(email, subject, body, mimeType, null, null);
+    }
+
+    /**
+     * Core Synchronous send method handling standard mail & attachments via Resend API.
+     */
+    public void sendMailWithAttachmentSync(String email, String subject, String body,
+                                           String mimeType, DataSource attachment, String fileName) {
         try {
-            MimeMessage mimeMessage = javaMailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, "utf-8");
-            setFrom(helper);
-            helper.setSubject(subject);
-            helper.setText(body, mimeType != null && mimeType.equalsIgnoreCase("text/html"));
-            Arrays.stream(email.split(",")).map(String::trim).forEach(s -> {
-                try {
-                    if (StringUtils.hasText(s)) helper.addTo(s);
-                } catch (MessagingException e) {
-                    log.warn("Cannot add recipient {}: {}", s, e.getMessage());
+            Map<String, Object> payload = new HashMap<>();
+
+            // Set 'from' field (Supports "Name <email@domain.com>" format if name is configured)
+            if (StringUtils.hasText(emailFromName)) {
+                payload.put("from", String.format("%s <%s>", emailFromName, emailFrom));
+            } else {
+                payload.put("from", emailFrom);
+            }
+
+            // Parse comma-separated emails into a List
+            List<String> recipients = Arrays.stream(email.split(","))
+                    .map(String::trim)
+                    .filter(StringUtils::hasText)
+                    .collect(Collectors.toList());
+
+            if (recipients.isEmpty()) {
+                throw new MailDeliveryException("No valid recipient email address found", null);
+            }
+
+            payload.put("to", recipients);
+            payload.put("subject", subject);
+
+            if ("text/html".equalsIgnoreCase(mimeType)) {
+                payload.put("html", body);
+            } else {
+                payload.put("text", body);
+            }
+
+            // Handle attachment via Resend JSON Payload (Base64 Encoded)
+            if (attachment != null) {
+                try (InputStream inputStream = attachment.getInputStream()) {
+                    byte[] bytes = StreamUtils.copyToByteArray(inputStream);
+                    String base64Content = Base64.getEncoder().encodeToString(bytes);
+
+                    Map<String, Object> attachmentMap = new HashMap<>();
+                    attachmentMap.put("filename", StringUtils.hasText(fileName) ? fileName : "attachment");
+                    attachmentMap.put("content", base64Content);
+
+                    payload.put("attachments", List.of(attachmentMap));
+                } catch (IOException e) {
+                    log.error("Failed to process attachment for email to {}", email, e);
+                    throw new MailDeliveryException("Failed to encode attachment", e);
                 }
-            });
-            javaMailSender.send(mimeMessage);
-            log.debug("Email sent to {} — subject: {}", email, subject);
-        } catch (MessagingException | org.springframework.mail.MailException e) {
-            throw new MailDeliveryException("SMTP send failed to " + email + ": " + e.getMessage(), e);
+            }
+
+            RequestBody requestBody = RequestBody.create(
+                    mapper.writeValueAsString(payload),
+                    MediaType.parse("application/json")
+            );
+
+            Request request = new Request.Builder()
+                    .url(resendUrl)
+                    .addHeader("Authorization", "Bearer " + apiKey)
+                    .addHeader("Content-Type", "application/json")
+                    .post(requestBody)
+                    .build();
+
+            try (Response response = client.newCall(request).execute()) {
+                if (!response.isSuccessful()) {
+                    String error = response.body() != null ? response.body().string() : "Unknown error";
+                    throw new MailDeliveryException("Resend API Error: " + error, null);
+                }
+                log.debug("Email sent successfully via Resend to {} — subject: {}", email, subject);
+            }
+
+        } catch (IOException e) {
+            log.error("Failed sending email via Resend to {}", email, e);
+            throw new MailDeliveryException("Resend HTTP request failed", e);
         }
     }
 
@@ -94,35 +162,9 @@ public class EmailSenderService {
     public void sendMailWithAttachment(String email, String subject, String body,
                                        String mimeType, DataSource attachment, String name) {
         try {
-            MimeMessage mimeMessage = javaMailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, true, "UTF-8");
-            setMimeMessageHelper(helper, subject, body, mimeType);
-            if (attachment != null) helper.addAttachment(name, attachment);
-            Arrays.stream(email.split(",")).map(String::trim).forEach(s -> {
-                try {
-                    if (StringUtils.hasText(s)) helper.addTo(s);
-                } catch (MessagingException e) {
-                    log.warn("Cannot add recipient {}: {}", s, e.getMessage());
-                }
-            });
-            javaMailSender.send(mimeMessage);
-        } catch (MessagingException e) {
+            sendMailWithAttachmentSync(email, subject, body, mimeType, attachment, name);
+        } catch (MailDeliveryException e) {
             log.error("Failed to send email with attachment to {}: {}", email, e.getMessage(), e);
-        }
-    }
-
-    public void setMimeMessageHelper(MimeMessageHelper helper, String subject,
-                                     String body, String mimeType) throws MessagingException {
-        setFrom(helper);
-        helper.setSubject(subject);
-        helper.setText(body, mimeType != null && mimeType.equalsIgnoreCase("text/html"));
-    }
-
-    private void setFrom(MimeMessageHelper helper) throws MessagingException {
-        try {
-            helper.setFrom(emailFrom, emailFromName);
-        } catch (UnsupportedEncodingException e) {
-            helper.setFrom(emailFrom);
         }
     }
 }
