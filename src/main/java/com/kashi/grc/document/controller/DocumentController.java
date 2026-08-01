@@ -66,6 +66,9 @@ public class DocumentController {
     private final StorageService         storageService;
     private final UtilityService         utilityService;
 
+    /** KashiLink — turns an attached document into reusable, tag-propagated evidence. */
+    private final com.kashi.grc.evidence.service.EvidenceRegistrationService evidenceRegistration;
+
     // ── Request/Response DTOs ─────────────────────────────────────────────
 
     @Data
@@ -547,6 +550,24 @@ public class DocumentController {
 
         log.info("[DOC-LINK] Created | docId={} | entity={}/{} | type={}",
                 doc.getId(), entityType, entityId, linkType);
+
+        // ── KashiLink ────────────────────────────────────────────────────────
+        // Single choke point for all three upload paths (presigned confirm,
+        // image upload, explicit link). Registering here means every manual
+        // upload enters the evidence reuse engine with the tag resolved from the
+        // target entity itself — no frontend change, no tag to forget.
+        //
+        // Never allowed to break an upload: the file is already in S3 and the
+        // link is already saved. Registration failures are logged only.
+        try {
+            evidenceRegistration.registerFromDocument(
+                    doc.getId(), doc.getFileName(), doc.getMimeType(), doc.getContentLength(),
+                    entityType, entityId, linkType, tenantId, userId);
+        } catch (Exception e) {
+            log.error("[KASHILINK] Evidence registration failed | docId={} | entity={}/{}: {}",
+                    doc.getId(), entityType, entityId, e.getMessage());
+        }
+
         return link;
     }
 

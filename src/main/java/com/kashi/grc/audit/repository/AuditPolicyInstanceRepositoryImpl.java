@@ -25,4 +25,37 @@ public class AuditPolicyInstanceRepositoryImpl implements AuditPolicyInstanceRep
         cq.orderBy(cb.asc(p.get("titleSnapshot")));
         return em.createQuery(cq).getResultList();
     }
+
+    @Override
+    public List<AuditPolicyInstance> findByTenantAndExpandedTag(Long tenantId, String tag) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<AuditPolicyInstance> cq = cb.createQuery(AuditPolicyInstance.class);
+        Root<AuditPolicyInstance> p = cq.from(AuditPolicyInstance.class);
+
+        Expression<String> expandedWrapped = cb.concat(cb.concat(
+                        cb.literal(","), cb.function("REPLACE", String.class,
+                                p.get("matchedTagsSnapshot"), cb.literal(" "), cb.literal(""))),
+                cb.literal(","));
+        Expression<String> legacyWrapped = cb.concat(cb.concat(
+                        cb.literal(","), cb.function("REPLACE", String.class,
+                                p.get("controlTagsSnapshot"), cb.literal(" "), cb.literal(""))),
+                cb.literal(","));
+
+        cq.where(
+                cb.equal(p.get("tenantId"), tenantId),
+                cb.or(
+                        cb.and(
+                                cb.isNotNull(p.get("matchedTagsSnapshot")),
+                                cb.like(expandedWrapped, "%," + tag + ",%")
+                        ),
+                        cb.and(
+                                cb.isNull(p.get("matchedTagsSnapshot")),
+                                cb.isNotNull(p.get("controlTagsSnapshot")),
+                                cb.like(legacyWrapped, "%," + tag + ",%")
+                        )
+                )
+        );
+        cq.orderBy(cb.asc(p.get("titleSnapshot")));
+        return em.createQuery(cq).getResultList();
+    }
 }

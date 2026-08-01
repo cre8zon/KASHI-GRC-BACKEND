@@ -18,6 +18,9 @@ public class UiNavigationItemResponse {
     private Integer sortOrder;
     private String module;
     private String badgeCountEndpoint;
+    /** Feature entitlement key — the frontend route guard blocks the route if the
+     *  tenant lacks it. Mirrors the server-side @RequiresFeature enforcement. */
+    private String requiredFeature;
     private List<UiNavigationItemResponse> children;
     @JsonProperty("isActive")
     private boolean isActive;

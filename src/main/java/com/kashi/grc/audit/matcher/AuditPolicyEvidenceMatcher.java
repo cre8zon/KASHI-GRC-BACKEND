@@ -41,26 +41,17 @@ public class AuditPolicyEvidenceMatcher implements EvidenceTagMatcher {
     public List<MatchResult> findMatches(String tag, Long tenantId) {
         if (tag == null || tag.isBlank()) return List.of();
 
-        return policyInstanceRepository.findAll().stream()
-                .filter(p -> tenantId.equals(p.getTenantId()))
-                .filter(p -> containsTag(p.getControlTagsSnapshot(), tag))
+        // Phase 3: indexed membership against the frozen expanded set (with
+        // legacy control_tags_snapshot fallback). Replaces a findAll() that
+        // pulled every tenant's policy instances into heap on each upload.
+        return policyInstanceRepository
+                .findByTenantAndExpandedTag(tenantId, tag.toUpperCase().trim())
+                .stream()
                 .map(p -> new MatchResult(
                         "AUDIT_POLICY_INSTANCE",
                         p.getId(),
                         p.getOwnerIdSnapshot()
                 ))
                 .toList();
-    }
-
-    /**
-     * Check if a comma-separated tag list contains the given tag (case-insensitive).
-     * e.g. containsTag("MFA,ENCRYPTION_AT_REST,ACCESS_MGMT", "MFA") → true
-     */
-    private boolean containsTag(String tagList, String searchTag) {
-        if (tagList == null || tagList.isBlank()) return false;
-        for (String t : tagList.split(",")) {
-            if (searchTag.equalsIgnoreCase(t.trim())) return true;
-        }
-        return false;
     }
 }

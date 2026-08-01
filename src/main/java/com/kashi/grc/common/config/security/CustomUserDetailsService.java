@@ -48,6 +48,17 @@ public class CustomUserDetailsService implements UserDetailsService {
                 authorities.add(new SimpleGrantedAuthority("ROLE_" + role.getName().toUpperCase().replace(" ", "_")))
         );
 
+        // Add the role SIDE as an authority (SIDE_SYSTEM, SIDE_ORGANIZATION, …).
+        // This lets SecurityConfig gate the platform-admin URL space to
+        // SIDE_SYSTEM only — a hard boundary a customer's JWT can never satisfy,
+        // enforced at the filter layer before any controller runs.
+        user.getRoles().stream()
+                .map(role -> role.getSide())
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .forEach(side ->
+                        authorities.add(new SimpleGrantedAuthority("SIDE_" + side.name())));
+
         return org.springframework.security.core.userdetails.User.builder()
                 .username(String.valueOf(user.getId()))
                 .password(user.getPasswordHash())

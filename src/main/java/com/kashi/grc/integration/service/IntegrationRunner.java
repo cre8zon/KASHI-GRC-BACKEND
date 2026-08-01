@@ -168,7 +168,13 @@ public class IntegrationRunner {
         // and MANUAL/HYBRID AuditTestInstance rows (AUTOMATED test instances excluded
         // from AuditTestEvidenceMatcher — handled below).
         if (record.getControlTag() != null && result.result() != IntegrationCheck.Result.ERROR) {
-            reuseEngine.propagateAutomated(record.getId(), isPass);
+            int newLinks = reuseEngine.propagate(record.getId(), isPass);
+            if (newLinks == 0) {
+                // Not fatal, but it is the exact signature of tag drift: the check
+                // collected evidence under a tag no instance carries.
+                log.warn("[KASHILINK] Automated evidence matched nothing | checkKey={} | tag={} | tenantId={}",
+                        tenantCheck.getCheckKey(), record.getControlTag(), tenantId);
+            }
         }
 
         // Precise checkKey-based routing to AUTOMATED AuditTestInstance rows

@@ -25,4 +25,31 @@ public class AuditTestInstanceRepositoryImpl implements AuditTestInstanceReposit
         cq.orderBy(cb.asc(t.get("testNameSnapshot")));
         return em.createQuery(cq).getResultList();
     }
+
+    @Override
+    public List<AuditTestInstance> findManualByTenantAndExpandedTag(Long tenantId, String tag) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<AuditTestInstance> cq = cb.createQuery(AuditTestInstance.class);
+        Root<AuditTestInstance> t = cq.from(AuditTestInstance.class);
+
+        Expression<String> wrapped = cb.concat(cb.concat(
+                cb.literal(","), t.get("matchedTagsSnapshot")), cb.literal(","));
+
+        cq.where(
+                cb.equal(t.get("tenantId"), tenantId),
+                // AUTOMATED tests are fed by checkKey routing, never by tag
+                cb.notEqual(t.get("automationTypeSnapshot"), "AUTOMATED"),
+                cb.or(
+                        cb.and(
+                                cb.isNotNull(t.get("matchedTagsSnapshot")),
+                                cb.like(wrapped, "%," + tag + ",%")
+                        ),
+                        cb.and(
+                                cb.isNull(t.get("matchedTagsSnapshot")),
+                                cb.equal(t.get("controlTagSnapshot"), tag)
+                        )
+                )
+        );
+        return em.createQuery(cq).getResultList();
+    }
 }

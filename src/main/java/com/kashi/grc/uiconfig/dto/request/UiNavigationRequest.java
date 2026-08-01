@@ -15,6 +15,7 @@ public class UiNavigationRequest {
     public String allowedSides;
     public String minLevel;
     public String requiredPermission;
+    public String requiredFeature;
     public boolean isActive = true;
     public String badgeCountEndpoint;
 }

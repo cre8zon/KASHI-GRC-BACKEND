@@ -1073,6 +1073,12 @@ public class AuditEngagementController {
                     if (allParams.containsKey("auditType"))
                         preds.add(cb.equal(root.get("auditType"),
                                 AuditTemplate.AuditType.valueOf(allParams.get("auditType").toUpperCase())));
+                    // frameworkRef scopes the SHARED engagement list to one framework
+                    // (e.g. ISO27001) so a tenant reaching this page via a framework-
+                    // specific nav row sees only that framework's engagements.
+                    if (allParams.containsKey("frameworkRef")
+                            && !allParams.get("frameworkRef").isBlank())
+                        preds.add(cb.equal(root.get("frameworkRef"), allParams.get("frameworkRef")));
                     return preds;
                 },
                 (cb, root) -> Map.of(

@@ -41,6 +41,7 @@ public class AuditSectionService {
     private final AuditControlRepository            controlRepository;
     private final AuditSectionControlMappingRepository controlMappingRepository;
     private final AuditControlInstanceRepository    controlInstanceRepository;
+    private final com.kashi.grc.ucf.service.TagExpansionService tagExpansionService;
 
     // ══════════════════════════════════════════════════════════════════════
     // LIBRARY SECTION TREE
@@ -264,6 +265,9 @@ public class AuditSectionService {
                     .testTypeSnapshot(control.getTestType().name())
                     .frameworkRefSnapshot(control.getFrameworkRef())
                     .controlTagSnapshot(control.getControlTag())
+                    // Phase 3: freeze the expanded ancestry chain. UCF matching
+                    // reads this; control_tag_snapshot is kept for the legacy path.
+                    .matchedTagsSnapshot(tagExpansionService.expand(control.getControlTag()))
                     .sectionBreadcrumbSnapshot(buildBreadcrumb(sectionInstance))
                     .weight(mapping.getWeight())
                     .isMandatory(mapping.isMandatory())

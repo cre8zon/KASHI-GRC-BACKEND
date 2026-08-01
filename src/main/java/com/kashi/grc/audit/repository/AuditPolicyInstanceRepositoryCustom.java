@@ -8,4 +8,11 @@ public interface AuditPolicyInstanceRepositoryCustom {
 
     /** Policy instances for an engagement + tenant, ORDER BY titleSnapshot. */
     List<AuditPolicyInstance> findByEngagementIdAndTenantId(Long engagementId, Long tenantId);
+
+    /**
+     * Phase 3: policy instances for a tenant whose frozen expanded tag set
+     * contains the evidence tag, OR (legacy) whose control_tags_snapshot does.
+     * Replaces the findAll() + in-memory filter — indexed and tenant-scoped.
+     */
+    List<AuditPolicyInstance> findByTenantAndExpandedTag(Long tenantId, String tag);
 }

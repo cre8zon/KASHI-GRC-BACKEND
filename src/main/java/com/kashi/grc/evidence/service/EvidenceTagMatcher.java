@@ -56,10 +56,24 @@ public interface EvidenceTagMatcher {
      * @param entityType         the polymorphic entity type string (e.g. "POLICY_CONTROL_INSTANCE")
      * @param entityId           the entity's ID
      * @param responsibleUserId  user to notify (auditor, reviewer, owner) — may be null
+     * @param engagementId       owning audit engagement, or null if the entity is not
+     *                           engagement-scoped (e.g. assessment questions).
+     *                           The engine uses this to skip engagements that are
+     *                           closed, cancelled, or whose audit period does not
+     *                           overlap the evidence validity window. Null means
+     *                           "unscoped" and is always allowed through, so
+     *                           matchers written against the old 3-arg constructor
+     *                           keep working unchanged.
      */
     record MatchResult(
-        String entityType,
-        Long   entityId,
-        Long   responsibleUserId
-    ) {}
+            String entityType,
+            Long   entityId,
+            Long   responsibleUserId,
+            Long   engagementId
+    ) {
+        /** Backwards-compatible 3-arg form — no engagement scoping. */
+        public MatchResult(String entityType, Long entityId, Long responsibleUserId) {
+            this(entityType, entityId, responsibleUserId, null);
+        }
+    }
 }

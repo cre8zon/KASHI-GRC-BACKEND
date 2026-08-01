@@ -2,7 +2,13 @@ package com.kashi.grc.module.controller;
 
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.PaginatedResponse;
+import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
+import com.kashi.grc.uiconfig.repository.FeatureFlagRepository;
+import com.kashi.grc.uiconfig.domain.FeatureFlag;
+import org.springframework.http.HttpStatus;
+import java.util.Set;
+import java.util.stream.Collectors;
 import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.module.domain.ModuleBlueprint;
@@ -50,6 +56,7 @@ public class ModuleBlueprintController {
     private final ModuleBlueprintRepository blueprintRepository;
     private final DbRepository              dbRepository;
     private final UtilityService            utilityService;
+    private final FeatureFlagRepository      featureFlagRepository;
 
     // ══════════════════════════════════════════════════════════════
     // LIST
@@ -110,6 +117,17 @@ public class ModuleBlueprintController {
                 .or(() -> blueprintRepository.findByEntityTypeIgnoreCaseAndTenantIdIsNull(entityType.toUpperCase()))
                 .orElseThrow(() -> new ResourceNotFoundException("ModuleBlueprint", "entityType", entityType));
 
+        // Feature entitlement gate: if this module requires a feature the tenant
+        // doesn't have, block the whole screen (not just its data). The frontend
+        // catches this 403 (FEATURE_NOT_LICENSED) and redirects.
+        if (bp.getRequiredFeature() != null && !bp.getRequiredFeature().isBlank()) {
+            Set<String> tenantFeatures = featureFlagRepository.resolveEnabledFeaturesForTenant(tenantId);
+            if (!tenantFeatures.contains(bp.getRequiredFeature())) {
+                throw new BusinessException("FEATURE_NOT_LICENSED",
+                        "This module is not enabled for your organization.", HttpStatus.FORBIDDEN);
+            }
+        }
+
         return ResponseEntity.ok(ApiResponse.success(toDetailMap(bp)));
     }
 
@@ -143,6 +161,7 @@ public class ModuleBlueprintController {
                 .supportsWorkflow(req.isSupportsWorkflow())
                 .showInNav(req.isShowInNav())
                 .allowedSides(req.getAllowedSides() != null ? req.getAllowedSides() : "ORGANIZATION,SYSTEM")
+                .requiredFeature(req.getRequiredFeature())
                 .sortOrder(req.getSortOrder() != null ? req.getSortOrder() : 0)
                 // ── v2 new fields ──
                 .supportsTree(req.isSupportsTree())
@@ -184,6 +203,7 @@ public class ModuleBlueprintController {
         if (req.getEditFormKey()        != null) bp.setEditFormKey(req.getEditFormKey());
         if (req.getApiBasePath()        != null) bp.setApiBasePath(req.getApiBasePath());
         if (req.getAllowedSides()       != null) bp.setAllowedSides(req.getAllowedSides());
+        if (req.getRequiredFeature()    != null) bp.setRequiredFeature(req.getRequiredFeature().isBlank() ? null : req.getRequiredFeature());
         if (req.getSortOrder()          != null) bp.setSortOrder(req.getSortOrder());
         // ── v2 new fields — null means "don't change", empty string means "clear"
         if (req.getParentContextJson()  != null) bp.setParentContextJson(
@@ -268,6 +288,7 @@ public class ModuleBlueprintController {
         m.put("showInNav",           bp.isShowInNav());
         m.put("supportsTree",        bp.isSupportsTree());          // v2
         m.put("allowedSides",        bp.getAllowedSides() != null ? bp.getAllowedSides() : "ORGANIZATION,SYSTEM");
+        m.put("requiredFeature",     bp.getRequiredFeature());
         m.put("sortOrder",           bp.getSortOrder() != null ? bp.getSortOrder() : 0);
         m.put("isActive",            bp.isActive());
         // v2 new fields — always included (null if not set, frontend must handle)
@@ -310,6 +331,7 @@ public class ModuleBlueprintController {
         private boolean           showInNav           = true;
         private boolean           supportsTree        = false;       // v2 — renders tree instead of flat DataTable
         private String            allowedSides;      // comma-sep sides: ORGANIZATION,VENDOR,AUDITOR
+        private String            requiredFeature;   // feature_flags key; blocks the module for tenants without it
         private Integer           sortOrder;
         // ── v2 new fields ─────────────────────────────────────────────────────────
         /**

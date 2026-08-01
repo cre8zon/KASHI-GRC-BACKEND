@@ -56,6 +56,31 @@ public class SecurityConfig {
                                 "/ws/**",
                                 "/v1/issues/ingest"
                         ).permitAll()
+                        // ── PLATFORM-ADMIN BOUNDARY ────────────────────────────
+                        // These URL spaces configure the platform itself and must
+                        // NEVER be reachable by a customer/organization user, even
+                        // though they are authenticated. Gated to SIDE_SYSTEM (a
+                        // role with RoleSide.SYSTEM), enforced here at the filter
+                        // layer — before any controller — so a new admin endpoint
+                        // is covered by the URL pattern automatically and cannot be
+                        // forgotten. This is the real gate; the frontend guard is
+                        // only UX.
+                        // Tenant-READ exception — the ONLY blueprint endpoint open to
+                        // non-System users. The Universal Module Page renders an org
+                        // user's screen by reading its blueprint via by-type (result is
+                        // tenant-scoped: the caller's blueprint or the global default).
+                        // Everything else on module-blueprints — the list, by-id, and
+                        // all writes — stays System-only via the /v1/admin/** lock
+                        // below. Configuring blueprints remains System-only; only
+                        // rendering is opened. Placed BEFORE the lock (first match wins).
+                        .requestMatchers(HttpMethod.GET,
+                                "/v1/admin/module-blueprints/by-type/**"
+                        ).authenticated()
+                        // ── PLATFORM-ADMIN BOUNDARY (writes + all other admin) ──────
+                        .requestMatchers(
+                                "/v1/admin/**",
+                                "/v1/tenants/**"
+                        ).hasAuthority("SIDE_SYSTEM")
                         .anyRequest().authenticated()
                 )
                 .authenticationProvider(authenticationProvider())

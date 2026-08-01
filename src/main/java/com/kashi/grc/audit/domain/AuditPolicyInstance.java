@@ -36,12 +36,12 @@ import java.time.LocalDateTime;
  */
 @Entity
 @Table(name = "audit_policy_instances",
-    indexes = {
-        @Index(name = "idx_api_engagement", columnList = "engagement_id"),
-        @Index(name = "idx_api_tenant",     columnList = "tenant_id"),
-        @Index(name = "idx_api_original",   columnList = "original_policy_id"),
-        @Index(name = "idx_api_status",     columnList = "review_result")
-    }
+        indexes = {
+                @Index(name = "idx_api_engagement", columnList = "engagement_id"),
+                @Index(name = "idx_api_tenant",     columnList = "tenant_id"),
+                @Index(name = "idx_api_original",   columnList = "original_policy_id"),
+                @Index(name = "idx_api_status",     columnList = "review_result")
+        }
 )
 @Getter @Setter
 @lombok.experimental.SuperBuilder
@@ -104,6 +104,13 @@ public class AuditPolicyInstance extends TenantAwareEntity {
 
     @Column(name = "control_tags_snapshot", length = 500)
     private String controlTagsSnapshot;
+
+    /**
+     * Phase 3 (UCF): DISTINCT union of the ancestry chains of every tag in
+     * controlTagsSnapshot, frozen at instantiation. See AuditControlInstance.
+     */
+    @Column(name = "matched_tags_snapshot", length = 500)
+    private String matchedTagsSnapshot;
 
     @Column(name = "framework_refs_snapshot", length = 500)
     private String frameworkRefsSnapshot;

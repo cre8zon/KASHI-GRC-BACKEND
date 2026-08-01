@@ -48,15 +48,14 @@ public class AuditTestEvidenceMatcher implements EvidenceTagMatcher {
     public List<MatchResult> findMatches(String tag, Long tenantId) {
         if (tag == null || tag.isBlank()) return List.of();
 
-        // Indexed query: tenantId + tag — no full table scan
+        // Phase 3: membership match on the frozen expanded set, with legacy
+        // exact-match fallback. AUTOMATED tests are excluded IN THE QUERY — they
+        // route by checkKey via EngagementIntegrationSnapshotService, never by
+        // tag, so a shared tag must never cross-contaminate them.
         List<AuditTestInstance> candidates =
-                testInstanceRepository.findByTenantIdAndControlTagSnapshot(tenantId, tag.toUpperCase());
+                testInstanceRepository.findManualByTenantAndExpandedTag(tenantId, tag.toUpperCase());
 
         return candidates.stream()
-                // AUTOMATED tests are handled by EngagementIntegrationSnapshotService
-                // via precise checkKey → testInstanceId mapping. Exclude them here
-                // to prevent cross-contamination between checks sharing the same tag.
-                .filter(t -> !"AUTOMATED".equalsIgnoreCase(t.getAutomationTypeSnapshot()))
                 .map(t -> new MatchResult(
                         "AUDIT_TEST_INSTANCE",
                         t.getId(),

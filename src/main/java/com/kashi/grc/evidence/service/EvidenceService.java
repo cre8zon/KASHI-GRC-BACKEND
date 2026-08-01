@@ -12,13 +12,16 @@ import com.kashi.grc.evidence.dto.response.EvidenceLinkResponse;
 import com.kashi.grc.evidence.dto.response.EvidenceRecordResponse;
 import com.kashi.grc.evidence.repository.EvidenceLinkRepository;
 import com.kashi.grc.evidence.repository.EvidenceRecordRepository;
+import com.kashi.grc.evidence.event.EvidenceRecordCreatedEvent;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 /**
@@ -40,6 +43,7 @@ public class EvidenceService {
     private final EvidenceLinkRepository   linkRepository;
     private final EvidenceReuseEngine      reuseEngine;
     private final UtilityService           utilityService;
+    private final ApplicationEventPublisher eventPublisher;
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
@@ -68,9 +72,12 @@ public class EvidenceService {
         log.info("[EVIDENCE] Created recordId={} tag={} tenantId={}", record.getId(),
                 record.getControlTag(), tenantId);
 
-        // Trigger async propagation — non-blocking
+        // KashiLink: fires only AFTER this transaction commits.
+        // Calling reuseEngine.propagate() directly here raced the commit — the
+        // async thread read the record before it existed and silently skipped.
         if (record.getControlTag() != null) {
-            reuseEngine.propagate(record.getId());
+            eventPublisher.publishEvent(EvidenceRecordCreatedEvent.manual(
+                    record.getId(), tenantId, record.getControlTag()));
         }
 
         return toRecordResponse(record, null);
@@ -87,7 +94,8 @@ public class EvidenceService {
     }
 
     public EvidenceRecordResponse getById(Long id, Long tenantId) {
-        EvidenceRecord record = recordRepository.findById(id)
+        // Tenant-scoped: findById alone leaked other tenants' evidence records.
+        EvidenceRecord record = recordRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", id));
 
         List<EvidenceLink> links = linkRepository.findByEvidenceRecordIdAndTenantId(id, tenantId);
@@ -100,11 +108,8 @@ public class EvidenceService {
      * e.g. GET /v1/evidence/links?entityType=AUDIT_CONTROL_INSTANCE&entityId=42
      */
     public List<EvidenceLinkResponse> getLinksForEntity(String entityType, Long entityId, Long tenantId) {
-        return linkRepository
-                .findByTargetEntityTypeAndTargetEntityIdAndTenantId(entityType, entityId, tenantId)
-                .stream()
-                .map(this::toLinkResponse)
-                .collect(Collectors.toList());
+        return withRecords(linkRepository
+                .findByTargetEntityTypeAndTargetEntityIdAndTenantId(entityType, entityId, tenantId));
     }
 
     /**
@@ -114,8 +119,7 @@ public class EvidenceService {
      * page to show "Evidence used:" referencing the originating control evidence.
      */
     public List<EvidenceLinkResponse> getControlEvidenceUsedByTest(Long testInstanceId, Long tenantId) {
-        return linkRepository.findControlEvidenceUsedByTest(testInstanceId, tenantId)
-                .stream().map(this::toLinkResponse).collect(Collectors.toList());
+        return withRecords(linkRepository.findControlEvidenceUsedByTest(testInstanceId, tenantId));
     }
 
     /**
@@ -123,8 +127,7 @@ public class EvidenceService {
      * Used by the evidence review inbox / notification badge.
      */
     public List<EvidenceLinkResponse> getPendingReview(Long tenantId) {
-        return linkRepository.findPendingReviewForTenant(tenantId)
-                .stream().map(this::toLinkResponse).collect(Collectors.toList());
+        return withRecords(linkRepository.findPendingReviewForTenant(tenantId));
     }
 
     // ── REVIEW ────────────────────────────────────────────────────────────────
@@ -147,8 +150,11 @@ public class EvidenceService {
     @Transactional
     public EvidenceLinkResponse manualLink(Long evidenceRecordId, ManualEvidenceLinkRequest req,
                                            Long linkedBy, Long tenantId) {
-        // Verify the record belongs to this tenant
-        recordRepository.findById(evidenceRecordId)
+        // Verify the record belongs to this tenant.
+        // findById alone allowed attaching ANOTHER tenant's evidence to your own
+        // entity — and the resulting link was stamped with YOUR tenantId, so it
+        // looked legitimate from then on.
+        recordRepository.findByIdAndTenantId(evidenceRecordId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("EvidenceRecord", evidenceRecordId));
 
         // Idempotent — if link already exists, return it
@@ -178,7 +184,7 @@ public class EvidenceService {
         linkRepository.save(link);
 
         // Update link count
-        recordRepository.findById(evidenceRecordId).ifPresent(r -> {
+        recordRepository.findByIdAndTenantId(evidenceRecordId, tenantId).ifPresent(r -> {
             r.setLinkCount(r.getLinkCount() + 1);
             recordRepository.save(r);
         });
@@ -218,8 +224,30 @@ public class EvidenceService {
                 .build();
     }
 
+    /**
+     * KashiLink: batch-hydrate links with their parent EvidenceRecord.
+     * One extra query for the whole page instead of N — and without this the
+     * frontend receives null titles and cannot tell an automated link from a
+     * manual one, which is why the "Integration checks" section always rendered
+     * as empty.
+     */
+    private List<EvidenceLinkResponse> withRecords(List<EvidenceLink> links) {
+        if (links.isEmpty()) return List.of();
+        List<Long> ids = links.stream()
+                .map(EvidenceLink::getEvidenceRecordId).distinct().collect(Collectors.toList());
+        Map<Long, EvidenceRecord> byId = recordRepository.findAllById(ids).stream()
+                .collect(Collectors.toMap(EvidenceRecord::getId, r -> r));
+        return links.stream()
+                .map(l -> toLinkResponse(l, byId.get(l.getEvidenceRecordId())))
+                .collect(Collectors.toList());
+    }
+
     private EvidenceLinkResponse toLinkResponse(EvidenceLink l) {
-        return EvidenceLinkResponse.builder()
+        return toLinkResponse(l, null);
+    }
+
+    private EvidenceLinkResponse toLinkResponse(EvidenceLink l, EvidenceRecord r) {
+        EvidenceLinkResponse.EvidenceLinkResponseBuilder b = EvidenceLinkResponse.builder()
                 .id(l.getId())
                 .evidenceRecordId(l.getEvidenceRecordId())
                 .targetEntityType(l.getTargetEntityType())
@@ -230,7 +258,20 @@ public class EvidenceService {
                 .reviewedBy(l.getReviewedBy())
                 .reviewedAt(l.getReviewedAt())
                 .reviewerNote(l.getReviewerNote())
-                .linkedAt(l.getLinkedAt())
-                .build();
+                .linkedAt(l.getLinkedAt());
+
+        if (r != null) {
+            b.evidenceTitle(r.getTitle())
+                    .evidenceFileUrl(r.getFileUrl())
+                    .evidenceFileName(r.getFileName())
+                    .evidenceControlTag(r.getControlTag())
+                    .evidenceValidUntil(r.getValidUntil())
+                    .evidenceExpired(r.isExpired())
+                    .collectionType(r.getCollectionType() != null ? r.getCollectionType().name() : "MANUAL")
+                    .automationResult(r.getAutomationResult() != null ? r.getAutomationResult().name() : null)
+                    .automationMessage(r.getAutomationMessage())
+                    .collectedAt(r.getCollectedAt());
+        }
+        return b.build();
     }
 }

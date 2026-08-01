@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
 @RequiredArgsConstructor
 public class AuditTestPolicySnapshotService {
 
+    private final com.kashi.grc.ucf.service.TagExpansionService tagExpansionService;
     private final AuditTestRepository                         testRepository;
     private final AuditControlTestMappingRepository           controlTestMappingRepository;
     private final AuditTestInstanceRepository                  testInstanceRepository;
@@ -173,6 +174,7 @@ public class AuditTestPolicySnapshotService {
                     .evidenceGuidanceSnapshot(test.getEvidenceGuidance())
                     .frameworkRefSnapshot(test.getFrameworkRef())
                     .controlTagSnapshot(test.getControlTag())
+                    .matchedTagsSnapshot(tagExpansionService.expand(test.getControlTag()))
                     .automationTypeSnapshot(test.getAutomationType() != null
                             ? test.getAutomationType().name() : "MANUAL")
                     .automationKeySnapshot(test.getAutomationKey())
@@ -273,6 +275,7 @@ public class AuditTestPolicySnapshotService {
                     .nextReviewDateSnapshot(policy.getNextReviewDate())
                     .policyStatusSnapshot(policy.getStatus().name())
                     .controlTagsSnapshot(policy.getControlTags())
+                    .matchedTagsSnapshot(tagExpansionService.expandCsv(policy.getControlTags()))
                     .frameworkRefsSnapshot(policy.getFrameworkRefs())
                     .reviewResult(AuditPolicyInstance.ReviewResult.NOT_REVIEWED)
                     .snapshottedAt(LocalDateTime.now())
