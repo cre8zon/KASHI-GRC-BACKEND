@@ -14,6 +14,7 @@ public class AuditEngagementRequest {
     private Long   projectInstanceId; // set by createProjectInstance cascade — bypasses findByOriginalProjectId lookup
     @NotBlank private String name;
     private String  description;
+    @NotNull(message = "templateId is required — an engagement must be created from a framework template so sections/controls can be snapshotted")
     private Long    templateId;
     private String  frameworkRef;
     private AuditTemplate.AuditType auditType;

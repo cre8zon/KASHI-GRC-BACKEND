@@ -3,7 +3,9 @@ package com.kashi.grc.audit.workflow;
 import com.kashi.grc.audit.domain.AuditControlInstance;
 import com.kashi.grc.audit.repository.AuditControlInstanceRepository;
 import com.kashi.grc.audit.repository.AuditEngagementRepository;
+import com.kashi.grc.workflow.domain.WorkflowInstance;
 import com.kashi.grc.workflow.event.SectionItemsNeededEvent;
+import com.kashi.grc.workflow.repository.WorkflowInstanceRepository;
 import com.kashi.grc.workflow.service.TaskSectionCompletionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -51,6 +53,7 @@ public class AuditControlSectionItemRegistrar {
     private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
     private final TaskSectionCompletionService   sectionService;
+    private final WorkflowInstanceRepository     workflowInstanceRepository;
 
     @EventListener
     @Transactional
@@ -62,14 +65,20 @@ public class AuditControlSectionItemRegistrar {
                         "workflowInstanceId={} | sectionKey={} | taskInstanceId={}",
                 event.workflowInstanceId(), event.sectionKey(), event.taskInstanceId());
 
-        // Resolve engagement from workflow instance
-        var engagement = engagementRepository
-                .findByTenantIdAndWorkflowInstanceId(event.tenantId(), event.workflowInstanceId())
+        // Resolve engagement via WorkflowInstance.entityId — set at instance-creation
+        // time, so no race window if this fires synchronously during engagement
+        // creation (same fix as AuditSectionItemRegistrar; see that class for detail).
+        WorkflowInstance wfInstance = workflowInstanceRepository
+                .findById(event.workflowInstanceId())
                 .orElse(null);
+
+        var engagement = (wfInstance != null && "AUDIT_ENGAGEMENT".equals(wfInstance.getEntityType()))
+                ? engagementRepository.findById(wfInstance.getEntityId()).orElse(null)
+                : null;
 
         if (engagement == null) {
             log.warn("[AUDIT-CTRL-REGISTRAR] No engagement found for workflowInstanceId={} tenantId={}" +
-                            " — startWorkflowIfConfigured() must have stored workflowInstanceId on engagement",
+                            " — WorkflowInstance missing or not AUDIT_ENGAGEMENT",
                     event.workflowInstanceId(), event.tenantId());
             return;
         }

@@ -40,6 +40,7 @@ public class AuditPolicyController {
     private final UtilityService                              utilityService;
     private final WorkflowEngineService                       workflowEngineService;
     private final WorkflowRepository                          workflowRepository;
+    private final com.kashi.grc.workflow.service.WorkflowAccessService workflowAccessService;
 
     // ── Library — Policies CRUD ───────────────────────────────────────────────
 
@@ -416,6 +417,18 @@ public class AuditPolicyController {
             @RequestBody PolicyReviewRequest req) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
+
+        // SECURITY: recording an adequacy conclusion is an AUDITOR action. Gate it
+        // on audit:policy:review resolved for this engagement's workflow — an
+        // auditee (or anyone lacking the permission) must not be able to review.
+        var reviewer = utilityService.getLoggedInUserWithRolesAndPermissions();
+        var access   = workflowAccessService.resolveForModule(reviewer, "AUDIT_ENGAGEMENT", engagementId);
+        java.util.List<String> perms = access != null ? access.getPermissions() : java.util.List.of();
+        if (!perms.contains("audit:policy:review")) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN)
+                    .body(ApiResponse.error("FORBIDDEN",
+                            "You do not have permission to review this policy."));
+        }
 
         AuditPolicyInstance instance = policyInstanceRepository.findById(policyInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", policyInstanceId));

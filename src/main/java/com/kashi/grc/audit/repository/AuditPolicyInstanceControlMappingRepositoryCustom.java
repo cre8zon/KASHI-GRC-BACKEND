@@ -10,4 +10,7 @@ public interface AuditPolicyInstanceControlMappingRepositoryCustom {
 
     /** All policy instance IDs covering a control instance. */
     List<Long> findPolicyInstanceIdsByControlInstanceId(Long controlInstanceId);
+
+    /** Batch: control-instance IDs in an engagement that have >=1 policy mapped. */
+    java.util.Set<Long> controlIdsWithPolicyForEngagement(Long engagementId);
 }

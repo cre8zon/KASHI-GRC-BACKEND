@@ -88,6 +88,9 @@ public class AuditEngagementController {
 
     private final AuditEngagementService                service;
     private final AuditProjectRepository                projectRepository;
+    private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepository;
+    private final com.kashi.grc.audit.repository.AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
+    private final com.fasterxml.jackson.databind.ObjectMapper controlFlagsMapper; // Spring-configured (JSR-310 enabled) — injected via @RequiredArgsConstructor
     private final AuditProjectTemplateRepository        projectTemplateRepository;
     private final AuditProjectInstanceRepository        projectInstanceRepository;
     private final AuditEngagementRepository             engagementRepository;
@@ -1098,6 +1101,11 @@ public class AuditEngagementController {
                     m.put("auditType",          e.getAuditType());
                     m.put("status",             e.getStatus());
                     m.put("frameworkRef",       e.getFrameworkRef() != null ? e.getFrameworkRef() : "");
+                    // Planned window + lead auditor — needed by the list's START/END/
+                    // LEAD AUDITOR columns (previously omitted, so they showed '—').
+                    m.put("plannedStart",       e.getPlannedStart());
+                    m.put("plannedEnd",         e.getPlannedEnd());
+                    m.put("leadAuditorId",      e.getLeadAuditorId());
                     m.put("totalControls",      e.getTotalControls());
                     m.put("testedControls",     e.getTestedControls());
                     m.put("openFindingCount",   e.getOpenFindingCount());
@@ -1331,6 +1339,19 @@ public class AuditEngagementController {
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    @PostMapping("/engagements/{id}/sections/bulk-assign")
+    @Operation(summary = "Bulk-assign auditor and/or auditee to multiple sections in one call",
+            description = "Provide sectionIds plus auditorUserId and/or auditeeUserId. Each " +
+                    "section reuses the per-section assign logic, so cascadeToChildren behaves " +
+                    "the same as single-section assignment (defaults to true).")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> bulkAssignSections(
+            @PathVariable Long id,
+            @RequestBody com.kashi.grc.audit.dto.request.BulkSectionAssignRequest req) {
+        var ctx = utilityService.getLoggedInDataContext();
+        int updated = service.bulkAssignSections(id, req, ctx.getId(), ctx.getTenantId());
+        return ResponseEntity.ok(ApiResponse.success(Map.of("updated", updated)));
+    }
+
     @PostMapping("/engagements/{id}/sections/{sid}/submit")
     @Operation(summary = "Auditor submits a section — locks test results")
     public ResponseEntity<ApiResponse<Void>> submitSection(
@@ -1357,11 +1378,34 @@ public class AuditEngagementController {
     // ══════════════════════════════════════════════════════════════════════════
 
     @GetMapping("/engagements/{id}/controls")
-    @Operation(summary = "List control instances for an engagement")
-    public ResponseEntity<ApiResponse<List<AuditControlInstance>>> listControls(
+    @Operation(summary = "List control instances for an engagement (+ hasPolicy / hasEvidence flags)")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listControls(
             @PathVariable Long id) {
-        return ResponseEntity.ok(ApiResponse.success(
-                controlInstanceRepository.findByEngagementId(id)));
+        List<AuditControlInstance> controls = controlInstanceRepository.findByEngagementId(id);
+
+        // Two batch queries for the WHOLE list (not per-control):
+        //   hasPolicy   — control has >=1 policy instance mapped
+        //   hasEvidence — control has >=1 evidence link of ANY status
+        //                 (PENDING_REVIEW or ACCEPTED — includes reused evidence)
+        java.util.Set<Long> withPolicy = policyInstanceControlMappingRepository
+                .controlIdsWithPolicyForEngagement(id);
+        List<Long> controlIds = controls.stream().map(AuditControlInstance::getId).toList();
+        java.util.Set<Long> withEvidence = evidenceLinkRepository
+                .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", controlIds);
+
+        List<Map<String, Object>> rows = controls.stream().map(c -> {
+            // convertValue preserves EVERY entity field the frontend already reads,
+            // so this is additive — no field is lost by switching to a map.
+            @SuppressWarnings("unchecked")
+            Map<String, Object> m = controlFlagsMapper.convertValue(c, Map.class);
+            m.put("hasPolicy",   withPolicy.contains(c.getId()));
+            // hasEvidence combines the legacy submit flag with any evidence link,
+            // so reused/linked evidence (pending or accepted) also counts.
+            m.put("hasEvidence", c.isAuditeeEvidenceSubmitted() || withEvidence.contains(c.getId()));
+            return m;
+        }).toList();
+
+        return ResponseEntity.ok(ApiResponse.success(rows));
     }
 
     @GetMapping("/engagements/{id}/controls/{cid}")

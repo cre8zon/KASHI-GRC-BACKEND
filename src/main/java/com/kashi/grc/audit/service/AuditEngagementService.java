@@ -222,6 +222,11 @@ public class AuditEngagementService {
         }
 
         int totalControls = (int) controlInstanceRepository.countByEngagementId(engagement.getId());
+        if (totalControls == 0) {
+            throw new BusinessException("EMPTY_TEMPLATE",
+                    "Template '" + template.getName() + "' has no sections/controls to snapshot — "
+                            + "fix the template in the Audit Library before using it for an engagement");
+        }
         engagement.setTotalControls(totalControls);
         engagementRepository.save(engagement);
 
@@ -294,6 +299,16 @@ public class AuditEngagementService {
                 root.setAssignedAuditorId(auditorId);
                 sectionInstanceRepository.save(root);
             }
+        }
+
+        // Fire the section-level compound-task item event — was previously dead
+        // code (fireSectionAssignmentEvent existed but nothing called it). This
+        // handles both standalone (WF14) and project-governed (WF16) engagements
+        // internally by resolving the correct workflow instance.
+        if (auditorId != null && performedBy != null) {
+            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR", sectionInstanceId, engagementId, performedBy);
+        } else if (auditorId == null && performedBy != null) {
+            uncompleteSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR", sectionInstanceId, engagementId);
         }
 
         // Fire ENGAGEMENTS_ONBOARDED once ALL sections of this engagement
@@ -403,6 +418,16 @@ public class AuditEngagementService {
                 root.setAuditeeAssignedUserId(auditeeUserId);
                 sectionInstanceRepository.save(root);
             }
+        }
+
+        // Fire the section-level compound-task item event — was previously dead
+        // code (fireSectionAssignmentEvent existed but nothing called it). This
+        // handles both standalone (WF14) and project-governed (WF16) engagements
+        // internally by resolving the correct workflow instance.
+        if (auditeeUserId != null && performedBy != null) {
+            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE", sectionInstanceId, engagementId, performedBy);
+        } else if (auditeeUserId == null && performedBy != null) {
+            uncompleteSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE", sectionInstanceId, engagementId);
         }
 
         // Fire EVIDENCE_OWNERS_ASSIGNED once ALL sections of this engagement
@@ -544,6 +569,44 @@ public class AuditEngagementService {
                         "auditorId={} | auditeeId={}",
                 engagementId, updated, owned.size(),
                 req.getAuditorUserId(), req.getAuditeeUserId());
+        return updated;
+    }
+
+    /**
+     * Bulk-assign auditor and/or auditee across multiple SECTIONS in one call.
+     * Each section reuses the existing per-section logic (assignSection /
+     * assignAuditeeToSection), so cascade-to-children behaves identically to a
+     * single-section assignment.
+     */
+    @Transactional
+    public int bulkAssignSections(Long engagementId,
+                                  com.kashi.grc.audit.dto.request.BulkSectionAssignRequest req,
+                                  Long actorId, Long tenantId) {
+        if (req.getSectionIds() == null || req.getSectionIds().isEmpty()) {
+            throw new BusinessException("MISSING_TARGET", "sectionIds must be provided");
+        }
+        boolean cascade = req.getCascadeToChildren() == null || req.getCascadeToChildren();
+
+        int updated = 0;
+        for (Long sectionId : req.getSectionIds()) {
+            // Safety: section must belong to this engagement (assignSection checks tenant;
+            // the per-section methods throw if the section isn't found under the engagement).
+            boolean changed = false;
+            if (req.getAuditorUserId() != null) {
+                assignSection(engagementId, sectionId, req.getAuditorUserId(), cascade, tenantId, actorId);
+                changed = true;
+            }
+            if (req.getAuditeeUserId() != null) {
+                assignAuditeeToSection(engagementId, sectionId, req.getAuditeeUserId(), cascade, tenantId, actorId);
+                changed = true;
+            }
+            if (changed) updated++;
+        }
+
+        log.info("[AUDIT-ENG-SERVICE] Bulk section assign | engagementId={} | updated={}/{} | " +
+                        "auditorId={} | auditeeId={} | cascade={}",
+                engagementId, updated, req.getSectionIds().size(),
+                req.getAuditorUserId(), req.getAuditeeUserId(), cascade);
         return updated;
     }
 
@@ -690,6 +753,26 @@ public class AuditEngagementService {
         }
     }
 
+    /**
+     * Counts controls in an engagement that have evidence PROVIDED — either a direct
+     * auditee submission or a reused/linked evidence record. Used for the engagement
+     * progress header so it agrees with the control-row "evidence" tags and the
+     * evidence-submission auto-complete gate. Adequacy (PASS/FAIL) is judged separately
+     * in the auditor review step and is not part of this count.
+     */
+    private int countControlsWithEvidence(Long engagementId) {
+        List<AuditControlInstance> controls =
+                controlInstanceRepository.findByEngagementId(engagementId);
+        if (controls.isEmpty()) return 0;
+        java.util.List<Long> ids = controls.stream()
+                .map(AuditControlInstance::getId).toList();
+        java.util.Set<Long> withReused = evidenceLinkRepository
+                .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", ids);
+        return (int) controls.stream()
+                .filter(c -> c.isAuditeeEvidenceSubmitted() || withReused.contains(c.getId()))
+                .count();
+    }
+
     private void fireProjectEvidenceCompleteEvent(AuditEngagement engagement,
                                                   Long engagementId,
                                                   Long submittedBy) {
@@ -698,10 +781,22 @@ public class AuditEngagementService {
                     controlInstanceRepository.findByEngagementId(engagementId);
             if (allControls.isEmpty()) return;
 
+            // A control counts as "evidence provided" if the auditee directly submitted
+            // OR it has any reused/linked evidence. Reused evidence is the auditee
+            // providing evidence for this control just like a direct upload — its
+            // adequacy is judged later in the auditor's review/testing step (PASS/FAIL
+            // + findings), NOT gated here. So presence (direct OR reused) advances the
+            // evidence-submission step.
+            java.util.List<Long> controlIds = allControls.stream()
+                    .map(AuditControlInstance::getId).toList();
+            java.util.Set<Long> controlsWithReusedEvidence = evidenceLinkRepository
+                    .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", controlIds);
+
             long submittedCount = allControls.stream()
-                    .filter(AuditControlInstance::isAuditeeEvidenceSubmitted)
+                    .filter(c -> c.isAuditeeEvidenceSubmitted()
+                            || controlsWithReusedEvidence.contains(c.getId()))
                     .count();
-            log.info("[AUDIT-ENG-SERVICE] Evidence progress | engagementId={} | {}/{} controls submitted",
+            log.info("[AUDIT-ENG-SERVICE] Evidence progress | engagementId={} | {}/{} controls have evidence (direct or reused)",
                     engagementId, submittedCount, allControls.size());
             if (submittedCount < allControls.size()) return;
 
@@ -1205,6 +1300,56 @@ public class AuditEngagementService {
         }
     }
 
+    /**
+     * Companion to fireSectionAssignmentEvent() — resets the section's item back
+     * to PENDING when its assignment is cleared, so the step's compound-task gate
+     * re-opens instead of staying complete on a now-unassigned section.
+     */
+    private void uncompleteSectionAssignmentEvent(String completionEvent,
+                                                  Long sectionInstanceId,
+                                                  Long engagementId) {
+        try {
+            AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
+            if (engagement == null) return;
+
+            Long workflowInstanceId = engagement.getWorkflowInstanceId();
+            if (workflowInstanceId == null && engagement.getProjectInstanceId() != null) {
+                var projInst = projectInstanceRepository
+                        .findById(engagement.getProjectInstanceId()).orElse(null);
+                if (projInst != null) {
+                    workflowInstanceId = projInst.getWorkflowInstanceId();
+                }
+            }
+            if (workflowInstanceId == null) return;
+
+            var activeSteps = stepInstanceRepository
+                    .findByWorkflowInstanceIdAndStatus(workflowInstanceId, StepStatus.IN_PROGRESS);
+            if (activeSteps.isEmpty()) return;
+            var stepInstance = activeSteps.get(0);
+
+            var anyTask = taskInstanceRepository
+                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                    .stream().findFirst()
+                    .or(() -> taskInstanceRepository
+                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                            .stream().findFirst());
+            if (anyTask.isEmpty()) return;
+
+            Long taskId = anyTask.get().getId();
+            var matchedSection = taskSectionCompletionRepository
+                    .findByTaskInstanceIdAndSnapCompletionEvent(taskId, completionEvent).orElse(null);
+            if (matchedSection == null) return;
+
+            taskSectionCompletionService.uncompleteItemByRef(
+                    taskId, matchedSection.getSnapSectionKey(), sectionInstanceId);
+            log.info("[AUDIT-ENG-SERVICE] Section assignment item reset | event='{}' | sectionInstanceId={} | taskId={}",
+                    completionEvent, sectionInstanceId, taskId);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] uncompleteSectionAssignmentEvent failed (non-fatal) | event={} | sectionInstanceId={} | {}",
+                    completionEvent, sectionInstanceId, ex.getMessage());
+        }
+    }
+
     private void fireControlSectionEvent(String completionEvent,
                                          Long controlInstanceId,
                                          Long engagementId,
@@ -1335,8 +1480,10 @@ public class AuditEngagementService {
                 .auditType(e.getAuditType()).status(e.getStatus()).frameworkRef(e.getFrameworkRef())
                 .leadAuditorId(e.getLeadAuditorId()).ownerId(e.getOwnerId())
                 .totalControls(e.getTotalControls()).testedControls(e.getTestedControls())
-                .submittedControls((int) controlInstanceRepository
-                        .countByEngagementIdAndAuditeeEvidenceSubmitted(e.getId(), true))
+                // Count controls that have evidence PROVIDED — direct submit OR reused
+                // link — so the header progress matches the control-row tags and the
+                // auto-complete gate (adequacy is judged later in the review step).
+                .submittedControls(countControlsWithEvidence(e.getId()))
                 .passedControls(e.getPassedControls()).failedControls(e.getFailedControls())
                 .openFindingCount(e.getOpenFindingCount()).workflowInstanceId(e.getWorkflowInstanceId())
                 .createdAt(e.getCreatedAt()).updatedAt(e.getUpdatedAt())

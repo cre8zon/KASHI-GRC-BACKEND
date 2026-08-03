@@ -102,6 +102,12 @@ public class UserController {
             @RequestParam Map<String, String> allParams) {
         String side    = allParams.get("side");  // ← extract before passing to pageDetails
         boolean noRoles = "true".equalsIgnoreCase(allParams.get("noRoles"));
+        // Optional role filter — e.g. leadAuditorId picker requests role LEAD_AUDITOR.
+        Long roleId = null;
+        String roleIdStr = allParams.get("roleId");
+        if (roleIdStr != null && !roleIdStr.isBlank()) {
+            try { roleId = Long.parseLong(roleIdStr); } catch (NumberFormatException ignored) {}
+        }
         // vendorId filter: org-admin drilling into a specific vendor's team,
         // OR scoping override. Vendor-side users are always scoped to their own
         // vendor by the service (via loggedInUser.getVendorId()) — this param
@@ -112,7 +118,7 @@ public class UserController {
             try { vendorId = Long.parseLong(vendorIdStr); } catch (NumberFormatException ignored) {}
         }
         return ResponseEntity.ok(ApiResponse.success(
-                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId)));
+                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId, roleId)));
     }
 
     // ── UPDATE ────────────────────────────────────────────────────

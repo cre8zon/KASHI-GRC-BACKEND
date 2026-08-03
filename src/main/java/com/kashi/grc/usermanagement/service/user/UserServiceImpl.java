@@ -161,7 +161,7 @@ public class UserServiceImpl implements UserService {
 
     @Override
     @Transactional(readOnly = true)
-    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam) {
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -188,6 +188,7 @@ public class UserServiceImpl implements UserService {
             } catch (IllegalArgumentException ignored) {}
         }
         final com.kashi.grc.usermanagement.domain.RoleSide finalRoleSide = roleSide;
+        final Long finalRoleId = roleIdParam;
 
         return dbRepository.findAll(
                 User.class,
@@ -232,6 +233,19 @@ public class UserServiceImpl implements UserService {
                     } else if (effectiveVendorId != null) {
                         // No side filter but vendorId given — scope to that vendor regardless
                         predicates.add(cb.equal(root.get("vendorId"), effectiveVendorId));
+                    }
+                    // Role filter — user must hold the given role (e.g. LEAD_AUDITOR).
+                    // Composable with the side filter above: side=AUDITOR & roleId=33
+                    // → auditor-side users who are Lead Auditors.
+                    if (finalRoleId != null) {
+                        jakarta.persistence.criteria.Subquery<Long> roleSub =
+                                cb.createQuery(Long.class).subquery(Long.class);
+                        jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.User> roleSubRoot =
+                                roleSub.correlate(root);
+                        jakarta.persistence.criteria.Join<Object, Object> rJoin = roleSubRoot.join("roles");
+                        roleSub.select(roleSubRoot.get("id"))
+                                .where(cb.equal(rJoin.get("id"), finalRoleId));
+                        predicates.add(cb.exists(roleSub));
                     }
                     return predicates;
                 },

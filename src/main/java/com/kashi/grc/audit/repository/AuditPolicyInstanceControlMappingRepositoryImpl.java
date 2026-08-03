@@ -25,6 +25,16 @@ public class AuditPolicyInstanceControlMappingRepositoryImpl
     }
 
     @Override
+    public java.util.Set<Long> controlIdsWithPolicyForEngagement(Long engagementId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<AuditPolicyInstanceControlMapping> m = cq.from(AuditPolicyInstanceControlMapping.class);
+        cq.select(m.get("controlInstanceId")).distinct(true)
+                .where(cb.equal(m.get("engagementId"), engagementId));
+        return new java.util.HashSet<>(em.createQuery(cq).getResultList());
+    }
+
+    @Override
     public List<Long> findPolicyInstanceIdsByControlInstanceId(Long controlInstanceId) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);
