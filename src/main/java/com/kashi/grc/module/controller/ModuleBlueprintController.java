@@ -158,6 +158,7 @@ public class ModuleBlueprintController {
                 .supportsActionItems(req.isSupportsActionItems())
                 .supportsDocuments(req.isSupportsDocuments())
                 .supportsComments(req.isSupportsComments())
+                .supportsHistory(req.isSupportsHistory())
                 .supportsWorkflow(req.isSupportsWorkflow())
                 .showInNav(req.isShowInNav())
                 .allowedSides(req.getAllowedSides() != null ? req.getAllowedSides() : "ORGANIZATION,SYSTEM")
@@ -216,6 +217,7 @@ public class ModuleBlueprintController {
         bp.setSupportsActionItems(req.isSupportsActionItems());
         bp.setSupportsDocuments(req.isSupportsDocuments());
         bp.setSupportsComments(req.isSupportsComments());
+        bp.setSupportsHistory(req.isSupportsHistory());
         bp.setSupportsWorkflow(req.isSupportsWorkflow());
         bp.setSupportsTree(req.isSupportsTree());   // v2
         bp.setShowInNav(req.isShowInNav());
@@ -284,6 +286,7 @@ public class ModuleBlueprintController {
         m.put("supportsActionItems", bp.isSupportsActionItems());
         m.put("supportsDocuments",   bp.isSupportsDocuments());
         m.put("supportsComments",    bp.isSupportsComments());
+        m.put("supportsHistory",     bp.isSupportsHistory());
         m.put("supportsWorkflow",    bp.isSupportsWorkflow());
         m.put("showInNav",           bp.isShowInNav());
         m.put("supportsTree",        bp.isSupportsTree());          // v2
@@ -327,6 +330,7 @@ public class ModuleBlueprintController {
         private boolean           supportsActionItems = true;
         private boolean           supportsDocuments   = true;
         private boolean           supportsComments    = true;
+        private boolean           supportsHistory     = true;
         private boolean           supportsWorkflow    = true;
         private boolean           showInNav           = true;
         private boolean           supportsTree        = false;       // v2 — renders tree instead of flat DataTable

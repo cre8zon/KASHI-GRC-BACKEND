@@ -504,8 +504,16 @@ public class AuditLibraryController {
                     if (allParams.containsKey("audittype"))
                         predicates.add(cb.equal(root.get("auditType"),
                                 AuditTemplate.AuditType.valueOf(allParams.get("audittype").toUpperCase())));
-                    if (allParams.containsKey("frameworkref"))
-                        predicates.add(cb.equal(root.get("frameworkRef"), allParams.get("frameworkref")));
+                    if (allParams.containsKey("frameworkref")) {
+                        // Tolerant match: templates may store 'ISO 27001' while the
+                        // nav passes 'ISO27001'. Compare space-stripped + lowercase.
+                        String want = allParams.get("frameworkref")
+                                .replaceAll("\\s+", "").toLowerCase();
+                        jakarta.persistence.criteria.Expression<String> normalized =
+                                cb.lower(cb.function("REPLACE", String.class,
+                                        root.get("frameworkRef"), cb.literal(" "), cb.literal("")));
+                        predicates.add(cb.equal(normalized, want));
+                    }
                     return predicates;
                 },
                 (cb, root) -> Map.of("name", root.get("name"), "status", root.get("status")),

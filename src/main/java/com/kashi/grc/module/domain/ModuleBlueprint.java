@@ -130,6 +130,10 @@ public class ModuleBlueprint extends GlobalOrTenantEntity {
     @Builder.Default
     private boolean supportsComments = false;  // opt-in: enable in Blueprint Settings
 
+    @Column(name = "supports_history", nullable = false)
+    @Builder.Default
+    private boolean supportsHistory = true;  // audit trail — on by default, toggleable in Blueprint Settings
+
     @Column(name = "supports_workflow", nullable = false)
     @Builder.Default
     private boolean supportsWorkflow = false;  // opt-in: enable in Blueprint Settings

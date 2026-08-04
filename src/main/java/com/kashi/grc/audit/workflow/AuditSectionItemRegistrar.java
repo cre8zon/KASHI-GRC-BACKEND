@@ -6,6 +6,8 @@ import com.kashi.grc.audit.repository.AuditEngagementRepository;
 import com.kashi.grc.audit.repository.AuditProjectInstanceRepository;
 import com.kashi.grc.audit.repository.AuditSectionInstanceRepository;
 import com.kashi.grc.workflow.event.SectionItemsNeededEvent;
+import com.kashi.grc.workflow.domain.WorkflowInstance;
+import com.kashi.grc.workflow.repository.WorkflowInstanceRepository;
 import com.kashi.grc.workflow.service.TaskSectionCompletionService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -42,6 +44,7 @@ public class AuditSectionItemRegistrar {
     private final AuditProjectInstanceRepository projectInstanceRepository;
     private final AuditSectionInstanceRepository sectionInstanceRepository;
     private final TaskSectionCompletionService   sectionService;
+    private final WorkflowInstanceRepository     workflowInstanceRepository;
 
     @EventListener
     @Transactional
@@ -55,32 +58,43 @@ public class AuditSectionItemRegistrar {
         int assignDepth = resolveAssignDepth(event.sectionUiJson());
 
         // ── Resolve engagements ────────────────────────────────────────────────
-        // Try engagement-own workflow first (WF14: engagement has its own wf instance).
-        // Fall back to project-level workflow (WF16: wf instance belongs to project).
+        // FIX: previously resolved via engagementRepository.findByTenantIdAndWorkflowInstanceId(),
+        // but AuditEngagement.workflowInstanceId is only written back AFTER
+        // workflowEngineService.startWorkflow() returns (see AuditEngagementService.
+        // startWorkflowIfConfigured()). When a step needing item registration is
+        // reached synchronously within that same call (e.g. our compressed workflow's
+        // step 2, right after step 1 auto-completes on start), that FK isn't committed
+        // yet and this lookup found nothing — logged as "No engagement or project
+        // found" and silently skipped, leaving the compound gate stuck with zero
+        // items forever.
+        //
+        // Resolving via WorkflowInstance.entityType/entityId instead — these are
+        // set at instance-creation time, before any step processing begins, so
+        // there's no race window regardless of when in the request this fires.
         List<AuditEngagement> engagements = new ArrayList<>();
 
-        var directEngagement = engagementRepository
-                .findByTenantIdAndWorkflowInstanceId(event.tenantId(), event.workflowInstanceId())
+        WorkflowInstance wfInstance = workflowInstanceRepository
+                .findById(event.workflowInstanceId())
                 .orElse(null);
 
-        if (directEngagement != null) {
+        if (wfInstance == null) {
+            log.warn("[AUDIT-SEC-REGISTRAR] WorkflowInstance {} not found — skipping",
+                    event.workflowInstanceId());
+            return;
+        }
+
+        if ("AUDIT_ENGAGEMENT".equals(wfInstance.getEntityType())) {
             // WF14 path — single engagement
-            engagements.add(directEngagement);
-            log.debug("[AUDIT-SEC-REGISTRAR] WF14 path — single engagementId={}", directEngagement.getId());
-        } else {
-            // WF16 path — project-level workflow
-            var projectInstance = projectInstanceRepository
-                    .findByWorkflowInstanceId(event.workflowInstanceId())
-                    .orElse(null);
-            if (projectInstance == null) {
-                log.warn("[AUDIT-SEC-REGISTRAR] No engagement or project found for " +
-                                "workflowInstanceId={} tenantId={} — skipping",
-                        event.workflowInstanceId(), event.tenantId());
-                return;
+            var directEngagement = engagementRepository.findById(wfInstance.getEntityId()).orElse(null);
+            if (directEngagement != null) {
+                engagements.add(directEngagement);
+                log.debug("[AUDIT-SEC-REGISTRAR] WF14 path — single engagementId={}", directEngagement.getId());
             }
-            engagements = engagementRepository.findByProjectInstanceId(projectInstance.getId());
+        } else if ("AUDIT_PROJECT".equals(wfInstance.getEntityType())) {
+            // WF16 path — project-level workflow
+            engagements = engagementRepository.findByProjectInstanceId(wfInstance.getEntityId());
             log.info("[AUDIT-SEC-REGISTRAR] WF16 path — projectInstanceId={} has {} engagement(s)",
-                    projectInstance.getId(), engagements.size());
+                    wfInstance.getEntityId(), engagements.size());
         }
 
         if (engagements.isEmpty()) {

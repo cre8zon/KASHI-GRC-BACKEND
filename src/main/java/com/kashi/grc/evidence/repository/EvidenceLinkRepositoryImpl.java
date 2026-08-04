@@ -22,12 +22,12 @@ public class EvidenceLinkRepositoryImpl implements EvidenceLinkRepositoryCustom 
         CriteriaUpdate<EvidenceLink> cu = cb.createCriteriaUpdate(EvidenceLink.class);
         Root<EvidenceLink> l = cu.from(EvidenceLink.class);
         cu.set(l.get("status"), EvidenceLink.Status.EXPIRED)
-          .where(
-                  cb.equal(l.get("evidenceRecordId"), recordId),
-                  l.get("status").in(List.of(
-                          EvidenceLink.Status.PENDING_REVIEW,
-                          EvidenceLink.Status.ACCEPTED))
-          );
+                .where(
+                        cb.equal(l.get("evidenceRecordId"), recordId),
+                        l.get("status").in(List.of(
+                                EvidenceLink.Status.PENDING_REVIEW,
+                                EvidenceLink.Status.ACCEPTED))
+                );
         return em.createQuery(cu).executeUpdate();
     }
 
@@ -43,6 +43,20 @@ public class EvidenceLinkRepositoryImpl implements EvidenceLinkRepositoryCustom 
         );
         cq.orderBy(cb.desc(l.get("linkedAt")));
         return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public java.util.Set<Long> entityIdsWithAnyLink(String entityType, java.util.List<Long> entityIds) {
+        if (entityIds == null || entityIds.isEmpty()) return new java.util.HashSet<>();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<EvidenceLink> l = cq.from(EvidenceLink.class);
+        // Select DISTINCT target ids that have any link (any status).
+        cq.select(l.get("targetEntityId")).distinct(true).where(
+                cb.equal(l.get("targetEntityType"), entityType),
+                l.get("targetEntityId").in(entityIds)
+        );
+        return new java.util.HashSet<>(em.createQuery(cq).getResultList());
     }
 
     @Override

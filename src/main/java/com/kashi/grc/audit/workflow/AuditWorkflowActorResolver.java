@@ -63,7 +63,14 @@ public class AuditWorkflowActorResolver implements WorkflowActorResolver {
             case "AUDITEE" -> {
                 List<Long> ids = controlInstanceRepository
                         .findDistinctAssignedAuditeeIdsByEngagementId(engagementId);
-                log.info("[AUDIT-ACTOR-RESOLVER] AUDITEE step '{}' | engagementId={} | {} assigned auditee(s)",
+                if (ids.isEmpty()) {
+                    // Section-level "Assign auditee" (with cascade) deliberately does not
+                    // write down to controls — fall back to section-level assignment,
+                    // mirroring AuditProjectWorkflowActorResolver's AUDITEE case.
+                    ids = sectionInstanceRepository
+                            .findDistinctAssignedAuditeeIdsByEngagementId(engagementId);
+                }
+                log.info("[AUDIT-ACTOR-RESOLVER] AUDITEE step '{}' | engagementId={} | {} assigned auditee(s) (control-level, falls back to section-level)",
                         si.getSnapName(), engagementId, ids.size());
                 yield ids;
             }
