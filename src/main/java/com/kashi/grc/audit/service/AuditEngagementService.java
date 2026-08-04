@@ -48,6 +48,30 @@ public class AuditEngagementService {
     private final WorkflowEngineService                     workflowEngineService;
     private final WorkflowRepository                        workflowRepository;
     private final NotificationService                       notificationService;
+
+    // Self-injected via the Spring proxy — NOT the same as `this`. Needed
+    // because completeEngagementProvisioning() calls snapshotTemplate() and
+    // markSnapshotFailed(), both in this same class. A plain `this.method()`
+    // call bypasses Spring's AOP proxy entirely, which means @Transactional
+    // on the callee is silently ignored — each JPA save/JDBC insert inside
+    // would commit independently instead of as one atomic unit. That was the
+    // actual root cause of an infinite Kafka retry loop: a later insert
+    // failing couldn't roll back an earlier insert that had already
+    // committed on its own, so every retry hit a duplicate-key error on the
+    // same already-committed row, forever. Calling through `self` instead
+    // routes through the proxy, so @Transactional actually applies.
+    //
+    // NOT constructor-injected via @RequiredArgsConstructor: Lombok does not
+    // copy field-level annotations onto the constructor parameter it
+    // generates, so @Lazy here was silently dropped and Spring tried to
+    // eagerly resolve AuditEngagementService while still constructing
+    // AuditEngagementService — a genuine, unresolvable circular dependency
+    // ("Requested bean is currently in creation"). Field injection with
+    // @Autowired keeps @Lazy on the actual injection point, which defers
+    // resolution until first use and correctly breaks the cycle.
+    @org.springframework.beans.factory.annotation.Autowired
+    @org.springframework.context.annotation.Lazy
+    private AuditEngagementService self;
     private final AuditTestPolicySnapshotService            testPolicySnapshotService;
     private final WorkflowInstanceRepository                workflowInstanceRepository;
     private final StepInstanceRepository                    stepInstanceRepository;
@@ -249,7 +273,7 @@ public class AuditEngagementService {
     public void completeEngagementProvisioning(AuditEngagement engagement, Long templateId, Long tenantId,
                                                boolean startWorkflow, Long overrideWorkflowId, Long createdBy) {
         try {
-            snapshotTemplate(engagement, templateId, tenantId);
+            self.snapshotTemplate(engagement, templateId, tenantId);
             if (startWorkflow) {
                 startWorkflowIfConfigured(engagement, overrideWorkflowId, createdBy, tenantId);
             } else {
@@ -267,7 +291,7 @@ public class AuditEngagementService {
             // PROVISIONING forever with no signal; rethrow so the caller
             // (consumer) can decide retry/DLT policy — the synchronous
             // fallback path just lets it propagate as before.
-            markSnapshotFailed(engagement.getId());
+            self.markSnapshotFailed(engagement.getId());
             throw e;
         }
     }

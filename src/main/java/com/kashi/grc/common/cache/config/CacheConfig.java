@@ -100,8 +100,32 @@ public class CacheConfig implements CachingConfigurer {
     // actually resolves against is cacheManager() below, which wraps this one.
     @Bean
     public RedisCacheManager redisCacheManager(RedisConnectionFactory connectionFactory) {
+        // A dedicated COPY of the shared ObjectMapper, not the shared bean
+        // itself. GenericJackson2JsonRedisSerializer needs
+        // activateDefaultTyping() to embed @class metadata in the cached
+        // JSON — without it, Jackson has no way to know a cached value
+        // should deserialize back into (say) UiFormResponse instead of a
+        // generic LinkedHashMap, which is exactly the
+        // "ClassCastException: LinkedHashMap cannot be cast to
+        // UiFormResponse" seen in production on getForm(). Enabling default
+        // typing on the SHARED objectMapper bean instead would fix caching
+        // but silently embed @class fields in every REST response the app
+        // sends to the frontend — a much worse, app-wide side effect for a
+        // Redis-only concern. .copy() keeps JavaTimeModule and every other
+        // registration already on the shared mapper; only this Redis-only
+        // copy gets typing activated.
+        ObjectMapper redisObjectMapper = objectMapper.copy();
+        com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator ptv =
+                com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator.builder()
+                        .allowIfSubType(Object.class) // trusted — this cache only ever holds our own DTOs
+                        .build();
+        redisObjectMapper.activateDefaultTyping(
+                ptv,
+                com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping.NON_FINAL,
+                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY);
+
         GenericJackson2JsonRedisSerializer jsonSerializer =
-                new GenericJackson2JsonRedisSerializer(objectMapper);
+                new GenericJackson2JsonRedisSerializer(redisObjectMapper);
 
         RedisCacheConfiguration defaults = RedisCacheConfiguration.defaultCacheConfig()
                 .entryTtl(Duration.ofMinutes(5))

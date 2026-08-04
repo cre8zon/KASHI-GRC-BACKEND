@@ -297,18 +297,32 @@ public class AuditSectionService {
                     breadcrumb, control.getTestType().name(), control.getFrameworkRef(),
                     control.getControlTag(), tagExpansionService.expand(control.getControlTag()),
                     mapping.getWeight(), mapping.isMandatory(), mapping.getOrderNo(),
-                    AuditControlInstance.TestResult.NOT_TESTED.name(), now, now
+                    AuditControlInstance.TestResult.NOT_TESTED.name(),
+                    false, false, // auditee_evidence_submitted, finding_linked — see comment below
+                    now, now
             });
         }
 
+        // auditee_evidence_submitted and finding_linked are both nullable=false
+        // on the entity, but only have a Java-side @Builder.Default (false) —
+        // ddl-auto=update does NOT translate @Builder.Default into an actual
+        // DB DEFAULT clause, so the column genuinely has no default at the
+        // schema level. The entity/builder path never notices because Java
+        // always supplies a value; this raw JDBC insert bypasses the entity
+        // entirely and was the actual cause of the "doesn't have a default
+        // value" error that put the Kafka consumer into an infinite retry
+        // loop (the DLT topic for this consumer's own topic also didn't have
+        // matching partition count, so even the safety-net dead-letter
+        // publish was failing — see KafkaConfig's DLT NewTopic bean for the
+        // matching fix).
         jdbcBatchInsertHelper.batchInsertAndGetIds(
                 "INSERT INTO audit_control_instances " +
                         "(tenant_id, engagement_id, section_instance_id, section_path, original_control_id, " +
                         "control_name_snapshot, control_code_snapshot, description_snapshot, " +
                         "section_breadcrumb_snapshot, test_type_snapshot, framework_ref_snapshot, " +
                         "control_tag_snapshot, matched_tags_snapshot, weight, is_mandatory, order_no, " +
-                        "test_result, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "test_result, auditee_evidence_submitted, finding_linked, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rows);
     }
 

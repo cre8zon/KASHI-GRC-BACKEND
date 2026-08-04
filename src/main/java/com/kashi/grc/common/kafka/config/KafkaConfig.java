@@ -47,7 +47,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *  - Consumer: ErrorHandlingDeserializer wrapper → a malformed message goes
  *    to the error handler instead of crash-looping the container.
  *  - DefaultErrorHandler: 3 retries with exponential backoff, then the record
- *    is published to "<topic>.DLT" and the partition moves on. A poison
+ *    is published to "<topic>-dlt" and the partition moves on. A poison
  *    message can never block a partition.
  *  - Every message deserialises to KafkaEventEnvelope — one target type for
  *    all topics, no type-mapping headers needed.
@@ -195,7 +195,9 @@ public class KafkaConfig {
     public ConcurrentKafkaListenerContainerFactory<String, KafkaEventEnvelope>
     kafkaListenerContainerFactory(KafkaTemplate<String, KafkaEventEnvelope> template) {
 
-        // Failed records → "<originalTopic>.DLT", same partition
+        // Failed records -> "<originalTopic>-dlt", same partition (Spring Kafka's
+        // actual default suffix — NOT ".DLT" despite what older comments in this
+        // file assumed; verified against real runtime behavior, not docs)
         DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template);
 
         // Counts every time a record actually gets dead-lettered (retries
@@ -247,7 +249,7 @@ public class KafkaConfig {
 
     @Bean
     public NewTopic testTopicDlt() {
-        return TopicBuilder.name(KafkaTopics.TEST + ".DLT")
+        return TopicBuilder.name(KafkaTopics.TEST + "-dlt")
                 .partitions(3)
                 .replicas(1)
                 .build();
@@ -263,7 +265,7 @@ public class KafkaConfig {
 
     @Bean
     public NewTopic emailTopicDlt() {
-        return TopicBuilder.name(KafkaTopics.EMAIL_REQUESTED + ".DLT")
+        return TopicBuilder.name(KafkaTopics.EMAIL_REQUESTED + "-dlt")
                 .partitions(3)
                 .replicas(1)
                 .build();
@@ -279,7 +281,7 @@ public class KafkaConfig {
 
     @Bean
     public NewTopic notificationEmailTopicDlt() {
-        return TopicBuilder.name(KafkaTopics.NOTIFICATION_EMAIL + ".DLT")
+        return TopicBuilder.name(KafkaTopics.NOTIFICATION_EMAIL + "-dlt")
                 .partitions(3)
                 .replicas(1)
                 .build();
@@ -295,7 +297,7 @@ public class KafkaConfig {
 
     @Bean
     public NewTopic assessmentExecuteTopicDlt() {
-        return TopicBuilder.name(KafkaTopics.ASSESSMENT_EXECUTE_REQUESTED + ".DLT")
+        return TopicBuilder.name(KafkaTopics.ASSESSMENT_EXECUTE_REQUESTED + "-dlt")
                 .partitions(3)
                 .replicas(1)
                 .build();
@@ -311,7 +313,7 @@ public class KafkaConfig {
 
     @Bean
     public NewTopic auditEngagementSnapshotTopicDlt() {
-        return TopicBuilder.name(KafkaTopics.AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED + ".DLT")
+        return TopicBuilder.name(KafkaTopics.AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED + "-dlt")
                 .partitions(3)
                 .replicas(1)
                 .build();
