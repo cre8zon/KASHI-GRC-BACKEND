@@ -60,6 +60,10 @@ public class AuditEngagementService {
     private final ApplicationEventPublisher                 eventPublisher;
     private final EvidenceLinkRepository evidenceLinkRepository;
     private final DocumentLinkRepository documentLinkRepository;
+    // ObjectProvider, not a direct dependency — KafkaEventPublisher only exists
+    // as a bean when kashi.kafka.enabled=true. getIfAvailable() returning null
+    // is the signal to fall back to synchronous snapshotting (see create()).
+    private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaEventPublisherProvider;
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
@@ -122,6 +126,7 @@ public class AuditEngagementService {
                 // FIX: request has LocalDate, domain has LocalDateTime — convert with atStartOfDay()
                 .plannedStart(req.getPlannedStart() != null ? req.getPlannedStart().atStartOfDay() : null)
                 .plannedEnd(req.getPlannedEnd()     != null ? req.getPlannedEnd().atStartOfDay()   : null)
+                .snapshotStatus(req.getTemplateId() != null ? "PROVISIONING" : null)
                 .build();
 
         engagementRepository.save(engagement);
@@ -171,13 +176,42 @@ public class AuditEngagementService {
         }
 
         if (req.getTemplateId() != null) {
-            snapshotTemplate(engagement, req.getTemplateId(), tenantId);
-        }
-
-        if (startWorkflow) {
-            startWorkflowIfConfigured(engagement, req.getWorkflowId(), createdBy, tenantId);
+            com.kashi.grc.common.kafka.KafkaEventPublisher publisher = kafkaEventPublisherProvider.getIfAvailable();
+            if (publisher != null) {
+                // Async path: return fast, snapshot + workflow start happen in
+                // AuditEngagementSnapshotConsumer. engagement.snapshotStatus stays
+                // PROVISIONING (set at build time above via .snapshotStatus(...))
+                // until the consumer flips it to READY/FAILED. Same "flip a flag,
+                // zero blast radius" contract as every other Kafka producer call —
+                // publisher==null (Kafka disabled) falls through to the synchronous
+                // branch below unchanged.
+                publisher.publish(
+                        com.kashi.grc.common.kafka.KafkaTopics.AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED,
+                        "AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED",
+                        String.valueOf(engagement.getId()),
+                        java.util.Map.of(
+                                "engagementId", engagement.getId(),
+                                "templateId", req.getTemplateId(),
+                                "createdBy", createdBy,
+                                "startWorkflow", startWorkflow,
+                                "workflowId", req.getWorkflowId() != null ? req.getWorkflowId() : -1L),
+                        tenantId, createdBy);
+                log.info("[AUDIT] Template snapshot dispatched via Kafka | engagementId={} | templateId={}",
+                        engagement.getId(), req.getTemplateId());
+            } else {
+                completeEngagementProvisioning(engagement, req.getTemplateId(), tenantId,
+                        startWorkflow, req.getWorkflowId(), createdBy);
+            }
         } else {
-            log.info("[AUDIT] Skipping per-engagement workflow start (project-governed) | engagementId={}", engagement.getId());
+            // No template supplied — nothing to snapshot (validation normally
+            // requires templateId, but this branch preserves the original
+            // unconditional behavior in case create() is ever called directly
+            // with a request that bypassed bean validation).
+            if (startWorkflow) {
+                startWorkflowIfConfigured(engagement, req.getWorkflowId(), createdBy, tenantId);
+            } else {
+                log.info("[AUDIT] Skipping per-engagement workflow start (project-governed) | engagementId={}", engagement.getId());
+            }
         }
 
         if (req.getLeadAuditorId() != null) {
@@ -187,6 +221,63 @@ public class AuditEngagementService {
         }
 
         return toResponse(engagement);
+    }
+
+    /**
+     * Does the actual template-snapshot + optional-workflow-start work, and
+     * updates snapshotStatus accordingly. Called from two places:
+     *   - create()'s synchronous fallback (Kafka disabled) — runs inline,
+     *     same request thread, same as before this async pattern existed.
+     *   - AuditEngagementSnapshotConsumer — runs on a Kafka listener thread,
+     *     after create() already returned a PROVISIONING engagement to the caller.
+     *
+     * Public (not private) specifically so the consumer, a different class,
+     * can call it — kept in this service rather than duplicated in the
+     * consumer so there is exactly one place that knows how to provision an
+     * engagement's snapshot.
+     *
+     * NOT itself @Transactional — snapshotTemplate() carries its own
+     * transaction boundary (correctly: a failed snapshot must roll back ALL
+     * of its section/control inserts, not leave a half-built tree). Marking
+     * this method @Transactional too would have put the FAILED status update
+     * below inside that SAME transaction — meaning if snapshotTemplate threw,
+     * the "FAILED" write would roll back right along with it, and the
+     * engagement would silently stay at PROVISIONING forever with no signal
+     * anything went wrong. markSnapshotFailed() below runs in its own fresh
+     * transaction specifically so it survives the failure it's recording.
+     */
+    public void completeEngagementProvisioning(AuditEngagement engagement, Long templateId, Long tenantId,
+                                               boolean startWorkflow, Long overrideWorkflowId, Long createdBy) {
+        try {
+            snapshotTemplate(engagement, templateId, tenantId);
+            if (startWorkflow) {
+                startWorkflowIfConfigured(engagement, overrideWorkflowId, createdBy, tenantId);
+            } else {
+                log.info("[AUDIT] Skipping per-engagement workflow start (project-governed) | engagementId={}",
+                        engagement.getId());
+            }
+            engagement.setSnapshotStatus("READY");
+            engagementRepository.save(engagement);
+        } catch (BusinessException e) {
+            // ResourceNotFoundException extends BusinessException — catching
+            // the parent alone already covers both; a multi-catch listing
+            // both is invalid Java (class + its own subclass together).
+            // Non-retryable — bad/missing template data. Mark FAILED (own
+            // transaction, see javadoc) so the engagement doesn't sit at
+            // PROVISIONING forever with no signal; rethrow so the caller
+            // (consumer) can decide retry/DLT policy — the synchronous
+            // fallback path just lets it propagate as before.
+            markSnapshotFailed(engagement.getId());
+            throw e;
+        }
+    }
+
+    @Transactional(propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)
+    public void markSnapshotFailed(Long engagementId) {
+        engagementRepository.findById(engagementId).ifPresent(e -> {
+            e.setSnapshotStatus("FAILED");
+            engagementRepository.save(e);
+        });
     }
 
     // ── TEMPLATE SNAPSHOT (recursive) ────────────────────────────────────────
@@ -211,15 +302,23 @@ public class AuditEngagementService {
         List<AuditTemplateSectionMapping> rootMappings =
                 templateSectionMappingRepository.findByTemplateIdOrderByOrderNoAsc(templateId);
 
-        for (AuditTemplateSectionMapping mapping : rootMappings) {
-            AuditSection rootSection = sectionRepository.findById(mapping.getSectionId()).orElse(null);
-            if (rootSection == null) continue;
+        // BATCHED — was one sectionRepository.findById() per root mapping.
+        // Root section count is usually small (top-level category nodes),
+        // but no reason to leave even that as N+1 when findAllById is free.
+        List<Long> rootSectionIds = rootMappings.stream()
+                .map(AuditTemplateSectionMapping::getSectionId).toList();
+        Map<Long, AuditSection> rootSectionMap = sectionRepository.findAllById(rootSectionIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AuditSection::getId, s -> s));
+        List<AuditSection> rootSections = rootMappings.stream()
+                .map(m -> rootSectionMap.get(m.getSectionId()))
+                .filter(java.util.Objects::nonNull)
+                .toList();
 
-            sectionService.snapshotSectionNode(
-                    rootSection, null, null,
-                    engagement.getId(), tmplInstance.getId(), tenantId
-            );
-        }
+        // See AuditSectionService.snapshotSectionTree javadoc for what changed
+        // here — was per-node recursion (2 saves + 1 query per section, plus a
+        // per-section saveAll() for controls that didn't actually batch at the
+        // JDBC level), now BFS-batched level-by-level with real JDBC batch inserts.
+        sectionService.snapshotSectionTree(rootSections, engagement.getId(), tmplInstance.getId(), tenantId);
 
         int totalControls = (int) controlInstanceRepository.countByEngagementId(engagement.getId());
         if (totalControls == 0) {
@@ -249,6 +348,32 @@ public class AuditEngagementService {
 
     public void assignSection(Long engagementId, Long sectionInstanceId,
                               Long auditorId, boolean cascadeToChildren, Long tenantId, Long performedBy) {
+        assignSectionInternal(engagementId, sectionInstanceId, auditorId, cascadeToChildren,
+                tenantId, performedBy, true, null);
+    }
+
+    /**
+     * Same as the public assignSection(), plus a checkOnboardedGate toggle.
+     *
+     * WHY THIS SPLIT EXISTS: the ENGAGEMENTS_ONBOARDED completeness check
+     * (see checkAndFireEngagementsOnboardedGate below) re-fetches EVERY
+     * section in the engagement and re-evaluates "is everything assigned
+     * yet" on every single call. For a single-section assign that's fine —
+     * it's exactly the check that decides whether to fire the gate. But
+     * bulkAssignSections calls assignSection once per section in the
+     * request, which meant this same engagement-wide fetch ran N times for
+     * one bulk request, and — because "all assigned" can flip true on an
+     * early section (if other sections were already assigned before this
+     * bulk call) and then stays true — the completion event could actually
+     * FIRE MULTIPLE TIMES within one bulk call, not just once. Checking
+     * once after the whole bulk loop gives the identical true/false result
+     * (it's a pure function of final DB state, monotonically only becoming
+     * true as more sections get assigned within one bulk request) while
+     * fixing that duplicate-fire risk as a side effect.
+     */
+    private void assignSectionInternal(Long engagementId, Long sectionInstanceId,
+                                       Long auditorId, boolean cascadeToChildren, Long tenantId, Long performedBy,
+                                       boolean checkOnboardedGate, SectionAssignmentTarget preResolvedTarget) {
         AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditSectionInstance", sectionInstanceId));
 
@@ -289,12 +414,15 @@ public class AuditEngagementService {
         // Also set auditor on the root ancestor (depth=0) if cascading, so no section
         // is left unassigned. The cascade goes downward only — without this the root
         // category node itself would have assignedAuditorId=null.
+        //
+        // Root id is read directly from the materialized path ("/rootId/.../thisId/")
+        // instead of walking parentInstanceId one level at a time — that walk was
+        // one findById() PER TREE LEVEL (up to depth queries) for data the path
+        // column already encodes in one string, no query needed to get there.
         if (cascadeToChildren && auditorId != null) {
-            AuditSectionInstance root = section;
-            while (root.getParentInstanceId() != null) {
-                root = sectionInstanceRepository.findById(root.getParentInstanceId()).orElse(null);
-                if (root == null) break;
-            }
+            AuditSectionInstance root = section.getParentInstanceId() == null
+                    ? section
+                    : sectionInstanceRepository.findById(rootIdFromPath(section.getPath())).orElse(null);
             if (root != null && root.getAssignedAuditorId() == null) {
                 root.setAssignedAuditorId(auditorId);
                 sectionInstanceRepository.save(root);
@@ -306,7 +434,12 @@ public class AuditEngagementService {
         // handles both standalone (WF14) and project-governed (WF16) engagements
         // internally by resolving the correct workflow instance.
         if (auditorId != null && performedBy != null) {
-            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR", sectionInstanceId, engagementId, performedBy);
+            if (preResolvedTarget != null) {
+                fireSectionAssignmentEventWithTarget(preResolvedTarget, sectionInstanceId, performedBy,
+                        "SECTIONS_ASSIGNED_AUDITOR");
+            } else {
+                fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR", sectionInstanceId, engagementId, performedBy);
+            }
         } else if (auditorId == null && performedBy != null) {
             uncompleteSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITOR", sectionInstanceId, engagementId);
         }
@@ -314,28 +447,53 @@ public class AuditEngagementService {
         // Fire ENGAGEMENTS_ONBOARDED once ALL sections of this engagement
         // (every depth) have an auditor assigned — no section left unassigned.
         // When unassigning (auditorId=null), reset the engagement item so the gate re-opens.
-        if (auditorId != null && performedBy != null) {
-            List<AuditSectionInstance> allSections =
-                    sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId);
-            boolean allAssigned = !allSections.isEmpty()
-                    && allSections.stream().allMatch(s -> s.getAssignedAuditorId() != null);
-            if (allAssigned) {
-                AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
-                if (eng != null && eng.getProjectInstanceId() != null) {
-                    fireProjectSectionEvent(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED",
-                            engagementId, performedBy);
-                }
-            }
-        } else if (auditorId == null && performedBy != null) {
-            // Unassign — reset the item so step cannot auto-complete with unassigned sections
-            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
-            if (eng != null && eng.getProjectInstanceId() != null) {
-                uncompleteEngagementItem(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED", engagementId);
+        if (checkOnboardedGate) {
+            if (auditorId != null && performedBy != null) {
+                checkAndFireEngagementsOnboardedGate(engagementId, performedBy);
+            } else if (auditorId == null && performedBy != null) {
+                resetEngagementsOnboardedGate(engagementId);
             }
         }
 
         log.info("[AUDIT] Section assigned | sectionInstanceId={} | auditorId={} | cascade={}",
                 sectionInstanceId, auditorId, cascadeToChildren);
+    }
+
+    /**
+     * Extracts the root section instance id from a materialized path like
+     * "/12/45/78/" (returns 12L). Path format is fixed by
+     * AuditSectionService.snapshotSectionTree — always "/" + id + "/" for
+     * root, parentPath + id + "/" for children, so the first segment after
+     * the leading slash is always the root id.
+     */
+    private Long rootIdFromPath(String path) {
+        String[] parts = path.split("/");
+        // parts[0] is "" (text before the leading slash); parts[1] is the root id.
+        return Long.parseLong(parts[1]);
+    }
+
+    private void checkAndFireEngagementsOnboardedGate(Long engagementId, Long performedBy) {
+        // COUNT instead of fetch-all-and-stream — this runs on every single
+        // section assignment (not just bulk), so pulling every full
+        // AuditSectionInstance row across the wire just to check one boolean
+        // was real, avoidable cost on the individual assign endpoint too.
+        long total      = sectionInstanceRepository.countByEngagementId(engagementId);
+        long unassigned = sectionInstanceRepository.countByEngagementIdAndAssignedAuditorIdIsNull(engagementId);
+        boolean allAssigned = total > 0 && unassigned == 0;
+        if (allAssigned) {
+            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+            if (eng != null && eng.getProjectInstanceId() != null) {
+                fireProjectSectionEvent(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED",
+                        engagementId, performedBy);
+            }
+        }
+    }
+
+    private void resetEngagementsOnboardedGate(Long engagementId) {
+        AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+        if (eng != null && eng.getProjectInstanceId() != null) {
+            uncompleteEngagementItem(eng.getProjectInstanceId(), "ENGAGEMENTS_ONBOARDED", engagementId);
+        }
     }
 
     // ── AUDITEE SECTION ASSIGNMENT ────────────────────────────────────────────
@@ -368,6 +526,18 @@ public class AuditEngagementService {
     public void assignAuditeeToSection(Long engagementId, Long sectionInstanceId,
                                        Long auditeeUserId, boolean cascadeToChildren,
                                        Long tenantId, Long performedBy) {
+        assignAuditeeToSectionInternal(engagementId, sectionInstanceId, auditeeUserId,
+                cascadeToChildren, tenantId, performedBy, true, null);
+    }
+
+    /** Same as the public assignAuditeeToSection(), plus a checkOnboardedGate
+     *  toggle and an optional pre-resolved section-assignment target — see
+     *  assignSectionInternal's javadoc for why both exist (identical
+     *  reasoning, mirrored for the EVIDENCE_OWNERS_ASSIGNED gate). */
+    private void assignAuditeeToSectionInternal(Long engagementId, Long sectionInstanceId,
+                                                Long auditeeUserId, boolean cascadeToChildren,
+                                                Long tenantId, Long performedBy, boolean checkOnboardedGate,
+                                                SectionAssignmentTarget preResolvedTarget) {
         AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditSectionInstance", sectionInstanceId));
 
@@ -407,13 +577,13 @@ public class AuditEngagementService {
                     "AUDIT_SECTION_INSTANCE", sectionInstanceId);
         }
 
-        // Also set auditee on the root ancestor if cascading, so no section is left unassigned.
+        // Also set auditee on the root ancestor if cascading, so no section is left
+        // unassigned. Root id read from the materialized path — see assignSectionInternal
+        // for why (one query instead of one per tree level).
         if (cascadeToChildren && auditeeUserId != null) {
-            AuditSectionInstance root = section;
-            while (root.getParentInstanceId() != null) {
-                root = sectionInstanceRepository.findById(root.getParentInstanceId()).orElse(null);
-                if (root == null) break;
-            }
+            AuditSectionInstance root = section.getParentInstanceId() == null
+                    ? section
+                    : sectionInstanceRepository.findById(rootIdFromPath(section.getPath())).orElse(null);
             if (root != null && root.getAuditeeAssignedUserId() == null) {
                 root.setAuditeeAssignedUserId(auditeeUserId);
                 sectionInstanceRepository.save(root);
@@ -425,7 +595,12 @@ public class AuditEngagementService {
         // handles both standalone (WF14) and project-governed (WF16) engagements
         // internally by resolving the correct workflow instance.
         if (auditeeUserId != null && performedBy != null) {
-            fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE", sectionInstanceId, engagementId, performedBy);
+            if (preResolvedTarget != null) {
+                fireSectionAssignmentEventWithTarget(preResolvedTarget, sectionInstanceId, performedBy,
+                        "SECTIONS_ASSIGNED_AUDITEE");
+            } else {
+                fireSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE", sectionInstanceId, engagementId, performedBy);
+            }
         } else if (auditeeUserId == null && performedBy != null) {
             uncompleteSectionAssignmentEvent("SECTIONS_ASSIGNED_AUDITEE", sectionInstanceId, engagementId);
         }
@@ -433,27 +608,36 @@ public class AuditEngagementService {
         // Fire EVIDENCE_OWNERS_ASSIGNED once ALL sections of this engagement
         // have an auditee assigned — no section left unassigned.
         // When unassigning (auditeeUserId=null), reset the engagement item so gate re-opens.
-        if (auditeeUserId != null && performedBy != null) {
-            List<AuditSectionInstance> allSections =
-                    sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId);
-            boolean allAssigned = !allSections.isEmpty()
-                    && allSections.stream().allMatch(s -> s.getAuditeeAssignedUserId() != null);
-            if (allAssigned) {
-                AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
-                if (eng != null && eng.getProjectInstanceId() != null) {
-                    fireProjectSectionEvent(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED",
-                            engagementId, performedBy);
-                }
-            }
-        } else if (auditeeUserId == null && performedBy != null) {
-            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
-            if (eng != null && eng.getProjectInstanceId() != null) {
-                uncompleteEngagementItem(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED", engagementId);
+        if (checkOnboardedGate) {
+            if (auditeeUserId != null && performedBy != null) {
+                checkAndFireEvidenceOwnersAssignedGate(engagementId, performedBy);
+            } else if (auditeeUserId == null && performedBy != null) {
+                resetEvidenceOwnersAssignedGate(engagementId);
             }
         }
 
         log.info("[AUDIT] Auditee assigned to section | sectionInstanceId={} | auditeeUserId={} | cascade={}",
                 sectionInstanceId, auditeeUserId, cascadeToChildren);
+    }
+
+    private void checkAndFireEvidenceOwnersAssignedGate(Long engagementId, Long performedBy) {
+        long total      = sectionInstanceRepository.countByEngagementId(engagementId);
+        long unassigned = sectionInstanceRepository.countByEngagementIdAndAuditeeAssignedUserIdIsNull(engagementId);
+        boolean allAssigned = total > 0 && unassigned == 0;
+        if (allAssigned) {
+            AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+            if (eng != null && eng.getProjectInstanceId() != null) {
+                fireProjectSectionEvent(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED",
+                        engagementId, performedBy);
+            }
+        }
+    }
+
+    private void resetEvidenceOwnersAssignedGate(Long engagementId) {
+        AuditEngagement eng = engagementRepository.findById(engagementId).orElse(null);
+        if (eng != null && eng.getProjectInstanceId() != null) {
+            uncompleteEngagementItem(eng.getProjectInstanceId(), "EVIDENCE_OWNERS_ASSIGNED", engagementId);
+        }
     }
 
     // ── AUDITEE CONTROL ASSIGNMENT ────────────────────────────────────────────
@@ -545,6 +729,14 @@ public class AuditEngagementService {
         }
 
         int updated = 0;
+        // Resolved ONCE — see resolveActorTaskInstanceId javadoc for why this,
+        // not the control.save() calls, was the actual N+1 here. engagementId
+        // and actorId are the same for every control in this request, so the
+        // lookup result is identical on every iteration.
+        Long resolvedTaskInstanceId = req.getAuditorUserId() != null
+                ? resolveActorTaskInstanceId(engagementId, actorId, "CONTROLS_ASSIGNED")
+                : null;
+
         for (AuditControlInstance ctrl : owned) {
             boolean changed = false;
             if (req.getAuditorUserId() != null) {
@@ -559,8 +751,10 @@ public class AuditEngagementService {
             }
             if (changed) {
                 controlInstanceRepository.save(ctrl);
-                if (req.getAuditorUserId() != null)
-                    fireControlSectionEvent("CONTROLS_ASSIGNED", ctrl.getId(), engagementId, actorId);
+                if (req.getAuditorUserId() != null) {
+                    fireControlSectionEventWithResolvedTask("CONTROLS_ASSIGNED", ctrl.getId(),
+                            resolvedTaskInstanceId, actorId);
+                }
                 updated++;
             }
         }
@@ -587,20 +781,46 @@ public class AuditEngagementService {
         }
         boolean cascade = req.getCascadeToChildren() == null || req.getCascadeToChildren();
 
+        // Resolved ONCE per bulk request — see resolveSectionAssignmentTarget
+        // javadoc for why (same engagementId/actorId/completionEvent for
+        // every section in this request means the same target every time).
+        SectionAssignmentTarget auditorTarget = req.getAuditorUserId() != null
+                ? resolveSectionAssignmentTarget("SECTIONS_ASSIGNED_AUDITOR", engagementId, actorId)
+                : null;
+        SectionAssignmentTarget auditeeTarget = req.getAuditeeUserId() != null
+                ? resolveSectionAssignmentTarget("SECTIONS_ASSIGNED_AUDITEE", engagementId, actorId)
+                : null;
+
         int updated = 0;
         for (Long sectionId : req.getSectionIds()) {
             // Safety: section must belong to this engagement (assignSection checks tenant;
             // the per-section methods throw if the section isn't found under the engagement).
             boolean changed = false;
             if (req.getAuditorUserId() != null) {
-                assignSection(engagementId, sectionId, req.getAuditorUserId(), cascade, tenantId, actorId);
+                // checkOnboardedGate=false — see assignSectionInternal javadoc.
+                // The completeness check runs ONCE below, after the whole loop,
+                // instead of once per section.
+                assignSectionInternal(engagementId, sectionId, req.getAuditorUserId(), cascade,
+                        tenantId, actorId, false, auditorTarget);
                 changed = true;
             }
             if (req.getAuditeeUserId() != null) {
-                assignAuditeeToSection(engagementId, sectionId, req.getAuditeeUserId(), cascade, tenantId, actorId);
+                assignAuditeeToSectionInternal(engagementId, sectionId, req.getAuditeeUserId(), cascade,
+                        tenantId, actorId, false, auditeeTarget);
                 changed = true;
             }
             if (changed) updated++;
+        }
+
+        // Run each completeness check ONCE for the whole bulk request instead
+        // of once per section — same final result (both checks are pure
+        // functions of final DB state), fewer engagement-wide re-fetches, and
+        // no risk of the gate event firing more than once within one request.
+        if (req.getAuditorUserId() != null && actorId != null) {
+            checkAndFireEngagementsOnboardedGate(engagementId, actorId);
+        }
+        if (req.getAuditeeUserId() != null && actorId != null) {
+            checkAndFireEvidenceOwnersAssignedGate(engagementId, actorId);
         }
 
         log.info("[AUDIT-ENG-SERVICE] Bulk section assign | engagementId={} | updated={}/{} | " +
@@ -1204,14 +1424,49 @@ public class AuditEngagementService {
         }
     }
 
+    /** Resolved target for a section-assignment completion event — see
+     *  resolveSectionAssignmentTarget()/fireSectionAssignmentEvent() below. */
+    private record SectionAssignmentTarget(Long taskId, String snapSectionKey) {}
+
     private void fireSectionAssignmentEvent(String completionEvent,
                                             Long sectionInstanceId,
                                             Long engagementId,
                                             Long actorUserId) {
         if (actorUserId == null || actorUserId == 0L) return;
+        SectionAssignmentTarget target = resolveSectionAssignmentTarget(completionEvent, engagementId, actorUserId);
+        if (target == null) return; // resolveSectionAssignmentTarget already logged why
+        fireSectionAssignmentEventWithTarget(target, sectionInstanceId, actorUserId, completionEvent);
+    }
+
+    /**
+     * Resolves the (taskId, snapSectionKey) target for a section-assignment
+     * completion event — the DB-read part of fireSectionAssignmentEvent
+     * (engagement lookup, workflow-instance resolution, active-step lookup,
+     * actor-task lookup, matched-section lookup).
+     *
+     * WHY THIS WAS ANOTHER BULK N+1: for one bulkAssignSections request,
+     * completionEvent, engagementId, and actorUserId (the caller doing the
+     * bulk assign) are the SAME for every section in the batch — so this
+     * entire resolution chain returns the identical target on every
+     * iteration, exactly like resolveActorTaskInstanceId for bulk control
+     * assignment. Only the final completeItemByRef() call genuinely needs
+     * to run per-section (each section is its own tracked compound-task
+     * item) — that part stays in fireSectionAssignmentEventWithTarget below.
+     *
+     * This also reinforces, rather than changes, the existing "resolve
+     * taskId NOW, before completing the item" principle already documented
+     * on the old single-method version: completing an item can advance the
+     * workflow to the next step within the same thread, so re-resolving
+     * per section mid-batch could silently start pointing at the NEXT
+     * step's task partway through a bulk request. Resolving once up front
+     * and reusing it for the whole batch is the correct fix for that, not
+     * just a performance one.
+     */
+    private SectionAssignmentTarget resolveSectionAssignmentTarget(
+            String completionEvent, Long engagementId, Long actorUserId) {
         try {
             AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
-            if (engagement == null) return;
+            if (engagement == null) return null;
 
             // Resolve the workflow instance to use:
             // 1. Engagement has its own workflow (WF14 individual lifecycle) → use it
@@ -1228,12 +1483,12 @@ public class AuditEngagementService {
             if (workflowInstanceId == null) {
                 log.debug("[AUDIT-ENG-SERVICE] No workflow instance for engagementId={} — " +
                         "skipping section assignment event '{}'", engagementId, completionEvent);
-                return;
+                return null;
             }
             var activeSteps = stepInstanceRepository
                     .findByWorkflowInstanceIdAndStatus(
                             workflowInstanceId, StepStatus.IN_PROGRESS);
-            if (activeSteps.isEmpty()) return;
+            if (activeSteps.isEmpty()) return null;
             var stepInstance = activeSteps.get(0);
             var actorTask = taskInstanceRepository
                     .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
@@ -1250,14 +1505,8 @@ public class AuditEngagementService {
             if (actorTask.isEmpty()) {
                 log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
                         "skipping section event '{}'", actorUserId, stepInstance.getId(), completionEvent);
-                return;
+                return null;
             }
-            // Resolve the taskId NOW — before completing the item.
-            // Completing the last item may cause the workflow to advance
-            // (Step N → Step N+1) within the same thread. If this method is
-            // called again (e.g. cascade loop), a second lookup would find
-            // Step N+1's task. By capturing taskId before completion, we pin
-            // to the right task.
             Long taskId = actorTask.get().getId();
 
             // Find the section snapshot that actually matches the completionEvent
@@ -1271,12 +1520,28 @@ public class AuditEngagementService {
             if (matchedSection == null) {
                 log.debug("[AUDIT-ENG-SERVICE] No section snapshotted with completionEvent='{}' on taskId={} — skipping",
                         completionEvent, taskId);
-                return;
+                return null;
             }
+            return new SectionAssignmentTarget(taskId, matchedSection.getSnapSectionKey());
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Section assignment target resolution '{}' failed (non-fatal) | " +
+                    "engagementId={} | {}", completionEvent, engagementId, ex.getMessage());
+            return null;
+        }
+    }
 
+    /**
+     * Fires the per-section completion using an ALREADY-RESOLVED target (see
+     * resolveSectionAssignmentTarget). Same "never break the domain action"
+     * exception contract as the original single-method version.
+     */
+    private void fireSectionAssignmentEventWithTarget(SectionAssignmentTarget target, Long sectionInstanceId,
+                                                      Long actorUserId, String completionEvent) {
+        if (actorUserId == null || actorUserId == 0L) return;
+        try {
             log.info("[AUDIT-ENG-SERVICE] Section item completing | event='{}' | sectionKey='{}' | " +
                             "sectionInstanceId={} (itemRef) | taskId={} | actorUserId={}",
-                    completionEvent, matchedSection.getSnapSectionKey(), sectionInstanceId, taskId, actorUserId);
+                    completionEvent, target.snapSectionKey(), sectionInstanceId, target.taskId(), actorUserId);
 
             // tracks_items=1 on this section — sectionInstanceId is ONE of potentially
             // many items (one per AUDIT_SECTION_INSTANCE across ALL engagements in the
@@ -1286,14 +1551,10 @@ public class AuditEngagementService {
             // closing the whole gate via the blanket TaskSectionEvent, leaving sections
             // on engagement B/C unassigned forever because the gate had already fired.
             taskSectionCompletionService.completeItemByRef(
-                    taskId,
-                    matchedSection.getSnapSectionKey(),
-                    sectionInstanceId,
-                    actorUserId
-            );
+                    target.taskId(), target.snapSectionKey(), sectionInstanceId, actorUserId);
 
             log.info("[AUDIT-ENG-SERVICE] Section item completed | event='{}' | sectionInstanceId={} | taskId={} | actorUserId={}",
-                    completionEvent, sectionInstanceId, taskId, actorUserId);
+                    completionEvent, sectionInstanceId, target.taskId(), actorUserId);
         } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] Section assignment event '{}' failed (non-fatal) | " +
                     "sectionInstanceId={} | {}", completionEvent, sectionInstanceId, ex.getMessage());
@@ -1355,58 +1616,11 @@ public class AuditEngagementService {
                                          Long engagementId,
                                          Long userId) {
         try {
-            // Find the engagement's active workflow instance
-            AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
-            if (engagement == null || engagement.getWorkflowInstanceId() == null) {
-                log.debug("[AUDIT-ENG-SERVICE] No workflow instance for engagementId={} — " +
-                        "skipping section event '{}'", engagementId, completionEvent);
-                return;
-            }
-
-            // Find the currently IN_PROGRESS step instance
-            var activeSteps = stepInstanceRepository
-                    .findByWorkflowInstanceIdAndStatus(
-                            engagement.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
-
-            if (activeSteps.isEmpty()) {
-                log.debug("[AUDIT-ENG-SERVICE] No IN_PROGRESS step for workflowInstanceId={} — " +
-                                "skipping section event '{}'",
-                        engagement.getWorkflowInstanceId(), completionEvent);
-                return;
-            }
-
-            var stepInstance = activeSteps.get(0);
-
-            // Find the task for this user at this step (ACTOR task only)
-            // Try IN_PROGRESS first, fall back to PENDING (task may not have been opened yet)
-            var actorTask = taskInstanceRepository
-                    .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
-                    .stream()
-                    .filter(t -> userId.equals(t.getAssignedUserId())
-                            && t.getTaskRole() == TaskRole.ACTOR)
-                    .findFirst()
-                    .or(() -> taskInstanceRepository
-                            .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
-                            .stream()
-                            .filter(t -> userId.equals(t.getAssignedUserId())
-                                    && t.getTaskRole() == TaskRole.ACTOR)
-                            .findFirst());
-
-            if (actorTask.isEmpty()) {
-                log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
-                        "skipping section event '{}'", userId, stepInstance.getId(), completionEvent);
-                return;
-            }
-
-            Long taskInstanceId = actorTask.get().getId();
+            Long taskInstanceId = resolveActorTaskInstanceId(engagementId, userId, completionEvent);
+            if (taskInstanceId == null) return; // resolveActorTaskInstanceId already logged why
 
             eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    completionEvent,
-                    taskInstanceId,
-                    userId,
-                    "AUDIT_CONTROL_INSTANCE",
-                    controlInstanceId
-            ));
+                    completionEvent, taskInstanceId, userId, "AUDIT_CONTROL_INSTANCE", controlInstanceId));
 
             log.info("[AUDIT-ENG-SERVICE] Section event fired | event='{}' | " +
                             "controlInstanceId={} | taskInstanceId={} | userId={}",
@@ -1414,6 +1628,83 @@ public class AuditEngagementService {
 
         } catch (Exception ex) {
             // Never let section event failure break the domain action
+            log.warn("[AUDIT-ENG-SERVICE] Section event '{}' failed (non-fatal) | " +
+                    "controlInstanceId={} | {}", completionEvent, controlInstanceId, ex.getMessage());
+        }
+    }
+
+    /**
+     * Resolves the ACTOR taskInstanceId for (engagementId, userId) — the part of
+     * fireControlSectionEvent that involves DB reads (engagement lookup, active
+     * step lookup, task lookup). Split out so bulk callers can resolve it ONCE
+     * instead of once per row.
+     *
+     * WHY THIS WAS THE REAL BULK-ASSIGN N+1, NOT THE control.save() CALLS:
+     * for a single bulkAssignControls request, engagementId and userId (the
+     * actor doing the bulk assign) are the SAME for every control in the
+     * batch — so this lookup returns the identical taskInstanceId on every
+     * iteration. It isn't "N different rows to fetch" (what batching fixes),
+     * it's the SAME row being re-fetched N times (what hoisting fixes). For
+     * 100 controls this was up to 400 avoidable queries (engagement + active
+     * step + up to 2 task-status lookups per control) for data that never
+     * changed between iterations.
+     */
+    private Long resolveActorTaskInstanceId(Long engagementId, Long userId, String completionEvent) {
+        AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
+        if (engagement == null || engagement.getWorkflowInstanceId() == null) {
+            log.debug("[AUDIT-ENG-SERVICE] No workflow instance for engagementId={} — " +
+                    "skipping section event '{}'", engagementId, completionEvent);
+            return null;
+        }
+
+        var activeSteps = stepInstanceRepository
+                .findByWorkflowInstanceIdAndStatus(
+                        engagement.getWorkflowInstanceId(), StepStatus.IN_PROGRESS);
+        if (activeSteps.isEmpty()) {
+            log.debug("[AUDIT-ENG-SERVICE] No IN_PROGRESS step for workflowInstanceId={} — " +
+                            "skipping section event '{}'",
+                    engagement.getWorkflowInstanceId(), completionEvent);
+            return null;
+        }
+
+        var stepInstance = activeSteps.get(0);
+
+        // Try IN_PROGRESS first, fall back to PENDING (task may not have been opened yet)
+        var actorTask = taskInstanceRepository
+                .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.IN_PROGRESS)
+                .stream()
+                .filter(t -> userId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                .findFirst()
+                .or(() -> taskInstanceRepository
+                        .findByStepInstanceIdAndStatus(stepInstance.getId(), TaskStatus.PENDING)
+                        .stream()
+                        .filter(t -> userId.equals(t.getAssignedUserId()) && t.getTaskRole() == TaskRole.ACTOR)
+                        .findFirst());
+
+        if (actorTask.isEmpty()) {
+            log.debug("[AUDIT-ENG-SERVICE] No ACTOR task for userId={} at stepInstanceId={} — " +
+                    "skipping section event '{}'", userId, stepInstance.getId(), completionEvent);
+            return null;
+        }
+        return actorTask.get().getId();
+    }
+
+    /**
+     * Bulk-path counterpart to fireControlSectionEvent — takes an
+     * ALREADY-RESOLVED taskInstanceId (see resolveActorTaskInstanceId) instead
+     * of re-resolving it per control. Same "never break the domain action"
+     * exception contract as the original.
+     */
+    private void fireControlSectionEventWithResolvedTask(String completionEvent, Long controlInstanceId,
+                                                         Long taskInstanceId, Long userId) {
+        if (taskInstanceId == null) return;
+        try {
+            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                    completionEvent, taskInstanceId, userId, "AUDIT_CONTROL_INSTANCE", controlInstanceId));
+            log.info("[AUDIT-ENG-SERVICE] Section event fired | event='{}' | " +
+                            "controlInstanceId={} | taskInstanceId={} | userId={}",
+                    completionEvent, controlInstanceId, taskInstanceId, userId);
+        } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] Section event '{}' failed (non-fatal) | " +
                     "controlInstanceId={} | {}", completionEvent, controlInstanceId, ex.getMessage());
         }
@@ -1479,7 +1770,8 @@ public class AuditEngagementService {
                 .projectId(e.getProjectId()).name(e.getName()).description(e.getDescription())
                 .auditType(e.getAuditType()).status(e.getStatus()).frameworkRef(e.getFrameworkRef())
                 .leadAuditorId(e.getLeadAuditorId()).ownerId(e.getOwnerId())
-                .totalControls(e.getTotalControls()).testedControls(e.getTestedControls())
+                .totalControls(e.getTotalControls()).snapshotStatus(e.getSnapshotStatus())
+                .testedControls(e.getTestedControls())
                 // Count controls that have evidence PROVIDED — direct submit OR reused
                 // link — so the header progress matches the control-row tags and the
                 // auto-complete gate (adequacy is judged later in the review step).

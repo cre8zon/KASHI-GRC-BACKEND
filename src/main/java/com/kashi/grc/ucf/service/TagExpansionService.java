@@ -1,9 +1,13 @@
 package com.kashi.grc.ucf.service;
 
+import com.kashi.grc.common.cache.CacheNames;
 import com.kashi.grc.ucf.domain.CommonControl;
 import com.kashi.grc.ucf.repository.CommonControlRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.cache.Cache;
+import org.springframework.cache.CacheManager;
 import org.springframework.stereotype.Service;
 
 import java.util.ArrayList;
@@ -43,8 +47,13 @@ import java.util.concurrent.atomic.AtomicReference;
 public class TagExpansionService {
 
     private final CommonControlRepository controlRepository;
+    private final ObjectProvider<CacheManager> cacheManagerProvider;
 
     private static final long TTL_MS = 5 * 60_000;
+
+    // Redis L2 — one fixed key, not tenant-scoped: the UCF catalogue is global,
+    // shared by every tenant (see CacheNames.UCF_CATALOGUE javadoc).
+    private static final String REDIS_KEY = "parentMap";
 
     private final AtomicReference<Snapshot> cache = new AtomicReference<>();
 
@@ -102,17 +111,73 @@ public class TagExpansionService {
         return s.parentByCode();
     }
 
+    @SuppressWarnings("unchecked")
     private Snapshot load() {
+        Cache cache = getRedisCache();
+
+        if (cache != null) {
+            try {
+                Map<String, String> fromRedis = cache.get(REDIS_KEY, Map.class);
+                if (fromRedis != null) {
+                    log.debug("[UCF] Loaded {} catalogue codes from Redis L2 (skipped MySQL)", fromRedis.size());
+                    return new Snapshot(fromRedis, System.currentTimeMillis());
+                }
+            } catch (Exception e) {
+                log.warn("[UCF] Redis L2 read failed, falling through to MySQL — {}", e.toString());
+            }
+        }
+
         Map<String, String> map = new java.util.HashMap<>();
         for (CommonControl c : controlRepository.findAll()) {
             map.put(c.getCode(), c.getParentCode());
         }
-        log.debug("[UCF] Loaded {} catalogue codes into expansion cache", map.size());
+        log.debug("[UCF] Loaded {} catalogue codes from MySQL into expansion cache", map.size());
+
+        if (cache != null) {
+            try {
+                cache.put(REDIS_KEY, map);
+            } catch (Exception e) {
+                log.warn("[UCF] Redis L2 write failed, next reload (any instance) will re-hit MySQL — {}", e.toString());
+            }
+        }
         return new Snapshot(map, System.currentTimeMillis());
     }
 
-    /** Force a reload — call after a catalogue edit if immediacy is needed. */
+    /**
+     * Force a reload — call after a catalogue edit if immediacy is needed.
+     * Clears both L1 (this instance's AtomicReference) and L2 (Redis, so
+     * every other app instance also re-hits MySQL on its next expand() call
+     * instead of serving the old map until its own TTL expires).
+     */
     public void invalidate() {
         cache.set(null);
+        Cache redisCache = getRedisCache();
+        if (redisCache != null) {
+            try {
+                redisCache.evict(REDIS_KEY);
+            } catch (Exception e) {
+                log.warn("[UCF] Redis L2 evict failed, stale catalogue may persist on other instances until TTL — {}",
+                        e.toString());
+            }
+        }
+    }
+
+    /**
+     * Forces an L1+L2 load right now instead of waiting for the first real
+     * expand() call to trigger it lazily. Called by CacheWarmupRunner on
+     * app startup so the very first assessment/audit instantiation after a
+     * deploy doesn't pay the cold-cache MySQL cost — global/tenant-independent
+     * data, so this is always safe to warm unconditionally (see
+     * CacheWarmupRunner for why tenant-scoped caches are NOT warmed the
+     * same way).
+     */
+    public void warmUp() {
+        int size = parentMap().size();
+        log.info("[UCF] Cache warmed | codes={}", size);
+    }
+
+    private Cache getRedisCache() {
+        CacheManager manager = cacheManagerProvider.getIfAvailable();
+        return manager == null ? null : manager.getCache(CacheNames.UCF_CATALOGUE);
     }
 }

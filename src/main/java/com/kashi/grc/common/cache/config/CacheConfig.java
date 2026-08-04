@@ -1,0 +1,167 @@
+package com.kashi.grc.common.cache.config;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.kashi.grc.common.cache.CacheNames;
+import com.kashi.grc.common.cache.LoggingCacheErrorHandler;
+import com.kashi.grc.common.cache.RedisCircuitBreaker;
+import com.kashi.grc.common.cache.ResilientCacheManager;
+import com.kashi.grc.common.cache.TenantAwareKeyGenerator;
+import io.micrometer.core.instrument.MeterRegistry;
+import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.cache.CacheManager;
+import org.springframework.cache.annotation.CachingConfigurer;
+import org.springframework.cache.annotation.EnableCaching;
+import org.springframework.cache.interceptor.CacheErrorHandler;
+import org.springframework.cache.interceptor.KeyGenerator;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.data.redis.cache.RedisCacheConfiguration;
+import org.springframework.data.redis.cache.RedisCacheManager;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.connection.lettuce.LettuceConnectionFactory;
+import org.springframework.data.redis.connection.RedisStandaloneConfiguration;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.serializer.GenericJackson2JsonRedisSerializer;
+import org.springframework.data.redis.serializer.RedisSerializationContext;
+import org.springframework.data.redis.serializer.StringRedisSerializer;
+
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Redis cache foundation for KashiGRC.
+ *
+ * Gated behind kashi.redis.enabled so environments without a Redis instance
+ * start normally with caching switched off — every {@code @Cacheable}
+ * effectively no-ops back to the underlying method (Spring's NoOpCacheManager
+ * auto-configures when no CacheManager bean is present and caching isn't
+ * otherwise configured). Same "flip a flag, zero blast radius" contract as
+ * KafkaConfig.
+ *
+ * Design decisions:
+ *  - JSON serde via the Spring-managed ObjectMapper (JavaTimeModule already
+ *    registered) — same rule as Kafka's JsonSerializer, never a bare one.
+ *  - Default key generator = TenantAwareKeyGenerator: every @Cacheable in the
+ *    app is tenant-scoped by default unless it explicitly opts out (e.g. the
+ *    global UCF catalogue), closing off the single most dangerous failure
+ *    mode for a shared cache in a multi-tenant app.
+ *  - Error handler = LoggingCacheErrorHandler: a Redis outage degrades to
+ *    "caching didn't happen", never to a 500. Never let the accelerator
+ *    become a single point of failure for the whole app.
+ *  - Per-cache TTL map: reference/config data that only changes via admin
+ *    action gets a short TTL (5 min) as a safety net, with @CacheEvict at
+ *    the write side (see UiAdminController) for immediate correctness —
+ *    the TTL is a backstop against a missed eviction, not the primary
+ *    invalidation mechanism.
+ *  - The bean actually registered as "cacheManager" (what @Cacheable resolves
+ *    against) is ResilientCacheManager, not the raw RedisCacheManager built
+ *    here — it wraps every cache region with circuit breaking, stampede
+ *    protection, and metrics. See ResilientRedisCache for why each of those
+ *    exists; nothing about that wrapping requires touching call sites.
+ */
+@Configuration
+@EnableCaching
+@RequiredArgsConstructor
+@ConditionalOnProperty(name = "kashi.redis.enabled", havingValue = "true")
+public class CacheConfig implements CachingConfigurer {
+
+    private final ObjectMapper objectMapper;
+    private final TenantAwareKeyGenerator tenantAwareKeyGenerator;
+    private final LoggingCacheErrorHandler loggingCacheErrorHandler;
+
+    @Value("${spring.data.redis.host:localhost}")
+    private String redisHost;
+
+    @Value("${spring.data.redis.port:6379}")
+    private int redisPort;
+
+    @Value("${spring.data.redis.password:}")
+    private String redisPassword;
+
+    // ── Connection ──────────────────────────────────────────────────
+
+    @Bean
+    public RedisConnectionFactory redisConnectionFactory() {
+        RedisStandaloneConfiguration config = new RedisStandaloneConfiguration(redisHost, redisPort);
+        if (redisPassword != null && !redisPassword.isBlank()) {
+            config.setPassword(redisPassword);
+        }
+        return new LettuceConnectionFactory(config);
+    }
+
+    // ── Cache manager ───────────────────────────────────────────────
+
+    // Named redisCacheManager (not "cacheManager") deliberately — this is the
+    // raw, undecorated manager. The bean Spring's @Cacheable machinery
+    // actually resolves against is cacheManager() below, which wraps this one.
+    @Bean
+    public RedisCacheManager redisCacheManager(RedisConnectionFactory connectionFactory) {
+        GenericJackson2JsonRedisSerializer jsonSerializer =
+                new GenericJackson2JsonRedisSerializer(objectMapper);
+
+        RedisCacheConfiguration defaults = RedisCacheConfiguration.defaultCacheConfig()
+                .entryTtl(Duration.ofMinutes(5))
+                .disableCachingNullValues()
+                .serializeKeysWith(RedisSerializationContext.SerializationPair
+                        .fromSerializer(StringRedisSerializer.UTF_8))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair
+                        .fromSerializer(jsonSerializer))
+                .prefixCacheNameWith("kashigrc:");
+
+        // Per-cache TTL overrides — see CacheNames for what each region holds
+        // and why. Anything not listed here falls back to the 5-min default.
+        Map<String, RedisCacheConfiguration> perCache = new HashMap<>();
+        perCache.put(CacheNames.UI_FORM,      defaults.entryTtl(Duration.ofMinutes(5)));
+        perCache.put(CacheNames.UI_SCREEN,    defaults.entryTtl(Duration.ofMinutes(5)));
+        perCache.put(CacheNames.UI_ACTIONS,   defaults.entryTtl(Duration.ofMinutes(5)));
+        perCache.put(CacheNames.UI_DASHBOARD, defaults.entryTtl(Duration.ofMinutes(5)));
+        // User display names change rarely (profile edits) and are read on
+        // every history/assignment screen — longer TTL is safe.
+        perCache.put(CacheNames.USER_DISPLAY_NAME, defaults.entryTtl(Duration.ofMinutes(15)));
+        // Global catalogue, edited only from the UCF admin screens.
+        perCache.put(CacheNames.UCF_CATALOGUE, defaults.entryTtl(Duration.ofMinutes(5)));
+        // Entitlements should feel immediate to an admin who just changed a
+        // plan — short TTL + explicit evict on write (see TenantFeatureService).
+        perCache.put(CacheNames.TENANT_ENTITLEMENTS, defaults.entryTtl(Duration.ofMinutes(10)));
+        // Compound "template structure" snapshot (see AssessmentTemplateStructureCacheService)
+        // — read on every instantiation, changes only when an admin edits a
+        // template in the library. Longer TTL is safe; explicit evict on write.
+        perCache.put(CacheNames.ASSESSMENT_TEMPLATE_STRUCTURE, defaults.entryTtl(Duration.ofMinutes(30)));
+
+        return RedisCacheManager.builder(connectionFactory)
+                .cacheDefaults(defaults)
+                .withInitialCacheConfigurations(perCache)
+                .build();
+    }
+
+    /** Plain string Redis access for the stampede-lock (SETNX/Lua unlock) in ResilientRedisCache. */
+    @Bean
+    public StringRedisTemplate stringRedisTemplate(RedisConnectionFactory connectionFactory) {
+        return new StringRedisTemplate(connectionFactory);
+    }
+
+    @Bean
+    @Primary
+    public CacheManager cacheManager(RedisCacheManager redisCacheManager,
+                                     RedisCircuitBreaker circuitBreaker,
+                                     StringRedisTemplate stringRedisTemplate,
+                                     MeterRegistry meterRegistry) {
+        return new ResilientCacheManager(redisCacheManager, circuitBreaker, stringRedisTemplate, meterRegistry);
+    }
+
+    // ── Wiring for @EnableCaching (CachingConfigurer) ────────────────
+
+    @Override
+    public KeyGenerator keyGenerator() {
+        return tenantAwareKeyGenerator;
+    }
+
+    @Override
+    public CacheErrorHandler errorHandler() {
+        return loggingCacheErrorHandler;
+    }
+}

@@ -220,4 +220,32 @@ public class TenantIntegrationCheckService {
                 "neverRun",     neverRun
         );
     }
+
+    /**
+     * Batch counterpart to getStats — ONE query for every connected
+     * integration's stats instead of 4 queries PER integration. Fixes the
+     * N+1 in IntegrationController.connected(): a tenant with 10 connected
+     * integrations meant 40 round trips just to render the dashboard list.
+     * Returns integrationKey -> same stats map shape as getStats().
+     */
+    public Map<String, Map<String, Object>> getStatsForTenant(Long tenantId) {
+        List<TenantIntegrationCheck> checks = tenantCheckRepo.findByTenantIdAndIsActiveTrue(tenantId);
+        Map<String, Map<String, Object>> result = new java.util.HashMap<>();
+        Map<String, List<TenantIntegrationCheck>> byKey = checks.stream()
+                .collect(java.util.stream.Collectors.groupingBy(TenantIntegrationCheck::getIntegrationKey));
+        for (var entry : byKey.entrySet()) {
+            List<TenantIntegrationCheck> group = entry.getValue();
+            long total    = group.size();
+            long passing  = group.stream().filter(c -> "PASS".equals(c.getLastRunStatus())).count();
+            long failing  = group.stream().filter(c -> "FAIL".equals(c.getLastRunStatus())).count();
+            long neverRun = group.stream().filter(c -> c.getLastRunStatus() == null).count();
+            result.put(entry.getKey(), Map.of(
+                    "totalChecks",  total,
+                    "passing",      passing,
+                    "failing",      failing,
+                    "neverRun",     neverRun
+            ));
+        }
+        return result;
+    }
 }

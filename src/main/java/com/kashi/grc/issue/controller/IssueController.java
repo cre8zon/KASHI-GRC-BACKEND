@@ -302,20 +302,21 @@ public class IssueController {
             @PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
         // Fetch ALL workflow instances for this issue (covers reopen cycles)
-        // sorted oldest first so history reads chronologically
         List<com.kashi.grc.workflow.domain.WorkflowInstance> instances =
                 instanceRepository.findByTenantIdAndEntityTypeAndEntityId(
                         ctx.getTenantId(), "ISSUE", id);
         if (instances.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(List.of()));
         }
-        // Collect history from all cycles, oldest instance first
-        List<WorkflowHistoryResponse> allHistory = new java.util.ArrayList<>();
-        instances.stream()
-                .sorted(java.util.Comparator.comparing(
-                        com.kashi.grc.workflow.domain.WorkflowInstance::getId))
-                .forEach(inst -> allHistory.addAll(
-                        workflowEngineService.getFullHistory(inst.getId())));
+        // BATCHED (was one getFullHistory() call — and one query — per
+        // workflow instance/reopen cycle). getFullHistoryForInstances orders
+        // by performedAt across the whole set, so cycles still read as one
+        // true chronological timeline, not per-cycle concatenated blocks.
+        List<Long> instanceIds = instances.stream()
+                .map(com.kashi.grc.workflow.domain.WorkflowInstance::getId)
+                .toList();
+        List<WorkflowHistoryResponse> allHistory =
+                workflowEngineService.getFullHistoryForInstances(instanceIds);
         return ResponseEntity.ok(ApiResponse.success(allHistory));
     }
 

@@ -1,5 +1,6 @@
 package com.kashi.grc.uiconfig.controller;
 
+import com.kashi.grc.common.cache.CacheNames;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.PaginatedResponse;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
@@ -12,6 +13,8 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -184,6 +187,15 @@ public class UiAdminController {
 
     @PostMapping("/components")
     @Operation(summary = "Register a new UI component (dropdown, badge set, etc.)")
+    // Components feed both getForm() (global components) and getScreenConfig()
+    // (screen-scoped components) — evict both regions on any write. allEntries=true
+    // because we don't know at write time which cached formKey/screenKey entries
+    // reference this component; it's an infrequent admin action so a full-region
+    // sweep is cheap relative to correctness.
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Map<String, Object>>> createComponent(
             @Valid @RequestBody UiComponentRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -222,6 +234,10 @@ public class UiAdminController {
 
     @PutMapping("/components/{id}")
     @Operation(summary = "Update a UI component")
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateComponent(
             @PathVariable Long id, @RequestBody UiComponentRequest req) {
         UiComponent c = componentRepository.findById(id)
@@ -237,6 +253,10 @@ public class UiAdminController {
 
     @DeleteMapping("/components/{id}")
     @Operation(summary = "Delete a UI component (also deletes its options)")
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Void>> deleteComponent(@PathVariable Long id) {
         componentRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -248,6 +268,10 @@ public class UiAdminController {
 
     @PostMapping("/options")
     @Operation(summary = "Add an option to a component (e.g. add 'CRITICAL' to risk_classification)")
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Map<String, Object>>> createOption(
             @Valid @RequestBody UiOptionRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -285,6 +309,10 @@ public class UiAdminController {
 
     @PutMapping("/options/{id}")
     @Operation(summary = "Update an option — change label, color, sort order")
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateOption(
             @PathVariable Long id, @RequestBody UiOptionRequest req) {
         UiOption opt = optionRepository.findById(id)
@@ -303,6 +331,10 @@ public class UiAdminController {
 
     @DeleteMapping("/options/{id}")
     @Operation(summary = "Delete an option")
+    @Caching(evict = {
+            @CacheEvict(cacheNames = CacheNames.UI_FORM,   allEntries = true),
+            @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
+    })
     public ResponseEntity<ApiResponse<Void>> deleteOption(@PathVariable Long id) {
         optionRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -314,6 +346,7 @@ public class UiAdminController {
 
     @PostMapping("/layouts")
     @Operation(summary = "Create a table layout (column definitions for a screen)")
+    @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> createLayout(
             @Valid @RequestBody UiLayoutRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -374,6 +407,7 @@ public class UiAdminController {
 
     @PutMapping("/layouts/{id}")
     @Operation(summary = "Update a layout — change columns, filters, access rules")
+    @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateLayout(
             @PathVariable Long id, @RequestBody UiLayoutRequest req) {
         UiLayout layout = layoutRepository.findById(id)
@@ -393,6 +427,7 @@ public class UiAdminController {
 
     @DeleteMapping("/layouts/{id}")
     @Operation(summary = "Delete a layout")
+    @CacheEvict(cacheNames = CacheNames.UI_SCREEN, allEntries = true)
     public ResponseEntity<ApiResponse<Void>> deleteLayout(@PathVariable Long id) {
         layoutRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -404,6 +439,7 @@ public class UiAdminController {
 
     @PostMapping("/forms")
     @Operation(summary = "Create a dynamic form definition")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> createForm(
             @Valid @RequestBody UiFormRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -487,6 +523,7 @@ public class UiAdminController {
 
     @PutMapping("/forms/{id}")
     @Operation(summary = "Update a form")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateForm(
             @PathVariable Long id, @RequestBody UiFormRequest req) {
         UiForm form = formRepository.findById(id)
@@ -502,6 +539,7 @@ public class UiAdminController {
 
     @DeleteMapping("/forms/{id}")
     @Operation(summary = "Delete a form and all its fields")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Void>> deleteForm(@PathVariable Long id) {
         formRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -513,6 +551,7 @@ public class UiAdminController {
 
     @PostMapping("/form-fields")
     @Operation(summary = "Add a field to a form")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> createField(
             @Valid @RequestBody UiFormFieldRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -556,6 +595,7 @@ public class UiAdminController {
 
     @PutMapping("/form-fields/{id}")
     @Operation(summary = "Update a form field — label, validation, visibility, grid width")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateField(
             @PathVariable Long id, @RequestBody UiFormFieldRequest req) {
         UiFormField f = formFieldRepository.findById(id)
@@ -588,6 +628,7 @@ public class UiAdminController {
 
     @DeleteMapping("/form-fields/{id}")
     @Operation(summary = "Remove a field from a form")
+    @CacheEvict(cacheNames = CacheNames.UI_FORM, allEntries = true)
     public ResponseEntity<ApiResponse<Void>> deleteField(@PathVariable Long id) {
         formFieldRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -599,6 +640,7 @@ public class UiAdminController {
 
     @PostMapping("/actions")
     @Operation(summary = "Add an action button to a screen")
+    @CacheEvict(cacheNames = {CacheNames.UI_ACTIONS, CacheNames.UI_SCREEN}, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> createAction(
             @Valid @RequestBody UiActionRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -670,6 +712,7 @@ public class UiAdminController {
 
     @PutMapping("/actions/{id}")
     @Operation(summary = "Update an action button")
+    @CacheEvict(cacheNames = {CacheNames.UI_ACTIONS, CacheNames.UI_SCREEN}, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateAction(
             @PathVariable Long id, @RequestBody UiActionRequest req) {
         UiAction a = actionRepository.findById(id)
@@ -695,6 +738,7 @@ public class UiAdminController {
 
     @DeleteMapping("/actions/{id}")
     @Operation(summary = "Remove an action button from a screen")
+    @CacheEvict(cacheNames = {CacheNames.UI_ACTIONS, CacheNames.UI_SCREEN}, allEntries = true)
     public ResponseEntity<ApiResponse<Void>> deleteAction(@PathVariable Long id) {
         actionRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());
@@ -706,6 +750,7 @@ public class UiAdminController {
 
     @PostMapping("/widgets")
     @Operation(summary = "Add a dashboard widget")
+    @CacheEvict(cacheNames = CacheNames.UI_DASHBOARD, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> createWidget(
             @Valid @RequestBody DashboardWidgetRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
@@ -764,6 +809,7 @@ public class UiAdminController {
 
     @PutMapping("/widgets/{id}")
     @Operation(summary = "Update a dashboard widget")
+    @CacheEvict(cacheNames = CacheNames.UI_DASHBOARD, allEntries = true)
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateWidget(
             @PathVariable Long id, @RequestBody DashboardWidgetRequest req) {
         DashboardWidget w = widgetRepository.findById(id)
@@ -785,6 +831,7 @@ public class UiAdminController {
 
     @DeleteMapping("/widgets/{id}")
     @Operation(summary = "Remove a dashboard widget")
+    @CacheEvict(cacheNames = CacheNames.UI_DASHBOARD, allEntries = true)
     public ResponseEntity<ApiResponse<Void>> deleteWidget(@PathVariable Long id) {
         widgetRepository.deleteById(id);
         return ResponseEntity.ok(ApiResponse.success());

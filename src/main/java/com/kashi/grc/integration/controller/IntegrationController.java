@@ -59,6 +59,10 @@ public class IntegrationController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         List<Map<String, Object>> result = new ArrayList<>();
 
+        // BATCHED — was 4 count queries PER connected integration (via
+        // tenantCheckService.getStats). getStatsForTenant does it in one.
+        Map<String, Map<String, Object>> statsByKey = tenantCheckService.getStatsForTenant(tenantId);
+
         configRepo.findByTenantId(tenantId).forEach(config -> {
             Map<String, Object> m = new LinkedHashMap<>();
             m.put("id",             config.getId());
@@ -68,7 +72,8 @@ public class IntegrationController {
             m.put("lastRunAt",      config.getLastRunAt());
             m.put("lastRunStatus",  config.getLastRunStatus());
             // Use tenant check stats, not global library count
-            m.put("checksStats",    tenantCheckService.getStats(tenantId, config.getIntegrationKey()));
+            m.put("checksStats",    statsByKey.getOrDefault(config.getIntegrationKey(), Map.of(
+                    "totalChecks", 0L, "passing", 0L, "failing", 0L, "neverRun", 0L)));
             result.add(m);
         });
 

@@ -20,4 +20,8 @@ public interface AuditTestRepository
     List<AuditTest> findByControlTag(String controlTag);
 
     Optional<AuditTest> findByNameAndTenantId(String name, Long tenantId);
+
+    /** Indexed lookup for CSV library import — was a full findAll()+filter per row,
+     *  reused by upsertTest and upsertControlTestMapping. */
+    Optional<AuditTest> findByTestRefAndTenantId(String testRef, Long tenantId);
 }

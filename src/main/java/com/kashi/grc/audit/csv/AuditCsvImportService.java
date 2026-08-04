@@ -197,16 +197,12 @@ public class AuditCsvImportService {
                             if (!sectionCodeCol.isBlank()) {
                                 // Exact match first, then prefix match (CC6 matches CC6.x)
                                 String sc = sectionCodeCol.trim();
-                                target = sectionRepository.findAll().stream()
-                                        .filter(s -> sc.equals(s.getSectionCode())
-                                                && Objects.equals(s.getTenantId(), tenantId))
-                                        .findFirst()
+                                target = sectionRepository.findBySectionCodeAndTenantId(sc, tenantId)
+                                        .stream().findFirst()
                                         // Fallback: section whose code starts with our prefix
-                                        .orElseGet(() -> sectionRepository.findAll().stream()
-                                                .filter(s -> s.getSectionCode() != null
-                                                        && s.getSectionCode().startsWith(sc)
-                                                        && Objects.equals(s.getTenantId(), tenantId))
-                                                .findFirst().orElse(null));
+                                        .orElseGet(() -> sectionRepository
+                                                .findBySectionCodeStartingWithAndTenantId(sc, tenantId)
+                                                .stream().findFirst().orElse(null));
                             }
 
                             if (target == null) {
@@ -215,10 +211,8 @@ public class AuditCsvImportService {
                                 String ctrlCode = col(cols, h, "control_code");
                                 if (!ctrlCode.isBlank() && ctrlCode.contains("-")) {
                                     String prefix = ctrlCode.substring(0, ctrlCode.lastIndexOf('-'));
-                                    target = sectionRepository.findAll().stream()
-                                            .filter(s -> prefix.equals(s.getSectionCode())
-                                                    && Objects.equals(s.getTenantId(), tenantId))
-                                            .findFirst().orElse(null);
+                                    target = sectionRepository.findBySectionCodeAndTenantId(prefix, tenantId)
+                                            .stream().findFirst().orElse(null);
                                 }
                             }
 
@@ -361,9 +355,7 @@ public class AuditCsvImportService {
         AuditTemplate.AuditType auditType = typeStr.isBlank()
                 ? AuditTemplate.AuditType.INTERNAL
                 : AuditTemplate.AuditType.valueOf(typeStr.toUpperCase());
-        return templateRepository.findAll().stream()
-                .filter(t -> name.equals(t.getName()) && Objects.equals(t.getTenantId(), tenantId))
-                .findFirst()
+        return templateRepository.findByNameAndTenantId(name, tenantId)
                 .map(t -> { if (!description.isBlank()) t.setDescription(description);
                     if (!frameworkRef.isBlank()) t.setFrameworkRef(frameworkRef);
                     t.setAuditType(auditType); t.setTemplateName(name);
@@ -386,11 +378,9 @@ public class AuditCsvImportService {
         Optional<AuditSection> existing = !sectionCode.isBlank()
                 ? sectionRepository.findBySectionCodeAndFrameworkRef(sectionCode,
                 frameworkRef.isBlank() ? null : frameworkRef)
-                : sectionRepository.findAll().stream()
-                  .filter(s -> name.equals(s.getName())
-                               && Objects.equals(s.getTenantId(), tenantId)
-                               && Objects.equals(s.getParentId(), parentId))
-                  .findFirst();
+                : (parentId == null
+                   ? sectionRepository.findByNameAndTenantIdAndParentIdIsNull(name, tenantId)
+                   : sectionRepository.findByNameAndTenantIdAndParentId(name, tenantId, parentId));
         return existing.map(s -> { if (!description.isBlank()) s.setDescription(description);
                     if (!sectionCode.isBlank())  s.setSectionCode(sectionCode);
                     if (!frameworkRef.isBlank()) s.setFrameworkRef(frameworkRef);
@@ -415,13 +405,8 @@ public class AuditCsvImportService {
                 ? AuditControl.TestType.DOCUMENT_REVIEW
                 : AuditControl.TestType.valueOf(testTypeStr.toUpperCase());
         Optional<AuditControl> existing = controlCode.isBlank()
-                ? controlRepository.findAll().stream()
-                  .filter(c -> name.equals(c.getName()) && Objects.equals(c.getTenantId(), tenantId))
-                  .findFirst()
-                : controlRepository.findAll().stream()
-                  .filter(c -> controlCode.equals(c.getControlCode())
-                               && Objects.equals(c.getTenantId(), tenantId))
-                  .findFirst();
+                ? controlRepository.findByNameAndTenantId(name, tenantId)
+                : controlRepository.findByControlCodeAndTenantId(controlCode, tenantId);
         return existing.map(c -> { if (!name.isBlank())         c.setName(name);
                     if (!description.isBlank())  c.setDescription(description);
                     if (!controlCode.isBlank())  c.setControlCode(controlCode);
@@ -489,10 +474,7 @@ public class AuditCsvImportService {
 
         // Find existing by testRef (preferred) or name
         Optional<AuditTest> existing = !testRef.isBlank()
-                ? testRepository.findAll().stream()
-                  .filter(t -> testRef.equals(t.getTestRef())
-                               && Objects.equals(t.getTenantId(), tenantId))
-                  .findFirst()
+                ? testRepository.findByTestRefAndTenantId(testRef, tenantId)
                 : testRepository.findByNameAndTenantId(name, tenantId);
 
         return existing.map(t -> {
@@ -584,17 +566,11 @@ public class AuditCsvImportService {
     public String upsertControlTestMapping(String controlCode, String testRef,
                                            Long tenantId, String[] cols,
                                            Map<String, Integer> h, Long createdBy) {
-        AuditControl control = controlRepository.findAll().stream()
-                .filter(c -> controlCode.equals(c.getControlCode())
-                        && Objects.equals(c.getTenantId(), tenantId))
-                .findFirst()
+        AuditControl control = controlRepository.findByControlCodeAndTenantId(controlCode, tenantId)
                 .orElseThrow(() -> new RuntimeException(
                         "Control not found: controlCode=" + controlCode));
 
-        AuditTest test = testRepository.findAll().stream()
-                .filter(t -> testRef.equals(t.getTestRef())
-                        && Objects.equals(t.getTenantId(), tenantId))
-                .findFirst()
+        AuditTest test = testRepository.findByTestRefAndTenantId(testRef, tenantId)
                 .orElseThrow(() -> new RuntimeException(
                         "Test not found: testRef=" + testRef));
 
@@ -633,10 +609,7 @@ public class AuditCsvImportService {
                 .orElseThrow(() -> new RuntimeException(
                         "Policy not found: policyRef=" + policyRef));
 
-        AuditControl control = controlRepository.findAll().stream()
-                .filter(c -> controlCode.equals(c.getControlCode())
-                        && Objects.equals(c.getTenantId(), tenantId))
-                .findFirst()
+        AuditControl control = controlRepository.findByControlCodeAndTenantId(controlCode, tenantId)
                 .orElseThrow(() -> new RuntimeException(
                         "Control not found: controlCode=" + controlCode));
 
@@ -661,18 +634,12 @@ public class AuditCsvImportService {
     // ── Auto-ref generators ───────────────────────────────────────────────────
 
     private String generateTestRef(Long tenantId) {
-        long count = testRepository.findAll().stream()
-                .filter(t -> Objects.equals(t.getTenantId(), tenantId)
-                        || t.getTenantId() == null)
-                .count() + 1;
+        long count = testRepository.countForTenant(tenantId) + 1;
         return String.format("AT-%04d", count);
     }
 
     private String generatePolicyRef(Long tenantId) {
-        long count = policyRepository.findAll().stream()
-                .filter(p -> Objects.equals(p.getTenantId(), tenantId)
-                        || p.getTenantId() == null)
-                .count() + 1;
+        long count = policyRepository.countForTenant(tenantId) + 1;
         return String.format("POL-%04d", count);
     }
 

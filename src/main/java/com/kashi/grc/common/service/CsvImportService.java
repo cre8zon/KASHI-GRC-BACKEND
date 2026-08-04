@@ -763,6 +763,16 @@ public class CsvImportService {
         List<String[]> dataRows = allRows.subList(1, allRows.size());
         int ok = 0, fail = 0;
 
+        // Pre-fetch every existing step for this workflow ONCE — was previously
+        // re-fetched (findByWorkflowIdOrderByStepOrderAsc, filtered in Java for
+        // the matching stepOrder) on every row that didn't resolve via an
+        // explicit id column. For a large blueprint that was one query
+        // fetching every step, per row. Updated in place as rows are
+        // processed so later rows see steps created earlier in the same pass.
+        Map<Integer, WorkflowStep> stepsByOrder = workflowStepRepository
+                .findByWorkflowIdOrderByStepOrderAsc(workflowId).stream()
+                .collect(java.util.stream.Collectors.toMap(WorkflowStep::getStepOrder, s -> s, (a, b) -> a));
+
         if (isDbExport) importLog.add(entry(
                 "DB export format detected. Add actorRoles/assignerRoles/observerRoles columns to import roles.",
                 "INFO"));
@@ -843,8 +853,7 @@ public class CsvImportService {
             if (step == null) {
                 // Try to match by stepOrder within this workflow
                 final int fOrder = stepOrder;
-                step = workflowStepRepository.findByWorkflowIdOrderByStepOrderAsc(workflowId)
-                        .stream().filter(s -> s.getStepOrder() == fOrder).findFirst().orElse(null);
+                step = stepsByOrder.get(fOrder);
             }
             boolean created = (step == null);
             if (step == null) step = WorkflowStep.builder().workflowId(workflowId).build();
@@ -862,6 +871,7 @@ public class CsvImportService {
             step.setAssignerNavKey(assignerNavKey);
             step.setAllowOverride(allowOverride);
             step = workflowStepRepository.save(step);
+            stepsByOrder.put(stepOrder, step);
             final Long stepId = step.getId();
 
             // ── Role assignments — only if columns present in CSV ─────────────
@@ -945,8 +955,7 @@ public class CsvImportService {
                 .filter(o -> o > 0)
                 .collect(java.util.stream.Collectors.toSet());
 
-        List<WorkflowStep> existingSteps = workflowStepRepository
-                .findByWorkflowIdOrderByStepOrderAsc(workflowId);
+        List<WorkflowStep> existingSteps = new ArrayList<>(stepsByOrder.values());
         int deleted = 0;
         for (WorkflowStep s : existingSteps) {
             if (!csvOrders.contains(s.getStepOrder())) {

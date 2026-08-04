@@ -400,12 +400,13 @@ public class AuditEngagementController {
         if (instances.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(List.of()));
         }
-        List<WorkflowHistoryResponse> allHistory = new ArrayList<>();
-        instances.stream()
-                .sorted(java.util.Comparator.comparing(
-                        com.kashi.grc.workflow.domain.WorkflowInstance::getId))
-                .forEach(inst -> allHistory.addAll(
-                        workflowEngineService.getFullHistory(inst.getId())));
+        // BATCHED — same fix as getProjectInstanceHistory above (was one
+        // getFullHistory() call, and one query, per workflow instance).
+        List<Long> instanceIds = instances.stream()
+                .map(com.kashi.grc.workflow.domain.WorkflowInstance::getId)
+                .toList();
+        List<WorkflowHistoryResponse> allHistory =
+                workflowEngineService.getFullHistoryForInstances(instanceIds);
         return ResponseEntity.ok(ApiResponse.success(allHistory));
     }
 
@@ -468,12 +469,18 @@ public class AuditEngagementController {
         if (instances.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(List.of()));
         }
-        List<WorkflowHistoryResponse> allHistory = new ArrayList<>();
-        instances.stream()
-                .sorted(java.util.Comparator.comparing(
-                        com.kashi.grc.workflow.domain.WorkflowInstance::getId))
-                .forEach(inst -> allHistory.addAll(
-                        workflowEngineService.getFullHistory(inst.getId())));
+        // BATCHED (was one getFullHistory() call — and therefore one query —
+        // PER workflow instance under this project). Also now a true merged
+        // chronological timeline across all instances (ordered by
+        // performedAt globally), rather than per-instance blocks
+        // concatenated in id order — closer to what "full chronological
+        // history for a project" actually implies when engagements run in
+        // parallel.
+        List<Long> instanceIds = instances.stream()
+                .map(com.kashi.grc.workflow.domain.WorkflowInstance::getId)
+                .toList();
+        List<WorkflowHistoryResponse> allHistory =
+                workflowEngineService.getFullHistoryForInstances(instanceIds);
         return ResponseEntity.ok(ApiResponse.success(allHistory));
     }
 
@@ -488,6 +495,19 @@ public class AuditEngagementController {
                 .orElseThrow(() -> new ResourceNotFoundException("AuditProjectInstance", id));
 
         List<AuditEngagement> engagements = engagementRepository.findByProjectInstanceId(id);
+
+        // BATCHED (was 2 queries PER engagement — controls + findings — inside
+        // the loop below; a project with 20 engagements meant 40 round trips
+        // for one report load). Now: 2 queries total, grouped in memory.
+        List<Long> engagementIds = engagements.stream().map(AuditEngagement::getId).toList();
+        Map<Long, List<AuditControlInstance>> controlsByEngagementId = engagementIds.isEmpty()
+                ? Map.of()
+                : controlInstanceRepository.findByEngagementIdIn(engagementIds).stream()
+                  .collect(java.util.stream.Collectors.groupingBy(AuditControlInstance::getEngagementId));
+        Map<Long, List<AuditFinding>> findingsByEngagementId = engagementIds.isEmpty()
+                ? Map.of()
+                : findingRepository.findByEngagementIdInAndTenantId(engagementIds, tenantId).stream()
+                  .collect(java.util.stream.Collectors.groupingBy(AuditFinding::getEngagementId));
 
         long programTotalControls  = 0;
         long programEffective      = 0;
@@ -504,7 +524,7 @@ public class AuditEngagementController {
         List<Map<String, Object>> engBreakdown = new ArrayList<>();
 
         for (AuditEngagement eng : engagements) {
-            List<AuditControlInstance> controls = controlInstanceRepository.findByEngagementId(eng.getId());
+            List<AuditControlInstance> controls = controlsByEngagementId.getOrDefault(eng.getId(), List.of());
 
             long total       = controls.size();
             long effective   = controls.stream().filter(c -> AuditControlInstance.TestResult.EFFECTIVE           == c.getTestResult()).count();
@@ -514,7 +534,7 @@ public class AuditEngagementController {
                     || AuditControlInstance.TestResult.NOT_TESTED == c.getTestResult()).count();
             double passRate  = total > 0 ? Math.round((effective * 10000.0) / total) / 100.0 : 0.0;
 
-            List<AuditFinding> findings = findingRepository.findByEngagementIdAndTenantId(eng.getId(), tenantId);
+            List<AuditFinding> findings = findingsByEngagementId.getOrDefault(eng.getId(), List.of());
             long critical = findings.stream().filter(f -> AuditFinding.Severity.CRITICAL == f.getSeverity()).count();
             long high     = findings.stream().filter(f -> AuditFinding.Severity.HIGH     == f.getSeverity()).count();
             long medium   = findings.stream().filter(f -> AuditFinding.Severity.MEDIUM   == f.getSeverity()).count();
@@ -718,10 +738,20 @@ public class AuditEngagementController {
         // ── 2. Cascade-create an engagement instance per planned template ──────
         // Mirrors startEngagementFromPlan() but with startWorkflow=false — no
         // workflow-14 instance per engagement, since workflow 16 governs all.
+        //
+        // BATCHED template lookup — was one templateRepository.findById() per
+        // planned template in the loop below.
+        List<Long> plannedTemplateIds = planned.stream()
+                .map(AuditProjectTemplate::getTemplateId).toList();
+        Map<Long, AuditTemplate> plannedTemplateMap = templateRepository.findAllById(plannedTemplateIds)
+                .stream().collect(java.util.stream.Collectors.toMap(AuditTemplate::getId, t -> t));
+
         List<Long> createdEngagementIds = new ArrayList<>();
         for (AuditProjectTemplate pt : planned) {
-            AuditTemplate template = templateRepository.findById(pt.getTemplateId())
-                    .orElseThrow(() -> new ResourceNotFoundException("AuditTemplate", pt.getTemplateId()));
+            AuditTemplate template = plannedTemplateMap.get(pt.getTemplateId());
+            if (template == null) {
+                throw new ResourceNotFoundException("AuditTemplate", pt.getTemplateId());
+            }
 
             AuditEngagementRequest engReq = new AuditEngagementRequest();
             engReq.setProjectId(originalProjectId);
@@ -736,11 +766,11 @@ public class AuditEngagementController {
 
             AuditEngagementResponse engagement = service.create(engReq, ctx.getId(), tenantId, false);
 
-            // Point the engagement at THIS instance — registrar and tabs query by projectInstanceId
-            engagementRepository.findById(engagement.getId()).ifPresent(e -> {
-                e.setProjectInstanceId(inst.getId());
-                engagementRepository.save(e);
-            });
+            // NOTE: no need to re-link projectInstanceId here — service.create()
+            // already sets and saves it internally when engReq.projectInstanceId
+            // is populated (see the "Fast path" branch in
+            // AuditEngagementService.create()). The re-fetch+re-set+re-save that
+            // used to happen here was setting the exact same value a second time.
 
             pt.setEngagementId(engagement.getId());
             projectTemplateRepository.save(pt);
@@ -868,26 +898,34 @@ public class AuditEngagementController {
                         || p.getTenantId().equals(ctx.getTenantId()))
                 .orElseThrow(() -> new ResourceNotFoundException("AuditProject", projectId));
 
+        List<AuditProjectTemplate> planned = projectTemplateRepository.findByProjectIdOrderByOrderNoAsc(projectId);
+
+        // BATCHED — was one templateRepository.findById() per row.
+        List<Long> templateIds = planned.stream().map(AuditProjectTemplate::getTemplateId).toList();
+        Map<Long, AuditTemplate> templatesById = templateIds.isEmpty() ? Map.of()
+                : templateRepository.findAllById(templateIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(AuditTemplate::getId, t -> t));
+
         List<Map<String, Object>> result =
-                projectTemplateRepository.findByProjectIdOrderByOrderNoAsc(projectId)
-                        .stream().map(pt -> {
-                            Map<String, Object> row = new LinkedHashMap<>();
-                            row.put("id",           pt.getId());
-                            row.put("projectId",    pt.getProjectId());
-                            row.put("templateId",   pt.getTemplateId());
-                            row.put("orderNo",      pt.getOrderNo());
-                            row.put("note",         pt.getNote());
-                            row.put("engagementId", pt.getEngagementId());
-                            row.put("started",      pt.getEngagementId() != null);
-                            templateRepository.findById(pt.getTemplateId()).ifPresent(t -> {
-                                row.put("templateName",      t.getName());
-                                row.put("templateStatus",    t.getStatus());
-                                row.put("templateFramework", t.getFrameworkRef());
-                                row.put("templateAuditType", t.getAuditType());
-                                row.put("templateVersion",   t.getVersion());
-                            });
-                            return row;
-                        }).toList();
+                planned.stream().map(pt -> {
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("id",           pt.getId());
+                    row.put("projectId",    pt.getProjectId());
+                    row.put("templateId",   pt.getTemplateId());
+                    row.put("orderNo",      pt.getOrderNo());
+                    row.put("note",         pt.getNote());
+                    row.put("engagementId", pt.getEngagementId());
+                    row.put("started",      pt.getEngagementId() != null);
+                    AuditTemplate t = templatesById.get(pt.getTemplateId());
+                    if (t != null) {
+                        row.put("templateName",      t.getName());
+                        row.put("templateStatus",    t.getStatus());
+                        row.put("templateFramework", t.getFrameworkRef());
+                        row.put("templateAuditType", t.getAuditType());
+                        row.put("templateVersion",   t.getVersion());
+                    }
+                    return row;
+                }).toList();
 
         return ResponseEntity.ok(ApiResponse.success(result));
     }
@@ -1247,12 +1285,12 @@ public class AuditEngagementController {
         if (instances.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(List.of()));
         }
-        List<WorkflowHistoryResponse> allHistory = new ArrayList<>();
-        instances.stream()
-                .sorted(java.util.Comparator.comparing(
-                        com.kashi.grc.workflow.domain.WorkflowInstance::getId))
-                .forEach(inst -> allHistory.addAll(
-                        workflowEngineService.getFullHistory(inst.getId())));
+        // BATCHED — same fix as getProjectHistory/getProjectInstanceHistory above.
+        List<Long> instanceIds = instances.stream()
+                .map(com.kashi.grc.workflow.domain.WorkflowInstance::getId)
+                .toList();
+        List<WorkflowHistoryResponse> allHistory =
+                workflowEngineService.getFullHistoryForInstances(instanceIds);
         return ResponseEntity.ok(ApiResponse.success(allHistory));
     }
 

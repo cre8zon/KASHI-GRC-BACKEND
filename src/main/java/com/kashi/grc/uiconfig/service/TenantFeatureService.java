@@ -1,14 +1,11 @@
 package com.kashi.grc.uiconfig.service;
 
 import com.kashi.grc.common.config.multitenancy.TenantContext;
-import com.kashi.grc.uiconfig.domain.FeatureFlag;
-import com.kashi.grc.uiconfig.repository.FeatureFlagRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
 import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * TenantFeatureService — the single source of truth for "does this tenant have
@@ -27,17 +24,20 @@ import java.util.stream.Collectors;
  * project library already scope by tenant.
  *
  * ── CACHING ─────────────────────────────────────────────────────────────────
- * The flag set is small and read on nearly every request, so it is cached per
- * request in a ThreadLocal (cleared by the tenant filter at request end). A
- * feature grant takes effect on the tenant's next request — acceptable, since
- * licensing is not a sub-second operation.
+ * Two layers now: a per-request ThreadLocal (unchanged — free within a single
+ * request, cleared by the tenant filter at request end) in front of a
+ * Redis-backed cache in TenantEntitlementCacheService (new — free ACROSS
+ * requests for the same tenant, until an admin licensing change evicts it or
+ * the TTL expires). Previously every request outside the ThreadLocal window
+ * hit MySQL directly; this data changes only on admin action, so most of
+ * those round trips were pure waste.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class TenantFeatureService {
 
-    private final FeatureFlagRepository featureFlagRepository;
+    private final TenantEntitlementCacheService entitlementCacheService;
 
     private static final ThreadLocal<Set<String>> CACHE = new ThreadLocal<>();
 
@@ -47,9 +47,7 @@ public class TenantFeatureService {
         if (cached != null) return cached;
 
         Long tenantId = TenantContext.getCurrentTenant();
-        Set<String> keys = featureFlagRepository.findEnabledForTenant(tenantId).stream()
-                .map(FeatureFlag::getFlagKey)
-                .collect(Collectors.toSet());
+        Set<String> keys = entitlementCacheService.getEnabledFeatureKeys(tenantId);
         CACHE.set(keys);
         return keys;
     }
@@ -66,8 +64,7 @@ public class TenantFeatureService {
 
     public boolean hasFeature(Long tenantId, String featureKey) {
         if (featureKey == null || featureKey.isBlank()) return true;
-        return featureFlagRepository.findEnabledForTenant(tenantId).stream()
-                .anyMatch(f -> featureKey.equals(f.getFlagKey()));
+        return entitlementCacheService.getEnabledFeatureKeys(tenantId).contains(featureKey);
     }
 
     /** Called by the tenant request filter at end of request. */

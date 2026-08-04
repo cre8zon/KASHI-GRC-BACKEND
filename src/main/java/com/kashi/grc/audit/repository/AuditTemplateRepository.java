@@ -12,4 +12,7 @@ public interface AuditTemplateRepository extends JpaRepository<AuditTemplate, Lo
     List<AuditTemplate> findByStatus(String status);
     boolean existsByNameAndTenantId(String name, Long tenantId);
     boolean existsByTemplateNameAndTenantId(String templateName, Long tenantId);
+
+    /** Indexed lookup for CSV library import upsert — was a full findAll()+filter per row. */
+    Optional<AuditTemplate> findByNameAndTenantId(String name, Long tenantId);
 }

@@ -30,12 +30,14 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.LinkedHashMap;
+import java.util.Objects;
 import java.util.stream.Collectors;
 
 /**
@@ -116,7 +118,13 @@ public class WorkflowEngineService {
     private final UtilityService                  utilityService;
     private final com.kashi.grc.usermanagement.repository.RoleRepository roleRepository;
     private final com.kashi.grc.usermanagement.repository.UserRepository  userRepository;
+    private final com.kashi.grc.usermanagement.service.user.UserDisplayNameService userDisplayNameService;
     private final com.kashi.grc.workflow.automation.AutomatedActionRegistry automatedActionRegistry;
+    // ObjectProvider, not a direct dependency — KafkaEventPublisher only
+    // exists as a bean when kashi.kafka.enabled=true. getIfAvailable()
+    // returns null when it's off, which is the signal to fall back to
+    // synchronous dispatch (see createStepInstance).
+    private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaEventPublisherProvider;
     private final ApplicationEventPublisher eventPublisher;
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
@@ -1562,13 +1570,29 @@ public class WorkflowEngineService {
     // ══════════════════════════════════════════════════════════════
 
     public List<WorkflowHistoryResponse> getFullHistory(Long instanceId) {
-        return historyRepository.findByWorkflowInstanceIdOrderByPerformedAtAsc(instanceId)
-                .stream().map(this::toHistoryResponse).toList();
+        return toHistoryResponses(
+                historyRepository.findByWorkflowInstanceIdOrderByPerformedAtAsc(instanceId));
+    }
+
+    /**
+     * Batch counterpart to getFullHistory — for callers that need history
+     * across MULTIPLE workflow instances (e.g. every engagement under a
+     * project). Was previously done by calling getFullHistory() once per
+     * instance in a loop and concatenating the results instance-by-instance
+     * (so two engagements running in parallel would NOT interleave
+     * chronologically). This issues one query ordered by performedAt across
+     * the WHOLE set of instances — a true merged timeline — plus one
+     * batched name resolution, instead of N of each.
+     */
+    public List<WorkflowHistoryResponse> getFullHistoryForInstances(Collection<Long> instanceIds) {
+        if (instanceIds == null || instanceIds.isEmpty()) return List.of();
+        return toHistoryResponses(
+                historyRepository.findByWorkflowInstanceIdInOrderByPerformedAtAsc(instanceIds));
     }
 
     public List<WorkflowHistoryResponse> getHistoryByStep(Long instanceId, Long stepId) {
-        return historyRepository.findByWorkflowInstanceIdAndStepIdOrderByPerformedAtAsc(instanceId, stepId)
-                .stream().map(this::toHistoryResponse).toList();
+        return toHistoryResponses(
+                historyRepository.findByWorkflowInstanceIdAndStepIdOrderByPerformedAtAsc(instanceId, stepId));
     }
 
     public Workflow getWorkflowById(Long id) {
@@ -1601,6 +1625,8 @@ public class WorkflowEngineService {
         recordHistory(instance, si, null, "STEP_MANUALLY_ADVANCED",
                 StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
                 performedBy, remarks);
+        eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
+                instance.getId(), si.getId(), si.getSnapName(), "APPROVED", performedBy));
 
         stepRepository.findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(
                         step.getWorkflowId(), step.getStepOrder())
@@ -1631,8 +1657,8 @@ public class WorkflowEngineService {
 
 
     public List<WorkflowHistoryResponse> getHistoryByUser(Long userId, Long tenantId) {
-        return historyRepository.findByPerformedByAndTenantId(userId, tenantId)
-                .stream().map(this::toHistoryResponse).toList();
+        return toHistoryResponses(
+                historyRepository.findByPerformedByAndTenantId(userId, tenantId));
     }
 
     /**
@@ -2188,7 +2214,50 @@ public class WorkflowEngineService {
         // On success the handler returns true → auto-approve the step and advance.
         // On failure (returns false) or no handler found → step stays IN_PROGRESS
         // so a human can investigate and manually approve or retry.
-        if ("SYSTEM".equals(step.getSide()) && step.getAutomatedAction() != null) {
+        //
+        // EXCEPTION: EXECUTE_ASSESSMENT is dispatched via Kafka instead of
+        // inline. This method (createStepInstance) runs on whatever thread
+        // caused the PREVIOUS step to complete — often a live HTTP request
+        // (e.g. an org admin picking a template, or vendor onboarding). Even
+        // after batching the DB writes and caching the read side (see
+        // AssessmentTemplateStructureCacheService / ExecuteAssessmentAction),
+        // that handler is real work that has no business blocking an
+        // unrelated HTTP response. Every other automated action stays
+        // synchronous — this is a deliberate, narrow exception for the one
+        // handler that does meaningful bulk work, not a general async
+        // dispatch mechanism.
+        boolean dispatchedAsync = false;
+        if ("SYSTEM".equals(step.getSide()) && "EXECUTE_ASSESSMENT".equals(step.getAutomatedAction())) {
+            com.kashi.grc.common.kafka.KafkaEventPublisher publisher = kafkaEventPublisherProvider.getIfAvailable();
+            if (publisher != null) {
+                // Same IN_PROGRESS status the synchronous failure branch below
+                // already uses for "handler pending" — which means
+                // retryStuckSystemSteps() (the existing 5-minute sweep) is an
+                // automatic safety net here for free: if the Kafka message is
+                // ever lost, or the consumer crashes mid-flight, that sweep
+                // picks this step up and falls back to synchronous dispatch,
+                // exactly as it already does today for any handler that
+                // returned false. No new failure mode was introduced.
+                si.setStatus(StepStatus.IN_PROGRESS);
+                stepInstanceRepository.save(si);
+                publisher.publish(
+                        com.kashi.grc.common.kafka.KafkaTopics.ASSESSMENT_EXECUTE_REQUESTED,
+                        "EXECUTE_ASSESSMENT_REQUESTED",
+                        String.valueOf(instance.getId()),
+                        java.util.Map.of(
+                                "workflowInstanceId", instance.getId(),
+                                "stepInstanceId", si.getId()),
+                        instance.getTenantId(), instance.getInitiatedBy());
+                log.info("[WORKFLOW-AUTO] EXECUTE_ASSESSMENT dispatched via Kafka | instanceId={} | stepInstanceId={}",
+                        instance.getId(), si.getId());
+                dispatchedAsync = true;
+            }
+            // publisher == null (kashi.kafka.enabled=false) — fall through to
+            // the normal synchronous path below, same "flip a flag, zero
+            // blast radius" contract as every other Kafka producer call site.
+        }
+
+        if (!dispatchedAsync && "SYSTEM".equals(step.getSide()) && step.getAutomatedAction() != null) {
             com.kashi.grc.workflow.automation.AutomatedActionContext ctx =
                     com.kashi.grc.workflow.automation.AutomatedActionContext.builder()
                             .workflowInstance(instance)
@@ -3349,19 +3418,15 @@ public class WorkflowEngineService {
         return toEnrichedTaskResponse(task);
     }
 
-    /** Maps a WorkflowInstanceHistory entity to its response DTO. Logic unchanged. */
-    private WorkflowHistoryResponse toHistoryResponse(WorkflowInstanceHistory h) {
-        // Resolve performedBy userId to display name
-        String performedByName = null;
-        if (h.getPerformedBy() != null) {
-            performedByName = userRepository.findById(h.getPerformedBy())
-                    .map(u -> {
-                        String name = ((u.getFirstName() != null ? u.getFirstName() : "") + " "
-                                + (u.getLastName() != null ? u.getLastName() : "")).trim();
-                        return name.isEmpty() ? u.getEmail() : name;
-                    })
-                    .orElse("User #" + h.getPerformedBy());
-        }
+    /**
+     * Maps a WorkflowInstanceHistory entity to its response DTO, given an
+     * already-resolved userId -> displayName map. Callers must batch-resolve
+     * names via toHistoryResponses() below rather than calling this directly
+     * per-row — that's what caused the N+1 (one findById() per history row)
+     * this method used to have inline.
+     */
+    private WorkflowHistoryResponse toHistoryResponse(WorkflowInstanceHistory h, Map<Long, String> nameMap) {
+        String performedByName = h.getPerformedBy() != null ? nameMap.get(h.getPerformedBy()) : null;
         return WorkflowHistoryResponse.builder()
                 .id(h.getId()).workflowInstanceId(h.getWorkflowInstanceId())
                 .stepInstanceId(h.getStepInstanceId()).taskInstanceId(h.getTaskInstanceId())
@@ -3371,6 +3436,24 @@ public class WorkflowEngineService {
                 .remarks(h.getRemarks())
                 .stepId(h.getStepId()).stepName(h.getStepName()).stepOrder(h.getStepOrder())
                 .build();
+    }
+
+    /**
+     * Batch entry point for all three history queries (getFullHistory,
+     * getHistoryByStep, getHistoryByUser). Resolves every distinct
+     * performedBy id in ONE call to UserDisplayNameService (which itself
+     * does at most one findAllById() for whatever isn't already
+     * Redis-cached) instead of one userRepository.findById() per row —
+     * a 200-row history page used to mean 200 remote DB round trips just
+     * to show names.
+     */
+    private List<WorkflowHistoryResponse> toHistoryResponses(List<WorkflowInstanceHistory> rows) {
+        Set<Long> userIds = rows.stream()
+                .map(WorkflowInstanceHistory::getPerformedBy)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        Map<Long, String> nameMap = userDisplayNameService.resolveNames(userIds);
+        return rows.stream().map(h -> toHistoryResponse(h, nameMap)).toList();
     }
 
     // ══════════════════════════════════════════════════════════════

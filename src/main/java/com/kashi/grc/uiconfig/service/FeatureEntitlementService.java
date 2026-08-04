@@ -1,8 +1,10 @@
 package com.kashi.grc.uiconfig.service;
 
+import com.kashi.grc.common.cache.CacheNames;
 import com.kashi.grc.uiconfig.domain.FeatureFlag;
 import com.kashi.grc.uiconfig.repository.FeatureFlagRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -42,6 +44,7 @@ public class FeatureEntitlementService {
      * everyone. Soft-deletes every active tenant row (history retained).
      */
     @Transactional
+    @CacheEvict(cacheNames = CacheNames.TENANT_ENTITLEMENTS, allEntries = true)
     public void setGlobal(String flagKey, boolean enabled, Long actorUserId) {
         FeatureFlag global = globalRow(flagKey, null);
         global.setMode("GLOBAL");
@@ -67,6 +70,7 @@ public class FeatureEntitlementService {
      * The global row is kept (mode marker + catalogue definition) but inert.
      */
     @Transactional
+    @CacheEvict(cacheNames = CacheNames.TENANT_ENTITLEMENTS, allEntries = true)
     public void setLicensed(String flagKey, Long actorUserId) {
         FeatureFlag global = globalRow(flagKey, null);
         global.setMode("LICENSED");
@@ -81,6 +85,7 @@ public class FeatureEntitlementService {
      * LICENSED. Restores a soft-deleted row if re-licensing that tenant.
      */
     @Transactional
+    @CacheEvict(cacheNames = CacheNames.TENANT_ENTITLEMENTS, allEntries = true)
     public void setTenant(String flagKey, Long tenantId, boolean enabled, Long actorUserId) {
         FeatureFlag global = featureFlagRepository.findByFlagKeyAndTenantIdIsNull(flagKey)
                 .orElse(null);

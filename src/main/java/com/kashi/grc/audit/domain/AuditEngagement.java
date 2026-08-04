@@ -121,6 +121,23 @@ public class AuditEngagement extends TenantAwareEntity {
     @Builder.Default
     private Integer totalControls = 0;
 
+    /**
+     * Async provisioning state for the template snapshot (sections/controls)
+     * and workflow start — see AuditEngagementSnapshotConsumer.
+     *   null / "READY" — snapshot complete (or no template was requested).
+     *     Existing rows created before this field existed default to null,
+     *     which the frontend/backend both treat identically to "READY" —
+     *     backward compatible, no migration needed for historical data.
+     *   "PROVISIONING" — engagement row exists, template snapshot (and
+     *     workflow start, if configured) is running in the background.
+     *     totalControls is 0 and no workflow instance exists yet.
+     *   "FAILED" — the background snapshot hit an unrecoverable error
+     *     (e.g. template not found). Engagement exists but has no sections/
+     *     controls/workflow; needs manual attention.
+     */
+    @Column(name = "snapshot_status", length = 20)
+    private String snapshotStatus;
+
     @Column(name = "tested_controls")
     @Builder.Default
     private Integer testedControls = 0;

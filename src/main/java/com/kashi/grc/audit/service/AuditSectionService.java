@@ -4,11 +4,13 @@ import com.kashi.grc.audit.domain.*;
 import com.kashi.grc.audit.repository.*;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
+import com.kashi.grc.common.jdbc.JdbcBatchInsertHelper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.Timestamp;
 import java.util.*;
 
 /**
@@ -37,11 +39,10 @@ import java.util.*;
 public class AuditSectionService {
 
     private final AuditSectionRepository            sectionRepository;
-    private final AuditSectionInstanceRepository    sectionInstanceRepository;
     private final AuditControlRepository            controlRepository;
     private final AuditSectionControlMappingRepository controlMappingRepository;
-    private final AuditControlInstanceRepository    controlInstanceRepository;
     private final com.kashi.grc.ucf.service.TagExpansionService tagExpansionService;
+    private final JdbcBatchInsertHelper jdbcBatchInsertHelper;
 
     // ══════════════════════════════════════════════════════════════════════
     // LIBRARY SECTION TREE
@@ -170,123 +171,154 @@ public class AuditSectionService {
     // ══════════════════════════════════════════════════════════════════════
 
     /**
-     * Recursively snapshots a library section subtree into instance rows.
-     * Called by AuditEngagementService.snapshotTemplate() for each root section.
+     * Snapshots an entire library section tree (starting from a set of root
+     * sections) into instance rows — BFS-batched, level by level, instead of
+     * the previous per-node recursion.
      *
-     * @param libSection        library section being snapshotted
-     * @param parentInstanceId  instance ID of already-snapshotted parent (null for roots)
-     * @param parentPath        path of already-snapshotted parent (null for roots)
-     * @param engagementId      target engagement
-     * @param templateInstanceId  FK to the engagement template instance
-     * @return the created AuditSectionInstance (used by caller to recurse into children)
+     * WHY THIS CHANGED: the old snapshotSectionNode() recursed one section at
+     * a time, doing 2 saves (INSERT placeholder + UPDATE path) plus 1 query
+     * (fetch children) PER NODE, and called snapshotControlsForSection() once
+     * per section for controls (which itself had the same fake-batching
+     * problem as the pre-fix assessment instantiation code — see
+     * JdbcBatchInsertHelper javadoc: saveAll() does not actually batch
+     * INSERTs for IDENTITY-strategy entities, which is every entity here).
+     * For a 50-section, 4-level-deep framework that was ~150 round trips.
+     *
+     * This version:
+     *   - Reads the whole tree level-by-level via findByParentIdInOrderByOrderNoAsc
+     *     — O(tree depth) queries instead of O(section count).
+     *   - Writes each level as ONE JDBC batch INSERT (genuine batching, see
+     *     JdbcBatchInsertHelper) + ONE batch UPDATE for the path column
+     *     (path needs the row's own generated id, so it's still a two-step
+     *     insert-then-fixup — just batched per LEVEL instead of per NODE).
+     *   - Snapshots controls for the ENTIRE tree in one batch insert at the
+     *     end, instead of one saveAll() per section.
+     * Net effect for the same 50-section example: roughly 2×depth + a
+     * handful of read queries + 1 control batch insert — typically under 15
+     * round trips instead of ~150+.
+     *
+     * @return total number of section instances created (for the caller's log line)
      */
     @Transactional
-    public AuditSectionInstance snapshotSectionNode(
-            AuditSection libSection,
-            Long parentInstanceId,
-            String parentPath,
-            Long engagementId,
-            Long templateInstanceId,
-            Long tenantId) {
+    public int snapshotSectionTree(List<AuditSection> rootSections, Long engagementId,
+                                   Long templateInstanceId, Long tenantId) {
+        if (rootSections.isEmpty()) return 0;
 
-        int depth = libSection.getDepth();  // preserved from library
+        Timestamp now = Timestamp.valueOf(java.time.LocalDateTime.now());
 
-        // Save with placeholder path — updated once we have the instance ID
-        AuditSectionInstance instance = sectionInstanceRepository.save(
-                AuditSectionInstance.builder()
-                        .tenantId(tenantId)
-                        .engagementId(engagementId)
-                        .templateInstanceId(templateInstanceId)
-                        .parentInstanceId(parentInstanceId)
-                        .originalSectionId(libSection.getId())
-                        .sectionNameSnapshot(libSection.getName())
-                        .sectionCodeSnapshot(libSection.getSectionCode())
-                        .descriptionSnapshot(libSection.getDescription())
-                        .frameworkRefSnapshot(libSection.getFrameworkRef())
-                        .orderNo(libSection.getOrderNo())
-                        .depth(depth)
-                        .path("/PLACEHOLDER/")
-                        .build()
-        );
+        // Accumulated across all levels as we go — lib section id -> its instance id/path.
+        Map<Long, Long>   libIdToInstanceId   = new HashMap<>();
+        Map<Long, String> libIdToInstancePath = new HashMap<>();
+        List<AuditSection> allLibSections = new ArrayList<>();
 
-        // Build instance path — requires the generated ID, so one update save needed
-        String path = (parentPath == null || parentPath.equals("/"))
-                ? "/" + instance.getId() + "/"
-                : parentPath + instance.getId() + "/";
+        List<AuditSection> currentLevel = rootSections;
+        while (!currentLevel.isEmpty()) {
+            List<Object[]> insertRows = new ArrayList<>();
+            for (AuditSection sec : currentLevel) {
+                Long parentInstanceId = sec.getParentId() == null
+                        ? null : libIdToInstanceId.get(sec.getParentId());
+                insertRows.add(new Object[]{
+                        tenantId, engagementId, templateInstanceId, parentInstanceId,
+                        "/PLACEHOLDER/", sec.getDepth(), sec.getId(), sec.getName(),
+                        sec.getSectionCode(), sec.getDescription(), sec.getFrameworkRef(),
+                        sec.getOrderNo(), now, now
+                });
+            }
+            List<Long> instanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
+                    "INSERT INTO audit_section_instances " +
+                            "(tenant_id, engagement_id, template_instance_id, parent_instance_id, path, depth, " +
+                            "original_section_id, section_name_snapshot, section_code_snapshot, " +
+                            "description_snapshot, framework_ref_snapshot, order_no, created_at, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    insertRows);
 
-        instance.setPath(path);
-        sectionInstanceRepository.save(instance);
+            List<Object[]> pathUpdateRows = new ArrayList<>();
+            for (int i = 0; i < currentLevel.size(); i++) {
+                AuditSection sec = currentLevel.get(i);
+                Long instanceId = instanceIds.get(i);
+                String parentPath = sec.getParentId() == null ? null : libIdToInstancePath.get(sec.getParentId());
+                String path = parentPath == null ? "/" + instanceId + "/" : parentPath + instanceId + "/";
+                libIdToInstanceId.put(sec.getId(), instanceId);
+                libIdToInstancePath.put(sec.getId(), path);
+                pathUpdateRows.add(new Object[]{path, instanceId});
+            }
+            jdbcBatchInsertHelper.batchUpdate(
+                    "UPDATE audit_section_instances SET path = ? WHERE id = ?", pathUpdateRows);
 
-        // Snapshot controls attached to this section in the library
-        snapshotControlsForSection(libSection, instance, engagementId, tenantId);
+            allLibSections.addAll(currentLevel);
 
-        // Recurse into library children
-        List<AuditSection> children = sectionRepository.findByParentIdOrderByOrderNoAsc(libSection.getId());
-        for (AuditSection child : children) {
-            snapshotSectionNode(child, instance.getId(), path, engagementId, templateInstanceId, tenantId);
+            List<Long> currentLevelIds = currentLevel.stream().map(AuditSection::getId).toList();
+            currentLevel = sectionRepository.findByParentIdInOrderByOrderNoAsc(currentLevelIds);
         }
 
-        return instance;
+        snapshotControlsForWholeTree(allLibSections, libIdToInstanceId, libIdToInstancePath,
+                engagementId, tenantId, now);
+
+        return allLibSections.size();
     }
 
     /**
-     * Snapshots all controls attached to a library section into AuditControlInstance rows.
-     * Controls belong to the leaf section where they are mapped.
+     * Batch-snapshots every control across an entire section tree in one
+     * pass — was previously one saveAll() call PER SECTION (see
+     * snapshotSectionTree javadoc for why that didn't actually batch at the
+     * JDBC level either). Now: 2 read queries total (mappings + controls,
+     * both already using existing batch repository methods) and 1 JDBC
+     * batch insert for every control instance in the tree.
      */
-    private void snapshotControlsForSection(AuditSection libSection,
-                                            AuditSectionInstance sectionInstance,
-                                            Long engagementId,
-                                            Long tenantId) {
-        List<AuditSectionControlMapping> mappings =
-                controlMappingRepository.findBySectionIdOrderByOrderNoAsc(libSection.getId());
+    private void snapshotControlsForWholeTree(List<AuditSection> allLibSections,
+                                              Map<Long, Long> libIdToInstanceId,
+                                              Map<Long, String> libIdToInstancePath,
+                                              Long engagementId, Long tenantId, Timestamp now) {
+        List<Long> allSectionIds = allLibSections.stream().map(AuditSection::getId).toList();
+        List<AuditSectionControlMapping> allMappings =
+                controlMappingRepository.findBySectionIdInOrderBySectionIdAscOrderNoAsc(allSectionIds);
+        if (allMappings.isEmpty()) return;
 
-        if (mappings.isEmpty()) return;
-
-        // Batch all control lookups and builds, then saveAll in one round-trip
-        List<Long> controlIds = mappings.stream()
-                .map(AuditSectionControlMapping::getControlId).toList();
+        List<Long> controlIds = allMappings.stream().map(AuditSectionControlMapping::getControlId).toList();
         Map<Long, AuditControl> controlMap = controlRepository.findAllById(controlIds)
                 .stream().collect(java.util.stream.Collectors.toMap(AuditControl::getId, c -> c));
+        Map<Long, AuditSection> libSectionsById = allLibSections.stream()
+                .collect(java.util.stream.Collectors.toMap(AuditSection::getId, s -> s));
 
-        List<AuditControlInstance> toSave = new ArrayList<>();
-        for (AuditSectionControlMapping mapping : mappings) {
+        List<Object[]> rows = new ArrayList<>();
+        for (AuditSectionControlMapping mapping : allMappings) {
             AuditControl control = controlMap.get(mapping.getControlId());
             if (control == null) continue;
+            Long sectionInstanceId = libIdToInstanceId.get(mapping.getSectionId());
+            String sectionPath = libIdToInstancePath.get(mapping.getSectionId());
+            if (sectionInstanceId == null) continue; // defensive — shouldn't happen
 
-            toSave.add(AuditControlInstance.builder()
-                    .tenantId(tenantId)
-                    .engagementId(engagementId)
-                    .sectionInstanceId(sectionInstance.getId())
-                    .sectionPath(sectionInstance.getPath())
-                    .originalControlId(control.getId())
-                    .controlNameSnapshot(control.getName())
-                    .controlCodeSnapshot(control.getControlCode())
-                    .descriptionSnapshot(control.getDescription())
-                    .testTypeSnapshot(control.getTestType().name())
-                    .frameworkRefSnapshot(control.getFrameworkRef())
-                    .controlTagSnapshot(control.getControlTag())
-                    // Phase 3: freeze the expanded ancestry chain. UCF matching
-                    // reads this; control_tag_snapshot is kept for the legacy path.
-                    .matchedTagsSnapshot(tagExpansionService.expand(control.getControlTag()))
-                    .sectionBreadcrumbSnapshot(buildBreadcrumb(sectionInstance))
-                    .weight(mapping.getWeight())
-                    .isMandatory(mapping.isMandatory())
-                    .orderNo(mapping.getOrderNo())
-                    .testResult(AuditControlInstance.TestResult.NOT_TESTED)
-                    .build());
+            AuditSection libSection = libSectionsById.get(mapping.getSectionId());
+            String breadcrumb = buildBreadcrumb(libSection.getSectionCode(), libSection.getName());
+
+            rows.add(new Object[]{
+                    tenantId, engagementId, sectionInstanceId, sectionPath,
+                    control.getId(), control.getName(), control.getControlCode(), control.getDescription(),
+                    breadcrumb, control.getTestType().name(), control.getFrameworkRef(),
+                    control.getControlTag(), tagExpansionService.expand(control.getControlTag()),
+                    mapping.getWeight(), mapping.isMandatory(), mapping.getOrderNo(),
+                    AuditControlInstance.TestResult.NOT_TESTED.name(), now, now
+            });
         }
 
-        controlInstanceRepository.saveAll(toSave);
+        jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO audit_control_instances " +
+                        "(tenant_id, engagement_id, section_instance_id, section_path, original_control_id, " +
+                        "control_name_snapshot, control_code_snapshot, description_snapshot, " +
+                        "section_breadcrumb_snapshot, test_type_snapshot, framework_ref_snapshot, " +
+                        "control_tag_snapshot, matched_tags_snapshot, weight, is_mandatory, order_no, " +
+                        "test_result, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows);
     }
 
     // ══════════════════════════════════════════════════════════════════════
     // HELPERS
     // ══════════════════════════════════════════════════════════════════════
 
-    private String buildBreadcrumb(AuditSectionInstance sectionInstance) {
+    private String buildBreadcrumb(String sectionCode, String sectionName) {
         // Simple: use code if present, else name
-        String code = sectionInstance.getSectionCodeSnapshot();
-        return code != null && !code.isBlank() ? code : sectionInstance.getSectionNameSnapshot();
+        return sectionCode != null && !sectionCode.isBlank() ? sectionCode : sectionName;
     }
 
     private int nextOrderNo(Long parentId, Long tenantId) {

@@ -81,6 +81,7 @@ public class ReviewController {
     private final WorkflowEngineService                workflowEngineService;
     private final TaskSectionCompletionService         sectionCompletionService;
     private final UserRepository                       userRepository;
+    private final com.kashi.grc.usermanagement.service.user.UserDisplayNameService userDisplayNameService;
     private final NotificationService                  notificationService;
     private final UtilityService                       utilityService;
 
@@ -186,13 +187,46 @@ public class ReviewController {
                     : List.of();
         }
 
+        // ── Bulk-load everything upfront (was: 1 query per section for
+        // questions, plus per-question queries for response, options, and up
+        // to 3 user-name lookups each) ────────────────────────────────────
+
+        Set<Long> sectionIds = sectionList.stream().map(AssessmentSectionInstance::getId)
+                .collect(java.util.stream.Collectors.toSet());
+        List<AssessmentQuestionInstance> allQuestions = sectionIds.isEmpty()
+                ? List.of()
+                : questionInstanceRepository.findBySectionInstanceIdInOrderByOrderNo(sectionIds);
+        Map<Long, List<AssessmentQuestionInstance>> questionsBySectionId = allQuestions.stream()
+                .collect(java.util.stream.Collectors.groupingBy(AssessmentQuestionInstance::getSectionInstanceId));
+
+        Map<Long, AssessmentResponse> latestResponseByQiId = responseRepository.findByAssessmentId(assessmentId)
+                .stream().collect(java.util.stream.Collectors.toMap(
+                        AssessmentResponse::getQuestionInstanceId, r -> r,
+                        (a, b) -> a.getId() >= b.getId() ? a : b));
+
+        List<Long> allQuestionIds = allQuestions.stream().map(AssessmentQuestionInstance::getId).toList();
+        Map<Long, List<AssessmentOptionInstance>> optionsByQuestionId = allQuestionIds.isEmpty()
+                ? Map.of()
+                : optionInstanceRepository.findByQuestionInstanceIdInOrderByOrderNo(allQuestionIds).stream()
+                  .collect(java.util.stream.Collectors.groupingBy(AssessmentOptionInstance::getQuestionInstanceId));
+
+        Set<Long> userIdsToResolve = new java.util.HashSet<>();
+        allQuestions.forEach(qi -> {
+            if (qi.getAssignedUserId() != null) userIdsToResolve.add(qi.getAssignedUserId());
+            if (qi.getReviewerAssignedUserId() != null) userIdsToResolve.add(qi.getReviewerAssignedUserId());
+        });
+        latestResponseByQiId.values().forEach(r -> {
+            if (r.getSubmittedBy() != null) userIdsToResolve.add(r.getSubmittedBy());
+        });
+        Map<Long, String> nameMap = userDisplayNameService.resolveNames(userIdsToResolve);
+
         List<Map<String, Object>> result =
                 sectionList
                         .stream().map(si -> {
                             List<Map<String, Object>> qMaps =
-                                    questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(si.getId())
+                                    questionsBySectionId.getOrDefault(si.getId(), List.of())
                                             .stream().map(qi -> {
-                                                var r = responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, qi.getId());
+                                                var r = Optional.ofNullable(latestResponseByQiId.get(qi.getId()));
                                                 Map<String, Object> m = new LinkedHashMap<>();
                                                 m.put("questionInstanceId",      qi.getId());
                                                 m.put("questionText",            qi.getQuestionTextSnapshot());
@@ -201,12 +235,12 @@ public class ReviewController {
                                                 m.put("mandatory",               qi.isMandatory());
                                                 m.put("orderNo",                 qi.getOrderNo());
                                                 m.put("assignedUserId",          qi.getAssignedUserId());
-                                                m.put("assignedUserName",        resolveUserName(qi.getAssignedUserId()));
+                                                m.put("assignedUserName",        nameMap.get(qi.getAssignedUserId()));
                                                 m.put("reviewerAssignedUserId",  qi.getReviewerAssignedUserId());
-                                                m.put("reviewerAssignedUserName",resolveUserName(qi.getReviewerAssignedUserId()));
+                                                m.put("reviewerAssignedUserName",nameMap.get(qi.getReviewerAssignedUserId()));
                                                 // Options for SINGLE_CHOICE and MULTI_CHOICE questions
-                                                List<Map<String, Object>> optMaps = optionInstanceRepository
-                                                        .findByQuestionInstanceIdOrderByOrderNo(qi.getId())
+                                                List<Map<String, Object>> optMaps = optionsByQuestionId
+                                                        .getOrDefault(qi.getId(), List.of())
                                                         .stream().map(opt -> {
                                                             Map<String, Object> om = new LinkedHashMap<>();
                                                             om.put("optionInstanceId", opt.getId());
@@ -225,7 +259,7 @@ public class ReviewController {
                                                     rm.put("scoreEarned",               resp.getScoreEarned() != null ? resp.getScoreEarned() : 0.0);
                                                     rm.put("reviewerStatus",            resp.getReviewerStatus() != null ? resp.getReviewerStatus() : "");
                                                     rm.put("submittedAt",               resp.getSubmittedAt() != null ? resp.getSubmittedAt().toString() : "");
-                                                    rm.put("answeredByName",            resolveUserName(resp.getSubmittedBy()));
+                                                    rm.put("answeredByName",            nameMap.get(resp.getSubmittedBy()));
                                                     rm.put("selectedOptionInstanceId",  resp.getSelectedOptionInstanceId());
                                                     // Parse multi-choice IDs stored as JSON array in responseText e.g. "[4257,4259]"
                                                     List<Long> multiIds = new java.util.ArrayList<>();
@@ -717,11 +751,23 @@ public class ReviewController {
         assessmentRepository.findByIdAndTenantId(assessmentId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
 
-        List<Map<String, Object>> reports = documentLinkRepository
-                .findReportVersions("ASSESSMENT", assessmentId)
-                .stream()
+        List<DocumentLink> links = documentLinkRepository.findReportVersions("ASSESSMENT", assessmentId);
+
+        // BATCHED — was 1 documentRepository.findById + 1 resolveUserName
+        // (itself 1 userRepository.findById before the Redis-cache delegation
+        // above) PER report version.
+        List<Long> documentIds = links.stream().map(DocumentLink::getDocumentId).toList();
+        Map<Long, Document> documentsById = documentIds.isEmpty() ? Map.of()
+                : documentRepository.findAllById(documentIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(Document::getId, d -> d));
+        Set<Long> uploaderIds = documentsById.values().stream()
+                .map(Document::getUploadedBy).filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        Map<Long, String> uploaderNameById = userDisplayNameService.resolveNames(uploaderIds);
+
+        List<Map<String, Object>> reports = links.stream()
                 .map(link -> {
-                    Document doc = documentRepository.findById(link.getDocumentId()).orElse(null);
+                    Document doc = documentsById.get(link.getDocumentId());
                     if (doc == null) return null;
 
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -730,7 +776,7 @@ public class ReviewController {
                     m.put("linkId",        link.getId());
                     m.put("reportVersion", doc.getVersion());
                     m.put("generatedAt",   doc.getCreatedAt() != null ? doc.getCreatedAt().toString() : "");
-                    m.put("generatedByName", resolveUserName(doc.getUploadedBy()));
+                    m.put("generatedByName", uploaderNameById.get(doc.getUploadedBy()));
                     m.put("status",        doc.getStatus());
 
                     Map<?, ?> data = doc.getGeneratedData();
@@ -935,12 +981,11 @@ public class ReviewController {
         } catch (Exception e) { log.warn("[NOTIFY-CISO] {}", e.getMessage()); }
     }
 
+    /** Delegates to UserDisplayNameService (batch + Redis-cached) — see that
+     * class for why single-id resolution now hits Redis instead of MySQL on
+     * repeat calls. Call sites in a loop should prefer resolveNames() (batch)
+     * over N calls to this — see getReports/getMyReviewerSections below. */
     private String resolveUserName(Long userId) {
-        if (userId == null) return null;
-        return userRepository.findById(userId).map(u -> {
-            String full = ((u.getFirstName() != null ? u.getFirstName() : "") + " " +
-                    (u.getLastName()  != null ? u.getLastName()  : "")).trim();
-            return full.isEmpty() ? u.getEmail() : full;
-        }).orElse(null);
+        return userDisplayNameService.resolveName(userId);
     }
 }
