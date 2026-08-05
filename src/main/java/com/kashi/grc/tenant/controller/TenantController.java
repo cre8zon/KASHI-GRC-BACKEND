@@ -36,6 +36,9 @@ public class TenantController {
 
     private final TenantRepository tenantRepository;
     private final UserRepository   userRepository;
+
+    @org.springframework.beans.factory.annotation.Value("${kashi.app.base-url:https://app.kashigrc.com}")
+    private String appBaseUrl;
     private final DbRepository     dbRepository;
     private final UtilityService   utilityService;
     private final MailService      mailService;
@@ -47,6 +50,22 @@ public class TenantController {
     @Operation(summary = "Create a new tenant")
     public ResponseEntity<ApiResponse<TenantResponse>> createTenant(
             @Valid @RequestBody TenantCreateRequest req) {
+
+        // Pre-checks give a clean, field-specific message instead of letting
+        // the DB's unique constraint on `code` (and this new check on `name`)
+        // surface as a raw DataIntegrityViolationException — see
+        // GlobalExceptionHandler for the defense-in-depth catch on that
+        // exception type for any case this pre-check doesn't cover (e.g. a
+        // race between two concurrent creates with the same code).
+        if (tenantRepository.existsByNameIgnoreCase(req.getName())) {
+            throw new BusinessException("TENANT_NAME_TAKEN",
+                    "An organization named \"" + req.getName() + "\" already exists", HttpStatus.CONFLICT);
+        }
+        if (req.getCode() != null && tenantRepository.existsByCode(req.getCode())) {
+            throw new BusinessException("TENANT_CODE_TAKEN",
+                    "Organization code \"" + req.getCode() + "\" is already in use", HttpStatus.CONFLICT);
+        }
+
         Tenant t = Tenant.builder()
                 .name(req.getName()).code(req.getCode())
                 .description(req.getDescription()).plan(req.getPlan())
@@ -214,7 +233,7 @@ public class TenantController {
         String firstName = StringUtils.hasText(req.getAdminFirstName())
                 ? req.getAdminFirstName() : "Admin";
         String loginUrl  = StringUtils.hasText(req.getLoginUrl())
-                ? req.getLoginUrl() : "http://localhost:3000/auth/login";
+                ? req.getLoginUrl() : appBaseUrl + "/auth/login";
         String tempPwd   = StringUtils.hasText(req.getTempPassword())
                 ? req.getTempPassword() : "(see your original welcome email)";
 

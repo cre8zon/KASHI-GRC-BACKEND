@@ -42,4 +42,11 @@ public final class CacheNames {
     // assessment/audit creation, changes only when an admin edits a template
     // in the library. See AssessmentTemplateStructureCacheService.
     public static final String ASSESSMENT_TEMPLATE_STRUCTURE = "assessmentTemplateStructure";
+
+    // ── Audit template / workflow dropdown listings — hit on every "New
+    // engagement" form open (search-as-you-type), backed by data that only
+    // changes when an admin publishes/edits a template or workflow blueprint.
+    // See AuditReferenceListCacheService.
+    public static final String AUDIT_TEMPLATE_LIST = "auditTemplateList";
+    public static final String WORKFLOW_BLUEPRINT_LIST = "workflowBlueprintList";
 }

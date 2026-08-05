@@ -17,6 +17,8 @@ public interface StepInstanceRepository
 
     List<StepInstance> findByWorkflowInstanceIdOrderByCreatedAtAsc(Long workflowInstanceId);
 
+    List<StepInstance> findByWorkflowInstanceIdInOrderByCreatedAtAsc(java.util.Collection<Long> workflowInstanceIds);
+
     List<StepInstance> findByWorkflowInstanceId(Long workflowInstanceId);
 
     List<StepInstance> findByWorkflowInstanceIdAndStatus(Long workflowInstanceId, StepStatus status);

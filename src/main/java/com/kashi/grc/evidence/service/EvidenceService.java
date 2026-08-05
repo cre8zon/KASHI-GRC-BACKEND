@@ -264,6 +264,7 @@ public class EvidenceService {
             b.evidenceTitle(r.getTitle())
                     .evidenceFileUrl(r.getFileUrl())
                     .evidenceFileName(r.getFileName())
+                    .evidenceMimeType(r.getMimeType())
                     .evidenceControlTag(r.getControlTag())
                     .evidenceValidUntil(r.getValidUntil())
                     .evidenceExpired(r.isExpired())

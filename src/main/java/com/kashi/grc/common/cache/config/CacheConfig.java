@@ -156,6 +156,12 @@ public class CacheConfig implements CachingConfigurer {
         // template in the library. Longer TTL is safe; explicit evict on write.
         perCache.put(CacheNames.ASSESSMENT_TEMPLATE_STRUCTURE, defaults.entryTtl(Duration.ofMinutes(30)));
 
+        // Templates/workflows change only via rare admin actions (publish,
+        // edit blueprint) but this dropdown is re-queried on every "New
+        // engagement" modal open — same reasoning as USER_DISPLAY_NAME.
+        perCache.put(CacheNames.AUDIT_TEMPLATE_LIST,     defaults.entryTtl(Duration.ofMinutes(15)));
+        perCache.put(CacheNames.WORKFLOW_BLUEPRINT_LIST, defaults.entryTtl(Duration.ofMinutes(15)));
+
         return RedisCacheManager.builder(connectionFactory)
                 .cacheDefaults(defaults)
                 .withInitialCacheConfigurations(perCache)

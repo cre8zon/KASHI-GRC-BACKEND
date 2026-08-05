@@ -117,8 +117,18 @@ public class UserController {
         if (vendorIdStr != null && !vendorIdStr.isBlank()) {
             try { vendorId = Long.parseLong(vendorIdStr); } catch (NumberFormatException ignored) {}
         }
+        // tenantId filter: SYSTEM-side callers drilling into one specific
+        // tenant's users (e.g. the platform-admin "per-tenant, side-wise"
+        // user management view). Only honoured for SYSTEM callers — org/
+        // vendor/auditee/auditor callers are already locked to their own
+        // tenant above and cannot use this to see another tenant's users.
+        Long tenantId = null;
+        String tenantIdStr = allParams.get("tenantId");
+        if (tenantIdStr != null && !tenantIdStr.isBlank()) {
+            try { tenantId = Long.parseLong(tenantIdStr); } catch (NumberFormatException ignored) {}
+        }
         return ResponseEntity.ok(ApiResponse.success(
-                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId, roleId)));
+                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId, roleId, tenantId)));
     }
 
     // ── UPDATE ────────────────────────────────────────────────────

@@ -427,10 +427,24 @@ public class AuditEngagementController {
 
     @GetMapping("/project-instances")
     @Operation(summary = "List running project instances for this tenant")
-    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listProjectInstances() {
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listProjectInstances(
+            @RequestParam(required = false) Integer skip,
+            @RequestParam(required = false) Integer take) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
-        List<AuditProjectInstance> instances = projectInstanceRepository.findByTenantIdOrderByIdDesc(tenantId);
+        // NOTE ON WHY THIS IS OPTIONAL, NOT THE DEFAULT: this was the only
+        // list endpoint in the app with no skip/take at all — genuinely
+        // unbounded, returns every project instance for the tenant. Making
+        // pagination the DEFAULT (even a generous cap) would silently
+        // return fewer rows than before for any caller not yet passing
+        // skip/take — which looks like missing data, not a performance fix,
+        // to a frontend that isn't expecting it. So: unspecified skip/take
+        // preserves the exact old (slow but complete) behavior; passing them
+        // is the actual fix, and needs a frontend change to call it that way.
+        List<AuditProjectInstance> instances = (skip != null && take != null)
+                ? projectInstanceRepository.findByTenantIdOrderByIdDesc(
+                tenantId, org.springframework.data.domain.PageRequest.of(skip / Math.max(take, 1), take))
+                : projectInstanceRepository.findByTenantIdOrderByIdDesc(tenantId);
 
         // Bulk-load workflow statuses to avoid N+1 per instance
         Set<Long> wfIds = instances.stream()

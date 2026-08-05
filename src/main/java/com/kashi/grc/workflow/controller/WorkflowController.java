@@ -54,6 +54,7 @@ public class WorkflowController {
     private final UtilityService                 utilityService;
     private final AutomatedActionRegistry        automatedActionRegistry;
     private final WorkflowBlueprintImportService blueprintImportService;
+    private final com.kashi.grc.audit.service.AuditReferenceListCacheService auditReferenceListCacheService;
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -121,20 +122,11 @@ public class WorkflowController {
         boolean isSystem = utilityService.isSystemUser();
         log.debug("[WorkflowController] LIST | isSystem={}", isSystem);
 
-        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
-                Workflow.class,
-                utilityService.getpageDetails(allParams),
-                (cb, root) -> {
-                    List<Predicate> preds = new ArrayList<>();
-                    preds.add(cb.isNull(root.get("tenantId")));
-                    if (!isSystem) preds.add(cb.isTrue(root.get("isActive")));
-                    if (allParams.containsKey("entityType"))
-                        preds.add(cb.equal(root.get("entityType"), allParams.get("entityType")));
-                    return preds;
-                },
-                (cb, root) -> Map.of("name", root.get("name"), "entitytype", root.get("entityType")),
-                w -> service.buildWorkflowResponse(w)
-        )));
+        var pageDetails = utilityService.getpageDetails(allParams);
+
+        return ResponseEntity.ok(ApiResponse.success(
+                auditReferenceListCacheService.listWorkflowBlueprints(
+                        isSystem, pageDetails, allParams.get("entityType"))));
     }
 
     // ── GET SINGLE ────────────────────────────────────────────────

@@ -52,6 +52,11 @@ public interface UserRepository extends JpaRepository<User, Long> {
     // ── Existence checks ──────────────────────────────────────────────────────
     boolean existsByEmailAndTenantIdAndIsDeletedFalse(String email, Long tenantId);
 
+    /** Global (not tenant-scoped) — email is now a globally unique identity,
+     *  matching what login() has always assumed. Excludes soft-deleted rows
+     *  so a previously offboarded email can legitimately be re-invited later. */
+    boolean existsByEmailAndIsDeletedFalse(String email);
+
     boolean existsByEmail(String email);
 
     // ── Counts ────────────────────────────────────────────────────────────────

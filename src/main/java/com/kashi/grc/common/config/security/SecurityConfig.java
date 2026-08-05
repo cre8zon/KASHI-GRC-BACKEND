@@ -76,6 +76,20 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.GET,
                                 "/v1/admin/module-blueprints/by-type/**"
                         ).authenticated()
+                        // ── ROLE SELF-SERVICE EXCEPTION (matched before the boundary below) ──
+                        // These RoleController endpoints are nested under
+                        // /v1/tenants/{tenantId}/... for REST-friendliness, but that
+                        // prefix is also used by genuinely platform-admin-only tenant
+                        // management (TenantController) locked below. Without this
+                        // exception, EVERY org/vendor/auditee/auditor user gets a
+                        // silent 403 just reading the assignable-roles list for their
+                        // own tenant — the role data and the Criteria query were both
+                        // correct all along; the request never reached the controller.
+                        // Cross-tenant writes are still enforced at the service layer
+                        // (RoleServiceImpl.createRoleForTenant / deleteRole).
+                        .requestMatchers(HttpMethod.GET,    "/v1/tenants/*/roles/hierarchy").authenticated()
+                        .requestMatchers(HttpMethod.POST,   "/v1/tenants/*/roles").authenticated()
+                        .requestMatchers(HttpMethod.DELETE, "/v1/tenants/*/roles/*").authenticated()
                         // ── PLATFORM-ADMIN BOUNDARY (writes + all other admin) ──────
                         .requestMatchers(
                                 "/v1/admin/**",
