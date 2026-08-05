@@ -18,6 +18,10 @@ public interface AuditProjectInstanceRepository extends JpaRepository<AuditProje
     /** All project instances for a tenant — backs GET /v1/audit/project-instances */
     java.util.List<AuditProjectInstance> findByTenantIdOrderByIdDesc(Long tenantId);
 
+    /** Paginated variant — used when the caller opts into skip/take. */
+    java.util.List<AuditProjectInstance> findByTenantIdOrderByIdDesc(
+            Long tenantId, org.springframework.data.domain.Pageable pageable);
+
     java.util.Optional<AuditProjectInstance> findByTenantIdAndId(Long tenantId, Long id);
 
     /** Used by AuditSectionItemRegistrar to resolve project from WF16 workflow instance */

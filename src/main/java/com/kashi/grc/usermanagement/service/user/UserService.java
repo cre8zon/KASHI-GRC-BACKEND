@@ -13,7 +13,7 @@ public interface UserService {
     UserResponse createUser(UserCreateRequest request);
     Map<String, Object> bulkUpload(MultipartFile file, Long defaultRoleId, boolean sendWelcomeEmails);
     UserResponse getUserById(Long userId);
-    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId);
+    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam);
     UserResponse updateUser(Long userId, UserUpdateRequest request);
     void deleteUser(Long userId);
     UserResponse suspendUser(Long userId);

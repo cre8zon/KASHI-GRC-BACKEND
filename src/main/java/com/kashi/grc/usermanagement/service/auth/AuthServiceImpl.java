@@ -260,7 +260,7 @@ public class AuthServiceImpl implements AuthService {
 
         if (req.isSendEmail()) {
             String firstName = admin.getFirstName() != null ? admin.getFirstName() : "Admin";
-            String loginUrl  = "http://localhost:3000/auth/login";
+            String loginUrl  = appBaseUrl + "/auth/login";
             mailService.send("user-invitation", req.getEmail(), Map.ofEntries(
                     Map.entry("firstName",         firstName),
                     Map.entry("email",             admin.getEmail()),

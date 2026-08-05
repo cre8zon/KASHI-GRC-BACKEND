@@ -31,8 +31,59 @@ public class RoleServiceImpl implements RoleService {
     @Transactional
     public RoleInfoResponse createRole(RoleCreateRequest req) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        return buildAndSaveRole(tenantId, req);
+    }
+
+    @Override
+    @Transactional
+    public RoleInfoResponse createRoleForTenant(Long tenantId, RoleCreateRequest req) {
+        // The path tenantId was previously ignored entirely — this endpoint
+        // silently stamped every role with the CALLER's own JWT tenantId
+        // instead, regardless of which tenant's roles URL was actually hit.
+        // For a same-tenant org admin the two values happen to match, which
+        // is why this went unnoticed; the bug shows up for anyone whose own
+        // tenant differs from the tenant they're managing (a platform/system
+        // admin acting on a specific org's roles) — the role gets created
+        // under the wrong tenant_id and silently never appears in that org's
+        // own role hierarchy again, even though it can still be assigned to
+        // that org's users via the roles list (which enforces user-tenant,
+        // not role-tenant). Enforce instead of silently substituting:
+        // same-tenant callers proceed as before; only SYSTEM-side callers
+        // may act across tenants, and everyone else is rejected outright
+        // rather than quietly redirected to a different tenant's data.
+        User loggedInUser = utilityService.getLoggedInDataContext();
+        boolean isSystemUser = loggedInUser.getRoles().stream()
+                .anyMatch(r -> r.getSide() == RoleSide.SYSTEM);
+        if (!isSystemUser && !tenantId.equals(loggedInUser.getTenantId())) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "FORBIDDEN_TENANT",
+                    "Cannot create a role for a different tenant",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        return buildAndSaveRole(tenantId, req);
+    }
+
+    private RoleInfoResponse buildAndSaveRole(Long tenantId, RoleCreateRequest req) {
+        // Only a SYSTEM-side caller may create a genuinely global (tenant_id
+        // = NULL) role, and only when they EXPLICITLY ask for it via
+        // req.global — not simply because they happen to be SYSTEM-side.
+        // A system admin can also target one specific tenant on purpose:
+        // createRoleForTenant already permits a SYSTEM caller to act on a
+        // tenantId other than their own (see its FORBIDDEN_TENANT check).
+        // Inferring "global" purely from the creator's own side, as this
+        // used to do, silently discarded that explicit targeting and made
+        // every system-created role global regardless of actual intent —
+        // there was no way for a system admin to create a role for just one
+        // tenant. Non-system callers can never set global=true no matter
+        // what they send; effectiveTenantId always falls back to the
+        // tenantId the request actually resolved to.
+        User loggedInUser = utilityService.getLoggedInDataContext();
+        boolean isSystemCreator = loggedInUser.getRoles().stream()
+                .anyMatch(r -> r.getSide() == RoleSide.SYSTEM);
+        Long effectiveTenantId = (isSystemCreator && req.isGlobal()) ? null : tenantId;
+
         RoleSide side = RoleSide.valueOf(req.getSide());
-        if (roleRepository.existsByNameAndSideAndTenantId(req.getName(), side, tenantId)) {
+        if (roleRepository.existsByNameAndSideAndTenantId(req.getName(), side, effectiveTenantId)) {
             throw new ValidationException("Role with this name already exists");
         }
         Set<Permission> permissions = new HashSet<>();
@@ -42,7 +93,7 @@ public class RoleServiceImpl implements RoleService {
                             () -> new ResourceNotFoundException("Permission", id))));
         }
         Role role = Role.builder()
-                .tenantId(tenantId).name(req.getName()).side(side)
+                .tenantId(effectiveTenantId).name(req.getName()).side(side)
                 .level(req.getLevel() != null ? RoleLevel.valueOf(req.getLevel()) : null)
                 .description(req.getDescription()).isSystem(req.isSystem()).permissions(permissions)
                 .build();
@@ -104,10 +155,32 @@ public class RoleServiceImpl implements RoleService {
         var user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
 
+        // A user's roles must all come from exactly one side — an auditor can
+        // hold several AUDITOR-side roles at once, but never an AUDITOR role
+        // alongside an ORGANIZATION role. A user does not belong to multiple
+        // sides. Determine the side they're already committed to (if any);
+        // if they hold no roles yet, whichever role is assigned first in
+        // this call establishes it, and every other role in the same call
+        // must match.
+        RoleSide committedSide = user.getRoles().stream()
+                .map(Role::getSide)
+                .filter(java.util.Objects::nonNull)
+                .findFirst()
+                .orElse(null);
+
         for (Long roleId : req.getRoleIds()) {
             final Long finalRoleId = roleId;
             var role = roleRepository.findById(finalRoleId)
                     .orElseThrow(() -> new ResourceNotFoundException("Role", finalRoleId));
+
+            if (committedSide == null) {
+                committedSide = role.getSide();
+            } else if (role.getSide() != committedSide) {
+                throw new ValidationException(
+                        "Cannot assign a " + role.getSide() + "-side role — this user already holds "
+                                + committedSide + "-side role(s). A user's roles must all come from "
+                                + "the same side; a user cannot belong to more than one side.");
+            }
 
             if (!req.isSkipSodCheck()) {
                 List<Long> existingRoleIds = user.getRoles().stream()

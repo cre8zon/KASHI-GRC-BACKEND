@@ -8,6 +8,9 @@ import java.util.Optional;
 @Repository
 public interface WorkflowStepRepository extends JpaRepository<WorkflowStep, Long> {
     List<WorkflowStep>    findByWorkflowIdOrderByStepOrderAsc(Long workflowId);
+    // Bulk/plural variant for buildWorkflowResponsesBulk — fetches steps for
+    // every workflow in a page in one query instead of one query per row.
+    List<WorkflowStep>    findByWorkflowIdInOrderByStepOrderAsc(java.util.Collection<Long> workflowIds);
     Optional<WorkflowStep> findByWorkflowIdAndStepOrder(Long workflowId, Integer stepOrder);
     Optional<WorkflowStep> findFirstByWorkflowIdOrderByStepOrderAsc(Long workflowId);
     Optional<WorkflowStep> findFirstByWorkflowIdAndStepOrderGreaterThanOrderByStepOrderAsc(Long workflowId, Integer currentOrder);

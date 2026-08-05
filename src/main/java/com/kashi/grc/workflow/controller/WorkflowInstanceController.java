@@ -130,9 +130,18 @@ public class WorkflowInstanceController {
         Long tenantId    = isSystem ? null : utilityService.getLoggedInDataContext().getTenantId();
         log.debug("[WF-INSTANCE] LIST | isSystem={} | tenantId={}", isSystem, tenantId);
 
-        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
+        var pageDetails = utilityService.getpageDetails(allParams);
+
+        // BATCHED — was service::buildInstanceResponse as the per-row mapper,
+        // and that method does 1 (steps) + N (one task query PER STEP) + 1
+        // (current-step refetch) + 1 (workflow name) queries per instance —
+        // up to ~160 queries for a 20-item page averaging ~5 steps each.
+        // Identity mapper here (zero DB work per row), then one bulk call
+        // below builds every response in 3 queries total, regardless of
+        // page size.
+        PaginatedResponse<WorkflowInstance> raw = dbRepository.findAll(
                 WorkflowInstance.class,
-                utilityService.getpageDetails(allParams),
+                pageDetails,
                 (cb, root) -> {
                     List<Predicate> preds = new ArrayList<>();
                     if (!isSystem) preds.add(cb.equal(root.get("tenantId"), tenantId));
@@ -151,8 +160,13 @@ public class WorkflowInstanceController {
                         "status",     root.get("status"),
                         "entitytype", root.get("entityType"),
                         "priority",   root.get("priority")),
-                service::buildInstanceResponse
-        )));
+                wi -> wi
+        );
+
+        List<WorkflowInstanceResponse> responses = service.buildInstanceResponsesBulk(raw.getItems());
+
+        return ResponseEntity.ok(ApiResponse.success(
+                new PaginatedResponse<>(responses, raw.getPagination().getTotalItems(), pageDetails)));
     }
 
     @GetMapping("/active")

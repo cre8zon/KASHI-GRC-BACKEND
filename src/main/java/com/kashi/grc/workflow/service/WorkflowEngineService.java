@@ -1192,14 +1192,21 @@ public class WorkflowEngineService {
         // No hardcoded entity type names. Each module registers a WorkflowEntityResolver.
         // If a resolver exists for the entity type, use it for the bulk fallback map.
         // Per-task step+user-aware resolution happens in Step 7 via the three-arg call.
-        // For entity types with no resolver (currently only VENDOR), the legacy
-        // batch-load path below handles it. Once a VendorEntityResolver is registered,
-        // the default branch below can be removed entirely.
+        //
+        // VENDOR is deliberately excluded here even though a VendorEntityResolver IS
+        // registered (confirmed by the startup log: "Registered 5 resolver(s): [...,
+        // VENDOR, ...]"). Letting it through the resolver branch meant
+        // resolveArtifactId(instance) — 2 DB queries (cycle+assessment) — fired once
+        // per VENDOR instance here AND again per VENDOR task in Step 7 below, since
+        // the 3-arg call falls through to the 1-arg version with no override. The
+        // existing batch-load path already resolves all VENDOR artifact IDs in 2
+        // queries total regardless of instance count, so routing VENDOR there instead
+        // is strictly cheaper — this was the actual cause of the 5s /my-tasks response.
         for (Map.Entry<String, List<WorkflowInstance>> entry : byType.entrySet()) {
             String entityType = entry.getKey();
             List<WorkflowInstance> typeInstances = entry.getValue();
 
-            if (entityResolverRegistry.supports(entityType)) {
+            if (!"VENDOR".equals(entityType) && entityResolverRegistry.supports(entityType)) {
                 // Resolver registered — call single-arg for the bulk fallback map.
                 // Step 7 will override with step+user-aware resolution per task.
                 for (WorkflowInstance wi : typeInstances) {
@@ -1207,8 +1214,8 @@ public class WorkflowEngineService {
                     artifactIds.put(wi.getId(), resolved != null ? resolved : wi.getEntityId());
                 }
             } else {
-                // No resolver registered — legacy VENDOR batch-load path.
-                // TODO: extract to VendorWorkflowEntityResolver @Component to eliminate this.
+                // VENDOR (forced here above) and any type with no resolver registered —
+                // batch-load path, 2 queries total regardless of instance count.
                 Set<Long> wfIds = typeInstances.stream()
                         .map(WorkflowInstance::getId)
                         .collect(java.util.stream.Collectors.toSet());
@@ -1249,14 +1256,22 @@ public class WorkflowEngineService {
             // Always use the step-aware three-arg resolver — entity-type-agnostic.
             // Each WorkflowEntityResolver implementation decides how to resolve artifactId
             // for its own entity type and step. The engine has no knowledge of modules.
-            // VENDOR artifactIds pre-loaded above are used as fallback when resolver throws.
+            //
+            // EXCEPT VENDOR: its resolver has no step-aware override, so the 3-arg call
+            // falls straight through to the same 1-arg resolution (2 queries) we already
+            // did once per VENDOR instance above — calling it again per TASK here was the
+            // other half of the original N+1. Read the pre-computed value instead.
             Long artifactId;
-            try {
-                artifactId = wi != null
-                        ? entityResolverRegistry.resolveArtifactId(wi, si, t.getAssignedUserId())
-                        : null;
-            } catch (Exception ex) {
-                artifactId = wi != null ? artifactIds.get(wi.getId()) : null;
+            if (wi != null && "VENDOR".equals(wi.getEntityType())) {
+                artifactId = artifactIds.get(wi.getId());
+            } else {
+                try {
+                    artifactId = wi != null
+                            ? entityResolverRegistry.resolveArtifactId(wi, si, t.getAssignedUserId())
+                            : null;
+                } catch (Exception ex) {
+                    artifactId = wi != null ? artifactIds.get(wi.getId()) : null;
+                }
             }
             String entityTitle     = wi != null ? entityTitles.get(wi.getId()) : null;
 
@@ -1340,7 +1355,37 @@ public class WorkflowEngineService {
 
         Map<Long, Long>   artifactIds  = new java.util.HashMap<>();
         Map<Long, String> entityTitles = new java.util.HashMap<>();
+
+        // VENDOR batch-resolved (2 queries total, same pattern as
+        // getPendingTasksForUser) instead of the per-instance resolver call
+        // below, which for VENDOR falls through to the same 2-query
+        // resolution with no batching — was the other N+1 in this method.
+        List<WorkflowInstance> vendorInstances = instanceMap.values().stream()
+                .filter(wi -> "VENDOR".equals(wi.getEntityType())).toList();
+        if (!vendorInstances.isEmpty()) {
+            Set<Long> vendorWfIds = vendorInstances.stream()
+                    .map(WorkflowInstance::getId).collect(java.util.stream.Collectors.toSet());
+            try {
+                var cycles = vendorAssessmentCycleRepository.findByWorkflowInstanceIdIn(vendorWfIds);
+                Set<Long> cycleIds = cycles.stream()
+                        .map(c -> c.getId()).collect(java.util.stream.Collectors.toSet());
+                var assessments = vendorAssessmentRepository.findByCycleIdIn(cycleIds);
+                Map<Long, Long> cycleToAssessment = assessments.stream()
+                        .collect(java.util.stream.Collectors.toMap(
+                                a -> a.getCycleId(), a -> a.getId(), (a, b) -> a));
+                for (var c : cycles) {
+                    Long aid = cycleToAssessment.get(c.getId());
+                    if (aid != null) artifactIds.put(c.getWorkflowInstanceId(), aid);
+                }
+            } catch (Exception ignored) {}
+        }
+
         for (WorkflowInstance wi : instanceMap.values()) {
+            if ("VENDOR".equals(wi.getEntityType())) {
+                try { String t = entityResolverRegistry.resolveEntityTitle(wi);
+                    if (t != null) entityTitles.put(wi.getId(), t); } catch (Exception ignored) {}
+                continue; // artifactId already batch-resolved above
+            }
             try { Long aid = entityResolverRegistry.resolveArtifactId(wi);
                 if (aid != null) artifactIds.put(wi.getId(), aid); } catch (Exception ignored) {}
             try { String t = entityResolverRegistry.resolveEntityTitle(wi);
@@ -3211,6 +3256,107 @@ public class WorkflowEngineService {
                 .createdAt(w.getCreatedAt()).steps(stepResponses).build();
     }
 
+    /**
+     * Bulk version of buildWorkflowResponse — was being called per-row from
+     * WorkflowController.list() (via buildWorkflowResponse(w) in a loop),
+     * which meant 6 queries × N workflows for one paginated page (120
+     * queries for a 20-item page). This does the same 6 queries total,
+     * regardless of how many workflows are in the input list, by fetching
+     * every step and every step-association across ALL of them up front and
+     * grouping in memory — same technique buildWorkflowResponse already uses
+     * per-workflow, just widened to the whole batch.
+     */
+    public List<WorkflowResponse> buildWorkflowResponsesBulk(List<Workflow> workflows) {
+        if (workflows.isEmpty()) return List.of();
+
+        List<Long> workflowIds = workflows.stream().map(Workflow::getId).toList();
+
+        // 1 query: every step for every workflow in the batch
+        List<WorkflowStep> allSteps = stepRepository.findByWorkflowIdInOrderByStepOrderAsc(workflowIds);
+        Map<Long, List<WorkflowStep>> stepsByWorkflowId = allSteps.stream()
+                .collect(java.util.stream.Collectors.groupingBy(WorkflowStep::getWorkflowId));
+
+        List<Long> allStepIds = allSteps.stream().map(WorkflowStep::getId).toList();
+
+        // 5 queries: every step-association across the whole batch, same
+        // shape as buildWorkflowResponse's per-workflow version above.
+        Map<Long, List<Long>> roleIdsByStepId = allStepIds.isEmpty() ? Map.of()
+                : stepRoleRepository.findByStepIdIn(allStepIds)
+                  .stream().collect(java.util.stream.Collectors.groupingBy(
+                WorkflowStepRole::getStepId,
+                java.util.stream.Collectors.mapping(WorkflowStepRole::getRoleId,
+                        java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> userIdsByStepId = allStepIds.isEmpty() ? Map.of()
+                : stepUserRepository.findByStepIdIn(allStepIds)
+                  .stream().collect(java.util.stream.Collectors.groupingBy(
+                WorkflowStepUser::getStepId,
+                java.util.stream.Collectors.mapping(WorkflowStepUser::getUserId,
+                        java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> assignerRoleIdsByStepId = allStepIds.isEmpty() ? Map.of()
+                : stepAssignerRoleRepository.findByStepIdIn(allStepIds)
+                  .stream().collect(java.util.stream.Collectors.groupingBy(
+                WorkflowStepAssignerRole::getStepId,
+                java.util.stream.Collectors.mapping(WorkflowStepAssignerRole::getRoleId,
+                        java.util.stream.Collectors.toList())));
+
+        Map<Long, List<Long>> observerRoleIdsByStepId = allStepIds.isEmpty() ? Map.of()
+                : stepObserverRoleRepository.findByStepIdIn(allStepIds)
+                  .stream().collect(java.util.stream.Collectors.groupingBy(
+                WorkflowStepObserverRole::getStepId,
+                java.util.stream.Collectors.mapping(WorkflowStepObserverRole::getRoleId,
+                        java.util.stream.Collectors.toList())));
+
+        Map<Long, List<com.kashi.grc.workflow.dto.response.StepSectionResponse>> sectionsByStepId =
+                allStepIds.isEmpty() ? Map.of()
+                        : stepSectionRepository.findByStepIdInOrderBySectionOrderAsc(allStepIds)
+                          .stream().collect(java.util.stream.Collectors.groupingBy(
+                        com.kashi.grc.workflow.domain.WorkflowStepSection::getStepId,
+                        java.util.stream.Collectors.mapping(
+                                sec -> com.kashi.grc.workflow.dto.response.StepSectionResponse.builder()
+                                       .id(sec.getId()).sectionKey(sec.getSectionKey())
+                                       .sectionOrder(sec.getSectionOrder()).label(sec.getLabel())
+                                       .description(sec.getDescription()).required(sec.isRequired())
+                                       .completionEvent(sec.getCompletionEvent())
+                                       .requiresAssignment(sec.isRequiresAssignment())
+                                       .tracksItems(sec.isTracksItems())
+                                       .build(),
+                                java.util.stream.Collectors.toList())));
+
+        // Assemble each workflow's response from the pre-loaded maps —
+        // zero additional DB hits per workflow from here on.
+        return workflows.stream().map(w -> {
+            List<WorkflowStep> steps = stepsByWorkflowId.getOrDefault(w.getId(), List.of());
+
+            List<WorkflowStepResponse> stepResponses = steps.stream().map(s ->
+                            WorkflowStepResponse.builder()
+                                    .id(s.getId()).workflowId(w.getId()).stepOrder(s.getStepOrder())
+                                    .name(s.getName()).side(s.getSide()).description(s.getDescription())
+                                    .approvalType(s.getApprovalType()).minApprovalsRequired(s.getMinApprovalsRequired())
+                                    .isParallel(s.isParallel()).isOptional(s.isOptional()).slaHours(s.getSlaHours())
+                                    .automatedAction(s.getAutomatedAction())
+                                    .roleIds(roleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                    .userIds(userIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                    .assignerRoleIds(assignerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                    .observerRoleIds(observerRoleIdsByStepId.getOrDefault(s.getId(), List.of()))
+                                    .assignerResolution(s.getAssignerResolution())
+                                    .actorResolution(s.getActorResolution())
+                                    .allowOverride(s.isAllowOverride())
+                                    .stepAction(s.getStepAction())
+                                    .navKey(s.getNavKey())
+                                    .assignerNavKey(s.getAssignerNavKey())
+                                    .sections(sectionsByStepId.getOrDefault(s.getId(), List.of()))
+                                    .build())
+                    .collect(java.util.stream.Collectors.toList());
+
+            return WorkflowResponse.builder()
+                    .id(w.getId()).name(w.getName()).entityType(w.getEntityType())
+                    .description(w.getDescription()).version(w.getVersion()).isActive(w.isActive())
+                    .createdAt(w.getCreatedAt()).steps(stepResponses).build();
+        }).collect(java.util.stream.Collectors.toList());
+    }
+
     /** Builds full workflow instance response with all step and task instances. Logic unchanged. */
     public WorkflowInstanceResponse buildInstanceResponse(WorkflowInstance instance) {
         List<StepInstance> stepInstances = stepInstanceRepository
@@ -3249,6 +3395,81 @@ public class WorkflowEngineService {
                 .completedAt(instance.getCompletedAt()).dueDate(instance.getDueDate())
                 .priority(instance.getPriority()).initiatedBy(instance.getInitiatedBy())
                 .remarks(instance.getRemarks()).stepInstances(stepResponses).build();
+    }
+
+    /**
+     * Bulk version of buildInstanceResponse — was called per-row from
+     * WorkflowInstanceController.list() (service::buildInstanceResponse),
+     * and the single-item version does 1 (steps) + N (one task query PER
+     * STEP) + 1 (current-step refetch) + 1 (workflow name) queries per
+     * instance. For a 20-item page averaging ~5 steps each, that's up to
+     * ~160 queries. This does 3 queries total for the whole page: all step
+     * instances, all their tasks, and all workflow names, each fetched once
+     * up front and grouped in memory. The current-step lookup is resolved
+     * from the already-loaded step map instead of a second findById per
+     * instance — eliminates that query entirely rather than just batching it.
+     */
+    public List<WorkflowInstanceResponse> buildInstanceResponsesBulk(List<WorkflowInstance> instances) {
+        if (instances.isEmpty()) return List.of();
+
+        List<Long> instanceIds = instances.stream().map(WorkflowInstance::getId).toList();
+
+        // 1 query: every step instance for every workflow instance in the page
+        List<StepInstance> allStepInstances =
+                stepInstanceRepository.findByWorkflowInstanceIdInOrderByCreatedAtAsc(instanceIds);
+        Map<Long, List<StepInstance>> stepsByInstanceId = allStepInstances.stream()
+                .collect(java.util.stream.Collectors.groupingBy(StepInstance::getWorkflowInstanceId));
+        Map<Long, StepInstance> stepInstanceById = allStepInstances.stream()
+                .collect(java.util.stream.Collectors.toMap(StepInstance::getId, si -> si));
+
+        // 1 query: every task for every step instance in the page
+        List<Long> allStepInstanceIds = allStepInstances.stream().map(StepInstance::getId).toList();
+        Map<Long, List<TaskInstanceResponse>> tasksByStepInstanceId = allStepInstanceIds.isEmpty()
+                ? Map.of()
+                : taskInstanceRepository.findByStepInstanceIdIn(allStepInstanceIds).stream()
+                  .map(this::toTaskResponse)
+                  .collect(java.util.stream.Collectors.groupingBy(TaskInstanceResponse::getStepInstanceId));
+
+        // 1 query: every workflow name needed on the page
+        List<Long> workflowIds = instances.stream().map(WorkflowInstance::getWorkflowId).distinct().toList();
+        Map<Long, Workflow> workflowById = workflowRepository.findAllById(workflowIds)
+                .stream().collect(java.util.stream.Collectors.toMap(Workflow::getId, w -> w));
+
+        return instances.stream().map(instance -> {
+            List<StepInstance> stepInstances = stepsByInstanceId.getOrDefault(instance.getId(), List.of());
+
+            List<StepInstanceResponse> stepResponses = stepInstances.stream().map(si ->
+                    StepInstanceResponse.builder()
+                            .id(si.getId()).workflowInstanceId(instance.getId())
+                            .stepId(si.getStepId())
+                            .stepName(si.getSnapName())
+                            .stepOrder(si.getSnapStepOrder())
+                            .status(si.getStatus()).startedAt(si.getStartedAt())
+                            .completedAt(si.getCompletedAt()).slaDueAt(si.getSlaDueAt())
+                            .iterationCount(si.getIterationCount()).remarks(si.getRemarks())
+                            .taskInstances(tasksByStepInstanceId.getOrDefault(si.getId(), List.of()))
+                            .build()
+            ).toList();
+
+            // Resolved from the already-loaded map — no second findById per
+            // instance the way the single-item version does.
+            StepInstance currentSI = instance.getCurrentStepId() != null
+                    ? stepInstanceById.get(instance.getCurrentStepId()) : null;
+            Workflow workflow = workflowById.get(instance.getWorkflowId());
+
+            return WorkflowInstanceResponse.builder()
+                    .id(instance.getId()).tenantId(instance.getTenantId())
+                    .workflowId(instance.getWorkflowId())
+                    .workflowName(workflow != null ? workflow.getName() : null)
+                    .entityType(instance.getEntityType()).entityId(instance.getEntityId())
+                    .currentStepId(instance.getCurrentStepId())
+                    .currentStepName(currentSI != null ? currentSI.getSnapName() : null)
+                    .currentStepOrder(currentSI != null ? currentSI.getSnapStepOrder() : null)
+                    .status(instance.getStatus()).startedAt(instance.getStartedAt())
+                    .completedAt(instance.getCompletedAt()).dueDate(instance.getDueDate())
+                    .priority(instance.getPriority()).initiatedBy(instance.getInitiatedBy())
+                    .remarks(instance.getRemarks()).stepInstances(stepResponses).build();
+        }).toList();
     }
 
     /**

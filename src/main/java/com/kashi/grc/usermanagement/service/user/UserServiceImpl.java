@@ -41,6 +41,9 @@ public class UserServiceImpl implements UserService {
     private final RoleRepository  roleRepository;
     private final UserAttributeRepository attributeRepository;
     private final DelegationRepository delegationRepository;
+
+    @org.springframework.beans.factory.annotation.Value("${kashi.app.base-url:https://app.kashigrc.com}")
+    private String appBaseUrl;
     private final PasswordEncoder passwordEncoder;
     private final MailService mailService;
     private final EmailTemplateRepository emailTemplateRepository;
@@ -60,8 +63,14 @@ public class UserServiceImpl implements UserService {
         Long tenantId = (request.getTenantId() != null && !request.getTenantId().equals(loggedInTenantId))
                 ? request.getTenantId()
                 : loggedInTenantId;
-        if (userRepository.existsByEmailAndTenantIdAndIsDeletedFalse(request.getEmail(), tenantId)) {
-            throw new ValidationException("User with email " + request.getEmail() + " already exists in this tenant");
+        // Email is now a globally unique identity — was scoped per-tenant here,
+        // which let the same email exist as separate accounts in different
+        // tenants. login() has always assumed the opposite (findByEmail
+        // returning exactly one row), so that mismatch is what caused
+        // NonUniqueResultException on login for any email invited into more
+        // than one tenant. See UserRepository.existsByEmailAndIsDeletedFalse.
+        if (userRepository.existsByEmailAndIsDeletedFalse(request.getEmail())) {
+            throw new ValidationException("A user with email " + request.getEmail() + " already exists");
         }
 
         // Generate temporary password; user must reset on first login
@@ -85,6 +94,19 @@ public class UserServiceImpl implements UserService {
         // Assign roles
         if (request.getRoleIds() != null && !request.getRoleIds().isEmpty()) {
             Set<Role> roles = new HashSet<>(roleRepository.findAllById(request.getRoleIds()));
+            // Same rule as RoleServiceImpl.assignRoleToUser: a user's roles
+            // must all come from exactly one side. Checked here too since
+            // createUser assigns roles directly rather than going through
+            // that method — a brand-new user could otherwise be created
+            // already in a state (multi-side) that's supposed to be
+            // unreachable.
+            long distinctSides = roles.stream()
+                    .map(Role::getSide).filter(java.util.Objects::nonNull).distinct().count();
+            if (distinctSides > 1) {
+                throw new ValidationException(
+                        "Cannot assign roles from more than one side to a single user. "
+                                + "A user's roles must all come from exactly one side.");
+            }
             user.setRoles(roles);
         }
 
@@ -114,7 +136,7 @@ public class UserServiceImpl implements UserService {
             if (template != null) {
                 // Generate a dedicated invite token
                 // when passwordResetRequired=true (AUTH generates its own token on login)
-                final String loginUrl   = "http://localhost:3000/auth/login";
+                final String loginUrl   = appBaseUrl + "/auth/login";
                 final String subject    = template.getSubject();
                 final String content    = template.getContent()
                         .replace("{{firstName}}",         request.getFirstName())
@@ -161,7 +183,7 @@ public class UserServiceImpl implements UserService {
 
     @Override
     @Transactional(readOnly = true)
-    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam) {
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -169,6 +191,11 @@ public class UserServiceImpl implements UserService {
         boolean isSystemUser = loggedInUser.getRoles().stream()
                 .anyMatch(r -> r.getSide() != null &&
                         r.getSide().name().equals("SYSTEM"));
+
+        // SYSTEM callers may drill into one specific tenant's users (the
+        // per-tenant, side-wise view); everyone else stays locked to their
+        // own tenant regardless of what tenantIdParam they send.
+        final Long effectiveTenantId = (isSystemUser && tenantIdParam != null) ? tenantIdParam : tenantId;
 
         // Determine the effective vendorId for scoping:
         //   1. Vendor-side users are ALWAYS scoped to their own vendor (security gate).
@@ -200,7 +227,11 @@ public class UserServiceImpl implements UserService {
                     if (!isSystemUser) {
                         // Org/Vendor users only see their own tenant
                         predicates.add(cb.equal(root.get("tenantId"), tenantId));
+                    } else if (tenantIdParam != null) {
+                        // SYSTEM caller drilling into one specific tenant
+                        predicates.add(cb.equal(root.get("tenantId"), effectiveTenantId));
                     }
+                    // else: SYSTEM caller with no tenantIdParam — unscoped, all tenants
                     // Filter by role side — only users who have at least one role with this side
                     if (finalRoleSide != null) {
                         if (finalRoleSide == com.kashi.grc.usermanagement.domain.RoleSide.VENDOR) {

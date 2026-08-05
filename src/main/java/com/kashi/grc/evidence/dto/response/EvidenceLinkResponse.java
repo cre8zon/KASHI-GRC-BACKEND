@@ -48,6 +48,11 @@ public class EvidenceLinkResponse {
 
     private String evidenceFileName;
 
+    /** Needed by the frontend preview drawer to decide how to render this
+     *  file (PDF viewer, image, converted-HTML, or download-only fallback).
+     *  Stored on EvidenceRecord already — just wasn't mapped through here. */
+    private String evidenceMimeType;
+
     /** MANUAL | AUTOMATED | HYBRID */
     private String collectionType;
 

@@ -81,6 +81,10 @@ public class AuditTestPolicySnapshotService {
     // ── ADDED: creates engagement-scoped integration snapshots after test snapshotting ──
     private final com.kashi.grc.integration.service.EngagementIntegrationSnapshotService engagementIntegrationSnapshotService;
 
+    // Raw-JDBC batch inserts — see class javadoc addition below for why plain
+    // saveAll() here was the real bottleneck this whole method was known for.
+    private final com.kashi.grc.common.jdbc.JdbcBatchInsertHelper jdbcBatchInsertHelper;
+
     /**
      * Called by AuditEngagementService.snapshotTemplate() after control instances are created.
      *
@@ -157,40 +161,52 @@ public class AuditTestPolicySnapshotService {
         Map<Long, AuditTest> testMap = testRepository.findAllById(uniqueTestIds)
                 .stream().collect(Collectors.toMap(AuditTest::getId, t -> t));
 
-        // Build all test instances in memory, saveAll in one round-trip
+        // Build all test instances in memory, batch-insert in one round-trip.
+        // Was testInstanceRepository.saveAll(...) — looks batched, but every
+        // entity in this app uses GenerationType.IDENTITY (see BaseEntity),
+        // which forces Hibernate to execute one INSERT per row regardless of
+        // batch_size config. For 120 rows at Aiven's ~100-200ms RTT, that's
+        // the entire ~27s this step was costing. Raw JDBC batch insert
+        // bypasses JPA's per-row IDENTITY flush entirely.
         Map<Long, Long> testIdToInstanceId = new HashMap<>();
-        List<AuditTestInstance> testInstancesToSave = new ArrayList<>();
+        List<Long> testIdsInOrder = new ArrayList<>();
+        List<Object[]> testRows = new ArrayList<>();
+        LocalDateTime testSnapshotNow = LocalDateTime.now();
         for (Long testId : uniqueTestIds) {
             AuditTest test = testMap.get(testId);
             if (test == null) continue;
-            testInstancesToSave.add(AuditTestInstance.builder()
-                    .originalTestId(test.getId())
-                    .engagementId(engagementId)
-                    .tenantId(tenantId)
-                    .testNameSnapshot(test.getName())
-                    .testRefSnapshot(test.getTestRef())
-                    .descriptionSnapshot(test.getDescription())
-                    .testProcedureSnapshot(test.getTestProcedure())
-                    .evidenceGuidanceSnapshot(test.getEvidenceGuidance())
-                    .frameworkRefSnapshot(test.getFrameworkRef())
-                    .controlTagSnapshot(test.getControlTag())
-                    .matchedTagsSnapshot(tagExpansionService.expand(test.getControlTag()))
-                    .automationTypeSnapshot(test.getAutomationType() != null
-                            ? test.getAutomationType().name() : "MANUAL")
-                    .automationKeySnapshot(test.getAutomationKey())
-                    .frequencySnapshot(test.getFrequency() != null
-                            ? test.getFrequency().name() : "ANNUAL")
-                    .testResult(AuditTestInstance.TestResult.NOT_RUN)
-                    .snapshottedAt(LocalDateTime.now())
-                    .build());
+            testIdsInOrder.add(testId);
+            testRows.add(new Object[]{
+                    tenantId, test.getId(), engagementId,
+                    test.getName(), test.getTestRef(), test.getDescription(),
+                    test.getTestProcedure(), test.getEvidenceGuidance(), test.getFrameworkRef(),
+                    test.getControlTag(), tagExpansionService.expand(test.getControlTag()),
+                    test.getAutomationType() != null ? test.getAutomationType().name() : "MANUAL",
+                    test.getAutomationKey(),
+                    test.getFrequency() != null ? test.getFrequency().name() : "ANNUAL",
+                    testSnapshotNow,
+                    AuditTestInstance.TestResult.NOT_RUN.name(),
+                    false, // run_by_system — nullable=false, no DB default, see comment above
+                    testSnapshotNow, testSnapshotNow
+            });
         }
-        List<AuditTestInstance> savedInstances = testInstanceRepository.saveAll(testInstancesToSave);
-        for (AuditTestInstance saved : savedInstances) {
-            testIdToInstanceId.put(saved.getOriginalTestId(), saved.getId());
+        List<Long> generatedTestInstanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO audit_test_instances " +
+                        "(tenant_id, original_test_id, engagement_id, " +
+                        "test_name_snapshot, test_ref_snapshot, description_snapshot, " +
+                        "test_procedure_snapshot, evidence_guidance_snapshot, framework_ref_snapshot, " +
+                        "control_tag_snapshot, matched_tags_snapshot, automation_type_snapshot, " +
+                        "automation_key_snapshot, frequency_snapshot, snapshotted_at, test_result, " +
+                        "run_by_system, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                testRows);
+        for (int i = 0; i < testIdsInOrder.size(); i++) {
+            testIdToInstanceId.put(testIdsInOrder.get(i), generatedTestInstanceIds.get(i));
         }
 
         // Create runtime mappings in batch
-        List<AuditControlInstanceTestMapping> mappingsToSave = new ArrayList<>();
+        List<Object[]> mappingRows = new ArrayList<>();
+        int mappingsSkipped = 0;
         for (AuditControlTestMapping mapping : allMappings) {
             Long controlInstanceId = originalToInstanceId.get(mapping.getControlId());
             Long testInstanceId    = testIdToInstanceId.get(mapping.getTestId());
@@ -198,25 +214,28 @@ public class AuditTestPolicySnapshotService {
             if (controlInstanceId == null || testInstanceId == null) {
                 log.warn("[AUDIT-SNAPSHOT] Skipping mapping — missing instance | " +
                         "controlId={} testId={}", mapping.getControlId(), mapping.getTestId());
+                mappingsSkipped++;
                 continue;
             }
-
-            mappingsToSave.add(AuditControlInstanceTestMapping.builder()
-                    .controlInstanceId(controlInstanceId)
-                    .testInstanceId(testInstanceId)
-                    .engagementId(engagementId)
-                    .tenantId(tenantId)
-                    .isRequired(mapping.isRequired())
-                    .orderNo(mapping.getOrderNo())
-                    .mappingNoteSnapshot(mapping.getMappingNote())
-                    .originalControlId(mapping.getControlId())
-                    .originalTestId(mapping.getTestId())
-                    .build());
+            mappingRows.add(new Object[]{
+                    controlInstanceId, testInstanceId, engagementId, tenantId,
+                    mapping.isRequired(), mapping.getOrderNo(), mapping.getMappingNote(),
+                    mapping.getControlId(), mapping.getTestId(),
+                    testSnapshotNow, testSnapshotNow
+            });
         }
-        controlInstanceTestMappingRepository.saveAll(mappingsToSave);
+        if (!mappingRows.isEmpty()) {
+            jdbcBatchInsertHelper.batchInsertAndGetIds(
+                    "INSERT INTO audit_control_instance_test_mappings " +
+                            "(control_instance_id, test_instance_id, engagement_id, tenant_id, " +
+                            "is_required, order_no, mapping_note_snapshot, " +
+                            "original_control_id, original_test_id, created_at, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    mappingRows);
+        }
 
         log.info("[AUDIT-SNAPSHOT] Snapshotted {} test instances, {} mappings | engagementId={}",
-                testIdToInstanceId.size(), allMappings.size(), engagementId);
+                testIdToInstanceId.size(), allMappings.size() - mappingsSkipped, engagementId);
     }
 
     // ── Policies ──────────────────────────────────────────────────────────────
@@ -244,10 +263,13 @@ public class AuditTestPolicySnapshotService {
         Map<Long, AuditPolicy> policyMap = policyRepository.findAllById(uniquePolicyIds)
                 .stream().collect(Collectors.toMap(AuditPolicy::getId, p -> p));
 
-        // Build approved policy instances in memory, saveAll in one round-trip
+        // Build approved policy instances in memory, batch-insert in one round-trip.
+        // Same IDENTITY-batching issue as snapshotTests() above — was the other
+        // ~19s of the ~46s this whole method used to cost.
         Map<Long, Long> policyIdToInstanceId = new HashMap<>();
-        List<AuditPolicyInstance> policyInstancesToSave = new ArrayList<>();
         List<Long> policyIdsToSave = new ArrayList<>();
+        List<Object[]> policyRows = new ArrayList<>();
+        LocalDateTime policySnapshotNow = LocalDateTime.now();
         for (Long policyId : uniquePolicyIds) {
             AuditPolicy policy = policyMap.get(policyId);
             if (policy == null) continue;
@@ -256,58 +278,60 @@ public class AuditTestPolicySnapshotService {
                 log.debug("[AUDIT-SNAPSHOT] Skipping policy {} — status={}", policyId, policy.getStatus());
                 continue;
             }
-            policyInstancesToSave.add(AuditPolicyInstance.builder()
-                    .originalPolicyId(policy.getId())
-                    .engagementId(engagementId)
-                    .tenantId(tenantId)
-                    .titleSnapshot(policy.getTitle())
-                    .policyRefSnapshot(policy.getPolicyRef())
-                    .versionSnapshot(policy.getVersion())
-                    .descriptionSnapshot(policy.getDescription())
-                    .contentTypeSnapshot(policy.getContentType() != null
-                            ? policy.getContentType().name() : "RICH_TEXT")
-                    .contentBodySnapshot(policy.getContentBody())
-                    .evidenceRecordIdSnapshot(policy.getEvidenceRecordId())
-                    .externalUrlSnapshot(policy.getExternalUrl())
-                    .ownerIdSnapshot(policy.getOwnerId())
-                    .approvedAtSnapshot(policy.getApprovedAt())
-                    .effectiveDateSnapshot(policy.getEffectiveDate())
-                    .nextReviewDateSnapshot(policy.getNextReviewDate())
-                    .policyStatusSnapshot(policy.getStatus().name())
-                    .controlTagsSnapshot(policy.getControlTags())
-                    .matchedTagsSnapshot(tagExpansionService.expandCsv(policy.getControlTags()))
-                    .frameworkRefsSnapshot(policy.getFrameworkRefs())
-                    .reviewResult(AuditPolicyInstance.ReviewResult.NOT_REVIEWED)
-                    .snapshottedAt(LocalDateTime.now())
-                    .build());
             policyIdsToSave.add(policyId);
+            policyRows.add(new Object[]{
+                    tenantId, policy.getId(), engagementId,
+                    policy.getTitle(), policy.getPolicyRef(), policy.getVersion(),
+                    policy.getDescription(),
+                    policy.getContentType() != null ? policy.getContentType().name() : "RICH_TEXT",
+                    policy.getContentBody(), policy.getEvidenceRecordId(), policy.getExternalUrl(),
+                    policy.getOwnerId(), policy.getApprovedAt(), policy.getEffectiveDate(),
+                    policy.getNextReviewDate(), policy.getStatus().name(),
+                    policy.getControlTags(), tagExpansionService.expandCsv(policy.getControlTags()),
+                    policy.getFrameworkRefs(),
+                    AuditPolicyInstance.ReviewResult.NOT_REVIEWED.name(),
+                    policySnapshotNow, policySnapshotNow, policySnapshotNow
+            });
         }
-        List<AuditPolicyInstance> savedPolicies = policyInstanceRepository.saveAll(policyInstancesToSave);
-        for (int i = 0; i < savedPolicies.size(); i++) {
-            policyIdToInstanceId.put(policyIdsToSave.get(i), savedPolicies.get(i).getId());
+        List<Long> generatedPolicyInstanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO audit_policy_instances " +
+                        "(tenant_id, original_policy_id, engagement_id, " +
+                        "title_snapshot, policy_ref_snapshot, version_snapshot, description_snapshot, " +
+                        "content_type_snapshot, content_body_snapshot, evidence_record_id_snapshot, " +
+                        "external_url_snapshot, owner_id_snapshot, approved_at_snapshot, " +
+                        "effective_date_snapshot, next_review_date_snapshot, policy_status_snapshot, " +
+                        "control_tags_snapshot, matched_tags_snapshot, framework_refs_snapshot, " +
+                        "review_result, snapshotted_at, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                policyRows);
+        for (int i = 0; i < policyIdsToSave.size(); i++) {
+            policyIdToInstanceId.put(policyIdsToSave.get(i), generatedPolicyInstanceIds.get(i));
         }
 
         // Create runtime mappings in batch
-        List<AuditPolicyInstanceControlMapping> policyMappingsToSave = new ArrayList<>();
+        List<Object[]> policyMappingRows = new ArrayList<>();
         for (AuditPolicyControlMapping mapping : allMappings) {
             Long controlInstanceId = originalToInstanceId.get(mapping.getControlId());
             Long policyInstanceId  = policyIdToInstanceId.get(mapping.getPolicyId());
 
             if (controlInstanceId == null || policyInstanceId == null) continue;
 
-            policyMappingsToSave.add(AuditPolicyInstanceControlMapping.builder()
-                    .policyInstanceId(policyInstanceId)
-                    .controlInstanceId(controlInstanceId)
-                    .engagementId(engagementId)
-                    .tenantId(tenantId)
-                    .mappingTypeSnapshot(mapping.getMappingType() != null
-                            ? mapping.getMappingType().name() : "DIRECT")
-                    .mappingNoteSnapshot(mapping.getMappingNote())
-                    .originalPolicyId(mapping.getPolicyId())
-                    .originalControlId(mapping.getControlId())
-                    .build());
+            policyMappingRows.add(new Object[]{
+                    policyInstanceId, controlInstanceId, engagementId, tenantId,
+                    mapping.getMappingType() != null ? mapping.getMappingType().name() : "DIRECT",
+                    mapping.getMappingNote(), mapping.getPolicyId(), mapping.getControlId(),
+                    policySnapshotNow, policySnapshotNow
+            });
         }
-        policyInstanceControlMappingRepository.saveAll(policyMappingsToSave);
+        if (!policyMappingRows.isEmpty()) {
+            jdbcBatchInsertHelper.batchInsertAndGetIds(
+                    "INSERT INTO audit_policy_instance_control_mappings " +
+                            "(policy_instance_id, control_instance_id, engagement_id, tenant_id, " +
+                            "mapping_type_snapshot, mapping_note_snapshot, " +
+                            "original_policy_id, original_control_id, created_at, updated_at) " +
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    policyMappingRows);
+        }
 
         log.info("[AUDIT-SNAPSHOT] Snapshotted {} policy instances, {} mappings | engagementId={}",
                 policyIdToInstanceId.size(), allMappings.size(), engagementId);

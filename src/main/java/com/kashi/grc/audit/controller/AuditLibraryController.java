@@ -4,6 +4,7 @@ import com.kashi.grc.audit.csv.AuditCsvImportService;
 import com.kashi.grc.audit.domain.*;
 import com.kashi.grc.audit.dto.request.*;
 import com.kashi.grc.audit.repository.*;
+import com.kashi.grc.audit.service.AuditReferenceListCacheService;
 import com.kashi.grc.audit.service.AuditSectionService;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.CsvImportResult;
@@ -88,6 +89,7 @@ public class AuditLibraryController {
     private final AuditCsvImportExtension               csvImportExtension;   // FIX: for tests-policies CSV endpoints
     private final DbRepository                          dbRepository;
     private final UtilityService                        utilityService;
+    private final AuditReferenceListCacheService auditReferenceListCacheService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROLS
@@ -486,39 +488,9 @@ public class AuditLibraryController {
         var ctx          = utilityService.getLoggedInDataContext();
         Long tid         = ctx.getTenantId();
 
-        return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
-                AuditTemplate.class,
-                utilityService.getpageDetails(allParams),
-                (cb, root) -> {
-                    List<jakarta.persistence.criteria.Predicate> predicates = new ArrayList<>();
-                    if (!isSystem) {
-                        predicates.add(cb.equal(root.get("status"), "PUBLISHED"));
-                        predicates.add(cb.or(
-                                cb.isNull(root.get("tenantId")),
-                                cb.equal(root.get("tenantId"), tid)
-                        ));
-                    }
-                    if (allParams.containsKey("status"))
-                        predicates.add(cb.equal(root.get("status"),
-                                allParams.get("status").toUpperCase()));
-                    if (allParams.containsKey("audittype"))
-                        predicates.add(cb.equal(root.get("auditType"),
-                                AuditTemplate.AuditType.valueOf(allParams.get("audittype").toUpperCase())));
-                    if (allParams.containsKey("frameworkref")) {
-                        // Tolerant match: templates may store 'ISO 27001' while the
-                        // nav passes 'ISO27001'. Compare space-stripped + lowercase.
-                        String want = allParams.get("frameworkref")
-                                .replaceAll("\\s+", "").toLowerCase();
-                        jakarta.persistence.criteria.Expression<String> normalized =
-                                cb.lower(cb.function("REPLACE", String.class,
-                                        root.get("frameworkRef"), cb.literal(" "), cb.literal("")));
-                        predicates.add(cb.equal(normalized, want));
-                    }
-                    return predicates;
-                },
-                (cb, root) -> Map.of("name", root.get("name"), "status", root.get("status")),
-                this::buildTemplateMap
-        )));
+        return ResponseEntity.ok(ApiResponse.success(
+                auditReferenceListCacheService.listTemplates(
+                        isSystem, tid, utilityService.getpageDetails(allParams), allParams)));
     }
 
     @GetMapping("/templates/{templateId}")

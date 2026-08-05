@@ -96,11 +96,17 @@ public class FeatureEntitlementService {
                             + "setting per-tenant entitlement.");
         }
 
+        // NOTE: do not call .mode(null) here — the `mode` column is NOT NULL
+        // in the DB. Tenant rows don't use `mode` for anything (the resolver
+        // only ever reads it off the global row), but the column still needs
+        // a non-null value on every insert or the save throws
+        // DataIntegrityViolationException. Omitting .mode(...) lets
+        // @Builder.Default apply the entity's "GLOBAL" default instead.
         FeatureFlag row = featureFlagRepository.findByFlagKeyAndTenantId(flagKey, tenantId)
                 .orElseGet(() -> FeatureFlag.builder()
                         .flagKey(flagKey)
                         .description(global != null ? global.getDescription() : null)
-                        .tenantId(tenantId).mode(null)
+                        .tenantId(tenantId)
                         .build());
         row.setEnabled(enabled);
         row.setDeletedAt(null);   // un-soft-delete on re-license
