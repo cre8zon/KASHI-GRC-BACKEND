@@ -310,6 +310,12 @@ public class AuditPolicyController {
         List<AuditPolicyControlMapping> mappings =
                 policyControlMappingRepository.findByControlId(controlId);
 
+        // BATCHED — was one policyRepository.findById() per row.
+        List<Long> policyIds = mappings.stream().map(AuditPolicyControlMapping::getPolicyId).toList();
+        Map<Long, AuditPolicy> policiesById = policyIds.isEmpty() ? Map.of()
+                : policyRepository.findAllById(policyIds).stream()
+                  .collect(Collectors.toMap(AuditPolicy::getId, p -> p));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",   m.getId());
@@ -317,13 +323,14 @@ public class AuditPolicyController {
             row.put("controlId",   m.getControlId());
             row.put("mappingType", m.getMappingType());
             row.put("mappingNote", m.getMappingNote());
-            policyRepository.findById(m.getPolicyId()).ifPresent(p -> {
+            AuditPolicy p = policiesById.get(m.getPolicyId());
+            if (p != null) {
                 row.put("policyTitle",    p.getTitle());
                 row.put("policyRef",      p.getPolicyRef());
                 row.put("policyVersion",  p.getVersion());
                 row.put("policyStatus",   p.getStatus());
                 row.put("nextReviewDate", p.getNextReviewDate());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -337,6 +344,12 @@ public class AuditPolicyController {
         List<AuditPolicyControlMapping> mappings =
                 policyControlMappingRepository.findByPolicyId(policyId);
 
+        // BATCHED — was one controlRepository.findById() per row.
+        List<Long> controlIds = mappings.stream().map(AuditPolicyControlMapping::getControlId).toList();
+        Map<Long, AuditControl> controlsById = controlIds.isEmpty() ? Map.of()
+                : controlRepository.findAllById(controlIds).stream()
+                  .collect(Collectors.toMap(AuditControl::getId, c -> c));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",   m.getId());
@@ -344,12 +357,13 @@ public class AuditPolicyController {
             row.put("controlId",   m.getControlId());
             row.put("mappingType", m.getMappingType());
             row.put("mappingNote", m.getMappingNote());
-            controlRepository.findById(m.getControlId()).ifPresent(c -> {
+            AuditControl c = controlsById.get(m.getControlId());
+            if (c != null) {
                 row.put("controlName", c.getName());
                 row.put("controlCode", c.getControlCode());
                 row.put("controlTag",  c.getControlTag());
                 row.put("frameworkRef",c.getFrameworkRef());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 

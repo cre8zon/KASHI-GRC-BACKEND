@@ -105,15 +105,22 @@ public class VendorTemplateSelectionController {
         // Parse candidate IDs from JSON column
         List<Long> candidateIds = parseCandidateIds(sel.getCandidateTemplateIds());
 
-        // Hydrate candidate names + versions for the UI
-        List<Map<String, Object>> candidates = new ArrayList<>();
-        for (Long tplId : candidateIds) {
-            templateRepository.findById(tplId).ifPresent(t -> candidates.add(Map.of(
-                    "templateId", t.getId(),
-                    "name",       t.getName(),
-                    "version",    t.getVersion() != null ? t.getVersion() : 1
-            )));
-        }
+        // Hydrate candidate names + versions for the UI (batched — was one
+        // templateRepository.findById() per candidate id in a loop).
+        Map<Long, AssessmentTemplate> templatesById = candidateIds.isEmpty() ? Map.of()
+                : templateRepository.findAllById(candidateIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(AssessmentTemplate::getId, t -> t));
+        List<Map<String, Object>> candidates = candidateIds.stream()
+                .map(templatesById::get)
+                .filter(java.util.Objects::nonNull)
+                .map(t -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("templateId", t.getId());
+                    m.put("name",       t.getName());
+                    m.put("version",    t.getVersion() != null ? t.getVersion() : 1);
+                    return m;
+                })
+                .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
 
         boolean alreadySelected = sel.getSelectedTemplateId() != null;
 

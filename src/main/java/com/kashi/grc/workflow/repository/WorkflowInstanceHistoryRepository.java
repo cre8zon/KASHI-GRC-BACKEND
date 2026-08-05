@@ -13,6 +13,17 @@ public interface WorkflowInstanceHistoryRepository
     List<WorkflowInstanceHistory> findByWorkflowInstanceIdOrderByPerformedAtAsc(
             Long workflowInstanceId);
 
+    /**
+     * Batch counterpart to findByWorkflowInstanceIdOrderByPerformedAtAsc — ONE
+     * query for a whole set of workflow instance ids instead of one call per
+     * instance. Used by AuditEngagementController.getProjectInstanceHistory,
+     * which was calling getFullHistory() (and therefore this query) once per
+     * workflow instance under a project — a project with a dozen engagements
+     * meant a dozen round trips just for the history list.
+     */
+    List<WorkflowInstanceHistory> findByWorkflowInstanceIdInOrderByPerformedAtAsc(
+            java.util.Collection<Long> workflowInstanceIds);
+
     List<WorkflowInstanceHistory> findByWorkflowInstanceIdAndStepIdOrderByPerformedAtAsc(
             Long workflowInstanceId, Long stepId);
 

@@ -60,6 +60,7 @@ public class RbacAdminController {
     private final SodRuleRepository               sodRuleRepository;
     private final RoleRepository                  roleRepository;
     private final UserRepository                  userRepository;
+    private final com.kashi.grc.usermanagement.service.user.UserDisplayNameService userDisplayNameService;
     private final DbRepository                    dbRepository;
     private final UtilityService                  utilityService;
 
@@ -203,21 +204,31 @@ public class RbacAdminController {
                 .orElseThrow(() -> new ResourceNotFoundException("Permission", "code", permCode));
 
         // Find all grants for this permission
-        List<Map<String, Object>> result = permissionGrantRepository
+        List<PermissionGrant> grants = permissionGrantRepository
                 .findByPermissionId(perm.getId())
                 .stream()
                 .filter(PermissionGrant::isGranted)   // only active grants
+                .toList();
+
+        // BATCHED — was one roleRepository.findById() per grant row.
+        List<Long> roleIds = grants.stream().map(PermissionGrant::getRoleId).toList();
+        Map<Long, Role> rolesById = roleIds.isEmpty() ? Map.of()
+                : roleRepository.findAllById(roleIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(Role::getId, r -> r));
+
+        List<Map<String, Object>> result = grants.stream()
                 .map(g -> {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("grantId",   g.getId());
                     m.put("roleId",    g.getRoleId());
                     m.put("granted",   g.isGranted());
                     // Enrich with role details
-                    roleRepository.findById(g.getRoleId()).ifPresent(r -> {
+                    Role r = rolesById.get(g.getRoleId());
+                    if (r != null) {
                         m.put("roleName",  r.getName());
                         m.put("roleSide",  r.getSide());
                         m.put("roleLevel", r.getLevel());
-                    });
+                    }
                     return m;
                 })
                 .filter(m -> m.containsKey("roleName"))  // skip orphaned grants
@@ -287,14 +298,14 @@ public class RbacAdminController {
                 },
                 (cb, root) -> Map.of("createdat", root.get("createdAt")),
                 ov -> {
-                    String userName = userRepository.findById(ov.getUserId())
-                            .map(u -> u.getFirstName() + " " + u.getLastName()).orElse("—");
+                    var userOpt = userRepository.findById(ov.getUserId());
+                    String userName = userDisplayNameService.resolveName(ov.getUserId());
+                    if (userName == null) userName = "—";
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("id",             ov.getId());
                     m.put("userId",         ov.getUserId());
                     m.put("userName",       userName);
-                    m.put("userEmail",      userRepository.findById(ov.getUserId())
-                            .map(User::getEmail).orElse(""));
+                    m.put("userEmail",      userOpt.map(User::getEmail).orElse(""));
                     m.put("permissionId",   ov.getPermissionId());
                     m.put("permissionCode", ov.getPermissionCode() != null ? ov.getPermissionCode() : "");
                     m.put("granted",        ov.isGranted());

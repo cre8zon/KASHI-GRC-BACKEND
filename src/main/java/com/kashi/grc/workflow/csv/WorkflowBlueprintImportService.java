@@ -272,6 +272,18 @@ public class WorkflowBlueprintImportService {
         List<String[]> dataRows = allRows.subList(1, allRows.size());
         int ok = 0, fail = 0;
 
+        // Pre-fetch every existing step for this workflow ONCE — was previously
+        // re-fetched (findByWorkflowIdOrderByStepOrderAsc, then filtered in
+        // Java for the matching stepOrder) on EVERY row, in both the STEP and
+        // SECTION_OVERRIDE cases. For a 20-step blueprint that was up to 20
+        // queries fetching all 20 rows each. Kept as a mutable map — updated
+        // below whenever a step is created/updated — so later rows in the
+        // same import see steps created earlier in the same pass, exactly as
+        // the original per-row re-query would have.
+        Map<Integer, WorkflowStep> stepsByOrder = workflowStepRepository
+                .findByWorkflowIdOrderByStepOrderAsc(workflowId).stream()
+                .collect(Collectors.toMap(WorkflowStep::getStepOrder, s -> s, (a, b) -> a));
+
         // Track stepOrders seen so we can delete orphans at the end
         Set<Integer> csvOrders = new LinkedHashSet<>();
 
@@ -319,10 +331,8 @@ public class WorkflowBlueprintImportService {
 
                     // ── Upsert step ───────────────────────────────────────────
                     final int fOrder = stepOrder;
-                    WorkflowStep step = workflowStepRepository
-                            .findByWorkflowIdOrderByStepOrderAsc(workflowId)
-                            .stream().filter(s -> s.getStepOrder() == fOrder).findFirst()
-                            .orElse(WorkflowStep.builder().workflowId(workflowId).build());
+                    WorkflowStep step = stepsByOrder.getOrDefault(fOrder,
+                            WorkflowStep.builder().workflowId(workflowId).build());
 
                     boolean created = step.getId() == null;
 
@@ -347,6 +357,7 @@ public class WorkflowBlueprintImportService {
                     setAutoApprove(step, autoApprove);
 
                     step = workflowStepRepository.save(step);
+                    stepsByOrder.put(fOrder, step);
                     final Long stepId = step.getId();
 
                     // ── Roles ────────────────────────────────────────────────
@@ -450,10 +461,7 @@ public class WorkflowBlueprintImportService {
                     }
 
                     final int fOrder = stepOrder;
-                    WorkflowStep step = workflowStepRepository
-                            .findByWorkflowIdOrderByStepOrderAsc(workflowId)
-                            .stream().filter(s -> s.getStepOrder() == fOrder).findFirst()
-                            .orElse(null);
+                    WorkflowStep step = stepsByOrder.get(fOrder);
                     if (step == null) {
                         importLog.add(entry("Row " + lineNo +
                                 ": SECTION_OVERRIDE — no step at order=" + stepOrder + " — skipped", "WARNING"));
@@ -486,10 +494,14 @@ public class WorkflowBlueprintImportService {
         }
 
         // ── Remove orphan steps (step orders in DB but not in CSV) ────────────
-        // Same behaviour as CsvImportService.importWorkflowSteps().
+        // Same behaviour as CsvImportService.importWorkflowSteps(). Reuses
+        // stepsByOrder instead of a third full re-fetch — it already reflects
+        // the complete current state (pre-existing steps untouched by this
+        // CSV stayed in the map from the initial load; touched ones were
+        // updated in place as each row was processed).
         int deleted = 0;
         if (!csvOrders.isEmpty()) {
-            for (WorkflowStep s : workflowStepRepository.findByWorkflowIdOrderByStepOrderAsc(workflowId)) {
+            for (WorkflowStep s : stepsByOrder.values()) {
                 if (!csvOrders.contains(s.getStepOrder())) {
                     workflowStepRoleRepository.deleteByStepId(s.getId());
                     workflowStepAssignerRoleRepository.deleteByStepId(s.getId());

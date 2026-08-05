@@ -1,5 +1,6 @@
 package com.kashi.grc.uiconfig.service;
 
+import com.kashi.grc.common.cache.CacheNames;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.uiconfig.domain.*;
@@ -8,6 +9,7 @@ import com.kashi.grc.uiconfig.repository.*;
 import com.kashi.grc.usermanagement.repository.PermissionGrantRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -83,6 +85,7 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable(cacheNames = CacheNames.UI_SCREEN)
     public ScreenConfigResponse getScreenConfig(String screenKey) {
         User currentUser = utilityService.getLoggedInDataContext();
         Long tenantId    = currentUser.getTenantId();
@@ -192,6 +195,7 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable(cacheNames = CacheNames.UI_FORM)
     public UiFormResponse getForm(String formKey) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
@@ -209,11 +213,29 @@ public class UiConfigServiceImpl implements UiConfigService {
         // returns only global components (WHERE screen IS NULL OR screen = '').
         List<UiComponent> components = componentRepository
                 .findByScreenForTenant("__form_globals__", tenantId);
+
+        // Batch-fetch ALL options for these components in ONE query instead of
+        // one query per component (same N+1 fix already applied in
+        // getScreenConfig — this method just never got it).
+        Map<String, List<UiOption>> optionsByKey = Collections.emptyMap();
+        if (!components.isEmpty()) {
+            List<String> componentKeys = components.stream()
+                    .filter(UiComponent::isVisible)
+                    .map(UiComponent::getComponentKey)
+                    .toList();
+            if (!componentKeys.isEmpty()) {
+                optionsByKey = optionRepository
+                        .findByComponentKeysAndTenant(componentKeys, tenantId)
+                        .stream()
+                        .collect(Collectors.groupingBy(
+                                o -> o.getComponent().getComponentKey()));
+            }
+        }
+
         Map<String, UiComponentResponse> componentMap = new java.util.LinkedHashMap<>();
         for (UiComponent c : components) {
             if (!c.isVisible()) continue;
-            List<UiOption> options = optionRepository
-                    .findByComponentKeyAndTenant(c.getComponentKey(), tenantId);
+            List<UiOption> options = optionsByKey.getOrDefault(c.getComponentKey(), List.of());
             componentMap.put(c.getComponentKey(), toComponentResponse(c, options));
         }
 
@@ -230,6 +252,10 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
+    // NOTE: only applies to external calls through the Spring proxy — the
+    // internal self-invocation from getScreenConfig() bypasses this cache,
+    // which is fine since getScreenConfig()'s own result is cached as a whole.
+    @Cacheable(cacheNames = CacheNames.UI_ACTIONS)
     public List<UiActionResponse> getActions(String screenKey, String entityStatus) {
         // Single call — result cached in ThreadLocal for this request.
         // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).
@@ -248,6 +274,7 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
+    @Cacheable(cacheNames = CacheNames.UI_DASHBOARD)
     public List<DashboardWidgetResponse> getDashboardWidgets() {
         // Single call — result cached in ThreadLocal for this request.
         // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).

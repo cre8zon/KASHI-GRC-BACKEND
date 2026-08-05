@@ -36,6 +36,35 @@ public final class KafkaTopics {
      */
     public static final String NOTIFICATION_EMAIL = "kashigrc.notification.email";
 
+    /**
+     * Assessment instantiation — produced by WorkflowEngineService when a
+     * SYSTEM step with automatedAction=EXECUTE_ASSESSMENT starts (instead of
+     * dispatching the handler synchronously and blocking whatever request
+     * thread caused the step to start), consumed by
+     * ExecuteAssessmentConsumer, which dispatches the same handler off the
+     * request thread and advances the workflow on completion.
+     * Event types: EXECUTE_ASSESSMENT_REQUESTED.
+     * Key: workflowInstanceId (per-instance ordering — a given workflow
+     * instance's automated actions must not race each other).
+     * Consumer group: kashigrc-assessment.
+     */
+    public static final String ASSESSMENT_EXECUTE_REQUESTED = "kashigrc.assessment.execute-requested";
+
+    /**
+     * Audit engagement template snapshot — produced by AuditEngagementService.create()
+     * when a templateId is supplied (instead of running snapshotTemplate() + the
+     * optional workflow start inline, blocking whatever request thread is
+     * creating the engagement — a single POST /engagements call, or, worse,
+     * the project-instance cascade which creates one engagement per planned
+     * template in a loop). Consumed by AuditEngagementSnapshotConsumer.
+     * Event types: AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED.
+     * Key: engagementId (each engagement's own snapshot is independent —
+     * round-robin across engagements is fine, no cross-engagement ordering
+     * requirement).
+     * Consumer group: kashigrc-audit-engagement.
+     */
+    public static final String AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED = "kashigrc.audit.engagement-snapshot-requested";
+
     // ── Future topics (declared when implemented) ─────────────────────
     // public static final String WORKFLOW_EVENTS    = "kashigrc.workflow.events";
     // public static final String AUDIT_TRAIL        = "kashigrc.audit.trail";

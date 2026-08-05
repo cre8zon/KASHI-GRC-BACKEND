@@ -1,6 +1,9 @@
 package com.kashi.grc.common.kafka;
 
 import com.kashi.grc.common.config.multitenancy.TenantContext;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -35,6 +38,11 @@ import java.util.UUID;
  * Send is async and non-blocking; failures are logged with full context.
  * For events where loss is unacceptable (audit trail), we will add an
  * outbox pattern later — not needed for the foundation.
+ *
+ * METRICS (tag: topic, eventType): kashigrc.kafka.producer.sent (Counter,
+ * tag result=success|failure) and kashigrc.kafka.producer.latency (Timer) —
+ * this is the one place every publish in the app goes through, so it's also
+ * the one place that needs instrumenting to see producer health everywhere.
  */
 @Slf4j
 @Service
@@ -43,6 +51,7 @@ import java.util.UUID;
 public class KafkaEventPublisher {
 
     private final KafkaTemplate<String, KafkaEventEnvelope> kafkaTemplate;
+    private final MeterRegistry meterRegistry;
 
     /** Publish with tenant taken from the current request's TenantContext. */
     public void publish(String topic, String eventType, String key, Map<String, Object> payload) {
@@ -63,6 +72,8 @@ public class KafkaEventPublisher {
                 .payload(payload)
                 .build();
 
+        Timer.Sample sample = Timer.start(meterRegistry);
+
         // CONTRACT: publish() NEVER throws. send() is async for delivery but
         // can throw SYNCHRONOUSLY (metadata timeout when broker is down —
         // capped at max.block.ms — serialization failure, lazy producer
@@ -72,6 +83,7 @@ public class KafkaEventPublisher {
         // Loss-unacceptable events get the outbox pattern later, not throws.
         try {
             kafkaTemplate.send(topic, key, envelope).whenComplete((result, ex) -> {
+                recordSendMetric(topic, eventType, sample, ex == null);
                 if (ex != null) {
                     log.error("Kafka publish FAILED topic={} eventType={} eventId={} tenant={}: {}",
                             topic, eventType, envelope.getEventId(), tenantId, ex.getMessage());
@@ -84,8 +96,25 @@ public class KafkaEventPublisher {
                 }
             });
         } catch (Exception e) {
+            recordSendMetric(topic, eventType, sample, false);
             log.error("Kafka publish FAILED (synchronous) topic={} eventType={} eventId={} tenant={}: {}",
                     topic, eventType, envelope.getEventId(), tenantId, e.getMessage());
+        }
+    }
+
+    private void recordSendMetric(String topic, String eventType, Timer.Sample sample, boolean success) {
+        try {
+            String result = success ? "success" : "failure";
+            Counter.builder("kashigrc.kafka.producer.sent")
+                    .tag("topic", topic).tag("eventType", eventType).tag("result", result)
+                    .register(meterRegistry).increment();
+            sample.stop(Timer.builder("kashigrc.kafka.producer.latency")
+                    .tag("topic", topic).tag("result", result)
+                    .register(meterRegistry));
+        } catch (Exception e) {
+            // A metrics-recording failure must never affect publishing —
+            // same rule as everywhere else metrics are recorded in this app.
+            log.warn("[KAFKA-METRICS] Failed to record producer metric for topic={} — {}", topic, e.toString());
         }
     }
 }

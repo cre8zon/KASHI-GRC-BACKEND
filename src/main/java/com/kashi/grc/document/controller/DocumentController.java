@@ -353,8 +353,16 @@ public class DocumentController {
                 ? documentLinkRepository.findActiveByEntity(entityType, entityId, linkType)
                 : documentLinkRepository.findAllActiveByEntity(entityType, entityId);
 
+        // BATCHED — was one documentRepository.findById() per link. This is a
+        // universal "works for every module" endpoint, so the fix applies
+        // everywhere documents are listed against any entity.
+        List<Long> documentIds = links.stream().map(DocumentLink::getDocumentId).toList();
+        Map<Long, Document> documentsById = documentIds.isEmpty() ? Map.of()
+                : documentRepository.findAllById(documentIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(Document::getId, d -> d));
+
         List<Map<String, Object>> result = links.stream().map(lnk -> {
-            Document doc = documentRepository.findById(lnk.getDocumentId()).orElse(null);
+            Document doc = documentsById.get(lnk.getDocumentId());
             if (doc == null || !tenantId.equals(doc.getTenantId())) return null;
 
             Map<String, Object> m = new LinkedHashMap<>();

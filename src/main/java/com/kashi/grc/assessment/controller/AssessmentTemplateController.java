@@ -58,6 +58,7 @@ public class AssessmentTemplateController {
     private final SectionQuestionMappingRepository  sectionQuestionMappingRepository;
     private final QuestionOptionMappingRepository   questionOptionMappingRepository;
     private final DbRepository                      dbRepository;
+    private final com.kashi.grc.assessment.service.AssessmentTemplateStructureCacheService templateStructureCacheService;
     private final UtilityService                    utilityService;
     private final CsvImportService                  csvImportService;
 
@@ -377,6 +378,7 @@ public class AssessmentTemplateController {
 
         templateSectionMappingRepository.save(TemplateSectionMapping.builder()
                 .templateId(templateId).sectionId(sectionId).orderNo(effectiveOrder).build());
+        templateStructureCacheService.evictTemplateStructure(templateId);
 
         log.info("[TEMPLATE] Section id={} mapped to template id={} at order={}", sectionId, templateId, effectiveOrder);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(
@@ -397,6 +399,7 @@ public class AssessmentTemplateController {
         guardDraft(t, isSystem);
 
         templateSectionMappingRepository.deleteByTemplateIdAndSectionId(templateId, sectionId);
+        templateStructureCacheService.evictTemplateStructure(templateId);
         log.info("[TEMPLATE] Section id={} unmapped from template id={}", sectionId, templateId);
 
         return ResponseEntity.ok(ApiResponse.success(
@@ -437,6 +440,7 @@ public class AssessmentTemplateController {
                 .weight(req.getWeight())
                 .isMandatory(Boolean.TRUE.equals(req.getIsMandatory()))
                 .build());
+        evictTemplatesContainingSection(sectionId);
 
         log.info("[TEMPLATE] Question id={} mapped to section id={} at order={}", questionId, sectionId, effectiveOrder);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(Map.of(
@@ -464,6 +468,7 @@ public class AssessmentTemplateController {
         if (req.getIsMandatory() != null) sqm.setMandatory(Boolean.TRUE.equals(req.getIsMandatory()));
         if (req.getOrderNo() != null)     sqm.setOrderNo(req.getOrderNo());
         sectionQuestionMappingRepository.save(sqm);
+        evictTemplatesContainingSection(sectionId);
 
         log.info("[TEMPLATE] Question mapping updated | sectionId={} | questionId={}", sectionId, questionId);
         return ResponseEntity.ok(ApiResponse.success(Map.of(
@@ -480,6 +485,7 @@ public class AssessmentTemplateController {
 
         log.info("[TEMPLATE] Unmapping question id={} from section id={}", questionId, sectionId);
         sectionQuestionMappingRepository.deleteBySectionIdAndQuestionId(sectionId, questionId);
+        evictTemplatesContainingSection(sectionId);
         log.info("[TEMPLATE] Question id={} unmapped from section id={}", questionId, sectionId);
 
         return ResponseEntity.ok(ApiResponse.success(
@@ -534,6 +540,23 @@ public class AssessmentTemplateController {
             throw new BusinessException("TEMPLATE_PUBLISHED",
                     "Cannot modify a published template. Only Platform Admin can edit published templates.");
         }
+    }
+
+    /**
+     * A library section can be mapped into more than one template — question
+     * edits at the section level (add/update/remove) affect every template
+     * that includes this section, so every one of their cached structures
+     * needs evicting, not just "the" template (there isn't a single one to
+     * assume). Platform Admin CAN edit a PUBLISHED template's questions
+     * directly (see guardDraft — the published-lock only applies to non-system
+     * users), so relying on the 30-min TTL alone here would be wrong, not just
+     * slow: a published, already-in-use template could silently keep serving
+     * stale structure to new instantiations for up to 30 minutes after an
+     * admin edit.
+     */
+    private void evictTemplatesContainingSection(Long sectionId) {
+        templateSectionMappingRepository.findBySectionId(sectionId)
+                .forEach(tsm -> templateStructureCacheService.evictTemplateStructure(tsm.getTemplateId()));
     }
 
     private TemplateResponse toTemplateResponse(AssessmentTemplate t) {

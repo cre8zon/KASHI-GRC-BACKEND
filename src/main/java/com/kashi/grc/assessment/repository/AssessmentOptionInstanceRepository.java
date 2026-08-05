@@ -9,6 +9,7 @@ import jakarta.persistence.criteria.Root;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.stereotype.Repository;
 
+import java.util.Collection;
 import java.util.List;
 
 @Repository
@@ -16,6 +17,20 @@ public interface AssessmentOptionInstanceRepository
         extends JpaRepository<AssessmentOptionInstance, Long> {
 
     List<AssessmentOptionInstance> findByQuestionInstanceIdOrderByOrderNo(Long questionInstanceId);
+
+    /**
+     * Batch counterpart to findByQuestionInstanceIdOrderByOrderNo — ONE query
+     * for every question in a section/assessment instead of one per question.
+     * Fixes the last remaining per-question query in
+     * AssessmentController.getMySections — everything else in that method
+     * (questions, responses, user names, attachment counts) was already
+     * bulk-loaded, but options were still fetched inside the per-question map.
+     * Caller groups the flat list by questionInstanceId (e.g. via
+     * Collectors.groupingBy) and should preserve orderNo when consuming —
+     * this does not sort per-group the way the single-id query's derived
+     * name does.
+     */
+    List<AssessmentOptionInstance> findByQuestionInstanceIdInOrderByOrderNo(Collection<Long> questionInstanceIds);
 
     /**
      * Maximum score any option can give for a question.

@@ -21,6 +21,14 @@ public interface AuditControlInstanceRepository
 
     List<AuditControlInstance> findByEngagementId(Long engagementId);
 
+    /**
+     * Batch counterpart to findByEngagementId — ONE query for a whole list of
+     * engagement ids instead of one call per engagement. Fixes the N+1 in
+     * AuditEngagementController.getProjectInstanceReportData (a project with
+     * 20 engagements meant 20 separate control-instance queries).
+     */
+    List<AuditControlInstance> findByEngagementIdIn(java.util.Collection<Long> engagementIds);
+
     long countByEngagementId(Long engagementId);
 
     // ── Assignment ────────────────────────────────────────────────────────────

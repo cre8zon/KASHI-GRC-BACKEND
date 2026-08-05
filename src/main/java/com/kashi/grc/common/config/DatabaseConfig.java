@@ -179,7 +179,77 @@ public class DatabaseConfig {
 
             // notifications — unread count query fires on every page load via TopNav badge
             new String[]{ "notifications", "idx_notif_user_read",
-                    "CREATE INDEX idx_notif_user_read ON notifications (user_id, read_at)" }
+                    "CREATE INDEX idx_notif_user_read ON notifications (user_id, read_at)" },
+
+            // ── Added for the N+1 batch-query fixes done in this pass — these tables/
+            // columns weren't hit by any indexed lookup until the corresponding fix
+            // (findAll()+filter → indexed query, or full-fetch → COUNT query) existed.
+            // Without these, the batched/counted queries are fewer round trips but each
+            // one is still a full table scan — the fix's benefit is capped by whichever
+            // of the two is missing.
+
+            // audit_sections — CSV library import section resolution (was findAll() per row)
+            new String[]{ "audit_sections", "idx_asec_code_tenant",
+                    "CREATE INDEX idx_asec_code_tenant ON audit_sections (section_code, tenant_id)" },
+            new String[]{ "audit_sections", "idx_asec_parent_order",
+                    "CREATE INDEX idx_asec_parent_order ON audit_sections (parent_id, order_no)" },
+            new String[]{ "audit_sections", "idx_asec_tenant_parent_name",
+                    "CREATE INDEX idx_asec_tenant_parent_name ON audit_sections (tenant_id, parent_id, name(100))" },
+
+            // audit_controls — CSV import + control-test/policy mapping resolution
+            new String[]{ "audit_controls", "idx_actl_code_tenant",
+                    "CREATE INDEX idx_actl_code_tenant ON audit_controls (control_code, tenant_id)" },
+            new String[]{ "audit_controls", "idx_actl_name_tenant",
+                    "CREATE INDEX idx_actl_name_tenant ON audit_controls (name(150), tenant_id)" },
+
+            // audit_templates — CSV import template upsert
+            new String[]{ "audit_templates", "idx_atpl_name_tenant",
+                    "CREATE INDEX idx_atpl_name_tenant ON audit_templates (name(150), tenant_id)" },
+
+            // audit_tests — CSV import + control-test mapping resolution
+            new String[]{ "audit_tests", "idx_atest_ref_tenant",
+                    "CREATE INDEX idx_atest_ref_tenant ON audit_tests (test_ref, tenant_id)" },
+
+            // audit_section_instances — completeness-gate COUNT queries fire on EVERY
+            // single section assignment (not just bulk) — see
+            // checkAndFireEngagementsOnboardedGate/checkAndFireEvidenceOwnersAssignedGate.
+            // Without this, replacing "fetch every section" with a COUNT query still
+            // scans the whole table per call.
+            new String[]{ "audit_section_instances", "idx_asi_engagement_auditor",
+                    "CREATE INDEX idx_asi_engagement_auditor ON audit_section_instances (engagement_id, assigned_auditor_id)" },
+            new String[]{ "audit_section_instances", "idx_asi_engagement_auditee",
+                    "CREATE INDEX idx_asi_engagement_auditee ON audit_section_instances (engagement_id, auditee_assigned_user_id)" },
+
+            // audit_control_instances / audit_findings — project-instance report rollup
+            // (AuditEngagementController.getProjectInstanceReportData batch fix)
+            new String[]{ "audit_control_instances", "idx_aci_engagement",
+                    "CREATE INDEX idx_aci_engagement ON audit_control_instances (engagement_id)" },
+            new String[]{ "audit_findings", "idx_af_engagement_tenant",
+                    "CREATE INDEX idx_af_engagement_tenant ON audit_findings (engagement_id, tenant_id)" },
+
+            // assessment_question_instances — countByAssessmentIdIn/countBySectionInstanceIdIn
+            // (getVendorAssessments + getSectionsStatus batch fixes)
+            new String[]{ "assessment_question_instances", "idx_aqi_assessment",
+                    "CREATE INDEX idx_aqi_assessment ON assessment_question_instances (assessment_id)" },
+            new String[]{ "assessment_question_instances", "idx_aqi_section_instance",
+                    "CREATE INDEX idx_aqi_section_instance ON assessment_question_instances (section_instance_id)" },
+
+            // assessment_option_instances — findByQuestionInstanceIdInOrderByOrderNo
+            // (getMySections/getMyQuestions/buildSectionInstances/getMyReviewerSections —
+            // this was the single most repeated batch fix in the whole pass)
+            new String[]{ "assessment_option_instances", "idx_aoi_question_order",
+                    "CREATE INDEX idx_aoi_question_order ON assessment_option_instances (question_instance_id, order_no)" },
+
+            // workflow_instance_history — getFullHistoryForInstances (multi-instance
+            // history batch fix; also the underlying table for every single-instance
+            // history query, which benefits from this too)
+            new String[]{ "workflow_instance_history", "idx_wih_instance_performed",
+                    "CREATE INDEX idx_wih_instance_performed ON workflow_instance_history (workflow_instance_id, performed_at)" }
+
+            // NOTE: assessment_template_instances.assessment_id already has @Column(unique
+            // = true) on the entity, which Hibernate/ddl-auto=update creates as a unique
+            // constraint (and therefore an index) automatically — findByAssessmentIdIn on
+            // that table doesn't need a manual entry here.
     );
 
     @Bean

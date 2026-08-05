@@ -1,6 +1,7 @@
 package com.kashi.grc.workflow.automation;
 
 import com.kashi.grc.assessment.domain.*;
+import com.kashi.grc.assessment.dto.internal.TemplateStructureSnapshot;
 import com.kashi.grc.assessment.repository.*;
 import com.kashi.grc.vendor.domain.RiskTemplateMapping;
 import com.kashi.grc.vendor.domain.Vendor;
@@ -16,9 +17,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.sql.Timestamp;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -57,15 +59,8 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
     private final VendorAssessmentRepository           assessmentRepository;
     private final AssessmentTemplateRepository         templateRepository;
     private final AssessmentTemplateInstanceRepository templateInstanceRepository;
-    private final AssessmentSectionInstanceRepository  sectionInstanceRepository;
-    private final AssessmentSectionRepository          sectionRepository;
-    private final AssessmentQuestionInstanceRepository questionInstanceRepository;
-    private final AssessmentQuestionRepository         questionRepository;
-    private final AssessmentOptionInstanceRepository   optionInstanceRepository;
-    private final AssessmentQuestionOptionRepository   optionRepository;
-    private final TemplateSectionMappingRepository     templateSectionMappingRepository;
-    private final SectionQuestionMappingRepository     sectionQuestionMappingRepository;
-    private final QuestionOptionMappingRepository      questionOptionMappingRepository;
+    private final com.kashi.grc.assessment.service.AssessmentTemplateStructureCacheService templateStructureCacheService;
+    private final com.kashi.grc.common.jdbc.JdbcBatchInsertHelper jdbcBatchInsertHelper;
 
     @Override
     public String actionKey() {
@@ -188,124 +183,90 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
         templateInstanceRepository.save(templateInstance);
 
         // ── Snapshot sections + questions + options ───────────────────────────
-        // OLD: individual save() per section, question, option = 448 round-trips
-        //      × 20ms Aiven RTT = ~9 seconds just for this block.
-        // NEW: bulk-load all data in a handful of queries, build all objects
-        //      in memory, then saveAll() each type in one batched INSERT.
-        //      Result: 5 queries to read + 3 saveAll() calls = ~8 round-trips
-        //      instead of 448 — typically reduces this block from 9s to <1s.
+        // Read side: was 5 bulk-load queries every single instantiation, even
+        // though a template's structure only changes on a rare admin edit.
+        // Now: one call to the cached structure service — a Redis GET on a
+        // cache hit instead of 5 MySQL round trips. See
+        // AssessmentTemplateStructureCacheService for the cache design.
+        //
+        // Write side: JDBC batch inserts, tiered (sections, then questions,
+        // then options) via Statement.RETURN_GENERATED_KEYS — see
+        // jdbcBatchInsertHelper.batchInsertAndGetIds() below for why raw JDBC instead of saveAll()
+        // is required here (Hibernate cannot batch INSERTs for
+        // IDENTITY-strategy entities, which is everything in this app).
 
-        int questionCount = 0;
-        List<TemplateSectionMapping> sectionMappings =
-                templateSectionMappingRepository.findByTemplateIdOrderByOrderNo(templateId);
+        TemplateStructureSnapshot structure = templateStructureCacheService.getStructure(templateId);
 
-        // Bulk-load all sections for this template in one query
-        List<Long> sectionIds = sectionMappings.stream()
-                .map(TemplateSectionMapping::getSectionId).toList();
-        Map<Long, AssessmentSection> sectionMap = sectionRepository.findAllById(sectionIds)
-                .stream().collect(java.util.stream.Collectors.toMap(AssessmentSection::getId, s -> s));
+        // Single timestamp for the whole batch — mirrors what JPA auditing
+        // (@CreatedDate/@LastModifiedDate) would have stamped on each row
+        // individually; using one value for the batch is the standard
+        // approach and the sub-millisecond difference has no behavioral
+        // meaning anywhere downstream (nothing orders these instances by
+        // exact creation instant within a single assessment).
+        Timestamp now = Timestamp.valueOf(LocalDateTime.now());
 
-        // Bulk-load all question mappings for all sections in one query
-        List<SectionQuestionMapping> allQuestionMappings =
-                sectionQuestionMappingRepository.findBySectionIdInOrderByOrderNo(sectionIds);
+        // ── Tier 1: section instances ──────────────────────────────────────
+        List<Object[]> sectionRows = structure.sections().stream()
+                .map(s -> new Object[]{
+                        templateInstance.getId(), s.librarySectionId(),
+                        s.sectionName(), s.orderNo(), now, now
+                })
+                .toList();
+        List<Long> sectionInstanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO assessment_section_instances " +
+                        "(template_instance_id, original_section_id, section_name_snapshot, section_order_no, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                sectionRows);
 
-        List<Long> questionIds = allQuestionMappings.stream()
-                .map(SectionQuestionMapping::getQuestionId).toList();
-
-        // Bulk-load all questions in one query
-        Map<Long, AssessmentQuestion> questionMap = questionRepository.findAllById(questionIds)
-                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestion::getId, q -> q));
-
-        // Bulk-load all option mappings for all questions in one query
-        List<QuestionOptionMapping> allOptionMappings =
-                questionOptionMappingRepository.findByQuestionIdInOrderByOrderNo(questionIds);
-        List<Long> optionIds = allOptionMappings.stream()
-                .map(QuestionOptionMapping::getOptionId).toList();
-        Map<Long, AssessmentQuestionOption> optionMap = optionRepository.findAllById(optionIds)
-                .stream().collect(java.util.stream.Collectors.toMap(AssessmentQuestionOption::getId, o -> o));
-
-        // Group question mappings by section for easy lookup
-        Map<Long, List<SectionQuestionMapping>> questionsBySectionId = allQuestionMappings.stream()
-                .collect(java.util.stream.Collectors.groupingBy(SectionQuestionMapping::getSectionId));
-        // Group option mappings by question for easy lookup
-        Map<Long, List<QuestionOptionMapping>> optionsByQuestionId = allOptionMappings.stream()
-                .collect(java.util.stream.Collectors.groupingBy(QuestionOptionMapping::getQuestionId));
-
-        // Build + saveAll section instances
-        List<AssessmentSectionInstance> sectionInstances = new java.util.ArrayList<>();
-        for (TemplateSectionMapping tsm : sectionMappings) {
-            AssessmentSection section = sectionMap.get(tsm.getSectionId());
-            if (section == null) continue;
-            sectionInstances.add(AssessmentSectionInstance.builder()
-                    .templateInstanceId(templateInstance.getId())
-                    .originalSectionId(section.getId())
-                    .sectionNameSnapshot(section.getName())
-                    .sectionOrderNo(tsm.getOrderNo())
-                    .build());
-        }
-        sectionInstanceRepository.saveAll(sectionInstances);
-
-        // Build + saveAll question instances (sections now have IDs from saveAll)
-        List<AssessmentQuestionInstance> questionInstances = new java.util.ArrayList<>();
-        Map<Long, AssessmentSectionInstance> sectionInstanceBySectionId = new java.util.HashMap<>();
-        for (int i = 0; i < sectionMappings.size(); i++) {
-            AssessmentSection section = sectionMap.get(sectionMappings.get(i).getSectionId());
-            if (section == null || i >= sectionInstances.size()) continue;
-            sectionInstanceBySectionId.put(section.getId(), sectionInstances.get(i));
-        }
-
-        for (Map.Entry<Long, AssessmentSectionInstance> entry : sectionInstanceBySectionId.entrySet()) {
-            Long sectionId = entry.getKey();
-            AssessmentSectionInstance si = entry.getValue();
-            List<SectionQuestionMapping> qMappings = questionsBySectionId.getOrDefault(sectionId, List.of());
-            for (SectionQuestionMapping sqm : qMappings) {
-                AssessmentQuestion q = questionMap.get(sqm.getQuestionId());
-                if (q == null) continue;
-                questionInstances.add(AssessmentQuestionInstance.builder()
-                        .assessmentId(assessment.getId())
-                        .sectionInstanceId(si.getId())
-                        .originalQuestionId(q.getId())
-                        .questionTextSnapshot(q.getQuestionText())
-                        .responseType(q.getResponseType())
-                        .weight(sqm.getWeight())
-                        .isMandatory(sqm.isMandatory())
-                        .orderNo(sqm.getOrderNo())
-                        // Snapshot the tag at instantiation time — full isolation from future
-                        // tag changes on the library question. GuardEvaluator reads this
-                        // snapshot, never joins back to assessment_questions.
-                        // Was accidentally omitted during the bulk-save refactor — caused
-                        // all question_tag_snapshot values to be NULL on new assessments,
-                        // silently skipping the entire guard sweep on ciso-submit.
-                        .questionTagSnapshot(q.getQuestionTag())
-                        .build());
-                questionCount++;
+        // ── Tier 2: question instances ──────────────────────────────────────
+        // Flatten (sectionInstanceId, question) pairs in the same order as
+        // sectionRows/sectionInstanceIds so index i lines up across both.
+        record QuestionPair(Long sectionInstanceId, TemplateStructureSnapshot.QuestionSnapshot question) {}
+        List<QuestionPair> flatQuestions = new ArrayList<>();
+        for (int i = 0; i < structure.sections().size(); i++) {
+            Long sectionInstanceId = sectionInstanceIds.get(i);
+            for (var q : structure.sections().get(i).questions()) {
+                flatQuestions.add(new QuestionPair(sectionInstanceId, q));
             }
         }
-        questionInstanceRepository.saveAll(questionInstances);
 
-        // Build + saveAll option instances
-        List<AssessmentOptionInstance> optionInstances = new java.util.ArrayList<>();
-        for (AssessmentQuestionInstance qi : questionInstances) {
-            List<QuestionOptionMapping> oMappings =
-                    optionsByQuestionId.getOrDefault(qi.getOriginalQuestionId(), List.of());
-            for (QuestionOptionMapping qom : oMappings) {
-                AssessmentQuestionOption opt = optionMap.get(qom.getOptionId());
-                if (opt == null) continue;
-                optionInstances.add(AssessmentOptionInstance.builder()
-                        .questionInstanceId(qi.getId())
-                        .originalOptionId(opt.getId())
-                        .optionValue(opt.getOptionValue())
-                        .score(opt.getScore())
-                        .orderNo(qom.getOrderNo())
-                        .build());
+        List<Object[]> questionRows = flatQuestions.stream()
+                .map(p -> new Object[]{
+                        assessment.getId(), p.sectionInstanceId(), p.question().libraryQuestionId(),
+                        p.question().questionText(), p.question().responseType(),
+                        p.question().weight(), p.question().mandatory(), p.question().orderNo(),
+                        p.question().questionTag(), now, now
+                })
+                .toList();
+        List<Long> questionInstanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO assessment_question_instances " +
+                        "(assessment_id, section_instance_id, original_question_id, question_text_snapshot, " +
+                        "response_type, weight, is_mandatory, order_no, question_tag_snapshot, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                questionRows);
+        int questionCount = questionInstanceIds.size();
+
+        // ── Tier 3: option instances ─────────────────────────────────────────
+        List<Object[]> optionRows = new ArrayList<>();
+        for (int i = 0; i < flatQuestions.size(); i++) {
+            Long questionInstanceId = questionInstanceIds.get(i);
+            for (var opt : flatQuestions.get(i).question().options()) {
+                optionRows.add(new Object[]{
+                        questionInstanceId, opt.libraryOptionId(), opt.optionValue(),
+                        opt.score(), opt.orderNo(), now, now
+                });
             }
         }
-        optionInstanceRepository.saveAll(optionInstances);
+        jdbcBatchInsertHelper.batchInsertAndGetIds(
+                "INSERT INTO assessment_option_instances " +
+                        "(question_instance_id, original_option_id, option_value, score, order_no, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                optionRows);
 
         log.info("[EXECUTE_ASSESSMENT] Done | assessmentId={} | templateInstanceId={} | " +
                         "sections={} | questions={}",
                 assessment.getId(), templateInstance.getId(),
-                sectionMappings.size(), questionCount);
+                structure.sections().size(), questionCount);
 
         return true;
     }

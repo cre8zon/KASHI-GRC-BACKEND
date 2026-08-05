@@ -24,6 +24,15 @@ public class AuditEngagementResponse {
     private Long   leadAuditorId;
     private Long   ownerId;
     private Integer totalControls;
+    /**
+     * Async provisioning state — null/"READY" = snapshot complete (existing
+     * engagements created before this field existed are null, treated as
+     * READY), "PROVISIONING" = section/control snapshot + workflow start
+     * still running in the background (totalControls will read 0 until
+     * then), "FAILED" = the background snapshot hit an unrecoverable error.
+     * See AuditEngagementService.completeEngagementProvisioning.
+     */
+    private String  snapshotStatus;
     private Integer testedControls;
     private Integer submittedControls;
     private Integer passedControls;

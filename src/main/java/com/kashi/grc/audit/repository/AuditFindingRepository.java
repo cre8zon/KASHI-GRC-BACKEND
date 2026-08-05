@@ -14,6 +14,14 @@ public interface AuditFindingRepository extends JpaRepository<AuditFinding, Long
 
     List<AuditFinding> findByEngagementIdAndTenantId(Long engagementId, Long tenantId);
 
+    /**
+     * Batch counterpart to findByEngagementIdAndTenantId — ONE query for a
+     * whole list of engagement ids instead of one call per engagement. See
+     * AuditControlInstanceRepository.findByEngagementIdIn for why.
+     */
+    List<AuditFinding> findByEngagementIdInAndTenantId(
+            java.util.Collection<Long> engagementIds, Long tenantId);
+
     List<AuditFinding> findByControlInstanceIdAndTenantId(Long controlInstanceId, Long tenantId);
 
     Optional<AuditFinding> findByIdAndTenantId(Long id, Long tenantId);

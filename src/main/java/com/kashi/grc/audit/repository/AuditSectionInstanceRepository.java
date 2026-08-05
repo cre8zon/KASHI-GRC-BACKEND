@@ -19,6 +19,19 @@ public interface AuditSectionInstanceRepository
 
     List<AuditSectionInstance> findByEngagementIdOrderByPathAscOrderNoAsc(Long engagementId);
 
+    long countByEngagementId(Long engagementId);
+
+    /**
+     * Used by checkAndFireEngagementsOnboardedGate/checkAndFireEvidenceOwnersAssignedGate
+     * to check "is everything assigned yet" WITHOUT fetching every section row in
+     * the engagement (which could be 100+ full entities) just to check a single
+     * boolean. A COUNT query lets the DB answer directly instead of transferring
+     * and hydrating every row so Java can iterate allMatch() over them.
+     */
+    long countByEngagementIdAndAssignedAuditorIdIsNull(Long engagementId);
+
+    long countByEngagementIdAndAuditeeAssignedUserIdIsNull(Long engagementId);
+
     List<AuditSectionInstance> findByEngagementIdAndParentInstanceIdIsNullOrderByOrderNoAsc(Long engagementId);
 
     List<AuditSectionInstance> findByParentInstanceIdOrderByOrderNoAsc(Long parentInstanceId);

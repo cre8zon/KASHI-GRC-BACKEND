@@ -203,6 +203,12 @@ public class AuditTestController {
         List<AuditControlTestMapping> mappings =
                 controlTestMappingRepository.findByControlIdOrderByOrderNoAsc(controlId);
 
+        // BATCHED — was one testRepository.findById() per row.
+        List<Long> testIds = mappings.stream().map(AuditControlTestMapping::getTestId).toList();
+        Map<Long, AuditTest> testsById = testIds.isEmpty() ? Map.of()
+                : testRepository.findAllById(testIds).stream()
+                  .collect(Collectors.toMap(AuditTest::getId, t -> t));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",   m.getId());
@@ -211,13 +217,14 @@ public class AuditTestController {
             row.put("isRequired",  m.isRequired());
             row.put("orderNo",     m.getOrderNo());
             row.put("mappingNote", m.getMappingNote());
-            testRepository.findById(m.getTestId()).ifPresent(t -> {
+            AuditTest t = testsById.get(m.getTestId());
+            if (t != null) {
                 row.put("testName",        t.getName());
                 row.put("testRef",         t.getTestRef());
                 row.put("automationType",  t.getAutomationType());
                 row.put("frequency",       t.getFrequency());
                 row.put("controlTag",      t.getControlTag());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -231,6 +238,12 @@ public class AuditTestController {
         List<AuditControlTestMapping> mappings =
                 controlTestMappingRepository.findByTestIdOrderByOrderNoAsc(testId);
 
+        // BATCHED — was one controlRepository.findById() per row.
+        List<Long> controlIds = mappings.stream().map(AuditControlTestMapping::getControlId).toList();
+        Map<Long, AuditControl> controlsById = controlIds.isEmpty() ? Map.of()
+                : controlRepository.findAllById(controlIds).stream()
+                  .collect(Collectors.toMap(AuditControl::getId, c -> c));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",   m.getId());
@@ -238,13 +251,14 @@ public class AuditTestController {
             row.put("controlId",   m.getControlId());
             row.put("isRequired",  m.isRequired());
             row.put("orderNo",     m.getOrderNo());
-            controlRepository.findById(m.getControlId()).ifPresent(c -> {
+            AuditControl c = controlsById.get(m.getControlId());
+            if (c != null) {
                 row.put("controlName", c.getName());
                 row.put("controlCode", c.getControlCode());
                 row.put("controlTag",  c.getControlTag());
                 row.put("testType",    c.getTestType() != null ? c.getTestType().name() : null);
                 row.put("frameworkRef",c.getFrameworkRef());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 
