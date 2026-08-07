@@ -11,6 +11,7 @@ import com.kashi.grc.common.service.MailService;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.common.repository.DbRepository;
 import com.kashi.grc.usermanagement.domain.Role;
+import com.kashi.grc.usermanagement.domain.RoleSide;
 import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.usermanagement.domain.UserAttribute;
 import com.kashi.grc.usermanagement.domain.UserStatus;
@@ -76,6 +77,16 @@ public class UserServiceImpl implements UserService {
         // Generate temporary password; user must reset on first login
         String tempPassword = UUID.randomUUID().toString();
 
+        // A vendor-side creator can only ever create users for their OWN
+        // vendor — their own vendorId is authoritative and overrides
+        // anything sent in the request (same rule listUsers already applies
+        // when scoping reads). Org/System creators supply it explicitly via
+        // the vendor picker.
+        User creator = utilityService.getLoggedInDataContext();
+        Long effectiveVendorId = creator.getVendorId() != null
+                ? creator.getVendorId()
+                : request.getVendorId();
+
         User user = User.builder()
                 .tenantId(tenantId)
                 .email(request.getEmail())
@@ -86,7 +97,7 @@ public class UserServiceImpl implements UserService {
                 .jobTitle(request.getJobTitle())
                 .phone(request.getPhone())
                 .managerId(request.getManagerId())
-                .vendorId(request.getVendorId())
+                .vendorId(effectiveVendorId)
                 .status(UserStatus.ACTIVE)
                 .passwordResetRequired(true)
                 .build();
@@ -107,6 +118,36 @@ public class UserServiceImpl implements UserService {
                         "Cannot assign roles from more than one side to a single user. "
                                 + "A user's roles must all come from exactly one side.");
             }
+            // Same rule as RoleServiceImpl.assignRoleToUser: SYSTEM-side
+            // roles are reserved for the one Kashi System Tenant — creating
+            // a user with a SYSTEM role under any other tenant would give
+            // them platform-admin treatment despite belonging to a normal
+            // organisation.
+            boolean hasSystemRole = roles.stream().anyMatch(r -> r.getSide() == RoleSide.SYSTEM);
+            if (hasSystemRole && !com.kashi.grc.common.util.Constants.SYSTEM_TENANT_ID.equals(tenantId)) {
+                throw new ValidationException(
+                        "Cannot assign a SYSTEM-side role to a user outside the Kashi System Tenant. "
+                                + "SYSTEM roles are reserved for platform administration and can only "
+                                + "be held by users of that one tenant.");
+            }
+            // A VENDOR-side user must be tied to an actual vendor. When a
+            // vendor-side admin onboards a colleague this was implicit —
+            // the frontend passed their own vendorId — but an ORGANIZATION
+            // admin onboarding a vendor contact has no such context, so
+            // vendorId arrived null and the user was created orphaned:
+            // invisible to every vendor-scoped query (listUsers filters on
+            // vendorId) and unattached to any assessment. Require it
+            // explicitly rather than silently creating a broken row.
+            boolean hasVendorRole = roles.stream().anyMatch(r -> r.getSide() == RoleSide.VENDOR);
+            if (hasVendorRole && user.getVendorId() == null) {
+                throw new ValidationException(
+                        "A vendor must be selected when creating a VENDOR-side user — "
+                                + "vendor users have to belong to a specific vendor.");
+            }
+            if (!hasVendorRole && user.getVendorId() != null) {
+                throw new ValidationException(
+                        "vendorId can only be set on a user holding VENDOR-side role(s).");
+            }
             user.setRoles(roles);
         }
 
@@ -120,6 +161,30 @@ public class UserServiceImpl implements UserService {
                     .filter(r -> r.getName().equals(request.getDefaultRoleName()) && r.getTenantId() == null)
                     .findFirst()
                     .ifPresent(role -> {
+                        // This path bypassed both guards above — it resolves a
+                        // role by NAME with no side or tenant validation, so
+                        // passing defaultRoleName="PLATFORM_ADMIN" would attach
+                        // a SYSTEM role to any user in any tenant. Same two
+                        // rules apply here as everywhere else: SYSTEM roles are
+                        // for the Kashi System Tenant only, and a user's roles
+                        // must all come from a single side.
+                        if (role.getSide() == RoleSide.SYSTEM
+                                && !com.kashi.grc.common.util.Constants.SYSTEM_TENANT_ID.equals(tenantId)) {
+                            throw new ValidationException(
+                                    "Cannot assign a SYSTEM-side role to a user outside the Kashi "
+                                            + "System Tenant. SYSTEM roles are reserved for platform "
+                                            + "administration.");
+                        }
+                        boolean conflictsWithExistingSide = savedUser.getRoles().stream()
+                                .map(Role::getSide)
+                                .filter(java.util.Objects::nonNull)
+                                .anyMatch(s -> s != role.getSide());
+                        if (conflictsWithExistingSide) {
+                            throw new ValidationException(
+                                    "Cannot assign a " + role.getSide() + "-side default role — this "
+                                            + "user already holds role(s) from a different side. A user "
+                                            + "cannot belong to more than one side.");
+                        }
                         savedUser.getRoles().add(role);
                         userRepository.save(savedUser);
                     });

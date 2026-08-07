@@ -63,10 +63,11 @@ public class RoleController {
     public ResponseEntity<ApiResponse<RoleInfoResponse>> createTenantRole(
             @PathVariable Long tenantId,
             @Valid @RequestBody RoleCreateRequest request) {
-        // tenantId in path is for documentation; service reads tenant from JWT.
-        // This endpoint exists as a REST-friendly alias.
+        // Path tenantId is now actually enforced (see RoleServiceImpl
+        // .createRoleForTenant) instead of being silently ignored in favor
+        // of the caller's own JWT tenant.
         return ResponseEntity.status(HttpStatus.CREATED)
-                .body(ApiResponse.success(roleService.createRole(request)));
+                .body(ApiResponse.success(roleService.createRoleForTenant(tenantId, request)));
     }
 
     // ── DELETE ROLE ───────────────────────────────────────────────
@@ -93,13 +94,28 @@ public class RoleController {
         return ResponseEntity.ok(ApiResponse.success(roleService.updateRolePermissions(roleId, request)));
     }
 
+    // ── SUSPEND / REACTIVATE ROLE ─────────────────────────────────
+    @PatchMapping("/v1/roles/{roleId}/status")
+    @Operation(summary = "Park (SUSPENDED) or reactivate (ACTIVE) a role")
+    public ResponseEntity<ApiResponse<RoleInfoResponse>> setRoleStatus(
+            @PathVariable Long roleId,
+            @RequestBody Map<String, String> body) {
+        return ResponseEntity.ok(ApiResponse.success(
+                roleService.setRoleStatus(roleId, body.get("status"))));
+    }
+
     // ── GET ROLE HIERARCHY ────────────────────────────────────────
     @GetMapping("/v1/tenants/{tenantId}/roles/hierarchy")
     @Operation(summary = "Retrieve complete role structure with levels")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getRoleHierarchy(
             @PathVariable Long tenantId,
-            @RequestParam(required = false) String side) {
-        return ResponseEntity.ok(ApiResponse.success(roleService.getRoleHierarchy(tenantId, side)));
+            @RequestParam(required = false) String side,
+            @RequestParam(required = false, defaultValue = "false") boolean includeSuspended) {
+        // includeSuspended=true is for RBAC admin screens only — every
+        // assignment path leaves it false so suspended roles stay out of
+        // the assignable catalogue.
+        return ResponseEntity.ok(ApiResponse.success(
+                roleService.getRoleHierarchy(tenantId, side, includeSuspended)));
     }
 
     // ── ASSIGN ROLE TO USER (alt path used by rolesApi.assignToUser) ─
