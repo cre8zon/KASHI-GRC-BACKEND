@@ -41,6 +41,23 @@ public class Role extends BaseEntity {
     @Builder.Default
     private Boolean isSystem = false;
 
+    /**
+     * ACTIVE | SUSPENDED. A suspended role is hidden from the assignable
+     * role catalogue (role pickers, invite/onboard forms) but stays fully
+     * visible in RBAC admin so it can be edited and reactivated — the point
+     * is to park a role that isn't fully built out yet without deleting it.
+     *
+     * Suspending does NOT revoke the role from users who already hold it.
+     * See RoleServiceImpl.setRoleStatus for the reasoning.
+     *
+     * Defaults to ACTIVE so every existing row keeps working unchanged when
+     * the column is added (ddl-auto=update leaves existing rows NULL, which
+     * the queries treat as ACTIVE — see RoleRepositoryImpl).
+     */
+    @Column(name = "status", length = 20)
+    @Builder.Default
+    private String status = "ACTIVE";
+
     @ManyToMany(fetch = FetchType.LAZY)
     @JoinTable(
             name = "role_permissions",

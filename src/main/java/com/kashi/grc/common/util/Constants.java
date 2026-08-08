@@ -26,6 +26,16 @@ public final class Constants {
     public static final String ROLE_SIDE_ORGANIZATION = "ORGANIZATION";
     public static final String ROLE_SIDE_VENDOR       = "VENDOR";
 
+    // ── Tenancy ───────────────────────────────────────────────────
+    // The one and only reserved tenant a SYSTEM-side (platform admin) user
+    // may belong to — "Kashi System Tenant". Nothing in the schema itself
+    // enforces this; it was previously duplicated as a private constant in
+    // DataInitializer and UiAdminController (both hardcoded to 1L), which is
+    // exactly the kind of scattered-magic-value drift that let a normal
+    // tenant's user end up holding a SYSTEM-side role undetected. Every
+    // place that needs "the system tenant" should reference this one value.
+    public static final Long   SYSTEM_TENANT_ID     = 1L;
+
     // ── Status values ─────────────────────────────────────────────
     public static final String STATUS_ACTIVE    = "ACTIVE";
     public static final String STATUS_INACTIVE  = "INACTIVE";
