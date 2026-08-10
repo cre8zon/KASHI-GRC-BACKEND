@@ -17,6 +17,37 @@ public class AssessmentQuestionInstanceRepositoryImpl
     private EntityManager em;
 
     @Override
+    public List<Object[]> countByAssessmentIdIn(java.util.Collection<Long> assessmentIds) {
+        if (assessmentIds == null || assessmentIds.isEmpty()) return List.of();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<AssessmentQuestionInstance> q = cq.from(AssessmentQuestionInstance.class);
+
+        cq.multiselect(q.get("assessmentId"), cb.count(q))
+                .where(q.get("assessmentId").in(assessmentIds))
+                .groupBy(q.get("assessmentId"));
+        return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public List<Object[]> sumWeightByAssessmentIdIn(java.util.Collection<Long> assessmentIds) {
+        if (assessmentIds == null || assessmentIds.isEmpty()) return List.of();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<AssessmentQuestionInstance> q = cq.from(AssessmentQuestionInstance.class);
+
+        // Same NULL-weight-counts-as-1.0 rule as sumWeightByAssessmentId.
+        Expression<Double> weightOrOne = cb.<Double>selectCase()
+                .when(cb.isNotNull(q.get("weight")), q.<Double>get("weight"))
+                .otherwise(cb.literal(1.0));
+
+        cq.multiselect(q.get("assessmentId"), cb.coalesce(cb.sum(weightOrOne), 0.0))
+                .where(q.get("assessmentId").in(assessmentIds))
+                .groupBy(q.get("assessmentId"));
+        return em.createQuery(cq).getResultList();
+    }
+
+    @Override
     public Double sumWeightByAssessmentId(Long assessmentId) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Double> cq = cb.createQuery(Double.class);

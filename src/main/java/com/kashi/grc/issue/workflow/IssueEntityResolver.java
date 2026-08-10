@@ -68,4 +68,31 @@ public class IssueEntityResolver implements WorkflowEntityResolver {
                 .map(issue -> issue.getTitle())
                 .orElse(null);
     }
+
+    /**
+     * One query for every instance instead of one findById each. The task inbox
+     * resolves a title per workflow instance, so on a large inbox the single
+     * version was N sequential round trips.
+     */
+    @Override
+    public java.util.Map<Long, String> resolveEntityTitles(
+            java.util.Collection<WorkflowInstance> instances) {
+
+        java.util.Set<Long> issueIds = instances.stream()
+                .map(WorkflowInstance::getEntityId)
+                .filter(java.util.Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        if (issueIds.isEmpty()) return java.util.Map.of();
+
+        java.util.Map<Long, String> titleByIssueId = new java.util.HashMap<>();
+        issueRepository.findAllById(issueIds)
+                .forEach(i -> titleByIssueId.put(i.getId(), i.getTitle()));
+
+        java.util.Map<Long, String> out = new java.util.HashMap<>();
+        for (WorkflowInstance wi : instances) {
+            String title = titleByIssueId.get(wi.getEntityId());
+            if (title != null) out.put(wi.getId(), title);
+        }
+        return out;
+    }
 }

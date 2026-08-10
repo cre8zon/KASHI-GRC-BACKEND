@@ -8,4 +8,8 @@ public interface AssessmentTemplateInstanceRepository
         extends JpaRepository<AssessmentTemplateInstance, Long> {
 
     Optional<AssessmentTemplateInstance> findByAssessmentId(Long assessmentId);
+
+    /** Bulk variant for list views — one query instead of one per assessment row. */
+    java.util.List<AssessmentTemplateInstance> findByAssessmentIdIn(
+            java.util.Collection<Long> assessmentIds);
 }

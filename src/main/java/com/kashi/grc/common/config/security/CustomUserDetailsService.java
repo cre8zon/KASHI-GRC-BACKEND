@@ -30,7 +30,15 @@ public class CustomUserDetailsService implements UserDetailsService {
         User user;
         try {
             Long userId = Long.parseLong(userIdOrEmail);
-            user = userRepository.findById(userId)
+
+            // Cached path — this method runs on every authenticated request, so the
+            // cheapest version of it is the one that does not touch the DB at all.
+            UserDetails cached = AUTH_CACHE.getIfPresent(userId);
+            if (cached != null) return cached;
+
+            // findWithRolesAndPermissionsById, not findById: the entity graph pulls
+            // roles and permissions in ONE query instead of one lazy select per role.
+            user = userRepository.findWithRolesAndPermissionsById(userId)
                     .orElseThrow(() -> new UsernameNotFoundException("User not found: " + userId));
         } catch (NumberFormatException e) {
             user = userRepository.findByEmailAndIsDeletedFalse(userIdOrEmail)
@@ -59,12 +67,45 @@ public class CustomUserDetailsService implements UserDetailsService {
                 .forEach(side ->
                         authorities.add(new SimpleGrantedAuthority("SIDE_" + side.name())));
 
-        return org.springframework.security.core.userdetails.User.builder()
+        UserDetails details = org.springframework.security.core.userdetails.User.builder()
                 .username(String.valueOf(user.getId()))
                 .password(user.getPasswordHash())
                 .authorities(authorities)
                 .accountLocked(user.isLocked())
                 .disabled(!user.isActive() && !user.isLocked())
                 .build();
+
+        AUTH_CACHE.put(user.getId(), details);
+        return details;
+    }
+
+    /**
+     * Short-lived cache of the built UserDetails, keyed by user id.
+     *
+     * WHY: authorities change only when roles or permissions are edited, which is
+     * rare, while this method runs on every single authenticated request. 60s is
+     * short enough that a permission change takes effect almost immediately and
+     * long enough to remove the DB from the hot path entirely.
+     *
+     * Call invalidate(userId) — or invalidateAll() — from role/permission admin
+     * code if you need a change to apply instantly rather than within the minute.
+     * Lock and enabled state are also cached, so a user disabled mid-session keeps
+     * access for up to 60s; drop expireAfterWrite if that matters more than the
+     * latency.
+     */
+    private static final com.github.benmanes.caffeine.cache.Cache<Long, UserDetails> AUTH_CACHE =
+            com.github.benmanes.caffeine.cache.Caffeine.newBuilder()
+                    .expireAfterWrite(java.time.Duration.ofSeconds(60))
+                    .maximumSize(10_000)
+                    .build();
+
+    /** Drop one user's cached authorities — call after a role or permission change. */
+    public static void invalidate(Long userId) {
+        if (userId != null) AUTH_CACHE.invalidate(userId);
+    }
+
+    /** Drop every cached entry — call after a bulk role/permission migration. */
+    public static void invalidateAll() {
+        AUTH_CACHE.invalidateAll();
     }
 }

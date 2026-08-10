@@ -114,6 +114,25 @@ public class ActionItemController {
         return ResponseEntity.ok(ApiResponse.success(items));
     }
 
+    /**
+     * Bulk oversight fetch: every action item for a set of entity ids.
+     *
+     *   GET /v1/action-items/by-entities?entityType=QUESTION_RESPONSE&entityIds=1,2,3
+     *
+     * Replaces one request per question on the assessment fill/review pages.
+     * Each returned item carries its entityId, so the client groups locally.
+     */
+    @GetMapping("/v1/action-items/by-entities")
+    @Operation(summary = "Get action items for many entities at once — avoids per-row requests")
+    public ResponseEntity<ApiResponse<List<ActionItemResponse>>> getForEntities(
+            @RequestParam ActionItem.EntityType entityType,
+            @RequestParam List<Long> entityIds) {
+        User user = utilityService.getLoggedInDataContext();
+        List<ActionItemResponse> items = actionItemService.getForEntities(
+                entityType, entityIds, user.getId(), resolveRoleNames(user), user.getTenantId());
+        return ResponseEntity.ok(ApiResponse.success(items));
+    }
+
     // ══════════════════════════════════════════════════════════════
     // GET BY ID — new
     // ══════════════════════════════════════════════════════════════

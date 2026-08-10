@@ -3,6 +3,7 @@ package com.kashi.grc.assessment.controller;
 import com.kashi.grc.actionitem.domain.ActionItem;
 import com.kashi.grc.actionitem.repository.ActionItemRepository;
 import com.kashi.grc.actionitem.specification.ActionItemSpecification;
+import com.kashi.grc.assessment.domain.AssessmentOptionInstance;
 import com.kashi.grc.assessment.domain.AssessmentQuestionInstance;
 import com.kashi.grc.assessment.domain.AssessmentResponse;
 import com.kashi.grc.assessment.repository.AssessmentOptionInstanceRepository;
@@ -187,6 +188,16 @@ public class VendorItemActionController {
                 ? Long.parseLong(body.get("selectedOptionInstanceId").toString()) : null;
         String overrideReason = body.getOrDefault("overrideReason", "").toString().trim();
 
+        @SuppressWarnings("unchecked")
+        java.util.List<Number> rawMultiIds = body.get("selectedOptionInstanceIds") instanceof java.util.List
+                ? (java.util.List<Number>) body.get("selectedOptionInstanceIds") : null;
+        java.util.List<Long> selectedOptIds = rawMultiIds == null ? java.util.List.of()
+                : rawMultiIds.stream()
+                  .filter(java.util.Objects::nonNull)
+                  .map(Number::longValue)
+                  .distinct()
+                  .toList();
+
         assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
         AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)
@@ -194,6 +205,47 @@ public class VendorItemActionController {
         if (!qi.getAssessmentId().equals(assessmentId))
             throw new com.kashi.grc.common.exception.ValidationException(
                     "QuestionInstance does not belong to assessment " + assessmentId);
+
+        // ── VALIDATE THE REPLACEMENT ANSWER ───────────────────────────────────
+        // Previously nothing checked that an answer was actually supplied. An
+        // empty body sailed through: upsertResponse wrote NULL text and NULL
+        // option — wiping the contributor's answer — and the response was still
+        // stamped OVERRIDDEN. A choice question then rendered with every option
+        // deselected under an "Overridden" badge, with no answer of record.
+        //
+        // An override REPLACES an answer, so it must itself be a valid answer of
+        // the question's own type. Describing the right option in prose is not a
+        // selection: it does not display, does not score, and does not survive
+        // into the org-side review.
+        String qType = qi.getResponseType() != null ? qi.getResponseType() : "";
+        boolean hasText = overrideText != null && !overrideText.isBlank();
+
+        if ("SINGLE_CHOICE".equals(qType)) {
+            if (selectedOptId == null && selectedOptIds.size() == 1) selectedOptId = selectedOptIds.get(0);
+            if (selectedOptId == null)
+                throw new com.kashi.grc.common.exception.ValidationException(
+                        "selectedOptionInstanceId is required to override a SINGLE_CHOICE question");
+        } else if ("MULTI_CHOICE".equals(qType)) {
+            if (selectedOptIds.isEmpty() && selectedOptId != null) selectedOptIds = java.util.List.of(selectedOptId);
+            if (selectedOptIds.isEmpty())
+                throw new com.kashi.grc.common.exception.ValidationException(
+                        "selectedOptionInstanceIds is required to override a MULTI_CHOICE question");
+        } else if (!hasText) {
+            throw new com.kashi.grc.common.exception.ValidationException(
+                    "responseText is required to override this question");
+        }
+
+        // Every supplied option must belong to THIS question — otherwise an
+        // override could point at another question's option and score off it.
+        java.util.List<Long> optIdsToCheck = new java.util.ArrayList<>(selectedOptIds);
+        if (selectedOptId != null && !optIdsToCheck.contains(selectedOptId)) optIdsToCheck.add(selectedOptId);
+        for (Long optId : optIdsToCheck) {
+            AssessmentOptionInstance opt = optionInstanceRepository.findById(optId)
+                    .orElseThrow(() -> new ResourceNotFoundException("OptionInstance", optId));
+            if (!questionInstanceId.equals(opt.getQuestionInstanceId()))
+                throw new com.kashi.grc.common.exception.ValidationException(
+                        "OptionInstance " + optId + " does not belong to question " + questionInstanceId);
+        }
 
         // Preserve original answer as SYSTEM comment before overwriting
         responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(
@@ -208,16 +260,53 @@ public class VendorItemActionController {
                             "Original answer by " + originalBy + ": " + truncate(originalText, 200));
                 });
 
-        // Calculate score for override option if a choice was selected
+        // ── SCORE THE OVERRIDE THE SAME WAY A NORMAL ANSWER IS SCORED ─────────
+        // This previously stored the RAW option score. The normal answer path
+        // (AssessmentController#submitAnswer) stores the NORMALISED WEIGHTED
+        // contribution — (score / max) × weight — so an override silently wrote a
+        // value on a different scale and skewed the assessment's compliance %.
+        double weight = qi.getWeight() != null ? qi.getWeight() : 1.0;
         Double scoreEarned = null;
-        if (selectedOptId != null)
-            scoreEarned = optionInstanceRepository.findById(selectedOptId)
-                    .map(opt -> opt.getScore()).orElse(null);
+        String textToStore = overrideText;
+        Long   optToStore  = selectedOptId;
+
+        if ("MULTI_CHOICE".equals(qType) && !selectedOptIds.isEmpty()) {
+            // Mirror submitAnswer's storage: JSON array in responseText, first id
+            // in selectedOptionInstanceId, so every existing read path still works.
+            java.util.List<Long> sorted = selectedOptIds.stream().sorted().toList();
+            try {
+                textToStore = new com.fasterxml.jackson.databind.ObjectMapper().writeValueAsString(sorted);
+            } catch (Exception e) {
+                textToStore = sorted.toString();
+            }
+            optToStore = sorted.get(0);
+
+            double sumAll = optionInstanceRepository.sumScoreByQuestionInstanceId(questionInstanceId);
+            if (sumAll > 0) {
+                double sumSelected = sorted.stream()
+                        .mapToDouble(oid -> optionInstanceRepository.findById(oid)
+                                .map(o -> o.getScore() != null ? o.getScore() : 0.0).orElse(0.0))
+                        .sum();
+                scoreEarned = (sumSelected / sumAll) * weight;
+            } else {
+                scoreEarned = weight;   // no scores configured — participation credit
+            }
+        } else if (optToStore != null) {
+            AssessmentOptionInstance selectedOpt = optionInstanceRepository.findById(optToStore).orElse(null);
+            if (selectedOpt != null && selectedOpt.getScore() != null) {
+                double maxScore = optionInstanceRepository.maxScoreByQuestionInstanceId(questionInstanceId);
+                scoreEarned = maxScore > 0 ? (selectedOpt.getScore() / maxScore) * weight : weight;
+            } else {
+                scoreEarned = weight;
+            }
+        } else if (hasText) {
+            scoreEarned = weight;       // TEXT/NUMERIC/DATE/FILE — binary, same as submitAnswer
+        }
 
         // Write override via native upsert (safe, no session poisoning)
         responseRepository.upsertResponse(
                 tenantId, assessmentId, questionInstanceId,
-                overrideText, selectedOptId,
+                textToStore, optToStore,
                 scoreEarned, userId, LocalDateTime.now());
 
         // Stamp OVERRIDDEN status

@@ -74,6 +74,54 @@ public class AssessmentResponseRepositoryImpl
         return result != null ? result : 0L;
     }
 
+    @Override
+    public java.util.List<Object[]> countAnsweredByAssessmentIdIn(
+            java.util.Collection<Long> assessmentIds) {
+        if (assessmentIds == null || assessmentIds.isEmpty()) return java.util.List.of();
+
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<AssessmentResponse> root = cq.from(AssessmentResponse.class);
+
+        Predicate hasText   = cb.isNotNull(root.get("responseText"));
+        Predicate hasOption = cb.isNotNull(root.get("selectedOptionInstanceId"));
+        Predicate hasScore  = cb.isNotNull(root.get("scoreEarned"));
+
+        cq.multiselect(root.get("assessmentId"), cb.count(root))
+                .where(
+                        root.get("assessmentId").in(assessmentIds),
+                        cb.or(hasText, hasOption, hasScore)
+                )
+                .groupBy(root.get("assessmentId"));
+
+        return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public java.util.List<Object[]> sumReviewerAdjustedScoreByAssessmentIdIn(
+            java.util.Collection<Long> assessmentIds) {
+        if (assessmentIds == null || assessmentIds.isEmpty()) return java.util.List.of();
+
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<AssessmentResponse> root = cq.from(AssessmentResponse.class);
+
+        Expression<Double> adjustedScore = cb.<Double>selectCase()
+                .when(cb.equal(root.<String>get("reviewerStatus"), "FAIL"), cb.literal(0.0))
+                .when(cb.equal(root.<String>get("reviewerStatus"), "PARTIAL"),
+                        cb.prod(root.<Double>get("scoreEarned"), cb.literal(PARTIAL_SCORE_MULTIPLIER)))
+                .otherwise(root.<Double>get("scoreEarned"));
+
+        cq.multiselect(root.get("assessmentId"), cb.sum(adjustedScore))
+                .where(
+                        root.get("assessmentId").in(assessmentIds),
+                        cb.isNotNull(root.get("scoreEarned"))
+                )
+                .groupBy(root.get("assessmentId"));
+
+        return em.createQuery(cq).getResultList();
+    }
+
     // ── 2. updateResponderStatus ──────────────────────────────────────────────
 
     @Override

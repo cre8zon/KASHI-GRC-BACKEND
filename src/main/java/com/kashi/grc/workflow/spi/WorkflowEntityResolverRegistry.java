@@ -134,6 +134,25 @@ public class WorkflowEntityResolverRegistry {
     public boolean supports(String entityType) {
         return byEntityType.containsKey(entityType);
     }
+    /**
+     * Bulk title resolution for one entity type. Returns an empty map when no
+     * resolver is registered, matching the single-instance behaviour of returning
+     * null rather than throwing.
+     */
+    public java.util.Map<Long, String> resolveEntityTitles(
+            String entityType, java.util.Collection<WorkflowInstance> instances) {
+        if (instances == null || instances.isEmpty()) return java.util.Map.of();
+        WorkflowEntityResolver resolver = byEntityType.get(entityType);
+        if (resolver == null) return java.util.Map.of();
+        try {
+            return resolver.resolveEntityTitles(instances);
+        } catch (Exception e) {
+            log.warn("[ENTITY-RESOLVER] resolveEntityTitles threw for entityType={}: {}",
+                    entityType, e.getMessage());
+            return java.util.Map.of();
+        }
+    }
+
     public String resolveEntityTitle(WorkflowInstance instance) {
         if (instance == null || instance.getEntityType() == null) return null;
         WorkflowEntityResolver resolver = byEntityType.get(instance.getEntityType());

@@ -26,4 +26,18 @@ public interface TaskInstanceRepositoryCustom {
      * behaviour explicitly: status = APPROVED.
      */
     List<TaskInstance> findActorTasksForInstance(Long workflowInstanceId, Long userId);
+
+    /**
+     * Count of the user's active tasks that sit on a live workflow instance.
+     *
+     * Mirrors the filter in WorkflowEngineService.getPendingTasksForUser exactly:
+     * active task statuses, and the owning workflow instance must itself be
+     * IN_PROGRESS / ON_HOLD / PENDING.
+     *
+     * Exists because the nav badge endpoint used to call
+     * getPendingTasksForUser(userId).size() — building the entire enriched task
+     * list, entity titles and all, purely to discard it and take the size. That is
+     * ~14 queries on every page load for a number.
+     */
+    long countActiveTasksOnLiveInstances(Long userId);
 }

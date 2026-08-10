@@ -453,6 +453,10 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .selectable(l.isSelectable()).reorderable(l.isReorderable())
                 .layoutMode(l.getLayoutMode() != null ? l.getLayoutMode() : "FULL_PAGE")
                 .tabsJson(l.getTabsJson())
+                // Was missing: without it the client's parseRoleAccessJson() always got
+                // undefined -> {} -> isItemAllowed() default-allow, so per-role tab and
+                // action visibility never applied at runtime on any screen.
+                .roleAccessJson(l.getRoleAccessJson() != null ? l.getRoleAccessJson() : "{}")
                 .build();
     }
 

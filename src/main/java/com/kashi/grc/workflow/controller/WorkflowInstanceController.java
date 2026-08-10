@@ -77,6 +77,7 @@ public class WorkflowInstanceController {
     // Change 1: roleRepository for eligible-users side/role filtering
     private final com.kashi.grc.usermanagement.repository.RoleRepository roleRepository;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepository;
+    private final com.kashi.grc.workflow.repository.TaskInstanceRepository taskInstanceRepository;
 
     // ══════════════════════════════════════════════════════════════
     // INSTANCE MANAGEMENT
@@ -110,7 +111,11 @@ public class WorkflowInstanceController {
     @Operation(summary = "Count of pending tasks for the current user — used for nav badge")
     public ResponseEntity<ApiResponse<Long>> getMyTaskCount() {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        long count = service.getPendingTasksForUser(userId).size();
+        // One COUNT, not getPendingTasksForUser(userId).size() — that built the
+        // whole enriched task list (steps, instances, workflow names, artifact ids,
+        // entity titles) just to take its size. This endpoint feeds the nav badge,
+        // so it runs on every page load: 2.47s for a 73-byte response.
+        long count = taskInstanceRepository.countActiveTasksOnLiveInstances(userId);
         return ResponseEntity.ok(ApiResponse.success(count));
     }
 
@@ -163,7 +168,11 @@ public class WorkflowInstanceController {
                 wi -> wi
         );
 
-        List<WorkflowInstanceResponse> responses = service.buildInstanceResponsesBulk(raw.getItems());
+        // includeSteps=false — the list view never renders nested steps or tasks
+        // (WorkflowPage reads those from the detail endpoint). Skipping them drops
+        // two of three queries and most of the 53KB payload.
+        List<WorkflowInstanceResponse> responses =
+                service.buildInstanceResponsesBulk(raw.getItems(), false);
 
         return ResponseEntity.ok(ApiResponse.success(
                 new PaginatedResponse<>(responses, raw.getPagination().getTotalItems(), pageDetails)));
