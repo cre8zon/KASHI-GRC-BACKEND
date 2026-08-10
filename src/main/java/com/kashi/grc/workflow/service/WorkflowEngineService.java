@@ -1380,16 +1380,29 @@ public class WorkflowEngineService {
             } catch (Exception ignored) {}
         }
 
+        // ── Titles: ONE bulk call per entity type ────────────────────────────
+        // This loop used to call resolveEntityTitle(wi) per instance, and both
+        // IssueEntityResolver and AuditEngagementEntityResolver answer that with a
+        // findById. For a user holding 410 tasks across ~150 workflow instances
+        // that was ~150 sequential round trips — the entire 38s of this method.
+        // Everything else here was already batched.
+        Map<String, List<WorkflowInstance>> instancesByType = instanceMap.values().stream()
+                .collect(java.util.stream.Collectors.groupingBy(
+                        wi -> wi.getEntityType() != null ? wi.getEntityType() : "UNKNOWN"));
+
+        for (Map.Entry<String, List<WorkflowInstance>> e : instancesByType.entrySet()) {
+            entityTitles.putAll(
+                    entityResolverRegistry.resolveEntityTitles(e.getKey(), e.getValue()));
+        }
+
+        // ── Artifact ids for non-VENDOR types ────────────────────────────────
+        // Every registered resolver's single-arg resolveArtifactId returns
+        // instance.getEntityId() with no DB access, so this loop is free. VENDOR is
+        // skipped — it was batch-resolved above via cycle → assessment.
         for (WorkflowInstance wi : instanceMap.values()) {
-            if ("VENDOR".equals(wi.getEntityType())) {
-                try { String t = entityResolverRegistry.resolveEntityTitle(wi);
-                    if (t != null) entityTitles.put(wi.getId(), t); } catch (Exception ignored) {}
-                continue; // artifactId already batch-resolved above
-            }
+            if ("VENDOR".equals(wi.getEntityType())) continue;
             try { Long aid = entityResolverRegistry.resolveArtifactId(wi);
                 if (aid != null) artifactIds.put(wi.getId(), aid); } catch (Exception ignored) {}
-            try { String t = entityResolverRegistry.resolveEntityTitle(wi);
-                if (t != null) entityTitles.put(wi.getId(), t); } catch (Exception ignored) {}
         }
 
         List<TaskInstanceResponse> result = tasks.stream().map(t -> {
@@ -1489,6 +1502,7 @@ public class WorkflowEngineService {
                 if (result.isPresent() && Boolean.TRUE.equals(result.get())) {
                     completeStep(si, StepStatus.APPROVED,
                             "Auto-approved by " + step.getAutomatedAction() + " (retry)");
+                    expirePendingTasks(si, null);   // same omission as the manual-advance path
                     recordHistory(instance, si, null, "STEP_AUTO_APPROVED",
                             StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
                             instance.getInitiatedBy(),
@@ -1667,6 +1681,11 @@ public class WorkflowEngineService {
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowStep", si.getStepId()));
 
         completeStep(si, StepStatus.APPROVED, remarks);
+        // Close anything still outstanding on this step. Every performAction path
+        // pairs completeStep with expirePendingTasks; this one did not, so a step
+        // completed out-of-band (template selection, admin advance) left its tasks
+        // PENDING in the assignees' inboxes for a step that was already APPROVED.
+        expirePendingTasks(si, null);
         recordHistory(instance, si, null, "STEP_MANUALLY_ADVANCED",
                 StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
                 performedBy, remarks);
@@ -2318,6 +2337,7 @@ public class WorkflowEngineService {
             if (result.isPresent() && Boolean.TRUE.equals(result.get())) {
                 // Auto-approve: mark step APPROVED and advance to next step
                 completeStep(si, StepStatus.APPROVED, "Auto-approved by " + step.getAutomatedAction());
+                expirePendingTasks(si, null);   // same omission as the manual-advance path
                 recordHistory(instance, si, null, "STEP_AUTO_APPROVED",
                         StepStatus.IN_PROGRESS.name(), StepStatus.APPROVED.name(),
                         instance.getInitiatedBy(),
@@ -3111,6 +3131,9 @@ public class WorkflowEngineService {
      * by the caller) so we skip it to avoid a redundant save.
      */
     private void expirePendingTasks(StepInstance si, Long excludeTaskId) {
+        // PENDING only. IN_PROGRESS means a compound task with some section gates
+        // already satisfied — real work in flight — so it is deliberately left
+        // alone here rather than being closed out from under its owner.
         List<TaskInstance> pending = taskInstanceRepository
                 .findByStepInstanceIdAndStatus(si.getId(), TaskStatus.PENDING)
                 .stream().filter(t -> !t.getId().equals(excludeTaskId)).toList();
@@ -3358,43 +3381,22 @@ public class WorkflowEngineService {
     }
 
     /** Builds full workflow instance response with all step and task instances. Logic unchanged. */
+    /**
+     * Single-instance response — delegates to the bulk builder.
+     *
+     * This used to walk the steps itself, issuing one findByStepInstanceId PER STEP
+     * plus a current-step refetch and a workflow lookup: 1 + N + 2 queries. On a
+     * 16-step TPRM workflow with revisits that is 20+ sequential round trips, and it
+     * is called from 17 places — including getInstanceById and the tail of EVERY
+     * performAction, so every task action paid it too.
+     *
+     * buildInstanceResponsesBulk produces byte-identical output in 3 queries
+     * regardless of step count, and resolves the current step from the already-loaded
+     * map rather than a second findById. Delegating fixes all 17 call sites at once.
+     */
     public WorkflowInstanceResponse buildInstanceResponse(WorkflowInstance instance) {
-        List<StepInstance> stepInstances = stepInstanceRepository
-                .findByWorkflowInstanceIdOrderByCreatedAtAsc(instance.getId());
-
-        // Step names, orders, and all display fields from snapshot — no blueprint load per step.
-        List<StepInstanceResponse> stepResponses = stepInstances.stream().map(si -> {
-            List<TaskInstanceResponse> tasks = taskInstanceRepository.findByStepInstanceId(si.getId())
-                    .stream().map(this::toTaskResponse).toList();
-
-            return StepInstanceResponse.builder()
-                    .id(si.getId()).workflowInstanceId(instance.getId())
-                    .stepId(si.getStepId())
-                    .stepName(si.getSnapName())
-                    .stepOrder(si.getSnapStepOrder())
-                    .status(si.getStatus()).startedAt(si.getStartedAt())
-                    .completedAt(si.getCompletedAt()).slaDueAt(si.getSlaDueAt())
-                    .iterationCount(si.getIterationCount()).remarks(si.getRemarks())
-                    .taskInstances(tasks).build();
-        }).toList();
-
-        // Current step context from snapshot — no blueprint lookup needed.
-        StepInstance currentSI = instance.getCurrentStepId() != null
-                ? stepInstanceRepository.findById(instance.getCurrentStepId()).orElse(null) : null;
-        Workflow workflow = workflowRepository.findById(instance.getWorkflowId()).orElse(null);
-
-        return WorkflowInstanceResponse.builder()
-                .id(instance.getId()).tenantId(instance.getTenantId())
-                .workflowId(instance.getWorkflowId())
-                .workflowName(workflow != null ? workflow.getName() : null)
-                .entityType(instance.getEntityType()).entityId(instance.getEntityId())
-                .currentStepId(instance.getCurrentStepId())
-                .currentStepName(currentSI != null ? currentSI.getSnapName() : null)
-                .currentStepOrder(currentSI != null ? currentSI.getSnapStepOrder() : null)
-                .status(instance.getStatus()).startedAt(instance.getStartedAt())
-                .completedAt(instance.getCompletedAt()).dueDate(instance.getDueDate())
-                .priority(instance.getPriority()).initiatedBy(instance.getInitiatedBy())
-                .remarks(instance.getRemarks()).stepInstances(stepResponses).build();
+        List<WorkflowInstanceResponse> out = buildInstanceResponsesBulk(List.of(instance));
+        return out.isEmpty() ? null : out.get(0);
     }
 
     /**
@@ -3410,7 +3412,63 @@ public class WorkflowEngineService {
      * instance — eliminates that query entirely rather than just batching it.
      */
     public List<WorkflowInstanceResponse> buildInstanceResponsesBulk(List<WorkflowInstance> instances) {
+        return buildInstanceResponsesBulk(instances, true);
+    }
+
+    /**
+     * Summary variant for list views — omits stepInstances entirely.
+     *
+     * WHY: GET /v1/workflow-instances returned every step instance and every task
+     * nested under each of the 20 rows — 53KB, and two of the three queries below
+     * existed purely to build it. Nothing reads it: WorkflowPage renders the nested
+     * steps from useInstance(id) (the detail endpoint), not from useInstances()
+     * (the list). The list only shows status, workflow name and current step.
+     *
+     * With includeSteps=false the current step is still resolved — by id, not by
+     * loading every step of every instance — so currentStepName/Order survive.
+     * WorkflowInstanceResponse is @JsonInclude(NON_NULL), so a null stepInstances
+     * is simply absent from the JSON rather than serialised as null.
+     */
+    public List<WorkflowInstanceResponse> buildInstanceResponsesBulk(
+            List<WorkflowInstance> instances, boolean includeSteps) {
         if (instances.isEmpty()) return List.of();
+
+        if (!includeSteps) {
+            // 1 query: only the CURRENT step of each instance, for its name/order.
+            List<Long> currentStepIds = instances.stream()
+                    .map(WorkflowInstance::getCurrentStepId)
+                    .filter(java.util.Objects::nonNull)
+                    .distinct().toList();
+            Map<Long, StepInstance> currentById = currentStepIds.isEmpty()
+                    ? Map.of()
+                    : stepInstanceRepository.findAllById(currentStepIds).stream()
+                      .collect(java.util.stream.Collectors.toMap(StepInstance::getId, s -> s));
+
+            // 1 query: workflow names.
+            Map<Long, Workflow> wfById = workflowRepository.findAllById(
+                            instances.stream().map(WorkflowInstance::getWorkflowId).distinct().toList())
+                    .stream().collect(java.util.stream.Collectors.toMap(Workflow::getId, w -> w));
+
+            return instances.stream().map(instance -> {
+                StepInstance currentSI = instance.getCurrentStepId() != null
+                        ? currentById.get(instance.getCurrentStepId()) : null;
+                Workflow workflow = wfById.get(instance.getWorkflowId());
+                return WorkflowInstanceResponse.builder()
+                        .id(instance.getId()).tenantId(instance.getTenantId())
+                        .workflowId(instance.getWorkflowId())
+                        .workflowName(workflow != null ? workflow.getName() : null)
+                        .entityType(instance.getEntityType()).entityId(instance.getEntityId())
+                        .currentStepId(instance.getCurrentStepId())
+                        .currentStepName(currentSI != null ? currentSI.getSnapName() : null)
+                        .currentStepOrder(currentSI != null ? currentSI.getSnapStepOrder() : null)
+                        .status(instance.getStatus()).startedAt(instance.getStartedAt())
+                        .completedAt(instance.getCompletedAt()).dueDate(instance.getDueDate())
+                        .priority(instance.getPriority()).initiatedBy(instance.getInitiatedBy())
+                        .remarks(instance.getRemarks())
+                        .build();   // stepInstances deliberately omitted
+            }).toList();
+        }
+
 
         List<Long> instanceIds = instances.stream().map(WorkflowInstance::getId).toList();
 

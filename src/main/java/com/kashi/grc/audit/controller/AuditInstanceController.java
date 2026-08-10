@@ -62,6 +62,27 @@ public class AuditInstanceController {
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
         Map<String, Object> result = buildControlMap(ctrl);
+
+        // AuditControlInstance has no evidence-guidance column of its own — the
+        // guidance lives on each mapped AuditTestInstance. Roll them up here so
+        // the Overview tab's "Evidence required" field stops rendering empty.
+        // Kept out of buildControlMap so recordControlTestResult stays query-free.
+        List<Long> guidanceTestIds = ctrlTestMappingRepo
+                .findByControlInstanceIdOrderByOrderNoAsc(id).stream()
+                .map(AuditControlInstanceTestMapping::getTestInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+        if (!guidanceTestIds.isEmpty()) {
+            String rolledUpGuidance = testRepo.findAllById(guidanceTestIds).stream()
+                    .map(AuditTestInstance::getEvidenceGuidanceSnapshot)
+                    .filter(g -> g != null && !g.isBlank())
+                    .distinct()
+                    .collect(Collectors.joining("\n\n"));
+            if (!rolledUpGuidance.isBlank()) {
+                result.put("evidenceGuidanceSnapshot", rolledUpGuidance);
+            }
+        }
+
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
@@ -73,6 +94,17 @@ public class AuditInstanceController {
         List<AuditControlInstanceTestMapping> mappings =
                 ctrlTestMappingRepo.findByControlInstanceIdOrderByOrderNoAsc(id);
 
+        // Batch-load every mapped test in one query. The previous findById inside
+        // the stream was an N+1 — one extra query per mapped test on every open.
+        List<Long> testInstanceIds = mappings.stream()
+                .map(AuditControlInstanceTestMapping::getTestInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, AuditTestInstance> testsById = testInstanceIds.isEmpty()
+                ? Map.of()
+                : testRepo.findAllById(testInstanceIds).stream()
+                  .collect(Collectors.toMap(AuditTestInstance::getId, t -> t));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",          m.getId());
@@ -80,7 +112,8 @@ public class AuditInstanceController {
             row.put("isRequired",         m.isRequired());
             row.put("orderNo",            m.getOrderNo());
             row.put("mappingNoteSnapshot",m.getMappingNoteSnapshot());
-            testRepo.findById(m.getTestInstanceId()).ifPresent(t -> {
+            AuditTestInstance t = testsById.get(m.getTestInstanceId());
+            if (t != null) {
                 row.put("testNameSnapshot",        t.getTestNameSnapshot());
                 row.put("testRefSnapshot",         t.getTestRefSnapshot());
                 row.put("testResult",              t.getTestResult());
@@ -89,7 +122,20 @@ public class AuditInstanceController {
                 row.put("runAt",                   t.getRunAt());
                 row.put("runBySystem",             t.isRunBySystem());
                 row.put("automationResult",        t.getAutomationRawResult());
-            });
+                // Added so the Fieldwork accordion opens without a second call,
+                // and so the Evidence tab can list what the auditee must upload.
+                // NOTE: testerNotes / failureDetail / exceptionReason are auditor
+                // commentary — the Evidence tab must not render them for auditees.
+                row.put("runByUserId",             t.getRunByUserId());
+                row.put("descriptionSnapshot",     t.getDescriptionSnapshot());
+                row.put("testProcedureSnapshot",   t.getTestProcedureSnapshot());
+                row.put("evidenceGuidanceSnapshot",t.getEvidenceGuidanceSnapshot());
+                row.put("frequencySnapshot",       t.getFrequencySnapshot());
+                row.put("testerNotes",             t.getTesterNotes());
+                row.put("failureDetail",           t.getFailureDetail());
+                row.put("exceptionReason",         t.getExceptionReason());
+                row.put("affectedControlCount",    t.getAffectedControlCount());
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -104,6 +150,16 @@ public class AuditInstanceController {
         List<AuditPolicyInstanceControlMapping> mappings =
                 policyCtrlMappingRepo.findByControlInstanceId(id);
 
+        // Batch-load — same N+1 fix as getControlTests above.
+        List<Long> policyInstanceIds = mappings.stream()
+                .map(AuditPolicyInstanceControlMapping::getPolicyInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, AuditPolicyInstance> policiesById = policyInstanceIds.isEmpty()
+                ? Map.of()
+                : policyRepo.findAllById(policyInstanceIds).stream()
+                  .collect(Collectors.toMap(AuditPolicyInstance::getId, p -> p));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",            m.getId());
@@ -111,14 +167,21 @@ public class AuditInstanceController {
             row.put("reviewContribution",   m.getReviewContribution());
             row.put("mappingTypeSnapshot",  m.getMappingTypeSnapshot());
             row.put("mappingNoteSnapshot",  m.getMappingNoteSnapshot());
-            policyRepo.findById(m.getPolicyInstanceId()).ifPresent(p -> {
+            AuditPolicyInstance p = policiesById.get(m.getPolicyInstanceId());
+            if (p != null) {
                 row.put("titleSnapshot",        p.getTitleSnapshot());
                 row.put("policyRefSnapshot",    p.getPolicyRefSnapshot());
                 row.put("versionSnapshot",      p.getVersionSnapshot());
                 row.put("reviewResult",         p.getReviewResult());
                 row.put("contentTypeSnapshot",  p.getContentTypeSnapshot());
                 row.put("policyStatusSnapshot", p.getPolicyStatusSnapshot());
-            });
+                // Added for the Fieldwork policy rows.
+                row.put("auditorNotes",         p.getAuditorNotes());
+                row.put("reviewedAt",           p.getReviewedAt());
+                row.put("externalUrlSnapshot",  p.getExternalUrlSnapshot());
+                row.put("nextReviewDateSnapshot", p.getNextReviewDateSnapshot());
+                row.put("contentBodySnapshot",  p.getContentBodySnapshot());
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -247,6 +310,16 @@ public class AuditInstanceController {
         List<AuditControlInstanceTestMapping> mappings =
                 ctrlTestMappingRepo.findByTestInstanceId(id);
 
+        // Batch-load — same N+1 fix as getControlTests above.
+        List<Long> mappedControlIds = mappings.stream()
+                .map(AuditControlInstanceTestMapping::getControlInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, AuditControlInstance> mappedControlsById = mappedControlIds.isEmpty()
+                ? Map.of()
+                : controlRepo.findAllById(mappedControlIds).stream()
+                  .collect(Collectors.toMap(AuditControlInstance::getId, c -> c));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",           m.getId());
@@ -254,14 +327,15 @@ public class AuditInstanceController {
             row.put("isRequired",          m.isRequired());
             row.put("orderNo",             m.getOrderNo());
             row.put("mappingNoteSnapshot", m.getMappingNoteSnapshot());
-            controlRepo.findById(m.getControlInstanceId()).ifPresent(c -> {
+            AuditControlInstance c = mappedControlsById.get(m.getControlInstanceId());
+            if (c != null) {
                 row.put("controlCodeSnapshot",c.getControlCodeSnapshot());
                 row.put("controlNameSnapshot",c.getControlNameSnapshot());
                 row.put("controlTagSnapshot", c.getControlTagSnapshot());
                 row.put("testResult",         c.getTestResult());
                 row.put("sectionBreadcrumb",  c.getSectionBreadcrumbSnapshot());
                 row.put("engagementId",       c.getEngagementId());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -385,6 +459,16 @@ public class AuditInstanceController {
         List<AuditPolicyInstanceControlMapping> mappings =
                 policyCtrlMappingRepo.findByPolicyInstanceId(id);
 
+        // Batch-load — same N+1 fix as getControlTests above.
+        List<Long> coveredControlIds = mappings.stream()
+                .map(AuditPolicyInstanceControlMapping::getControlInstanceId)
+                .distinct()
+                .collect(Collectors.toList());
+        Map<Long, AuditControlInstance> coveredControlsById = coveredControlIds.isEmpty()
+                ? Map.of()
+                : controlRepo.findAllById(coveredControlIds).stream()
+                  .collect(Collectors.toMap(AuditControlInstance::getId, c -> c));
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",           m.getId());
@@ -392,13 +476,14 @@ public class AuditInstanceController {
             row.put("reviewContribution",  m.getReviewContribution());
             row.put("mappingTypeSnapshot", m.getMappingTypeSnapshot());
             row.put("mappingNoteSnapshot", m.getMappingNoteSnapshot());
-            controlRepo.findById(m.getControlInstanceId()).ifPresent(c -> {
+            AuditControlInstance c = coveredControlsById.get(m.getControlInstanceId());
+            if (c != null) {
                 row.put("controlCodeSnapshot", c.getControlCodeSnapshot());
                 row.put("controlNameSnapshot", c.getControlNameSnapshot());
                 row.put("controlTagSnapshot",  c.getControlTagSnapshot());
                 row.put("testResult",          c.getTestResult());
                 row.put("sectionBreadcrumb",   c.getSectionBreadcrumbSnapshot());
-            });
+            }
             return row;
         }).collect(Collectors.toList());
 
@@ -577,6 +662,8 @@ public class AuditInstanceController {
         m.put("controlNameSnapshot",      c.getControlNameSnapshot());
         m.put("descriptionSnapshot",      c.getDescriptionSnapshot());
         m.put("testProcedureSnapshot",    c.getTestProcedure());
+        // No evidence-guidance column on AuditControlInstance — getControlInstance
+        // overwrites this by rolling up the mapped tests' evidenceGuidanceSnapshot.
         m.put("evidenceGuidanceSnapshot", null);
         m.put("controlTagSnapshot",       c.getControlTagSnapshot());
         m.put("testTypeSnapshot",         c.getTestTypeSnapshot());

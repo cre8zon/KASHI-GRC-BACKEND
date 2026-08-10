@@ -70,4 +70,26 @@ public interface WorkflowEntityResolver {
     default String resolveEntityTitle(WorkflowInstance instance) {
         return null;
     }
+
+    /**
+     * Resolves titles for MANY instances at once, keyed by workflowInstanceId.
+     *
+     * WHY THIS EXISTS:
+     *   The task inbox resolves a title per workflow instance. Doing that one at a
+     *   time is a round trip each — a user holding 410 tasks across ~150 instances
+     *   paid ~150 sequential queries, which was the whole of a 38s /my-tasks call.
+     *
+     * The default implementation just loops, so every existing resolver keeps
+     * working unchanged and is no slower than before. Override it wherever the
+     * lookup can be expressed as a single IN query.
+     */
+    default java.util.Map<Long, String> resolveEntityTitles(
+            java.util.Collection<WorkflowInstance> instances) {
+        java.util.Map<Long, String> out = new java.util.HashMap<>();
+        for (WorkflowInstance wi : instances) {
+            String title = resolveEntityTitle(wi);
+            if (title != null) out.put(wi.getId(), title);
+        }
+        return out;
+    }
 }

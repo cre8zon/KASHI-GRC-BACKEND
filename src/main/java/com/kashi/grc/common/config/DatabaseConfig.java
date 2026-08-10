@@ -62,15 +62,30 @@ public class DatabaseConfig {
         config.setIdleTimeout(300_000);
         config.setMaxLifetime(1_800_000);
 
-        // CRITICAL for Aiven: ping idle connections every 60s.
+        // CRITICAL for Aiven: ping idle connections every 30s.
         // Aiven drops idle MySQL connections at ~5 min. Without keepalive,
         // Hikari hands out a dead connection → 30s hang on the next request.
         config.setKeepaliveTime(30_000);
 
         config.setValidationTimeout(3_000);
-        config.setConnectionTestQuery("SELECT 1");
 
-        log.info("[DB-CONFIG] HikariCP pool ready | maxPool=20 | keepalive=60s");
+        // NO setConnectionTestQuery.
+        //
+        // Setting it makes Hikari run that query on EVERY connection checkout —
+        // one extra network round trip per request. Against Aiven at ~150ms RTT
+        // measured from here (the 15ms in the class javadoc is optimistic) that is
+        // ~150ms added to every single endpoint, and because it is raw JDBC rather
+        // than Hibernate it never appears in query-count profiling.
+        //
+        // MySQL Connector/J supports JDBC4, so Hikari uses Connection.isValid()
+        // instead: validated locally, no round trip. HikariCP's own guidance is to
+        // leave this unset on any JDBC4 driver.
+        //
+        // Dead-connection safety is unaffected — that is what keepaliveTime below
+        // handles, by pinging IDLE connections in the background rather than
+        // taxing every checkout.
+
+        log.info("[DB-CONFIG] HikariCP pool ready | maxPool=20 | keepalive=30s | JDBC4 isValid()");
         return new HikariDataSource(config);
     }
 

@@ -46,6 +46,22 @@ public interface AssessmentResponseRepositoryCustom {
     long countAnsweredByAssessmentId(Long assessmentId);
 
     /**
+     * Answered-response count per assessment, for a set of assessments — one
+     * GROUP BY instead of countAnsweredByAssessmentId once per row in a list view.
+     * Returns rows of [assessmentId, count].
+     */
+    java.util.List<Object[]> countAnsweredByAssessmentIdIn(
+            java.util.Collection<Long> assessmentIds);
+
+    /**
+     * Reviewer-adjusted score sum per assessment, for a set of assessments.
+     * Same FAIL→0 / PARTIAL→×multiplier rule as the single version.
+     * Returns rows of [assessmentId, adjustedSum].
+     */
+    java.util.List<Object[]> sumReviewerAdjustedScoreByAssessmentIdIn(
+            java.util.Collection<Long> assessmentIds);
+
+    /**
      * Bulk-update reviewer_status for all responses matching the given
      * (assessmentId, questionInstanceId) pair.
      * Replaces the former JPQL @Query UPDATE.

@@ -21,10 +21,18 @@ import java.util.List;
  *   WorkflowInstance.id → VendorAssessmentCycle → VendorAssessment → templateInstanceId
  *   → AssessmentSectionInstance.assignedUserId / reviewerAssignedUserId
  *
- * ── FILL steps (Responders Fill Questionnaires, Reviewers Evaluate Questions) ─
- *   stepAction = FILL, side = VENDOR
+ * ── FILL / REVIEW steps on the VENDOR side ───────────────────────────────────
+ *   stepAction = FILL or REVIEW, side = VENDOR
  *   → returns distinct assignedUserId values from assessment_section_instances
  *   → only Responders who were actually assigned sections by the CISO get tasks
+ *
+ *   REVIEW belongs here as well as FILL: "Responders Review and Publish Answers"
+ *   is the same population doing the next thing to the same sections. Previously
+ *   only FILL was matched, so REVIEW returned an empty list, the engine logged
+ *   "resolver returned 0 users" and fell back to ROLE_BASED — which fans out to
+ *   EVERY user holding VENDOR_RESPONDER, including responders who own no
+ *   sections and therefore have nothing to review. Those tasks can never be
+ *   completed by their owner and stall the step.
  *
  * ── REVIEW / EVALUATE steps (org-side reviewer steps) ────────────────────────
  *   stepAction = REVIEW or EVALUATE, side = ORGANIZATION
@@ -65,12 +73,18 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
         String side   = si.getSnapSide()   != null ? si.getSnapSide().toUpperCase()   : "";
         String action = si.getSnapStepAction() != null ? si.getSnapStepAction().name() : "";
 
-        // FILL on VENDOR side → Responders assigned sections by the CISO
-        if ("VENDOR".equals(side) && "FILL".equals(action)) {
+        // FILL or REVIEW on VENDOR side → Responders assigned sections by the CISO.
+        //
+        // Safe for other VENDOR-side REVIEW steps (e.g. "Vendor CISO Final Review"):
+        // the engine applies the step's configured actor roles as a filter to
+        // whatever this returns, and when that filter empties the list it falls
+        // back to ROLE_BASED. So a CISO-only REVIEW step still resolves to the
+        // CISO pool rather than to section responders.
+        if ("VENDOR".equals(side) && ("FILL".equals(action) || "REVIEW".equals(action))) {
             List<Long> ids = sectionInstanceRepository
                     .findDistinctAssignedResponderIds(templateInstanceId);
-            log.info("[VENDOR-ACTOR-RESOLVER] FILL step '{}' | templateInstanceId={} | {} assigned responder(s)",
-                    si.getSnapName(), templateInstanceId, ids.size());
+            log.info("[VENDOR-ACTOR-RESOLVER] {} step '{}' | templateInstanceId={} | {} assigned responder(s)",
+                    action, si.getSnapName(), templateInstanceId, ids.size());
             return ids;
         }
 

@@ -17,6 +17,9 @@ public interface ContributorSectionSubmissionRepository
     List<ContributorSectionSubmission> findByAssessmentIdAndContributorUserId(
             Long assessmentId, Long contributorUserId);
 
+    /** All contributors who have submitted a given section — used by the responder reopen. */
+    List<ContributorSectionSubmission> findBySectionInstanceId(Long sectionInstanceId);
+
     boolean existsBySectionInstanceIdAndContributorUserId(
             Long sectionInstanceId, Long contributorUserId);
 

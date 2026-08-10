@@ -90,6 +90,18 @@ public class ActionItemSpecification {
         );
     }
 
+    /**
+     * Same as forEntity but for many ids at once — backs the bulk endpoint that
+     * replaced one request per question on the assessment pages.
+     */
+    public static Specification<ActionItem> forEntities(ActionItem.EntityType type,
+                                                        java.util.Collection<Long> entityIds) {
+        return (root, query, cb) -> cb.and(
+                cb.equal(root.get("entityType"), type),
+                root.get("entityId").in(entityIds)
+        );
+    }
+
     public static Specification<ActionItem> forSource(ActionItem.SourceType type, Long sourceId) {
         return (root, query, cb) -> cb.and(
                 cb.equal(root.get("sourceType"), type),

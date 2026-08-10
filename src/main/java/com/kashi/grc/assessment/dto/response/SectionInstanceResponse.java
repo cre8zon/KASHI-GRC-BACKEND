@@ -14,6 +14,11 @@ public class SectionInstanceResponse {
     private Integer       sectionOrderNo;
     private Long          assignedUserId;
     private String        assignedUserName;
+    // Org-side reviewer assignment (ReviewController writes reviewerAssignedUserId).
+    // Exposed so AssignReviewersPanel can seed committed state on refresh — without
+    // this the panel showed "0/N assigned" after every reload.
+    private Long          reviewerAssignedUserId;
+    private String        reviewerAssignedUserName;
     // Submission state — null means editable, non-null means locked
     private LocalDateTime submittedAt;
     private Long          submittedBy;

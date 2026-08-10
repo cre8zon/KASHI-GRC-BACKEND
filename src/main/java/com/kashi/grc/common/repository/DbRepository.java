@@ -93,6 +93,49 @@ public class DbRepository {
         return new PaginatedResponse<>(results, total, pageDetails);
     }
 
+    /**
+     * Same as findAll, but the mapper receives the WHOLE PAGE instead of one entity
+     * at a time.
+     *
+     * WHY: a per-row mapper that needs related data has no way to batch it — it
+     * fires its lookups once per row. The assessment list mapper did 4-6 queries
+     * per assessment, so a page of 10 cost 40-60 sequential round trips to build a
+     * 3KB response. Handing the mapper the full list lets it resolve everything
+     * with a handful of IN queries.
+     *
+     * Identical pagination, filtering, sorting and counting — only the mapping
+     * callback shape differs.
+     */
+    public <E, R> PaginatedResponse<R> findAllBulk(
+            Class<E> entityClass,
+            PageDetails pageDetails,
+            BiFunction<CriteriaBuilder, Root<E>, List<Predicate>> basePredicates,
+            BiFunction<CriteriaBuilder, Root<E>, Map<String, Path<?>>> searchableFields,
+            Function<List<E>, List<R>> bulkMapper) {
+
+        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
+
+        CriteriaQuery<E> cq = cb.createQuery(entityClass);
+        Root<E> root = cq.from(entityClass);
+
+        List<Predicate> predicates = buildPredicates(cb, root, basePredicates, searchableFields, pageDetails);
+        cq.where(predicates.toArray(new Predicate[0]));
+        applySort(cb, cq, root, searchableFields, pageDetails);
+
+        var query = entityManager.createQuery(cq);
+        long skip = pageDetails.getSkip() != null ? pageDetails.getSkip() : 0L;
+        int  take = pageDetails.getTake() != null && pageDetails.getTake() > 0 ? pageDetails.getTake() : 10;
+        query.setFirstResult((int) skip);
+        query.setMaxResults(take);
+
+        List<E> page = query.getResultList();
+        List<R> results = page.isEmpty() ? List.of() : bulkMapper.apply(page);
+
+        long total = count(entityClass, cb, basePredicates, searchableFields, pageDetails);
+
+        return new PaginatedResponse<>(results, total, pageDetails);
+    }
+
     // Add to DbRepository.java
     public List<Long> findUserIdsByRoleAndTenant(Long roleId, Long tenantId) {
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();

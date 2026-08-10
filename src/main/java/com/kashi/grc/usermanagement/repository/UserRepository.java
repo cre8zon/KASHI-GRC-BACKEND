@@ -29,6 +29,19 @@ public interface UserRepository extends JpaRepository<User, Long> {
     // Spring Security builds GrantedAuthority from role.permissions.code.
     // Without the graph these would be separate SELECT per role per permission.
 
+    /**
+     * Token auth path. JwtAuthenticationFilter resolves the user by the JWT
+     * subject (the id) on EVERY request, and Spring Security then walks
+     * role.permissions to build authorities.
+     *
+     * Without the graph that is 1 + 1 + one-per-role lazy selects — 6 sequential
+     * round trips for a 4-role user, paid before any controller runs. The email
+     * variants below already had the graph; this id variant was missed, so every
+     * authenticated request in every module paid for it.
+     */
+    @EntityGraph(User.WITH_ROLES_PERMISSIONS)
+    Optional<User> findWithRolesAndPermissionsById(Long id);
+
     @EntityGraph(User.WITH_ROLES_PERMISSIONS)
     Optional<User> findByEmailAndIsDeletedFalse(String email);
 

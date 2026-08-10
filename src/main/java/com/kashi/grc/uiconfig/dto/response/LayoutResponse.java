@@ -15,4 +15,9 @@ public class LayoutResponse {
     private boolean reorderable;
     private String layoutMode;  // FULL_PAGE | DRAWER | SIDE_PANEL
     private String tabsJson;    // JSON array of tab definitions for DETAIL screens
+    // Per-role / per-side tab and action visibility. The runtime screen endpoint
+    // dropped this field, so isTabAllowed()/isActionAllowed() on the client always
+    // received {} and defaulted to allow — every RoleVisibilityEditor config saved
+    // in Screen Designer was silently ignored outside the designer itself.
+    private String roleAccessJson;
 }

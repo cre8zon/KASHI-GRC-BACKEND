@@ -267,6 +267,30 @@ public class ActionItemService {
                 .toList();
     }
 
+    /**
+     * Bulk variant of getForEntity — one query for many entity ids.
+     *
+     * The assessment pages render a per-question action-item banner; fetching them
+     * one id at a time meant ~2 HTTP requests per question (~180 on a 90-question
+     * assessment), all serialised behind the browser connection limit. Callers
+     * group the result by entityId themselves.
+     */
+    @Transactional(readOnly = true)
+    public List<ActionItemResponse> getForEntities(ActionItem.EntityType entityType,
+                                                   java.util.Collection<Long> entityIds,
+                                                   Long userId, List<String> userRoles,
+                                                   Long tenantId) {
+        if (entityIds == null || entityIds.isEmpty()) return List.of();
+
+        Specification<ActionItem> spec =
+                ActionItemSpecification.forTenant(tenantId)
+                        .and(ActionItemSpecification.forEntities(entityType, entityIds));
+
+        return actionItemRepository.findAll(spec).stream()
+                .map(a -> toResponse(a, userId, userRoles))
+                .toList();
+    }
+
     // ── Count ─────────────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)

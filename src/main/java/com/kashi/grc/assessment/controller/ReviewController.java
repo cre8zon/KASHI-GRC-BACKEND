@@ -120,6 +120,71 @@ public class ReviewController {
                 "reviewerAssignedUserName", resolveUserName(reviewerId))));
     }
 
+    /**
+     * Bulk-assign several sections to ONE reviewer in a single call.
+     *
+     *   PUT /v1/assessments/{assessmentId}/sections/reviewer-assign-batch
+     *   Body: { "userId": 123, "sectionInstanceIds": [11, 12, 13] }
+     *
+     * Org-side mirror of AssessmentController#assignSectionsBatch. Writes
+     * reviewerAssignedUserId only — never touches assignedUserId, which belongs
+     * to the vendor-side responder.
+     *
+     * Validates the entire batch before writing so a bad id rolls back rather
+     * than leaving a partial assignment. No route ambiguity with the single
+     * endpoint: /sections/{id}/reviewer-assign vs /sections/reviewer-assign-batch.
+     */
+    @PutMapping("/{assessmentId}/sections/reviewer-assign-batch")
+    @Transactional
+    @Operation(summary = "Org CISO assigns multiple sections to one reviewer at once")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reviewerAssignSectionsBatch(
+            @PathVariable Long assessmentId,
+            @RequestBody Map<String, Object> body) {
+
+        Long reviewerId = body.get("userId") instanceof Number n ? n.longValue() : null;
+        if (reviewerId == null)
+            throw new com.kashi.grc.common.exception.ValidationException("userId is required");
+
+        @SuppressWarnings("unchecked")
+        List<Number> rawIds = (List<Number>) body.get("sectionInstanceIds");
+        if (rawIds == null || rawIds.isEmpty())
+            throw new com.kashi.grc.common.exception.ValidationException("sectionInstanceIds is required");
+
+        AssessmentTemplateInstance ti = templateInstanceRepository.findByAssessmentId(assessmentId)
+                .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance", assessmentId));
+
+        List<Long> sectionIds = rawIds.stream()
+                .filter(Objects::nonNull)
+                .map(Number::longValue)
+                .distinct()
+                .toList();
+
+        List<AssessmentSectionInstance> targets = new ArrayList<>();
+        for (Long sid : sectionIds) {
+            AssessmentSectionInstance si = sectionInstanceRepository.findById(sid)
+                    .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sid));
+            if (!si.getTemplateInstanceId().equals(ti.getId()))
+                throw new com.kashi.grc.common.exception.ValidationException(
+                        "SectionInstance " + sid + " does not belong to assessment " + assessmentId);
+            targets.add(si);
+        }
+
+        targets.forEach(si -> si.setReviewerAssignedUserId(reviewerId));
+        sectionInstanceRepository.saveAll(targets);
+
+        log.info("[REVIEWER-ASSIGN-SECTIONS-BATCH] {} section(s) -> reviewerId={} | assessmentId={}",
+                targets.size(), reviewerId, assessmentId);
+
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("assessmentId",             assessmentId);
+        resp.put("reviewerAssignedUserId",   reviewerId);
+        resp.put("reviewerAssignedUserName", resolveUserName(reviewerId));
+        resp.put("sectionInstanceIds",       sectionIds);
+        resp.put("assigned",                 targets.size());
+        resp.put("message",                  targets.size() + " section(s) assigned to reviewer");
+        return ResponseEntity.ok(ApiResponse.success(resp));
+    }
+
     @GetMapping("/{assessmentId}/my-reviewer-sections")
     @Transactional(readOnly = true)
     @Operation(summary = "Reviewer fetches their assigned sections with questions (filtered by reviewerAssignedUserId). " +
