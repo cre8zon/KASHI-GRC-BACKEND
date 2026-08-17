@@ -2,6 +2,7 @@ package com.kashi.grc.issue.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kashi.grc.common.exception.BusinessException;
+import com.kashi.grc.common.exception.ValidationException;
 import com.kashi.grc.common.exception.ForbiddenException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.service.MailService;
@@ -63,6 +64,7 @@ public class IssueService {
     private final NotificationService                                notificationService;
     private final MailService                                        mailService;
     private final UserRepository                                     userRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
     private final ObjectMapper             objectMapper;
 
@@ -97,6 +99,20 @@ public class IssueService {
 
     @Transactional
     public IssueResponse create(IssueRequest req, Long createdBy, Long tenantId) {
+
+        // ── Guard: createdBy and ownerId must be real users of THIS tenant ──
+        // Workflow actor resolution reads these columns directly — step 1 of the
+        // issue workflow is ENTITY_CREATOR and step 2 is ENTITY_OWNER — so a bad
+        // id here does not fail loudly, it silently assigns a task to whoever
+        // holds that id. User ids are global, so that person is usually in a
+        // different tenant entirely.
+        //
+        // This is exactly how audit findings escalated with createdBy set to the
+        // TENANT id: the value was a valid user id, just not the right user, and
+        // nothing downstream could tell the difference.
+        requireTenantUser(createdBy, tenantId, "createdBy");
+        requireTenantUser(req.getOwnerId(), tenantId, "ownerId");
+
         String ref = buildIssueRef(tenantId);
 
         Issue issue = Issue.builder()
@@ -798,6 +814,39 @@ public class IssueService {
     private LocalDateTime computeDueAt(Issue.Severity severity) {
         long hours = RESOLVE_SLA_HOURS.getOrDefault(severity, 720L);
         return LocalDateTime.now().plusHours(hours);
+    }
+
+    /**
+     * Rejects a user id that is null, deleted, or belongs to another tenant.
+     * An issue with a stray actor id is worse than a failed create: it produces
+     * a real task in a real inbox belonging to the wrong organisation.
+     */
+    private void requireTenantUser(Long userId, Long tenantId, String field) {
+        if (userId == null) {
+            throw new ValidationException(
+                    "Cannot create issue: " + field + " is required. "
+                            + "Assign an owner before escalating.");
+        }
+        // Membership, not users.tenant_id.
+        //
+        // An external auditor's HOME tenant is their firm; they work in the
+        // client through a GUEST membership. Checking users.tenant_id therefore
+        // rejects exactly the people this whole model exists to admit — it was
+        // failing every auto-escalation whose finding was raised by a guest
+        // auditor, with "createdBy=169 is not an active user of this
+        // organization".
+        boolean ok = userRepository.findById(userId)
+                .filter(u -> !u.isDeleted())
+                .map(u -> tenantId.equals(u.getTenantId())
+                        || membershipRepository.findByUserIdAndTenantId(userId, tenantId)
+                        .map(m -> m.isUsable())
+                        .orElse(false))
+                .orElse(false);
+        if (!ok) {
+            throw new ValidationException(
+                    "Cannot create issue: " + field + "=" + userId
+                            + " is not an active user of this organization.");
+        }
     }
 
     private String buildIssueRef(Long tenantId) {

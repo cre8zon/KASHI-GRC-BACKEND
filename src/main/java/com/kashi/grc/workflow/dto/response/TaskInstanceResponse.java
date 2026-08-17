@@ -86,4 +86,19 @@ public class TaskInstanceResponse {
     private Long          artifactId;
     /** Human-readable title of the entity (e.g. issue title, policy name) */
     private String        entityTitle;
+
+    /**
+     * Which organization this task belongs to.
+     *
+     * TaskInstance has no tenant column (it extends BaseEntity) and the inbox
+     * query is findByAssignedUserIdAndStatusIn, so the endpoint has always
+     * returned every tenant's tasks together. Harmless while one identity meant
+     * one tenant; confusing the moment an external auditor works at three
+     * clients and sees them interleaved with no indication of which is which.
+     *
+     * Resolved through the step instance's workflow instance, which does carry
+     * tenant_id.
+     */
+    private Long          tenantId;
+    private String        tenantName;
 }

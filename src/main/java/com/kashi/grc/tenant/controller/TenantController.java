@@ -70,6 +70,7 @@ public class TenantController {
                 .name(req.getName()).code(req.getCode())
                 .description(req.getDescription()).plan(req.getPlan())
                 .maxUsers(req.getMaxUsers()).maxVendors(req.getMaxVendors())
+                .isAuditFirm(Boolean.TRUE.equals(req.getIsAuditFirm()))
                 .status("ACTIVE")
                 .build();
         tenantRepository.save(t);
@@ -266,6 +267,7 @@ public class TenantController {
                 .tenantId(t.getId()).name(t.getName()).code(t.getCode())
                 .description(t.getDescription()).status(t.getStatus())
                 .plan(t.getPlan()).maxUsers(t.getMaxUsers()).maxVendors(t.getMaxVendors())
+                .isAuditFirm(t.isAuditFirm())
                 .createdAt(t.getCreatedAt())
                 .build();
     }

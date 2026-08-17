@@ -90,6 +90,21 @@ public class AuditEngagement extends TenantAwareEntity {
     @Column(name = "lead_auditor_id")
     private Long leadAuditorId;
 
+    /**
+     * The auditee-side counterpart of the lead auditor: the client's own person
+     * accountable for evidence across this engagement.
+     *
+     * ownerId was standing in for this, but they are different jobs. The owner
+     * is who commissioned the engagement; the lead auditee runs the evidence
+     * effort, allocates controls to their colleagues, and steps in when someone
+     * stalls. Without the distinction, assigning evidence owners falls to the
+     * lead AUDITOR — who does not know that access reviews belong to the IAM
+     * lead — and with an external firm that means a stranger allocating work
+     * inside the client's org chart.
+     */
+    @Column(name = "lead_auditee_id")
+    private Long leadAuditeeId;
+
     /** CAE or engagement owner */
     @Column(name = "owner_id")
     private Long ownerId;

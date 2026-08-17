@@ -13,6 +13,13 @@ import java.util.Map;
 public interface AuthService {
 
     /**
+     * Re-issues the session for another tenant this identity is a member of.
+     * The only way a token can name a tenant other than the user's home one,
+     * which is what makes an external auditor's GUEST membership usable.
+     */
+    com.kashi.grc.common.dto.ApiResponse<?> switchTenant(Long userId, Long tenantId);
+
+    /**
      * Authenticate user. Returns:
      *   - ApiResponse.success(AuthResponse)          on normal login
      *   - ApiResponse.withStatus("PASSWORD_RESET_REQUIRED", ...) on first login

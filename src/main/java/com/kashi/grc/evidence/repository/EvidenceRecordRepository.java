@@ -19,6 +19,15 @@ public interface EvidenceRecordRepository extends JpaRepository<EvidenceRecord, 
 
     List<EvidenceRecord> findByTenantId(Long tenantId);
 
+    /**
+     * Manual evidence stores its document id in fileUrl as a string
+     * (EvidenceRegistrationService), so this is the join from a document back to
+     * its evidence record. A derived query rather than filtering findByTenantId
+     * in memory — a tenant can have thousands of records and the delete path
+     * needs exactly one.
+     */
+    java.util.Optional<EvidenceRecord> findByTenantIdAndFileUrl(Long tenantId, String fileUrl);
+
     List<EvidenceRecord> findByExpiredFalseAndValidUntilBefore(LocalDateTime cutoff);
 
     // ── KashiLink ────────────────────────────────────────────────────────────

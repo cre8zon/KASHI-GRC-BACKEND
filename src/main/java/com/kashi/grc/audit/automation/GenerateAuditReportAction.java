@@ -61,6 +61,9 @@ public class GenerateAuditReportAction implements AutomatedActionHandler {
     private final DocumentRepository             documentRepository;
     private final DocumentLinkRepository         documentLinkRepository;
     private final StorageService                 storageService;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
 
     @Override
     public String actionKey() {
@@ -128,6 +131,16 @@ public class GenerateAuditReportAction implements AutomatedActionHandler {
         reportData.put("engagementName",      engagement.getName());
         reportData.put("auditType",           engagement.getAuditType() != null ? engagement.getAuditType().name() : "");
         reportData.put("frameworkRef",        engagement.getFrameworkRef() != null ? engagement.getFrameworkRef() : "");
+
+        // ── Who performed this audit ──────────────────────────────────────
+        // An audit report whose defining claim is independence has to say who
+        // did the work. The distinction between an internal audit and a
+        // third-party attestation is the whole point of the document, and until
+        // now the report recorded neither.
+        //
+        // KashiGRC never appears here. The tool is not the auditor, any more
+        // than a word processor signs a letter.
+        reportData.putAll(attribution(engagement.getLeadAuditorId(), engagement.getTenantId()));
         reportData.put("totalControls",       totalControls);
         reportData.put("effectiveControls",   effective);
         reportData.put("partiallyEffective",  partiallyEff);
@@ -208,4 +221,39 @@ public class GenerateAuditReportAction implements AutomatedActionHandler {
                 engagementId, passRate, openFindings);
         return true;
     }
+
+    /**
+     * Resolves the performing party from the engagement's lead auditor.
+     *
+     * A lead auditor holding a GUEST membership in this tenant is an external
+     * auditor, and firm_tenant_id names the firm that placed them. A HOME
+     * membership means the audit was performed by the organisation's own staff,
+     * which is an internal audit and must not be presented as anything else.
+     */
+    private Map<String, Object> attribution(Long leadAuditorId, Long tenantId) {
+        Map<String, Object> out = new HashMap<>();
+        out.put("performedBy",     "Internal Audit");
+        out.put("performedByType", "INTERNAL");
+        out.put("leadAuditorName", "");
+        out.put("auditFirmName",   "");
+
+        if (leadAuditorId == null) return out;
+
+        userRepository.findById(leadAuditorId).ifPresent(u ->
+                out.put("leadAuditorName", u.getFullName() != null ? u.getFullName().trim() : u.getEmail()));
+
+        membershipRepository.findByUserIdAndTenantId(leadAuditorId, tenantId).ifPresent(m -> {
+            if ("GUEST".equalsIgnoreCase(m.getMembershipType()) && m.getFirmTenantId() != null) {
+                String firm = tenantRepository.findById(m.getFirmTenantId())
+                        .map(t -> t.getName()).orElse(null);
+                if (firm != null) {
+                    out.put("performedBy",     firm);
+                    out.put("performedByType", "EXTERNAL_FIRM");
+                    out.put("auditFirmName",   firm);
+                }
+            }
+        });
+        return out;
+    }
+
 }

@@ -42,6 +42,16 @@ public class OktaAdminMfaCheck implements IntegrationCheck {
     @Override public String checkKey()        { return "OKTA_ADMIN_MFA"; }
     @Override public String integrationKey()  { return "OKTA"; }
 
+    /** How to make this check pass -- shown beside the failure in the UI. */
+    @Override
+    public String remediation() {
+        return
+                "Require MFA for admins: Okta Admin console > Security > Authentication policies, "
+                        + "and add a rule targeting the admin group requiring a phishing-resistant factor. "
+                        + "Keep one break-glass admin excluded and its credential stored offline, or a bad "
+                        + "policy locks you out of the org.";
+    }
+
     @Override
     public CheckResult run(String authConfig, String checkConfig) {
         try {

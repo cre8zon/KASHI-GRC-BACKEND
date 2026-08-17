@@ -8,6 +8,8 @@ import java.util.*;
 @Repository
 public interface IntegrationRunRepository extends JpaRepository<IntegrationRun, Long> {
     List<IntegrationRun> findTop50ByTenantIdOrderByRunAtDesc(Long tenantId);
+    List<IntegrationRun> findTop50ByTenantIdAndIntegrationConfigIdOrderByRunAtDesc(
+            Long tenantId, Long integrationConfigId);
     List<IntegrationRun> findByTenantIdAndCheckKeyOrderByRunAtDesc(Long tenantId, String checkKey);
     Optional<IntegrationRun> findByIdAndTenantId(Long id, Long tenantId);
 }

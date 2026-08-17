@@ -82,6 +82,23 @@
 			<groupId>software.amazon.awssdk</groupId>
 			<artifactId>sesv2</artifactId>
 		</dependency>
+		<!-- AwsRootMfaCheck + AwsIamPasswordPolicyCheck -->
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>iam</artifactId>
+		</dependency>
+
+		<!-- AwsCloudTrailCheck -->
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>cloudtrail</artifactId>
+		</dependency>
+
+		<!-- AwsGuardDutyCheck -->
+		<dependency>
+			<groupId>software.amazon.awssdk</groupId>
+			<artifactId>guardduty</artifactId>
+		</dependency>
 
 		<!-- Spring Boot Mail for DataSource/Activation support -->
 		<dependency>

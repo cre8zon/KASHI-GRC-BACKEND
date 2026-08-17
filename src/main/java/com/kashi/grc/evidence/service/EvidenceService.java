@@ -271,7 +271,9 @@ public class EvidenceService {
                     .collectionType(r.getCollectionType() != null ? r.getCollectionType().name() : "MANUAL")
                     .automationResult(r.getAutomationResult() != null ? r.getAutomationResult().name() : null)
                     .automationMessage(r.getAutomationMessage())
-                    .collectedAt(r.getCollectedAt());
+                    .collectedAt(r.getCollectedAt())
+                    .integrationKey(r.getIntegrationKey())
+                    .rawPayload(r.getRawPayload());
         }
         return b.build();
     }

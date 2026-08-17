@@ -23,6 +23,7 @@ public class IntegrationCheckConfig extends TenantAwareEntity {
     @Column(name = "display_name",      nullable = false, length = 300) private String displayName;
     @Column(name = "description",       columnDefinition = "TEXT")      private String description;
     @Column(name = "control_tag",       nullable = false, length = 80)  private String controlTag;
+    @Column(name = "capability",        length = 60)                    private String capability;   // vendor-neutral capability, e.g. MFA_ADMIN
     @Column(name = "run_frequency",     nullable = false, length = 10)  @Builder.Default private String runFrequency = "DAILY";
     @Column(name = "is_active",         nullable = false)               @Builder.Default private boolean isActive = true;
     @Column(name = "check_config_json", columnDefinition = "TEXT")      private String checkConfigJson;

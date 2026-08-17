@@ -119,6 +119,11 @@ public class TenantIntegrationCheck extends TenantAwareEntity {
     @Column(name = "control_tag", nullable = false, length = 80)
     private String controlTag;
 
+    /** Vendor-neutral capability (e.g. MFA_ADMIN) — enables capability-based
+     *  binding so a test can resolve to whichever vendor check this tenant connected. */
+    @Column(name = "capability", length = 60)
+    private String capability;
+
     // ── Tenant-overridable fields ─────────────────────────────────────────────
 
     /**

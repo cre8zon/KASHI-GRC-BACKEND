@@ -20,6 +20,12 @@ public interface TenantIntegrationCheckRepository
     Optional<TenantIntegrationCheck> findByTenantIdAndIntegrationKeyAndCheckKey(
             Long tenantId, String integrationKey, String checkKey);
 
+    /** Capability-based resolution: the ACTIVE check this tenant connected that
+     *  provides the given capability (e.g. MFA_ADMIN). If a tenant somehow connected
+     *  two providers for the same capability, the first active one wins. */
+    java.util.List<TenantIntegrationCheck> findByTenantIdAndCapabilityAndIsActiveTrue(
+            Long tenantId, String capability);
+
     Optional<TenantIntegrationCheck> findByTenantIdAndCheckKey(
             Long tenantId, String checkKey);
 

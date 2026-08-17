@@ -61,4 +61,27 @@ public class IntegrationRun extends TenantAwareEntity {
 
     @Column(name = "next_run_at")
     private LocalDateTime nextRunAt;
+
+    /**
+     * The result of the previous run of this same check, or null for the first.
+     *
+     * Continuous monitoring is not "we collect evidence often" — it is knowing
+     * the moment a control stops holding. Without the previous value there is
+     * nothing to compare against, and drift is invisible until someone reads a
+     * dashboard.
+     */
+    @Column(name = "previous_result", length = 10)
+    private String previousResult;
+
+    /**
+     * True when result differs from previousResult. Denormalised so "what broke
+     * this week" is an indexed query rather than a self-join over run history.
+     */
+    @Column(name = "result_changed")
+    @Builder.Default
+    private Boolean resultChanged = false;
+
+    /** PASS→FAIL | FAIL→PASS | null when unchanged or first run. */
+    @Column(name = "transition", length = 20)
+    private String transition;
 }

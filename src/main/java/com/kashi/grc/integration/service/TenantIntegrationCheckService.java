@@ -103,6 +103,7 @@ public class TenantIntegrationCheckService {
                         .displayName(global.getDisplayName())
                         .description(global.getDescription())
                         .controlTag(global.getControlTag())
+                        .capability(global.getCapability())   // carry capability for vendor-neutral binding
                         // Snapshot the global config — tenant can override later
                         .checkConfigJson(global.getCheckConfigJson())
                         .passCriteriaJson(global.getPassCriteriaJson())
