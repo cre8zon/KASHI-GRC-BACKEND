@@ -11,4 +11,6 @@ public class TenantCreateRequest {
     public String plan;
     public Integer maxUsers;
     public Integer maxVendors;
+    /** true when the tenant being created is an audit firm rather than a customer. */
+    public Boolean isAuditFirm;
 }

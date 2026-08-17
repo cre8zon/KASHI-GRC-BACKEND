@@ -56,6 +56,7 @@ import java.util.List;
 public class AuditFindingController {
 
     private final AuditFindingRepository         findingRepository;
+    private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
     private final DbRepository                   dbRepository;
@@ -355,12 +356,38 @@ public class AuditFindingController {
         req.setSourceEntityType("AUDIT_FINDING");
         req.setSourceEntityId(finding.getId());
         req.setFrameworkRef(finding.getFrameworkRef());
-        req.setOwnerId(finding.getOwnerId());
-        // workflowId from request body — caller decides which workflow to use.
-        // Defaults to null; IssueService will log a warning if not provided.
-        // The escalate-to-issue UI should pass the correct workflowId for EXTERNAL issues.
+        // Owner is who must remediate. Findings raised before the auditee-side
+        // resolution existed have owner_id NULL, and IssueService now refuses a
+        // null owner — so without this fallback the Escalate button fails on
+        // every historical finding with "ownerId is required".
+        //
+        // Falls back to the engagement's evidence lead, never to an auditor: an
+        // auditor remediating the control they tested is the situation an audit
+        // exists to prevent.
+        Long owner = finding.getOwnerId();
+        if (owner == null) {
+            owner = engagementRepository.findById(finding.getEngagementId())
+                    .map(e -> e.getLeadAuditeeId() != null ? e.getLeadAuditeeId() : e.getOwnerId())
+                    .orElse(null);
+            if (owner == null) {
+                throw new BusinessException("NO_OWNER",
+                        "This finding has no owner and the engagement has no lead auditee. "
+                                + "Name a lead auditee on the engagement, or set an owner on the "
+                                + "finding, then escalate.");
+            }
+            // Persist it, so the finding itself stops being ownerless.
+            finding.setOwnerId(owner);
+        }
+        req.setOwnerId(owner);
+        // Workflow: caller may override, otherwise resolve the finding workflow by
+        // name. Previously this defaulted to null when the UI sent no body — and
+        // the button sends none — so escalated issues were created with NO
+        // workflow at all. They appeared in the issue list and then sat there,
+        // because nothing had created a task for anyone.
         if (body != null && body.get("workflowId") instanceof Number n) {
             req.setWorkflowId(n.longValue());
+        } else {
+            req.setWorkflowId(findingWorkflowId(tenantId));
         }
 
         IssueResponse issueResponse = issueService.create(req, userId, tenantId);
@@ -390,6 +417,24 @@ public class AuditFindingController {
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(result));
     }
 
+    /**
+     * Workflow for issues escalated from a finding, resolved by name.
+     *
+     * Same lookup the automatic path uses, so a manually escalated finding and an
+     * auto-escalated one follow identical steps. Falls back to the generic issue
+     * workflow when the finding workflow has not been seeded.
+     */
+    private Long findingWorkflowId(Long tenantId) {
+        return workflowRepository.findAll().stream()
+                .filter(w -> w.isActive())
+                .filter(w -> "ISSUE".equalsIgnoreCase(w.getEntityType()))
+                .filter(w -> w.getTenantId() == null || w.getTenantId().equals(tenantId))
+                .filter(w -> "Audit Finding Remediation".equalsIgnoreCase(w.getName()))
+                .map(w -> w.getId())
+                .findFirst()
+                .orElse(15L);
+    }
+
     private Issue.Severity mapFindingSeverityToIssueSeverity(AuditFinding.Severity s) {
         if (s == null) return Issue.Severity.MEDIUM;
         return switch (s) {
@@ -416,6 +461,9 @@ public class AuditFindingController {
         m.put("auditorNotes",         f.getAuditorNotes());
         m.put("severity",             f.getSeverity());
         m.put("findingType",          f.getFindingType());
+        // Lets the UI distinguish "automation could not finish" from "nobody has
+        // escalated this yet" — identical on screen without it.
+        m.put("source",               f.getSource());
         m.put("status",               f.getStatus());
         m.put("frameworkRef",         f.getFrameworkRef());
         m.put("raisedBy",             f.getRaisedBy());

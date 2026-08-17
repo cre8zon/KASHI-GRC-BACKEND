@@ -42,6 +42,10 @@ import java.util.stream.Collectors;
 public class AuthServiceImpl implements AuthService {
 
     private final UserRepository      userRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+
+    @jakarta.persistence.PersistenceContext
+    private jakarta.persistence.EntityManager entityManager;
     private final TenantRepository    tenantRepository;
     private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
     private final PasswordEncoder     passwordEncoder;
@@ -139,7 +143,43 @@ public class AuthServiceImpl implements AuthService {
                 .distinct()
                 .collect(Collectors.toList());
 
-        String accessToken  = tokenProvider.generateAccessToken(user.getId(), user.getTenantId(),
+        // ── Which tenant is this session for? ────────────────────────────
+        // Almost everyone holds exactly one membership, in their own tenant, and
+        // this resolves to user.getTenantId() — byte-for-byte today's behaviour.
+        // It differs only for an identity that belongs to more than one tenant,
+        // which today means an external auditor staffed onto a client.
+        //
+        // A user with NO membership row falls back to user.getTenantId() rather
+        // than being refused: the backfill may not have run, and locking people
+        // out over a missing row in an additive migration would be unforgivable.
+        List<com.kashi.grc.usermanagement.domain.UserTenantMembership> memberships =
+                membershipRepository.findByUserIdAndStatus(user.getId(), "ACTIVE").stream()
+                        .filter(com.kashi.grc.usermanagement.domain.UserTenantMembership::isUsable)
+                        .toList();
+
+        com.kashi.grc.usermanagement.domain.UserTenantMembership active = memberships.stream()
+                .filter(com.kashi.grc.usermanagement.domain.UserTenantMembership::isPrimary)
+                .findFirst()
+                .or(() -> memberships.stream()
+                        .filter(m -> m.getTenantId().equals(user.getTenantId())).findFirst())
+                .or(() -> memberships.stream().findFirst())
+                .orElse(null);
+
+        Long activeTenantId = active != null ? active.getTenantId() : user.getTenantId();
+
+        // Roles are per membership. Only re-resolve when the session is NOT the
+        // home tenant — otherwise user.getRoles() is already correct and we
+        // avoid touching the path every existing login takes.
+        if (active != null && !activeTenantId.equals(user.getTenantId())) {
+            List<Long> roleIdList = membershipRepository.findRoleIdsByMembershipId(active.getId());
+            roleIds     = rolesFor(roleIdList).stream().map(r -> r.getName()).collect(Collectors.toList());
+            permissions = rolesFor(roleIdList).stream()
+                    .flatMap(r -> r.getPermissions().stream())
+                    .map(p -> p.getCode()).distinct().collect(Collectors.toList());
+            TenantContext.setCurrentTenant(activeTenantId);
+        }
+
+        String accessToken  = tokenProvider.generateAccessToken(user.getId(), activeTenantId,
                 user.getEmail(), roleIds, permissions);
         String refreshToken = tokenProvider.generateRefreshToken(user.getId());
 
@@ -150,7 +190,115 @@ public class AuthServiceImpl implements AuthService {
         log.info("Login successful: userId={} tenantId={}", user.getId(), user.getTenantId());
 
         AuthResponse response = buildAuthResponse(user, permissions, accessToken, refreshToken);
+        attachMemberships(response, memberships, activeTenantId);
         return ApiResponse.success(response);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // SWITCH TENANT
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Re-issues the session against another tenant this identity belongs to.
+     *
+     * This is the only path that can put a tenant OTHER than users.tenant_id in
+     * a token, and therefore the only thing that makes a GUEST membership do
+     * anything: UtilityService's overlay stays dormant until the JWT names a
+     * tenant that differs from the user's home one.
+     *
+     * Revocation and expiry are re-checked here, not merely at login — a session
+     * must not be re-scoped into a tenant the client has since withdrawn.
+     */
+    @Override
+    @Transactional
+    public ApiResponse<?> switchTenant(Long userId, Long tenantId) {
+
+        User user = userRepository.findById(userId)
+                .filter(u -> !u.isDeleted())
+                .orElseThrow(() -> new ValidationException("User not found"));
+
+        com.kashi.grc.usermanagement.domain.UserTenantMembership target =
+                membershipRepository.findByUserIdAndTenantId(userId, tenantId)
+                        .orElseThrow(() -> new ValidationException(
+                                "You do not have access to that organization"));
+
+        if (!target.isUsable()) {
+            throw new ValidationException("Your access to that organization has ended");
+        }
+
+        TenantContext.setCurrentTenant(tenantId);
+
+        List<String> roleIds;
+        List<String> permissions;
+
+        if (tenantId.equals(user.getTenantId())) {
+            // Home tenant — the roles already on the user are the right ones.
+            roleIds     = user.getRoles().stream().map(r -> r.getName()).collect(Collectors.toList());
+            permissions = user.getRoles().stream()
+                    .flatMap(r -> r.getPermissions().stream())
+                    .map(p -> p.getCode()).distinct().collect(Collectors.toList());
+        } else {
+            List<com.kashi.grc.usermanagement.domain.Role> roles =
+                    rolesFor(membershipRepository.findRoleIdsByMembershipId(target.getId()));
+            roleIds     = roles.stream().map(r -> r.getName()).collect(Collectors.toList());
+            permissions = roles.stream().flatMap(r -> r.getPermissions().stream())
+                    .map(p -> p.getCode()).distinct().collect(Collectors.toList());
+        }
+
+        String accessToken  = tokenProvider.generateAccessToken(
+                user.getId(), tenantId, user.getEmail(), roleIds, permissions);
+        String refreshToken = tokenProvider.generateRefreshToken(user.getId());
+
+        log.info("[TENANT-SWITCH] userId={} → tenantId={} membershipId={} type={} roles={}",
+                userId, tenantId, target.getId(), target.getMembershipType(), roleIds);
+
+        AuthResponse response = buildAuthResponse(user, permissions, accessToken, refreshToken);
+        // buildAuthResponse reads user.getTenantId(); the session is for the
+        // tenant just switched into, so correct it before returning.
+        response.getUser().setTenantId(tenantId);
+        response.getUser().setTenantName(
+                tenantRepository.findById(tenantId).map(t -> t.getName()).orElse(""));
+
+        List<com.kashi.grc.usermanagement.domain.UserTenantMembership> all =
+                membershipRepository.findByUserIdAndStatus(userId, "ACTIVE").stream()
+                        .filter(com.kashi.grc.usermanagement.domain.UserTenantMembership::isUsable)
+                        .toList();
+        attachMemberships(response, all, tenantId);
+        return ApiResponse.success(response);
+    }
+
+    /** Roles with permissions eagerly loaded, for a membership's role ids. */
+    private List<com.kashi.grc.usermanagement.domain.Role> rolesFor(List<Long> roleIds) {
+        if (roleIds == null || roleIds.isEmpty()) return List.of();
+        return entityManager.createQuery(
+                        "SELECT DISTINCT r FROM Role r LEFT JOIN FETCH r.permissions WHERE r.id IN :ids",
+                        com.kashi.grc.usermanagement.domain.Role.class)
+                .setParameter("ids", roleIds)
+                .getResultList();
+    }
+
+    /** Adds the tenant list to the response so the UI can offer a switcher. */
+    private void attachMemberships(
+            AuthResponse response,
+            List<com.kashi.grc.usermanagement.domain.UserTenantMembership> memberships,
+            Long activeTenantId) {
+
+        if (response.getUser() == null || memberships == null) return;
+
+        response.getUser().setMemberships(memberships.stream()
+                .map(m -> AuthResponse.TenantMembershipInfo.builder()
+                        .membershipId(m.getId())
+                        .tenantId(m.getTenantId())
+                        .tenantName(tenantRepository.findById(m.getTenantId())
+                                .map(t -> t.getName()).orElse(""))
+                        .membershipType(m.getMembershipType())
+                        .firmName(m.getFirmTenantId() == null ? null
+                                : tenantRepository.findById(m.getFirmTenantId())
+                                  .map(t -> t.getName()).orElse(null))
+                        .accessExpiresAt(m.getAccessExpiresAt())
+                        .active(m.getTenantId().equals(activeTenantId))
+                        .build())
+                .collect(Collectors.toList()));
     }
 
     // ─────────────────────────────────────────────────────────────

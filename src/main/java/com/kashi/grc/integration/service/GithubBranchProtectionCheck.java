@@ -49,6 +49,17 @@ public class GithubBranchProtectionCheck implements IntegrationCheck {
     @Override public String checkKey()       { return "GITHUB_BRANCH_PROTECTION"; }
     @Override public String integrationKey() { return "GITHUB"; }
 
+    /** How to make this check pass -- shown beside the failure in the UI. */
+    @Override
+    public String remediation() {
+        return
+                "Protect the default branch: GitHub > repository > Settings > Branches > Add branch "
+                        + "ruleset. Require a pull request before merging, require at least one approval, and "
+                        + "tick 'Do not allow bypassing the above settings' -- an admin bypass leaves the "
+                        + "control ineffective even with the rule in place. Apply it to every in-scope repo, "
+                        + "not just the busiest one.";
+    }
+
     @Override
     public CheckResult run(String authConfig, String checkConfig) {
         try {

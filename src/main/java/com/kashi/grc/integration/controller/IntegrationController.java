@@ -30,11 +30,15 @@ import java.util.*;
  * GET    /v1/integrations/{key}/checks                        — tenant's check instances for this integration
  * PUT    /v1/integrations/{key}/checks/{checkKey}             — customise a tenant check instance
  * POST   /v1/integrations/{key}/checks/{checkKey}/run         — manually trigger a check
+ * POST   /v1/integrations/{key}/checks/run-all                — trigger every active check now
  * GET    /v1/integrations/runs                                — run history for this tenant
+ *          ?checkKey=AWS_S3_ENCRYPTION   — one check
+ *          ?integrationKey=AWS           — every check under one integration
  * GET    /v1/integrations/runs/{id}                           — single run detail with raw payload
  */
 @RestController
 @RequestMapping("/v1/integrations")
+@lombok.extern.slf4j.Slf4j
 @Tag(name = "Integrations", description = "Automated compliance evidence collection")
 @RequiredArgsConstructor
 public class IntegrationController {
@@ -236,16 +240,75 @@ public class IntegrationController {
         )));
     }
 
+    @PostMapping("/{key}/checks/run-all")
+    @Operation(summary = "Run every active check for this integration now")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> triggerRunAll(@PathVariable String key) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        IntegrationConfig config = configRepo
+                .findByTenantIdAndIntegrationKey(tenantId, key.toUpperCase())
+                .orElseThrow(() -> new com.kashi.grc.common.exception.ResourceNotFoundException(
+                        "IntegrationConfig", 0L));
+
+        // Each check runs in its own transaction via triggerManual, so one
+        // failing check cannot roll back the others. nextRunAt is deliberately
+        // ignored — this is an explicit user action, not the scheduler.
+        List<Map<String, Object>> results = new java.util.ArrayList<>();
+        int ok = 0, failed = 0;
+
+        for (var tenantCheck : tenantCheckRepo
+                .findByIntegrationKeyAndTenantIdAndIsActiveTrue(config.getIntegrationKey(), tenantId)) {
+            Map<String, Object> r = new java.util.LinkedHashMap<>();
+            r.put("checkKey", tenantCheck.getCheckKey());
+            try {
+                IntegrationRun run = runner.triggerManual(config.getId(), tenantCheck.getCheckKey());
+                r.put("result",        run.getResult());
+                r.put("resultSummary", run.getResultSummary() != null ? run.getResultSummary() : "");
+                r.put("runId",         run.getId());
+                ok++;
+            } catch (Exception e) {
+                log.warn("[INTEGRATION] Run-all: {} failed — {}", tenantCheck.getCheckKey(), e.getMessage());
+                r.put("result",        "ERROR");
+                r.put("resultSummary", e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName());
+                failed++;
+            }
+            results.add(r);
+        }
+
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("integrationKey", config.getIntegrationKey());
+        body.put("total",   results.size());
+        body.put("ran",     ok);
+        body.put("errored", failed);
+        body.put("checks",  results);
+        return ResponseEntity.ok(ApiResponse.success(body));
+    }
+
     @GetMapping("/runs")
     @Operation(summary = "Integration run history for this tenant")
     public ResponseEntity<ApiResponse<List<IntegrationRun>>> runs(
             @RequestParam(required = false) String checkKey,
+            @RequestParam(required = false) String integrationKey,
             @RequestParam(defaultValue = "50") int limit) {
 
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        List<IntegrationRun> runs = checkKey != null
-                ? runRepo.findByTenantIdAndCheckKeyOrderByRunAtDesc(tenantId, checkKey)
-                : runRepo.findTop50ByTenantIdOrderByRunAtDesc(tenantId);
+
+        // checkKey filters one check (AWS_S3_ENCRYPTION); integrationKey filters
+        // every check under one integration (AWS). The panel previously passed the
+        // integration key into checkKey, which matched nothing — check_key values
+        // are AWS_S3_ENCRYPTION etc., never bare AWS.
+        List<IntegrationRun> runs;
+        if (checkKey != null && !checkKey.isBlank()) {
+            runs = runRepo.findByTenantIdAndCheckKeyOrderByRunAtDesc(tenantId, checkKey);
+        } else if (integrationKey != null && !integrationKey.isBlank()) {
+            runs = configRepo
+                    .findByTenantIdAndIntegrationKey(tenantId, integrationKey.toUpperCase())
+                    .map(cfg -> runRepo.findTop50ByTenantIdAndIntegrationConfigIdOrderByRunAtDesc(
+                            tenantId, cfg.getId()))
+                    .orElseGet(java.util.List::of);
+        } else {
+            runs = runRepo.findTop50ByTenantIdOrderByRunAtDesc(tenantId);
+        }
         return ResponseEntity.ok(ApiResponse.success(runs));
     }
 
@@ -259,7 +322,16 @@ public class IntegrationController {
         return ResponseEntity.ok(ApiResponse.success(run));
     }
 
-    @GetMapping("/v1/audit/engagements/{engagementId}/integration-snapshots")
+    /**
+     * NOTE ON THE PATH: this controller carries a class-level
+     * RequestMapping("/v1/integrations"), which Spring prepends to EVERY
+     * method mapping — a leading slash does not escape it. The old value
+     * "/v1/audit/engagements/{id}/integration-snapshots" therefore resolved to
+     * /v1/integrations/v1/audit/engagements/{id}/integration-snapshots and the
+     * URL the frontend called fell through to the static resource handler,
+     * throwing NoResourceFoundException on every request.
+     */
+    @GetMapping("/engagements/{engagementId}/snapshots")
     @Operation(summary = "List engagement-scoped integration snapshots — one per AUTOMATED test instance")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getEngagementSnapshots(
             @PathVariable Long engagementId) {
@@ -284,6 +356,7 @@ public class IntegrationController {
                     m.put("lastResultSummary",    snap.getLastResultSummary());
                     m.put("lastRunAt",            snap.getLastRunAt());
                     m.put("lastEvidenceRecordId", snap.getLastEvidenceRecordId());
+                    m.put("lastIntegrationRunId", snap.getLastIntegrationRunId());
                     m.put("runCount",             snap.getRunCount());
                     m.put("snapshottedAt",        snap.getSnapshottedAt());
                     result.add(m);
@@ -298,6 +371,10 @@ public class IntegrationController {
         return List.of(
                 integration("OKTA", "Okta", "Identity & MFA", "okta-logo.svg",
                         List.of("OKTA_ADMIN_MFA","OKTA_USER_MFA","OKTA_INACTIVE_ACCOUNTS","OKTA_SSO_ENFORCED","OKTA_PASSWORD_POLICY")),
+                integration("ZOHO", "Zoho", "Identity & MFA", "zoho-logo.svg",
+                        List.of("ZOHO_ADMIN_MFA","ZOHO_USER_MFA")),
+                integration("MICROSOFT", "Microsoft Entra ID", "Identity & MFA", "microsoft-logo.svg",
+                        List.of("MICROSOFT_ADMIN_MFA","MICROSOFT_USER_MFA")),
                 integration("AWS", "Amazon Web Services", "Cloud Infrastructure", "aws-logo.svg",
                         List.of("AWS_CLOUDTRAIL_ENABLED","AWS_ROOT_MFA","AWS_S3_ENCRYPTION","AWS_S3_PUBLIC_ACCESS_BLOCK","AWS_IAM_PASSWORD_POLICY","AWS_GUARDDUTY_ENABLED")),
                 integration("GITHUB", "GitHub", "Source Code Management", "github-logo.svg",
@@ -305,7 +382,7 @@ public class IntegrationController {
                 integration("AZURE", "Microsoft Azure", "Cloud & Identity", "azure-logo.svg",
                         List.of("AZURE_AD_MFA","AZURE_DEFENDER_ENABLED","AZURE_STORAGE_ENCRYPTION")),
                 integration("GOOGLE_WORKSPACE", "Google Workspace", "Productivity & Identity", "google-logo.svg",
-                        List.of("GWS_2SV","GWS_DRIVE_SHARING"))
+                        List.of("GWS_ADMIN_2SV","GWS_2SV","GWS_DRIVE_SHARING"))
         );
     }
 

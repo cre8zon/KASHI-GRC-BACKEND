@@ -30,4 +30,20 @@ public class Tenant extends BaseEntity {
 
     @Column(name = "max_vendors")
     private Integer maxVendors;
+
+    /**
+     * Marks this tenant as an audit firm.
+     *
+     * A firm is an ordinary tenant in every other respect — its own users, its
+     * own compliance posture, its own vendors. The flag exists so a client
+     * inviting an external auditor can be offered real firms to pick from, and
+     * so the platform-admin list distinguishes them from customers.
+     *
+     * It deliberately does NOT change how the firm's own tenant behaves. Any
+     * future firm-only UI should hang off a feature flag, which is already
+     * tenant-scoped, rather than off this column.
+     */
+    @Column(name = "is_audit_firm", nullable = false)
+    @Builder.Default
+    private boolean isAuditFirm = false;
 }

@@ -40,6 +40,7 @@ import java.util.stream.Collectors;
 public class AuditInstanceController {
 
     private final AuditControlInstanceRepository            controlRepo;
+    private final com.kashi.grc.audit.service.ControlAccessGuard controlAccessGuard;
     private final AuditTestInstanceRepository               testRepo;
     private final AuditPolicyInstanceRepository             policyRepo;
     private final AuditControlInstanceTestMappingRepository ctrlTestMappingRepo;
@@ -47,6 +48,7 @@ public class AuditInstanceController {
     private final AuditTestPolicySnapshotService             snapshotService;
     private final UtilityService                            utilityService;
     private final AuditFindingRepository                    findingRepo;
+    private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final IssueService                              issueService;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepo;
 
@@ -198,12 +200,9 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
-        if (ctrl.getAssignedAuditorId() != null &&
-                !ctrl.getAssignedAuditorId().equals(ctx.getId())) {
-            throw new com.kashi.grc.common.exception.BusinessException(
-                    "CONTROL_NOT_ASSIGNED",
-                    "You are not the assigned auditor for this control");
-        }
+        // Same hole as the auditee path: an unassigned control was testable by
+        // anyone with the permission. Assignee, section auditor or lead auditor.
+        controlAccessGuard.requireCanRecordResult(ctrl, ctx.getId());
 
         ctrl.setTestResult(req.getTestResult());
         if (req.getTestNotes() != null) ctrl.setTestNotes(req.getTestNotes());
@@ -235,12 +234,11 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
-        if (ctrl.getAuditeeAssignedUserId() != null &&
-                !ctrl.getAuditeeAssignedUserId().equals(ctx.getId())) {
-            throw new com.kashi.grc.common.exception.BusinessException(
-                    "CONTROL_NOT_ASSIGNED",
-                    "You are not the assigned auditee for this control");
-        }
+        // WAS: only blocked when the control HAD an assignee, so an unassigned
+        // control -- the normal state until someone bulk-assigns a section -- was
+        // open to anyone holding the permission. Now the assignee, the section
+        // owner or the engagement owner may act, and nobody else.
+        controlAccessGuard.requireCanSubmitEvidence(ctrl, ctx.getId());
 
         ctrl.setAuditeeEvidenceSubmitted(true);
         ctrl.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
@@ -358,10 +356,12 @@ public class AuditInstanceController {
         if (!hasAssignPermission) {
             List<Long> controlInstanceIds = ctrlTestMappingRepo
                     .findControlInstanceIdsByTestInstanceId(id);
+            // The old `|| c.getAssignedAuditorId() == null` made every unassigned
+            // control testable by anyone. Delegating to the guard keeps section
+            // owners and the lead auditor able to act without opening it up.
             boolean isAssigned = !controlInstanceIds.isEmpty() &&
                     controlRepo.findAllById(controlInstanceIds).stream()
-                            .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
-                                    || c.getAssignedAuditorId() == null);
+                            .anyMatch(c -> controlAccessGuard.canAct(c, ctx.getId(), false));
             if (!isAssigned) {
                 throw new com.kashi.grc.common.exception.BusinessException(
                         "TEST_NOT_ASSIGNED",
@@ -506,10 +506,12 @@ public class AuditInstanceController {
         if (!hasAssignPermission) {
             List<Long> controlInstanceIds = policyCtrlMappingRepo.findByPolicyInstanceId(id)
                     .stream().map(m -> m.getControlInstanceId()).toList();
+            // The old `|| c.getAssignedAuditorId() == null` made every unassigned
+            // control testable by anyone. Delegating to the guard keeps section
+            // owners and the lead auditor able to act without opening it up.
             boolean isAssigned = !controlInstanceIds.isEmpty() &&
                     controlRepo.findAllById(controlInstanceIds).stream()
-                            .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
-                                    || c.getAssignedAuditorId() == null);
+                            .anyMatch(c -> controlAccessGuard.canAct(c, ctx.getId(), false));
             if (!isAssigned) {
                 throw new com.kashi.grc.common.exception.BusinessException(
                         "POLICY_NOT_ASSIGNED",
@@ -533,7 +535,8 @@ public class AuditInstanceController {
                     .stream()
                     .anyMatch(f -> autoTitle.equals(f.getTitle())
                             && f.getStatus() != AuditFinding.Status.CLOSED
-                            && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
+                            && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK
+                            && f.getStatus() != AuditFinding.Status.WITHDRAWN);
 
             if (!alreadyExists) {
                 AuditFinding autoFinding = AuditFinding.builder()
@@ -546,6 +549,8 @@ public class AuditInstanceController {
                                 + policy.getVersionSnapshot() + " reviewed as INADEQUATE.")
                         .severity(AuditFinding.Severity.MEDIUM)
                         .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
+                        // Raised by the policy-review derivation, not typed by a person.
+                        .source(AuditFinding.Source.AUTOMATED)
                         .status(AuditFinding.Status.OPEN)
                         .frameworkRef(policy.getFrameworkRefsSnapshot())
                         .ownerId(policy.getOwnerIdSnapshot())  // policy owner remediates policy gaps
@@ -690,6 +695,15 @@ public class AuditInstanceController {
      * Wrapped in try-catch so a workflow config issue never breaks the parent operation.
      */
     private void autoEscalateToIssue(AuditFinding finding, Long createdBy, Long tenantId) {
+        // IssueService now rejects an owner or creator who is not a user of this
+        // tenant. Checking here first keeps the finding intact and the log
+        // readable instead of relying on the catch below.
+        if (finding.getOwnerId() == null || createdBy == null) {
+            log.warn("[AUDIT-FINDING] Not escalating {} — ownerId={} createdBy={}. "
+                            + "Set a policy owner, then escalate manually.",
+                    finding.getFindingRef(), finding.getOwnerId(), createdBy);
+            return;
+        }
         try {
             IssueRequest req = new IssueRequest();
             req.setTitle(finding.getTitle());
@@ -701,7 +715,7 @@ public class AuditInstanceController {
             req.setSourceEntityId(finding.getId());
             req.setFrameworkRef(finding.getFrameworkRef());
             req.setOwnerId(finding.getOwnerId());
-            req.setWorkflowId(15L);  // Issue Remediation Lifecycle
+            req.setWorkflowId(findingWorkflowId(tenantId));
             var issueResp = issueService.create(req, createdBy, tenantId);
             finding.setLinkedIssueId(issueResp.getId());
             findingRepo.save(finding);
@@ -711,6 +725,29 @@ public class AuditInstanceController {
             log.warn("[AUDIT-FINDING] Auto-escalate failed for finding {} — {}",
                     finding.getId(), ex.getMessage());
         }
+    }
+
+    /**
+     * Workflow used for issues escalated from an audit finding.
+     *
+     * Resolved by name, not by a hardcoded id. Workflow 15 "Issue Remediation
+     * Lifecycle" opens with a triage step resolved ENTITY_CREATOR, which is
+     * meaningless for an issue nobody filed — and it was that step that turned a
+     * bad createdBy into a task in a stranger's inbox. The finding workflow
+     * starts at the owner instead and has the auditor validate the fix.
+     *
+     * Falls back to the generic issue workflow if the finding one is absent, so
+     * escalation still happens on an environment where seed 17 has not run.
+     */
+    private Long findingWorkflowId(Long tenantId) {
+        return workflowRepository.findAll().stream()
+                .filter(w -> w.isActive())
+                .filter(w -> "ISSUE".equalsIgnoreCase(w.getEntityType()))
+                .filter(w -> w.getTenantId() == null || w.getTenantId().equals(tenantId))
+                .filter(w -> "Audit Finding Remediation".equalsIgnoreCase(w.getName()))
+                .map(w -> w.getId())
+                .findFirst()
+                .orElse(15L);
     }
 
     /** Collision-safe finding ref generator */

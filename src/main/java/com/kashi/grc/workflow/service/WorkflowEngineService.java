@@ -109,6 +109,7 @@ public class WorkflowEngineService {
     private final WorkflowActorResolverRegistry        actorResolverRegistry;      // assignment-scoped actor resolution
     private final WorkflowStepUserRepository          stepUserRepository;
     private final WorkflowInstanceRepository      instanceRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
     private final StepInstanceRepository          stepInstanceRepository;
     private final TaskInstanceRepository          taskInstanceRepository;
     private final WorkflowTaskActionRepository    actionRepository;
@@ -1356,6 +1357,22 @@ public class WorkflowEngineService {
         Map<Long, Long>   artifactIds  = new java.util.HashMap<>();
         Map<Long, String> entityTitles = new java.util.HashMap<>();
 
+        // Tenant names for the inbox, batched. This list spans tenants by
+        // construction — the query is by assigned user, not by tenant — so one
+        // lookup per distinct tenant, not per task.
+        Map<Long, String> tenantNames = new java.util.HashMap<>();
+        {
+            java.util.Set<Long> tenantIds = instanceMap.values().stream()
+                    .filter(java.util.Objects::nonNull)
+                    .map(WorkflowInstance::getTenantId)
+                    .filter(java.util.Objects::nonNull)
+                    .collect(java.util.stream.Collectors.toSet());
+            if (!tenantIds.isEmpty()) {
+                tenantRepository.findAllById(tenantIds)
+                        .forEach(tn -> tenantNames.put(tn.getId(), tn.getName()));
+            }
+        }
+
         // VENDOR batch-resolved (2 queries total, same pattern as
         // getPendingTasksForUser) instead of the per-instance resolver call
         // below, which for VENDOR falls through to the same 2-query
@@ -1437,6 +1454,12 @@ public class WorkflowEngineService {
                     .workflowInstanceStatus(wi != null ? wi.getStatus().name() : null)
                     .artifactId(wi != null ? artifactIds.get(wi.getId()) : null)
                     .entityTitle(wi != null ? entityTitles.get(wi.getId()) : null)
+                    // Which organization the task belongs to. TaskInstance has no
+                    // tenant of its own, so it comes from the workflow instance —
+                    // and without it an external auditor sees three clients'
+                    // tasks in one list with nothing to tell them apart.
+                    .tenantId(wi != null ? wi.getTenantId() : null)
+                    .tenantName(wi != null ? tenantNames.get(wi.getTenantId()) : null)
                     .build();
         }).toList();
 
@@ -1530,6 +1553,43 @@ public class WorkflowEngineService {
         }
     }
 
+    /**
+     * A step may only be overridden by someone on the SAME side as the step.
+     *
+     * Override exists so a lead can unblock a colleague who has stalled. It was
+     * gated on the workflow:step:override permission alone, with no regard for
+     * which side the step belongs to — so a lead auditor could complete an
+     * AUDITEE evidence step, and the moment that permission is granted to a lead
+     * auditee, the auditee could complete "Evidence Review" and mark their own
+     * audit reviewed. In an audit product that is not a bug, it is a hole in the
+     * thing being sold.
+     *
+     * SYSTEM steps are the one exception: they are automated, have no human side,
+     * and a stuck one has to be clearable by whoever is around.
+     */
+    private void requireSameSideToOverride(StepInstance si, Long performedBy) {
+        String stepSide = si.getSnapSide();
+        if (stepSide == null || "SYSTEM".equalsIgnoreCase(stepSide)) return;
+
+        java.util.Set<String> callerSides = userRepository.findById(performedBy)
+                .map(u -> u.getRoles().stream()
+                        .map(r -> r.getSide() != null ? r.getSide().name() : null)
+                        .filter(java.util.Objects::nonNull)
+                        .collect(java.util.stream.Collectors.toSet()))
+                .orElse(java.util.Set.of());
+
+        if (callerSides.contains(stepSide.toUpperCase())) return;
+
+        log.warn("[WORKFLOW] Cross-side override blocked | stepInstanceId={} stepSide={} "
+                        + "userId={} userSides={}",
+                si.getId(), stepSide, performedBy, callerSides);
+
+        throw new BusinessException("OVERRIDE_WRONG_SIDE",
+                "This is a " + stepSide + " step. You can only override steps on your own side — "
+                        + "ask the " + stepSide.toLowerCase() + " lead to action it.",
+                org.springframework.http.HttpStatus.FORBIDDEN);
+    }
+
     public WorkflowInstanceResponse overrideAdvanceStep(Long stepInstanceId, String action,
                                                         String remarks, Long performedBy) {
         StepInstance si = stepInstanceRepository.findById(stepInstanceId)
@@ -1539,6 +1599,8 @@ public class WorkflowEngineService {
             throw new BusinessException("STEP_NOT_ACTIVE",
                     "Step is not currently active — cannot override.");
         }
+
+        requireSameSideToOverride(si, performedBy);
 
         WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));

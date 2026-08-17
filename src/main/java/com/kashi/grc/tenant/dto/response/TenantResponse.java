@@ -16,5 +16,6 @@ public class TenantResponse {
     private String plan;
     private Integer maxUsers;
     private Integer maxVendors;
+    private Boolean isAuditFirm;
     private LocalDateTime createdAt;
 }

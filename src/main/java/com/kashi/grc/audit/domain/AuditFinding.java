@@ -72,6 +72,19 @@ public class AuditFinding extends TenantAwareEntity {
     @Builder.Default
     private FindingType findingType = FindingType.CONTROL_DEFICIENCY;
 
+    /**
+     * How this finding came to exist.
+     *
+     * An AUTOMATED finding with no linked issue means the runner raised it and
+     * escalation could not complete — worth surfacing. A MANUAL one with no
+     * issue simply has not been escalated yet, which is normal. Without this the
+     * two are indistinguishable on screen.
+     */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "source", nullable = false, length = 20)
+    @Builder.Default
+    private Source source = Source.MANUAL;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "status", nullable = false, length = 30)
     @Builder.Default
@@ -127,6 +140,20 @@ public class AuditFinding extends TenantAwareEntity {
     @Column(name = "closed_by")
     private Long closedBy;
 
+    // ── Withdrawal ────────────────────────────────────────────────────────
+    // Separate from closure on purpose: a withdrawn finding was never valid,
+    // and an auditor reading history has to be able to tell the difference
+    // between "we fixed it" and "we should not have raised it".
+
+    @Column(name = "withdrawn_at")
+    private LocalDateTime withdrawnAt;
+
+    @Column(name = "withdrawn_by")
+    private Long withdrawnBy;
+
+    @Column(name = "withdrawal_reason", columnDefinition = "TEXT")
+    private String withdrawalReason;
+
     // ── Risk acceptance ───────────────────────────────────────────────────────
 
     @Column(name = "accepted_risk", nullable = false)
@@ -162,11 +189,31 @@ public class AuditFinding extends TenantAwareEntity {
         BEST_PRACTICE
     }
 
+    /** MANUAL — an auditor raised it. AUTOMATED — the integration runner did. */
+    public enum Source {
+        MANUAL,
+        AUTOMATED
+    }
+
     public enum Status {
         OPEN,
         IN_REMEDIATION,
         PENDING_VALIDATION,
         CLOSED,
-        ACCEPTED_RISK
+        ACCEPTED_RISK,
+        /**
+         * The finding should never have been raised — the underlying test result
+         * was recorded in error and has been superseded.
+         *
+         * Distinct from CLOSED, which means "the problem was real and has been
+         * fixed". Conflating the two would let anyone erase a genuine finding by
+         * re-recording the test as PASS, which is exactly the silent mutation
+         * this status exists to replace.
+         *
+         * Terminal: cascadeDeriveControlResults and reviewPolicy must treat it
+         * like CLOSED when deciding whether an open finding already exists, or
+         * the next derive raises a duplicate.
+         */
+        WITHDRAWN
     }
 }

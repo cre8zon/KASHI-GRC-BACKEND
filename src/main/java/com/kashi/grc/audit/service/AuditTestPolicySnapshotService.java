@@ -65,6 +65,8 @@ public class AuditTestPolicySnapshotService {
 
     // ── ADDED: needed by syncEngagementScore() ────────────────────────────────
     private final AuditEngagementRepository                    engagementRepository;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
+    private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final AuditFindingRepository                       findingRepository;
 
     // ── ADDED: auto-escalate findings to Issue Management ─────────────────────
@@ -76,6 +78,27 @@ public class AuditTestPolicySnapshotService {
     @Autowired
     public void setIssueService(@Lazy IssueService issueService) {
         this.issueService = issueService;
+    }
+
+    /**
+     * Self-reference, so autoEscalateToIssue is invoked THROUGH the proxy.
+     *
+     * A direct this.autoEscalateToIssue(...) call bypasses the proxy entirely
+     * and its REQUIRES_NEW silently does nothing — the exact failure the
+     * annotation was added to prevent, with no sign it was ignored.
+     *
+     * Setter injection, not a constructor field: Lombok does not copy @Lazy onto
+     * the generated constructor parameter (that needs lombok.config
+     * copyableAnnotations), so a `@Lazy private final` self-reference is
+     * injected eagerly and the context fails to start with a self-referencing
+     * cycle. This mirrors the setIssueService pattern directly above, which
+     * exists for the same reason.
+     */
+    private AuditTestPolicySnapshotService self;
+
+    @Autowired
+    public void setSelf(@Lazy AuditTestPolicySnapshotService self) {
+        this.self = self;
     }
 
     // ── ADDED: creates engagement-scoped integration snapshots after test snapshotting ──
@@ -404,8 +427,13 @@ public class AuditTestPolicySnapshotService {
                         boolean alreadyOpen = findingRepository
                                 .findByControlInstanceIdAndTenantId(controlInstanceId, tenantId)
                                 .stream()
+                                // WITHDRAWN joins the terminal statuses: a finding
+                                // withdrawn as recorded-in-error must not be
+                                // re-raised by the next derive, or withdrawing it
+                                // achieves nothing.
                                 .anyMatch(f -> f.getStatus() != AuditFinding.Status.CLOSED
-                                        && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK);
+                                        && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK
+                                        && f.getStatus() != AuditFinding.Status.WITHDRAWN);
                         if (!alreadyOpen) {
                             String ref = generateFindingRef(tenantId);
                             AuditFinding finding = AuditFinding.builder()
@@ -419,20 +447,28 @@ public class AuditTestPolicySnapshotService {
                                             + control.getControlCodeSnapshot() + ".")
                                     .severity(AuditFinding.Severity.MEDIUM)
                                     .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
+                                    // Raised by the runner, not a person.
+                                    .source(AuditFinding.Source.AUTOMATED)
                                     .status(AuditFinding.Status.OPEN)
                                     .frameworkRef(control.getFrameworkRefSnapshot())
-                                    .ownerId(control.getAuditeeAssignedUserId())
-                                    .raisedBy(control.getAssignedAuditorId() != null
-                                            ? control.getAssignedAuditorId()
-                                            : control.getTestedBy() != null
-                                              ? control.getTestedBy()
-                                              : tenantId)
+                                    // Owner is who must remediate. Auditee first, then
+                                    // the control's auditor, then the engagement lead —
+                                    // never null, because an ownerless issue lands in
+                                    // nobody's queue and is silently never worked.
+                                    .ownerId(resolveOwner(control))
+                                    // WAS: fell back to `tenantId` when no auditor and no
+                                    // tester existed — a TENANT id written into a USER
+                                    // column, so the finding was attributed to whichever
+                                    // user happened to share that id, typically in another
+                                    // tenant entirely. Falls back to the engagement lead
+                                    // auditor instead, and to the owner as a last resort.
+                                    .raisedBy(resolveRaiser(control))
                                     .raisedAt(LocalDateTime.now())
                                     .build();
                             findingRepository.save(finding);
                             log.info("[AUDIT-DERIVE] Auto-finding raised | controlInstanceId={} findingRef={}",
                                     controlInstanceId, ref);
-                            autoEscalateToIssue(finding, tenantId);
+                            self.autoEscalateToIssue(finding, tenantId);
                         }
                     }
                 }
@@ -491,8 +527,77 @@ public class AuditTestPolicySnapshotService {
         });
     }
 
+    // ── Helper — who must remediate this finding ─────────────────────────────
+
+    /**
+     * Never returns the tenant id, and never silently returns null without the
+     * caller noticing: an issue with no owner sits in nobody's queue.
+     * Order: the auditee who owns the control, then the auditor who tested it,
+     * then the engagement's lead auditor.
+     */
+    private Long resolveOwner(AuditControlInstance control) {
+        if (control.getAuditeeAssignedUserId() != null) return control.getAuditeeAssignedUserId();
+        if (control.getAssignedAuditorId()     != null) return control.getAssignedAuditorId();
+        return engagementRepository.findById(control.getEngagementId())
+                .map(e -> e.getLeadAuditorId()).orElse(null);
+    }
+
+    /** Who raised it — the auditor who tested, else the engagement lead. */
+    private Long resolveRaiser(AuditControlInstance control) {
+        if (control.getAssignedAuditorId() != null) return control.getAssignedAuditorId();
+        if (control.getTestedBy()          != null) return control.getTestedBy();
+        return engagementRepository.findById(control.getEngagementId())
+                .map(e -> e.getLeadAuditorId()).orElse(null);
+    }
+
     // ── Helper — auto-escalate a finding to Issue Management ─────────────────
-    private void autoEscalateToIssue(AuditFinding finding, Long tenantId) {
+    /**
+     * REQUIRES_NEW is load-bearing, not tidiness.
+     *
+     * IssueService.create runs @Transactional. When it throws inside the
+     * caller's transaction, catching the exception does NOT clear the
+     * rollback-only mark Spring has already set — the outer commit then dies
+     * with UnexpectedRollbackException and the whole check run 500s, discarding
+     * a perfectly good test result and finding along with it.
+     *
+     * A separate transaction keeps escalation failures where they belong: the
+     * finding is still saved, the run still completes, and the failure is a log
+     * line rather than a lost result.
+     */
+    @org.springframework.transaction.annotation.Transactional(
+            propagation = org.springframework.transaction.annotation.Propagation.REQUIRES_NEW)
+    public void autoEscalateToIssue(AuditFinding finding, Long tenantId) {
+        // An issue with no owner and no creator cannot be worked and cannot be
+        // routed by the workflow engine. Better to leave the finding standing
+        // and log loudly than to create an orphan nobody sees.
+        if (finding.getOwnerId() == null || finding.getRaisedBy() == null) {
+            log.warn("[AUDIT-DERIVE] Not escalating finding {} — ownerId={} raisedBy={}. "
+                            + "Assign an auditee or a lead auditor to this engagement, then escalate manually.",
+                    finding.getFindingRef(), finding.getOwnerId(), finding.getRaisedBy());
+            return;
+        }
+
+        // Validate the actors HERE, before entering IssueService.create.
+        //
+        // create() is @Transactional and joins this transaction, so a guard that
+        // throws inside it marks the shared transaction rollback-only. The catch
+        // below then swallows the exception and the method carries on — but the
+        // transaction is already poisoned, and the outer commit dies with
+        // UnexpectedRollbackException. The visible symptom was a 500 on every
+        // FAILING check while passing ones succeeded, because only a failure
+        // reaches escalation at all.
+        //
+        // Checking first means a stale actor id skips escalation cleanly and the
+        // check result, the evidence and the finding all still commit.
+        if (!isActiveUserOfTenant(finding.getRaisedBy(), tenantId)
+                || !isActiveUserOfTenant(finding.getOwnerId(), tenantId)) {
+            log.warn("[AUDIT-DERIVE] Not escalating finding {} — ownerId={} or raisedBy={} is not an "
+                            + "active user of tenant {}. The finding stands; escalate it manually once "
+                            + "the engagement has a valid lead auditor and control owner.",
+                    finding.getFindingRef(), finding.getOwnerId(), finding.getRaisedBy(), tenantId);
+            return;
+        }
+
         try {
             IssueRequest req = new IssueRequest();
             req.setTitle(finding.getTitle());
@@ -504,7 +609,7 @@ public class AuditTestPolicySnapshotService {
             req.setSourceEntityId(finding.getId());
             req.setFrameworkRef(finding.getFrameworkRef());
             req.setOwnerId(finding.getOwnerId());
-            req.setWorkflowId(15L); // Issue Remediation Lifecycle
+            req.setWorkflowId(findingWorkflowId(tenantId));
             var issueResp = issueService.create(req, finding.getRaisedBy(), tenantId);
             finding.setLinkedIssueId(issueResp.getId());
             findingRepository.save(finding);
@@ -516,6 +621,29 @@ public class AuditTestPolicySnapshotService {
         }
     }
 
+    /**
+     * Workflow used for issues escalated from an audit finding.
+     *
+     * Resolved by name, not by a hardcoded id. Workflow 15 "Issue Remediation
+     * Lifecycle" opens with a triage step resolved ENTITY_CREATOR, which is
+     * meaningless for an issue nobody filed — and it was that step that turned a
+     * bad createdBy into a task in a stranger's inbox. The finding workflow
+     * starts at the owner instead and has the auditor validate the fix.
+     *
+     * Falls back to the generic issue workflow if the finding one is absent, so
+     * escalation still happens on an environment where seed 17 has not run.
+     */
+    private Long findingWorkflowId(Long tenantId) {
+        return workflowRepository.findAll().stream()
+                .filter(w -> w.isActive())
+                .filter(w -> "ISSUE".equalsIgnoreCase(w.getEntityType()))
+                .filter(w -> w.getTenantId() == null || w.getTenantId().equals(tenantId))
+                .filter(w -> "Audit Finding Remediation".equalsIgnoreCase(w.getName()))
+                .map(w -> w.getId())
+                .findFirst()
+                .orElse(15L);
+    }
+
     // ── Helper — collision-safe finding ref ───────────────────────────────────
     private String generateFindingRef(Long tenantId) {
         long count = findingRepository.countByTenantId(tenantId) + 1;
@@ -525,4 +653,18 @@ public class AuditTestPolicySnapshotService {
         }
         return candidate;
     }
+    /**
+     * True when the id is a live user of this tenant.
+     *
+     * Deliberately read-only and called BEFORE any @Transactional service, so a
+     * stale actor id cannot mark the shared transaction rollback-only.
+     */
+    private boolean isActiveUserOfTenant(Long userId, Long tenantId) {
+        if (userId == null || tenantId == null) return false;
+        return userRepository.findById(userId)
+                .filter(u -> !u.isDeleted())
+                .map(u -> tenantId.equals(u.getTenantId()))
+                .orElse(false);
+    }
+
 }

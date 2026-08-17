@@ -34,6 +34,21 @@ public interface IntegrationCheck {
      */
     CheckResult run(String authConfig, String checkConfig);
 
+    /**
+     * How to make this check pass, written for whoever has to fix it.
+     *
+     * Lives on the check rather than in a lookup table because the check is what
+     * knows the failure mode: "GuardDuty is NOT enabled in ap-south-1" and the
+     * steps to enable it belong together, and cannot drift apart.
+     *
+     * Two or three sentences and, where one exists, a console deep link. Returns
+     * null when there is nothing useful to say — the UI then shows the summary
+     * alone, which is the behaviour today.
+     */
+    default String remediation() {
+        return null;
+    }
+
     record CheckResult(
             Result result,           // PASS | FAIL | ERROR
             String summary,          // human-readable: "All 47 admins have MFA" | "3 missing: ..."

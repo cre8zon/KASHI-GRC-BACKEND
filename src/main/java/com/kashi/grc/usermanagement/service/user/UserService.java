@@ -14,6 +14,14 @@ public interface UserService {
     Map<String, Object> bulkUpload(MultipartFile file, Long defaultRoleId, boolean sendWelcomeEmails);
     UserResponse getUserById(Long userId);
     PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam);
+
+    /**
+     * Same list, additionally split by how the user belongs to the tenant:
+     *   "HOME"  — the tenant's own staff (internal auditors)
+     *   "GUEST" — invited external auditors from an audit firm
+     *   null    — both, identical to the six-arg form
+     */
+    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam, String membershipType);
     UserResponse updateUser(Long userId, UserUpdateRequest request);
     void deleteUser(Long userId);
     UserResponse suspendUser(Long userId);

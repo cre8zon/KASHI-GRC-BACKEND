@@ -8,6 +8,10 @@ import com.kashi.grc.common.repository.EmailTemplateRepository;
 import com.kashi.grc.usermanagement.domain.RoleSide;
 import com.kashi.grc.usermanagement.domain.User;
 import com.kashi.grc.usermanagement.repository.UserRepository;
+import com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository;
+import com.kashi.grc.usermanagement.domain.Role;
+import com.kashi.grc.usermanagement.domain.UserTenantMembership;
+import com.kashi.grc.common.config.multitenancy.TenantContext;
 import jakarta.persistence.EntityManager;
 import jakarta.transaction.Transactional;
 import lombok.AllArgsConstructor;
@@ -44,12 +48,14 @@ import java.util.Map;
 @Service
 @Transactional
 @AllArgsConstructor
+@lombok.extern.slf4j.Slf4j
 public class UtilityService {
 
     private final UserRepository          userRepository;
     private final AuthenticationManager   authenticationManager;
     private final EmailTemplateRepository emailTemplateRepository;
     private final EntityManager entityManager;
+    private final UserTenantMembershipRepository membershipRepository;
 
     // ── Per-request user cache ────────────────────────────────────────────────
     // ThreadLocal because Tomcat reuses threads across requests. The cache is only
@@ -161,8 +167,67 @@ public class UtilityService {
         User user = em.createQuery(cq).getResultStream().findFirst()
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
 
+        user = applyActiveMembership(em, user);
+
         // Cache for the remainder of this request
         REQUEST_USER_CACHE.set(user);
+        return user;
+    }
+
+    /**
+     * Overlays the tenant named by the JWT onto the loaded User.
+     *
+     * Almost every user has one membership, in users.tenant_id, and this method
+     * returns the entity untouched. It only does work for an identity acting in
+     * a tenant other than its home one — today that means an external auditor
+     * invited into a client tenant.
+     *
+     * The entity is DETACHED before anything is written to it. User.tenantId is
+     * a mapped column, so mutating a managed instance would dirty-check and
+     * UPDATE the user's real home tenant on flush — silently repointing their
+     * account. Detaching keeps the overlay purely in-memory for this request.
+     *
+     * Roles are replaced with the ones assigned to that membership: a DigiOSec
+     * auditor is ORGANIZATION-side at home and AUDITOR-side in the client, and
+     * carrying both at once would break the single-side rule everything
+     * downstream assumes.
+     */
+    private User applyActiveMembership(EntityManager em, User user) {
+        Long activeTenantId = TenantContext.getCurrentTenant();
+
+        // No tenant claim, or the token already names the home tenant.
+        if (activeTenantId == null || activeTenantId.equals(user.getTenantId())) {
+            return user;
+        }
+
+        UserTenantMembership membership = membershipRepository
+                .findByUserIdAndTenantId(user.getId(), activeTenantId)
+                .orElseThrow(() -> new com.kashi.grc.common.exception.BusinessException(
+                        "AUTH_NO_MEMBERSHIP",
+                        "You do not have access to this tenant",
+                        org.springframework.http.HttpStatus.FORBIDDEN));
+
+        if (!membership.isUsable()) {
+            // Covers both revoked firms and auditors past the audit period.
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "AUTH_MEMBERSHIP_INACTIVE",
+                    "Your access to this tenant has ended",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+
+        List<Long> roleIds = membershipRepository.findRoleIdsByMembershipId(membership.getId());
+        java.util.Set<Role> membershipRoles = roleIds.isEmpty()
+                ? new java.util.HashSet<>()
+                : new java.util.HashSet<>(em.createQuery(
+                "SELECT DISTINCT r FROM Role r LEFT JOIN FETCH r.permissions WHERE r.id IN :ids",
+                Role.class).setParameter("ids", roleIds).getResultList());
+
+        em.detach(user);                       // must precede every setter below
+        user.setTenantId(activeTenantId);
+        user.setRoles(membershipRoles);
+
+        log.debug("[MEMBERSHIP] userId={} acting in tenantId={} via membershipId={} roles={}",
+                user.getId(), activeTenantId, membership.getId(), roleIds);
         return user;
     }
 

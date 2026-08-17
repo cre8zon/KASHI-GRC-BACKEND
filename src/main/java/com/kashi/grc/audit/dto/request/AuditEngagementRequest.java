@@ -19,6 +19,8 @@ public class AuditEngagementRequest {
     private String  frameworkRef;
     private AuditTemplate.AuditType auditType;
     private Long    leadAuditorId;
+    /** Auditee-side lead — assigns evidence owners and covers for stalled colleagues. */
+    private Long    leadAuditeeId;
     private Long    ownerId;
     private LocalDate plannedStart;
     private LocalDate plannedEnd;

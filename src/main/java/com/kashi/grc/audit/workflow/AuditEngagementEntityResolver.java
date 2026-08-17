@@ -1,5 +1,6 @@
 package com.kashi.grc.audit.workflow;
 
+import com.kashi.grc.workflow.enums.StepAction;
 import com.kashi.grc.audit.repository.AuditEngagementRepository;
 import com.kashi.grc.workflow.domain.StepInstance;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
@@ -97,9 +98,41 @@ public class AuditEngagementEntityResolver implements WorkflowEntityResolver {
                         log.debug("[AUDIT-ENG-RESOLVER] step='{}' ORGANIZATION side → ownerId={}",
                                 si.getSnapName(), resolved);
 
+                    } else if ("AUDITEE".equalsIgnoreCase(side)
+                            && si.getSnapStepAction() == StepAction.ASSIGN) {
+                        // ONLY the assignment step.
+                        //
+                        // Returning null for AUDITEE is load-bearing: it is what
+                        // makes the engine fall through to assignment-scoped
+                        // resolution, so Evidence Collection lands on the people
+                        // actually assigned to each section rather than on one
+                        // lead. An earlier version of this branch applied to every
+                        // AUDITEE step and broke exactly that.
+                        //
+                        // The one step that genuinely cannot be assignment-scoped
+                        // is "Assign Evidence Owners" — it is where nobody has
+                        // been assigned yet, so a null leaves it unassignable and
+                        // the workflow stuck. Gating on StepAction.ASSIGN keeps
+                        // this to that case.
+                        //
+                        // ownerId is the fallback for engagements created before
+                        // leadAuditeeId existed.
+                        resolved = engagement.getLeadAuditeeId() != null
+                                ? engagement.getLeadAuditeeId()
+                                : engagement.getOwnerId();
+                        log.debug("[AUDIT-ENG-RESOLVER] step='{}' AUDITEE ASSIGN step → leadAuditeeId={}",
+                                si.getSnapName(), resolved);
+
+                    } else if ("AUDITEE".equalsIgnoreCase(side)) {
+                        // Every other AUDITEE step stays null so assignment-scoped
+                        // resolution handles it per section / per control.
+                        log.debug("[AUDIT-ENG-RESOLVER] step='{}' AUDITEE side → null "
+                                        + "(assignment-scoped handles this per section)",
+                                si.getSnapName());
+                        resolved = null;
+
                     } else {
-                        // AUDITEE → ASSIGNMENT_SCOPED handles per-control
-                        // SYSTEM  → automated, no owner
+                        // SYSTEM → automated, no owner
                         log.debug("[AUDIT-ENG-RESOLVER] step='{}' side={} → null (fallback)",
                                 si.getSnapName(), side);
                         resolved = null;

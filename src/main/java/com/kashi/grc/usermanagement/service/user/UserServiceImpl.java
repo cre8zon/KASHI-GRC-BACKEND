@@ -40,6 +40,8 @@ public class UserServiceImpl implements UserService {
 
     private final UserRepository  userRepository;
     private final RoleRepository  roleRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+    private final com.kashi.grc.usermanagement.service.role.MembershipRoleSync membershipRoleSync;
     private final UserAttributeRepository attributeRepository;
     private final DelegationRepository delegationRepository;
 
@@ -190,6 +192,12 @@ public class UserServiceImpl implements UserService {
                     });
         }
 
+        // user_roles rows written through the @ManyToMany carry no membership_id,
+        // which makes the user invisible to every membership-scoped picker.
+        // Stamp them once, after the roles are flushed.
+        userRepository.flush();
+        membershipRoleSync.stamp(savedUser.getId(), savedUser.getTenantId());
+
         if (request.getAttributes() != null) {
             request.getAttributes().forEach((k, v) -> attributeRepository.save(
                     UserAttribute.builder().user(savedUser).attributeKey(k).attributeValue(v).build()));
@@ -239,7 +247,16 @@ public class UserServiceImpl implements UserService {
     @Transactional(readOnly = true)
     public UserResponse getUserById(Long userId) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // findByIdAndTenantId reads users.tenant_id, which for an external
+        // auditor is their FIRM — so every attempt to display a guest working in
+        // this tenant 404'd. Anyone with a usable membership here is visible
+        // here; that is what membership means.
         User user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
+                .or(() -> membershipRepository.findByUserIdAndTenantId(userId, tenantId)
+                        .filter(m -> m.isUsable())
+                        .flatMap(m -> userRepository.findById(userId))
+                        .filter(u -> !u.isDeleted()))
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
         return toResponse(user);
     }
@@ -249,6 +266,12 @@ public class UserServiceImpl implements UserService {
     @Override
     @Transactional(readOnly = true)
     public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam) {
+        return listUsers(pageDetails, side, noRoles, vendorIdParam, roleIdParam, tenantIdParam, null);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam, String membershipType) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -281,6 +304,8 @@ public class UserServiceImpl implements UserService {
         }
         final com.kashi.grc.usermanagement.domain.RoleSide finalRoleSide = roleSide;
         final Long finalRoleId = roleIdParam;
+        final String finalMembershipType =
+                (membershipType != null && !membershipType.isBlank()) ? membershipType.toUpperCase() : null;
 
         return dbRepository.findAll(
                 User.class,
@@ -289,12 +314,17 @@ public class UserServiceImpl implements UserService {
                     List<jakarta.persistence.criteria.Predicate> predicates =
                             new java.util.ArrayList<>();
                     predicates.add(cb.isFalse(root.get("isDeleted")));
+                    // Tenant scope resolves through user_tenant_memberships, not
+                    // users.tenant_id. An invited external auditor's home tenant is
+                    // their own firm, so scoping on the column would hide them from
+                    // the very client whose data they can reach — a client admin
+                    // would have auditors in their tenant with no way to see or
+                    // revoke them.
                     if (!isSystemUser) {
-                        // Org/Vendor users only see their own tenant
-                        predicates.add(cb.equal(root.get("tenantId"), tenantId));
+                        predicates.add(cb.exists(membershipOf(cb, root, tenantId, finalMembershipType)));
                     } else if (tenantIdParam != null) {
                         // SYSTEM caller drilling into one specific tenant
-                        predicates.add(cb.equal(root.get("tenantId"), effectiveTenantId));
+                        predicates.add(cb.exists(membershipOf(cb, root, effectiveTenantId, finalMembershipType)));
                     }
                     // else: SYSTEM caller with no tenantIdParam — unscoped, all tenants
                     // Filter by role side — only users who have at least one role with this side
@@ -316,13 +346,27 @@ public class UserServiceImpl implements UserService {
                             predicates.add(cb.isNull(root.get("vendorId")));
                             // For non-vendor sides, also filter by role side
                             if (!noRoles) {
+                                // Roles are read through the membership for the tenant
+                                // being listed. Without this a guest auditor's
+                                // ORGANIZATION roles at their own firm would make them
+                                // show up under side=ORGANIZATION in the client's list.
                                 jakarta.persistence.criteria.Subquery<Long> sub =
                                         cb.createQuery(Long.class).subquery(Long.class);
-                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.User> subRoot =
-                                        sub.correlate(root);
-                                jakarta.persistence.criteria.Join<Object, Object> rolesJoin = subRoot.join("roles");
-                                sub.select(subRoot.get("id"))
-                                        .where(cb.equal(rolesJoin.get("side"), finalRoleSide));
+                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.UserRole> urRoot =
+                                        sub.from(com.kashi.grc.usermanagement.domain.UserRole.class);
+                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.UserTenantMembership> memRoot =
+                                        sub.from(com.kashi.grc.usermanagement.domain.UserTenantMembership.class);
+                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.Role> roleRoot =
+                                        sub.from(com.kashi.grc.usermanagement.domain.Role.class);
+                                sub.select(urRoot.get("userId"))
+                                        .where(
+                                                cb.equal(urRoot.get("userId"), root.get("id")),
+                                                cb.equal(urRoot.get("membershipId"), memRoot.get("id")),
+                                                cb.equal(memRoot.get("tenantId"),
+                                                        isSystemUser && tenantIdParam != null
+                                                                ? effectiveTenantId : tenantId),
+                                                cb.equal(roleRoot.get("id"), urRoot.get("roleId")),
+                                                cb.equal(roleRoot.get("side"), finalRoleSide));
                                 predicates.add(cb.exists(sub));
                             }
                         }
@@ -356,6 +400,39 @@ public class UserServiceImpl implements UserService {
                 this::toResponse
         );
     }
+
+    /**
+     * EXISTS subquery: "this user holds an active, unexpired membership in the
+     * given tenant". Replaces the old cb.equal(root.get("tenantId"), tenantId)
+     * so that invited external auditors are visible to the client whose tenant
+     * they work in, and disappear again when the membership is revoked or its
+     * access window closes.
+     */
+    private jakarta.persistence.criteria.Subquery<Long> membershipOf(
+            jakarta.persistence.criteria.CriteriaBuilder cb,
+            jakarta.persistence.criteria.Root<User> userRoot,
+            Long tenantId,
+            String membershipType) {
+
+        jakarta.persistence.criteria.Subquery<Long> sub =
+                cb.createQuery(Long.class).subquery(Long.class);
+        jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.UserTenantMembership> m =
+                sub.from(com.kashi.grc.usermanagement.domain.UserTenantMembership.class);
+
+        List<jakarta.persistence.criteria.Predicate> preds = new java.util.ArrayList<>();
+        preds.add(cb.equal(m.get("userId"), userRoot.get("id")));
+        preds.add(cb.equal(m.get("tenantId"), tenantId));
+        preds.add(cb.equal(m.get("status"), "ACTIVE"));
+        preds.add(cb.or(cb.isNull(m.get("accessExpiresAt")),
+                cb.greaterThan(m.get("accessExpiresAt"),
+                        cb.literal(java.time.LocalDateTime.now()))));
+        if (membershipType != null) {
+            preds.add(cb.equal(m.get("membershipType"), membershipType));
+        }
+        sub.select(m.get("userId")).where(preds.toArray(new jakarta.persistence.criteria.Predicate[0]));
+        return sub;
+    }
+
 
     // ─────────────────────────────────────────────────────────────
     // UPDATE

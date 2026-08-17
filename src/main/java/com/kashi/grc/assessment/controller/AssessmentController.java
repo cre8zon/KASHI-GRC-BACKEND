@@ -1187,10 +1187,14 @@ public class AssessmentController {
     @GetMapping("/v1/workflows/my-tasks")
     @Operation(summary = "Get all pending tasks for the current user — enriched with step, entity, and workflow context")
     public ResponseEntity<ApiResponse<List<TaskInstanceResponse>>> getMyTasks(
-            @RequestParam(required = false) String status) {
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false, defaultValue = "TENANT") String scope) {
 
-        Long userId = utilityService.getLoggedInDataContext().getId();
-        log.info("[MY-TASKS] userId={} status={}", userId, status);
+        var ctx = utilityService.getLoggedInDataContext();
+        Long userId = ctx.getId();
+        Long activeTenantId = ctx.getTenantId();
+        log.info("[MY-TASKS] userId={} status={} scope={} tenantId={}",
+                userId, status, scope, activeTenantId);
 
         List<TaskInstanceResponse> tasks;
 
@@ -1233,8 +1237,30 @@ public class AssessmentController {
             tasks = workflowEngineService.getPendingTasksForUser(userId);
         }
 
-        log.info("[MY-TASKS] Returning {} tasks | userId={} | statusFilter={}",
-                tasks.size(), userId, status != null ? status : "PENDING");
+        // ── Tenant scope ──────────────────────────────────────────────────
+        // TaskInstance carries no tenant and the query is by assigned user, so
+        // this endpoint has always returned every tenant's tasks together. That
+        // was invisible while one identity meant one tenant. Now an external
+        // auditor staffed at three clients gets all three interleaved with the
+        // firm's own work, and no way to tell which is which.
+        //
+        // Default TENANT: inside a client you want that client's work, and it
+        // restores the behaviour every existing caller assumed.
+        // scope=ALL is the cross-client inbox — a deliberate ask, and the one
+        // thing a single-tenant GRC tool cannot offer an audit firm at all.
+        int beforeScope = tasks.size();
+        if (!"ALL".equalsIgnoreCase(scope) && activeTenantId != null) {
+            tasks = tasks.stream()
+                    // Null tenantId means the workflow instance could not be
+                    // resolved; keep it rather than hide it, or a broken task
+                    // becomes an invisible one.
+                    .filter(t -> t.getTenantId() == null
+                            || activeTenantId.equals(t.getTenantId()))
+                    .toList();
+        }
+
+        log.info("[MY-TASKS] Returning {} tasks (of {} before scope) | userId={} status={} scope={}",
+                tasks.size(), beforeScope, userId, status != null ? status : "PENDING", scope);
         return ResponseEntity.ok(ApiResponse.success(tasks));
     }
 

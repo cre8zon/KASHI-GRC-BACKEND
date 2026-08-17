@@ -136,24 +136,51 @@ public class DbRepository {
         return new PaginatedResponse<>(results, total, pageDetails);
     }
 
-    // Add to DbRepository.java
+    /**
+     * ── MEMBERSHIP-SCOPED USER RESOLUTION ────────────────────────────────────
+     *
+     * These two methods back every workflow assignment dropdown and every
+     * ROLE_BASED actor resolution in the app.
+     *
+     * They used to filter on users.tenant_id and join User.roles. Both break for
+     * an external auditor:
+     *
+     *   users.tenant_id  is the auditor's HOME tenant (their firm), so a
+     *                    DigiOSec auditor working in client tenant 19 would
+     *                    never appear in tenant 19's picker at all.
+     *
+     *   User.roles       maps user_roles by user_id with no membership filter,
+     *                    so the auditor's ORGANIZATION-side roles at their own
+     *                    firm would leak into the client's role queries and they
+     *                    would surface in the wrong side's dropdowns.
+     *
+     * Both now resolve through user_tenant_memberships: which tenant a person
+     * may act in, and which roles apply there. For the ~all users with a single
+     * HOME membership the result set is identical to before.
+     *
+     * Written as native SQL rather than Criteria because user_roles is a plain
+     * @ManyToMany join table with no entity, so membership_id is not reachable
+     * from the object model.
+     *
+     * Expired and revoked memberships are excluded here, not just at login — an
+     * auditor whose audit period has ended must stop appearing as an assignable
+     * user, otherwise they can still be handed new work.
+     */
+    private static final String MEMBERSHIP_USER_SQL = """
+            SELECT DISTINCT u.id
+            FROM   users u
+            JOIN   user_tenant_memberships m ON m.user_id = u.id
+            JOIN   user_roles ur             ON ur.membership_id = m.id
+            JOIN   roles r                   ON r.id = ur.role_id
+            WHERE  r.id = :roleId
+              AND  m.tenant_id = :tenantId
+              AND  m.status = 'ACTIVE'
+              AND  (m.access_expires_at IS NULL OR m.access_expires_at > NOW())
+              AND  u.is_deleted = 0
+            """;
+
     public List<Long> findUserIdsByRoleAndTenant(Long roleId, Long tenantId) {
-        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
-        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
-        Root<com.kashi.grc.usermanagement.domain.User> root =
-                cq.from(com.kashi.grc.usermanagement.domain.User.class);
-
-        Join<Object, Object> rolesJoin = root.join("roles", JoinType.INNER);
-
-        cq.select(root.get("id"))
-                .distinct(true)
-                .where(
-                        cb.equal(rolesJoin.get("id"), roleId),
-                        cb.equal(root.get("tenantId"), tenantId),
-                        cb.isFalse(root.get("isDeleted"))
-                );
-
-        return entityManager.createQuery(cq).getResultList();
+        return findUserIdsByRoleAndTenant(roleId, tenantId, null, null);
     }
 
     /**
@@ -162,23 +189,34 @@ public class DbRepository {
      * Use this for ROLE_BASED actor resolution when step has a specific side.
      */
     public List<Long> findUserIdsByRoleAndTenantAndSide(Long roleId, Long tenantId, String side) {
-        CriteriaBuilder cb = entityManager.getCriteriaBuilder();
-        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
-        Root<com.kashi.grc.usermanagement.domain.User> root =
-                cq.from(com.kashi.grc.usermanagement.domain.User.class);
+        return findUserIdsByRoleAndTenant(roleId, tenantId, side, null);
+    }
 
-        Join<Object, Object> rolesJoin = root.join("roles", JoinType.INNER);
+    /**
+     * Full form. membershipType splits internal from external staff:
+     *   "HOME"  — the tenant's own people (internal auditors)
+     *   "GUEST" — invited external auditors from an audit firm
+     *   null    — both, which is the behaviour every existing caller gets
+     */
+    @SuppressWarnings("unchecked")
+    public List<Long> findUserIdsByRoleAndTenant(Long roleId, Long tenantId,
+                                                 String side, String membershipType) {
+        StringBuilder sql = new StringBuilder(MEMBERSHIP_USER_SQL);
+        if (side != null)           sql.append(" AND r.side = :side");
+        if (membershipType != null) sql.append(" AND m.membership_type = :membershipType");
 
-        cq.select(root.get("id"))
-                .distinct(true)
-                .where(
-                        cb.equal(rolesJoin.get("id"), roleId),
-                        cb.equal(root.get("tenantId"), tenantId),
-                        cb.equal(rolesJoin.get("side"), side),
-                        cb.isFalse(root.get("isDeleted"))
-                );
+        var q = entityManager.createNativeQuery(sql.toString())
+                .setParameter("roleId", roleId)
+                .setParameter("tenantId", tenantId);
+        if (side != null)           q.setParameter("side", side);
+        if (membershipType != null) q.setParameter("membershipType", membershipType);
 
-        return entityManager.createQuery(cq).getResultList();
+        List<Object> rows = q.getResultList();
+        List<Long> ids = new ArrayList<>(rows.size());
+        for (Object row : rows) {
+            ids.add(((Number) row).longValue());
+        }
+        return ids;
     }
 
     /**

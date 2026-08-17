@@ -7,6 +7,7 @@ import com.kashi.grc.integration.domain.EngagementIntegrationSnapshot;
 import com.kashi.grc.integration.domain.IntegrationCheckConfig;
 import com.kashi.grc.integration.repository.EngagementIntegrationSnapshotRepository;
 import com.kashi.grc.integration.repository.IntegrationCheckConfigRepository;
+import com.kashi.grc.integration.repository.IntegrationConfigRepository;
 import com.kashi.grc.integration.repository.TenantIntegrationCheckRepository;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -57,6 +58,7 @@ public class EngagementIntegrationSnapshotService {
     private final EngagementIntegrationSnapshotRepository snapshotRepo;
     private final IntegrationCheckConfigRepository         checkConfigRepo;      // global library — fallback only
     private final TenantIntegrationCheckRepository         tenantCheckRepo;      // preferred: tenant layer
+    private final IntegrationConfigRepository              configRepo;           // which integrations are actually connected
     private final AuditTestInstanceRepository              testInstanceRepo;
     private final AuditTestPolicySnapshotService           snapshotService;
 
@@ -73,11 +75,13 @@ public class EngagementIntegrationSnapshotService {
             EngagementIntegrationSnapshotRepository snapshotRepo,
             IntegrationCheckConfigRepository checkConfigRepo,
             TenantIntegrationCheckRepository tenantCheckRepo,
+            IntegrationConfigRepository configRepo,
             AuditTestInstanceRepository testInstanceRepo,
             @Lazy AuditTestPolicySnapshotService snapshotService) {
         this.snapshotRepo    = snapshotRepo;
         this.checkConfigRepo = checkConfigRepo;
         this.tenantCheckRepo = tenantCheckRepo;
+        this.configRepo      = configRepo;
         this.testInstanceRepo = testInstanceRepo;
         this.snapshotService  = snapshotService;
     }
@@ -135,11 +139,18 @@ public class EngagementIntegrationSnapshotService {
 
             CheckConfigView checkConfig = checkConfigOpt.get();
 
+            // The snapshot must store the RESOLVED vendor check_key (e.g.
+            // MICROSOFT_ADMIN_MFA), NOT the capability that may have been in
+            // automation_key (e.g. MFA_ADMIN) — because the runner matches results
+            // back to snapshots by the vendor check_key. For exact-key bindings
+            // these are identical; for capability bindings this is the resolution.
+            String resolvedCheckKey = checkConfig.checkKey();
+
             // Idempotency — don't create duplicates if snapshotting is called twice
             if (snapshotRepo.existsByEngagementIdAndTestInstanceIdAndCheckKey(
-                    engagementId, test.getId(), checkKey)) {
+                    engagementId, test.getId(), resolvedCheckKey)) {
                 log.debug("[EIS] Snapshot already exists | engagementId={} testInstanceId={} checkKey={}",
-                        engagementId, test.getId(), checkKey);
+                        engagementId, test.getId(), resolvedCheckKey);
                 continue;
             }
 
@@ -147,7 +158,7 @@ public class EngagementIntegrationSnapshotService {
                     .tenantId(tenantId)
                     .engagementId(engagementId)
                     .testInstanceId(test.getId())
-                    .checkKey(checkKey)
+                    .checkKey(resolvedCheckKey)
                     .integrationKey(checkConfig.integrationKey())
                     .controlTagSnapshot(test.getControlTagSnapshot())
                     .displayNameSnapshot(checkConfig.displayName())
@@ -163,7 +174,7 @@ public class EngagementIntegrationSnapshotService {
             created++;
 
             log.debug("[EIS] Snapshot created | engagementId={} testInstanceId={} checkKey={} integration={}",
-                    engagementId, test.getId(), checkKey, checkConfig.integrationKey());
+                    engagementId, test.getId(), resolvedCheckKey, checkConfig.integrationKey());
         }
 
         log.info("[EIS] Snapshot complete | engagementId={} tenantId={} created={} skipped={}",
@@ -254,10 +265,12 @@ public class EngagementIntegrationSnapshotService {
      * the customised checkConfigJson and passCriteriaJson for this tenant.
      * Falls back to global library only if no tenant instance exists yet.
      */
-    private Optional<CheckConfigView> findCheckConfig(String checkKey, Long tenantId) {
-        // Try tenant layer first
+    private Optional<CheckConfigView> findCheckConfig(String keyOrCapability, Long tenantId) {
+        // ── 1. EXACT check_key match (backward compatible) ──────────────────────
+        //    Tests that bind directly to a vendor check (e.g. "AWS_S3_ENCRYPTION")
+        //    keep working exactly as before.
         Optional<com.kashi.grc.integration.domain.TenantIntegrationCheck> tenantCheck =
-                tenantCheckRepo.findByTenantIdAndCheckKey(tenantId, checkKey);
+                tenantCheckRepo.findByTenantIdAndCheckKey(tenantId, keyOrCapability);
 
         if (tenantCheck.isPresent()) {
             var tc = tenantCheck.get();
@@ -267,10 +280,53 @@ public class EngagementIntegrationSnapshotService {
             ));
         }
 
-        // Fallback: global library (tenant hasn't connected this integration yet,
-        // but the test was snapshotted — unusual but handled gracefully)
+        // ── 2. CAPABILITY resolution (vendor-neutral) ───────────────────────────
+        //    If no exact check_key matched, treat the value as a CAPABILITY
+        //    (e.g. "MFA_ADMIN") and resolve it to whichever provider THIS tenant
+        //    actually connected. This is what lets the SAME audit test work for a
+        //    Microsoft org, an Okta org, or a Zoho org with NO per-tenant change.
+        java.util.List<com.kashi.grc.integration.domain.TenantIntegrationCheck> byCapability =
+                tenantCheckRepo.findByTenantIdAndCapabilityAndIsActiveTrue(tenantId, keyOrCapability);
+        if (!byCapability.isEmpty()) {
+            // The binding chosen here is FROZEN into the snapshot for the life of
+            // the engagement, so it cannot be left to whatever order the database
+            // happened to return. Prefer a provider the tenant has actually
+            // connected and left active; break remaining ties on checkKey so the
+            // same library test resolves the same way on every run and in every
+            // environment.
+            java.util.Set<String> connectedKeys = configRepo.findByTenantId(tenantId).stream()
+                    .filter(com.kashi.grc.integration.domain.IntegrationConfig::isActive)
+                    .map(com.kashi.grc.integration.domain.IntegrationConfig::getIntegrationKey)
+                    .collect(java.util.stream.Collectors.toSet());
+
+            byCapability = byCapability.stream()
+                    .sorted(java.util.Comparator
+                            .comparing((com.kashi.grc.integration.domain.TenantIntegrationCheck c) ->
+                                    connectedKeys.contains(c.getIntegrationKey()) ? 0 : 1)
+                            .thenComparing(com.kashi.grc.integration.domain.TenantIntegrationCheck::getCheckKey))
+                    .toList();
+
+            if (byCapability.size() > 1) {
+                log.warn("[EIS] Capability '{}' resolved to {} active checks for tenant {} — binding to '{}' "
+                                + "({}). Candidates: {}. The losing providers will never satisfy this test.",
+                        keyOrCapability, byCapability.size(), tenantId,
+                        byCapability.get(0).getCheckKey(),
+                        connectedKeys.contains(byCapability.get(0).getIntegrationKey())
+                                ? "connected" : "NOT connected",
+                        byCapability.stream()
+                                .map(com.kashi.grc.integration.domain.TenantIntegrationCheck::getCheckKey)
+                                .toList());
+            }
+            var tc = byCapability.get(0);
+            return Optional.of(new CheckConfigView(
+                    tc.getId(), tc.getIntegrationKey(), tc.getCheckKey(),
+                    tc.getDisplayName(), tc.getControlTag(), tc.getRunFrequency()
+            ));
+        }
+
+        // ── 3. Fallback: global library exact check_key (tenant not yet connected)
         return checkConfigRepo.findAll().stream()
-                .filter(c -> checkKey.equals(c.getCheckKey()))
+                .filter(c -> keyOrCapability.equals(c.getCheckKey()))
                 .filter(c -> c.getTenantId() == null || c.getTenantId().equals(tenantId))
                 .min((a, b) -> {
                     if (a.getTenantId() != null && b.getTenantId() == null) return -1;

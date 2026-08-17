@@ -21,6 +21,8 @@ public class RoleServiceImpl implements RoleService {
     private final RoleRepository       roleRepository;
     private final PermissionRepository permissionRepository;
     private final UserRepository       userRepository;
+    private final MembershipRoleSync membershipRoleSync;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     // SodRuleRepository is now guard.SodRuleRepository — unified entity in guard module.
     // ROLE_PAIR rules (role conflict at assignment time) and PERMISSION_PAIR rules
     // (permission conflict at access resolution time) both live in guard.SodRule / sod_rules table.
@@ -218,6 +220,7 @@ public class RoleServiceImpl implements RoleService {
     @Override
     @Transactional
     public UserResponse assignRoleToUser(Long tenantId, Long userId, RoleAssignmentRequest req) {
+        requireNotGuest(userId, tenantId, "given roles");
         var user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
 
@@ -291,12 +294,18 @@ public class RoleServiceImpl implements RoleService {
             }
             user.getRoles().add(role);
         }
-        return buildUserResponse(userRepository.save(user));
+        var saved = userRepository.save(user);
+        userRepository.flush();
+        // The @ManyToMany cannot write membership_id, and without it this role is
+        // invisible to every membership-scoped picker.
+        membershipRoleSync.stamp(userId, tenantId);
+        return buildUserResponse(saved);
     }
 
     @Override
     @Transactional
     public UserResponse removeRoleFromUser(Long tenantId, Long userId, Long roleId, RoleRemoveRequest req) {
+        requireNotGuest(userId, tenantId, "changed");
         var user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
         user.getRoles().removeIf(r -> r.getId().equals(roleId));
@@ -337,4 +346,31 @@ public class RoleServiceImpl implements RoleService {
                 .tenantId(user.getTenantId()).status(user.getStatus().name())
                 .roles(roles).build();
     }
+
+    /**
+     * Refuses to mutate a user who is only a GUEST in the acting tenant.
+     *
+     * A guest is an external auditor: their identity belongs to their own firm.
+     * A client admin may revoke the MEMBERSHIP — that is their access, their
+     * decision — but must not edit the person's name, email, status or roles,
+     * because that record is another company's employee data.
+     *
+     * listUsers is membership-scoped, so guests legitimately appear in the
+     * client's user list; without this they came with the full edit and role
+     * actions attached.
+     */
+    private void requireNotGuest(Long userId, Long tenantId, String action) {
+        boolean guest = membershipRepository.findByUserIdAndTenantId(userId, tenantId)
+                .map(m -> "GUEST".equalsIgnoreCase(m.getMembershipType()))
+                .orElse(false);
+        if (guest) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "EXTERNAL_USER_READONLY",
+                    "This is an external auditor. Their account belongs to their audit firm and "
+                            + "cannot be " + action + " here. You can revoke their access from "
+                            + "External Auditors.",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+    }
+
 }

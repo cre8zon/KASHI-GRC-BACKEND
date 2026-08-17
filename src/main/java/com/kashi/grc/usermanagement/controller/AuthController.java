@@ -6,6 +6,7 @@ import com.kashi.grc.usermanagement.dto.request.PasswordResetRequest;
 import com.kashi.grc.usermanagement.dto.request.ResendInvitationRequest;
 import com.kashi.grc.usermanagement.dto.request.ResetPasswordRequest;
 import com.kashi.grc.usermanagement.service.auth.AuthService;
+import com.kashi.grc.common.util.UtilityService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
@@ -33,12 +34,22 @@ import java.util.Map;
 public class AuthController {
 
     private final AuthService authService;
+    private final UtilityService utilityService;
 
     @PostMapping("/login")
     @Operation(summary = "Authenticate user and return JWT token")
     public ResponseEntity<ApiResponse<?>> login(@Valid @RequestBody LoginRequest request) {
         ApiResponse<?> response = authService.login(request);
         return ResponseEntity.ok(response);
+    }
+
+    @PostMapping("/switch-tenant")
+    @Operation(summary = "Re-issue the session scoped to another tenant this user belongs to")
+    public ResponseEntity<ApiResponse<?>> switchTenant(@RequestBody Map<String, Object> body) {
+        Long userId   = utilityService.getLoggedInDataContext().getId();
+        Object raw    = body.get("tenantId");
+        Long tenantId = raw instanceof Number n ? n.longValue() : Long.parseLong(String.valueOf(raw));
+        return ResponseEntity.ok(authService.switchTenant(userId, tenantId));
     }
 
     @PostMapping("/logout")

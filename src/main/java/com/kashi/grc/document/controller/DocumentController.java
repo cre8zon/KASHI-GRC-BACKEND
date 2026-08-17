@@ -105,6 +105,8 @@ public class DocumentController {
     private String kmsKeyArn;
 
     private final DocumentPreviewService previewService;
+    private final com.kashi.grc.evidence.repository.EvidenceRecordRepository evidenceRecordRepository;
+    private final com.kashi.grc.evidence.repository.EvidenceLinkRepository   evidenceLinkRepository;
 
     // ══════════════════════════════════════════════════════════════════════
     // STEP 1 of upload: Request presigned PUT URL
@@ -322,17 +324,143 @@ public class DocumentController {
                 "linkType",    body.getLinkType())));
     }
 
-    @DeleteMapping("/v1/documents/links/{linkId}")
-    @Transactional
-    @Operation(summary = "Remove a document link (does not delete the document or S3 object)")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> removeLink(@PathVariable Long linkId) {
+    @GetMapping("/v1/documents/links/{linkId}/usage")
+    @Operation(summary = "Where else this document is used as evidence — call before deleting")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> linkUsage(@PathVariable Long linkId) {
+
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         DocumentLink link = documentLinkRepository.findById(linkId)
                 .orElseThrow(() -> new ResourceNotFoundException("DocumentLink", linkId));
         if (!tenantId.equals(link.getTenantId()))
             throw new BusinessException("ACCESS_DENIED", "Not your tenant.", HttpStatus.FORBIDDEN);
-        documentLinkRepository.delete(link);
-        return ResponseEntity.ok(ApiResponse.success(Map.of("linkId", linkId, "removed", true)));
+
+        var recordOpt = findEvidenceRecordFor(link.getDocumentId(), tenantId);
+        List<com.kashi.grc.evidence.domain.EvidenceLink> all = recordOpt
+                .map(r -> evidenceLinkRepository.findByEvidenceRecordIdAndTenantId(r.getId(), tenantId))
+                .orElse(List.of());
+
+        List<Map<String, Object>> elsewhere = all.stream()
+                .filter(el -> !(el.getTargetEntityType().equals(link.getEntityType())
+                        && el.getTargetEntityId().equals(link.getEntityId())))
+                .map(el -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("linkId",     el.getId());
+                    m.put("entityType", el.getTargetEntityType());
+                    m.put("entityId",   el.getTargetEntityId());
+                    m.put("status",     el.getStatus().name());
+                    m.put("locked",     isLocked(el));
+                    return m;
+                })
+                .toList();
+
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("linkId",          linkId);
+        out.put("evidenceRecordId", recordOpt.map(r -> r.getId()).orElse(null));
+        out.put("otherUsages",     elsewhere.size());
+        out.put("lockedUsages",    elsewhere.stream().filter(m -> Boolean.TRUE.equals(m.get("locked"))).count());
+        out.put("usages",          elsewhere);
+        return ResponseEntity.ok(ApiResponse.success(out));
+    }
+
+    /**
+     * Remove a document link.
+     *
+     * WHY THIS IS NOT A ONE-LINE DELETE
+     *   Evidence uploaded once is propagated by EvidenceReuseEngine to every
+     *   control and test whose tag matches, as rows in evidence_links. Those are
+     *   a separate table from document_links, and this endpoint used to delete
+     *   only the latter — so the file vanished from the screen the user was
+     *   standing on and stayed attached everywhere it had been reused, with
+     *   evidence_records.link_count still counting it.
+     *
+     *   Cascading blindly is equally wrong: reused evidence is shared, and
+     *   ripping it out from under a control an auditor has already accepted
+     *   destroys part of the audit trail.
+     *
+     * @param scope HERE (default) removes this usage only.
+     *              EVERYWHERE removes all usages, and is refused if any of them
+     *              has been ACCEPTED or AUTOMATION_VERIFIED — evidence an auditor
+     *              has signed off is not the uploader's to withdraw.
+     */
+    @DeleteMapping("/v1/documents/links/{linkId}")
+    @Transactional
+    @Operation(summary = "Remove a document link and its matching evidence links (does not delete the S3 object)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> removeLink(
+            @PathVariable Long linkId,
+            @RequestParam(defaultValue = "HERE") String scope) {
+
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        DocumentLink link = documentLinkRepository.findById(linkId)
+                .orElseThrow(() -> new ResourceNotFoundException("DocumentLink", linkId));
+        if (!tenantId.equals(link.getTenantId()))
+            throw new BusinessException("ACCESS_DENIED", "Not your tenant.", HttpStatus.FORBIDDEN);
+
+        var recordOpt = findEvidenceRecordFor(link.getDocumentId(), tenantId);
+        List<com.kashi.grc.evidence.domain.EvidenceLink> allLinks = recordOpt
+                .map(r -> evidenceLinkRepository.findByEvidenceRecordIdAndTenantId(r.getId(), tenantId))
+                .orElse(List.of());
+
+        boolean everywhere = "EVERYWHERE".equalsIgnoreCase(scope);
+        List<com.kashi.grc.evidence.domain.EvidenceLink> toRemove = everywhere
+                ? allLinks
+                : allLinks.stream()
+                  .filter(el -> el.getTargetEntityType().equals(link.getEntityType())
+                                && el.getTargetEntityId().equals(link.getEntityId()))
+                  .toList();
+
+        List<Long> locked = toRemove.stream().filter(this::isLocked)
+                .map(el -> el.getId()).toList();
+        if (!locked.isEmpty()) {
+            throw new BusinessException("EVIDENCE_ACCEPTED",
+                    "This evidence has been accepted by an auditor in " + locked.size()
+                            + " place(s) and cannot be removed. Ask the auditor to reject it first.",
+                    HttpStatus.CONFLICT);
+        }
+
+        evidenceLinkRepository.deleteAll(toRemove);
+
+        // link_count is denormalised onto the record and drives the reuse badge;
+        // leaving it stale makes evidence look shared when it is not.
+        recordOpt.ifPresent(r -> {
+            int remaining = Math.max(0, allLinks.size() - toRemove.size());
+            r.setLinkCount(remaining);
+            evidenceRecordRepository.save(r);
+        });
+
+        if (everywhere) {
+            documentLinkRepository.deleteAll(
+                    documentLinkRepository.findByDocumentId(link.getDocumentId()));
+        } else {
+            documentLinkRepository.delete(link);
+        }
+
+        log.info("[DOCUMENT] Link removed | linkId={} scope={} evidenceLinksRemoved={} tenantId={}",
+                linkId, scope.toUpperCase(), toRemove.size(), tenantId);
+
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("linkId", linkId);
+        out.put("removed", true);
+        out.put("scope", scope.toUpperCase());
+        out.put("evidenceLinksRemoved", toRemove.size());
+        out.put("remainingUsages", Math.max(0, allLinks.size() - toRemove.size()));
+        return ResponseEntity.ok(ApiResponse.success(out));
+    }
+
+    /**
+     * Manual evidence stores its document id in EvidenceRecord.fileUrl as a
+     * string (see EvidenceRegistrationService), so that is the only join back
+     * from a document to its evidence record.
+     */
+    private java.util.Optional<com.kashi.grc.evidence.domain.EvidenceRecord>
+    findEvidenceRecordFor(Long documentId, Long tenantId) {
+        if (documentId == null) return java.util.Optional.empty();
+        return evidenceRecordRepository.findByTenantIdAndFileUrl(tenantId, String.valueOf(documentId));
+    }
+
+    /** Evidence an auditor has signed off is not the uploader's to withdraw. */
+    private boolean isLocked(com.kashi.grc.evidence.domain.EvidenceLink el) {
+        return el.getStatus() == com.kashi.grc.evidence.domain.EvidenceLink.Status.ACCEPTED
+                || el.getStatus() == com.kashi.grc.evidence.domain.EvidenceLink.Status.AUTOMATION_VERIFIED;
     }
 
     // ══════════════════════════════════════════════════════════════════════

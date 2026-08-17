@@ -201,6 +201,39 @@ public class IntegrationRunner {
         config.setLastRunStatus(status);
         configRepo.save(config);
 
+        // ── Transition detection ──────────────────────────────────────────
+        // Continuous monitoring is not "we collect evidence often" — it is
+        // knowing the moment a control stops holding. Comparing this result with
+        // the previous one is what turns a stream of runs into drift you can act
+        // on, and it has to be recorded at write time: reconstructing it later
+        // from run history is a self-join over a table that only grows.
+        //
+        // ERROR is excluded on purpose. A throttled API or an expired credential
+        // is not the control failing, and treating it as PASS→FAIL would raise
+        // alarms about the integration rather than the posture.
+        String previousResult = runRepo
+                .findByTenantIdAndCheckKeyOrderByRunAtDesc(tenantId, tenantCheck.getCheckKey())
+                .stream()
+                .map(IntegrationRun::getResult)
+                .filter(r -> "PASS".equals(r) || "FAIL".equals(r))
+                .findFirst()
+                .orElse(null);
+
+        String currentResult = result.result().name();
+        String transition = null;
+        boolean changed = false;
+
+        if (previousResult != null
+                && ("PASS".equals(currentResult) || "FAIL".equals(currentResult))
+                && !previousResult.equals(currentResult)) {
+            changed    = true;
+            transition = previousResult + "_TO_" + currentResult;
+            // WARN rather than INFO: a control that just stopped holding is the
+            // single most actionable line this system produces.
+            log.warn("[INTEGRATION] DRIFT | checkKey={} tenantId={} {} — {}",
+                    tenantCheck.getCheckKey(), tenantId, transition, result.summary());
+        }
+
         IntegrationRun run = IntegrationRun.builder()
                 .tenantId(tenantId)
                 .integrationConfigId(config.getId())
@@ -214,6 +247,9 @@ public class IntegrationRunner {
                 .rawPayload(result.rawPayload())
                 .durationMs(durationMs)
                 .nextRunAt(record.getNextRunAt())
+                .previousResult(previousResult)
+                .resultChanged(changed)
+                .transition(transition)
                 .build();
         runRepo.save(run);
 

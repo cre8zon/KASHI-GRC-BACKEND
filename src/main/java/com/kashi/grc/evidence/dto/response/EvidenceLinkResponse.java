@@ -64,4 +64,16 @@ public class EvidenceLinkResponse {
 
     /** Integration run time — distinct from linkedAt */
     private LocalDateTime collectedAt;
+
+    /** Which integration produced this, e.g. AWS — null for manual evidence */
+    private String integrationKey;
+
+    /**
+     * The raw API response the check recorded, as JSON. For an API-collected
+     * control this IS the evidence — the equivalent of a screenshot for a
+     * manual control — so it has to reach the reviewer, not just the one-line
+     * automationMessage. Stored on EvidenceRecord since the first automated
+     * run; simply was never mapped through.
+     */
+    private String rawPayload;
 }

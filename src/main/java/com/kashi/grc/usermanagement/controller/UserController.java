@@ -127,8 +127,14 @@ public class UserController {
         if (tenantIdStr != null && !tenantIdStr.isBlank()) {
             try { tenantId = Long.parseLong(tenantIdStr); } catch (NumberFormatException ignored) {}
         }
+        // HOME | GUEST — lets the engagement form ask for internal staff or for
+        // external auditors invited from a firm, using one endpoint.
+        String membershipType = allParams.get("membershipType");
+        if (membershipType != null && membershipType.isBlank()) membershipType = null;
+
         return ResponseEntity.ok(ApiResponse.success(
-                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles, vendorId, roleId, tenantId)));
+                userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles,
+                        vendorId, roleId, tenantId, membershipType)));
     }
 
     // ── UPDATE ────────────────────────────────────────────────────

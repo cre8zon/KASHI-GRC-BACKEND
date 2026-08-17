@@ -48,6 +48,16 @@ public class OktaUserMfaCheck implements IntegrationCheck {
     @Override public String checkKey()       { return "OKTA_USER_MFA"; }
     @Override public String integrationKey() { return "OKTA"; }
 
+    /** How to make this check pass -- shown beside the failure in the UI. */
+    @Override
+    public String remediation() {
+        return
+                "Require MFA for all users: Okta Admin console > Security > Authentication policies "
+                        + "> add a rule for Any user requiring a second factor on every sign-in. Enrolment "
+                        + "policies alone do not block access -- users without a factor keep signing in until "
+                        + "an authentication policy requires one.";
+    }
+
     @Override
     public CheckResult run(String authConfig, String checkConfig) {
         try {

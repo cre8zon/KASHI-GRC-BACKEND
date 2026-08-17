@@ -238,9 +238,27 @@ public class AuditEngagementService {
             }
         }
 
+        // The lead auditor was already told. The other two named people were not,
+        // so an engagement could be created naming an owner and a lead auditee who
+        // never found out they were expected to do anything — and step 2 sits
+        // waiting on one of them.
         if (req.getLeadAuditorId() != null) {
             notificationService.send(req.getLeadAuditorId(), "AUDIT_ENGAGEMENT_ASSIGNED",
-                    "Audit engagement " + ref + " has been assigned to you",
+                    "Audit engagement " + ref + " has been assigned to you as lead auditor",
+                    "AUDIT_ENGAGEMENT", engagement.getId());
+        }
+        if (req.getLeadAuditeeId() != null
+                && !req.getLeadAuditeeId().equals(req.getLeadAuditorId())) {
+            notificationService.send(req.getLeadAuditeeId(), "AUDIT_ENGAGEMENT_LEAD_AUDITEE_ASSIGNED",
+                    "You are the evidence lead for audit engagement " + ref
+                            + ". Assign control owners in your organization to begin evidence collection.",
+                    "AUDIT_ENGAGEMENT", engagement.getId());
+        }
+        if (req.getOwnerId() != null
+                && !req.getOwnerId().equals(req.getLeadAuditorId())
+                && !req.getOwnerId().equals(req.getLeadAuditeeId())) {
+            notificationService.send(req.getOwnerId(), "AUDIT_ENGAGEMENT_OWNER_ASSIGNED",
+                    "Audit engagement " + ref + " has been created under your ownership",
                     "AUDIT_ENGAGEMENT", engagement.getId());
         }
 

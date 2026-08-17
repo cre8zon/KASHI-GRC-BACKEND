@@ -37,6 +37,29 @@ public class AuthResponse {
         private List<RoleInfo> roles;
         private List<String> permissions;
         private Map<String, String> attributes;
+
+        /**
+         * Every tenant this identity may act in. One entry for almost everyone;
+         * an external auditor has their firm plus each client they are staffed
+         * on. Purely additive — a client that ignores it behaves as before.
+         */
+        private List<TenantMembershipInfo> memberships;
+    }
+
+    @Data
+    @Builder
+    @lombok.NoArgsConstructor
+    @lombok.AllArgsConstructor
+    public static class TenantMembershipInfo {
+        private Long    membershipId;
+        private Long    tenantId;
+        private String  tenantName;
+        /** HOME = own organisation, GUEST = invited external auditor. */
+        private String  membershipType;
+        private String  firmName;
+        private LocalDateTime accessExpiresAt;
+        /** True for the tenant this session's token is scoped to. */
+        private Boolean active;
     }
 
     @Data
