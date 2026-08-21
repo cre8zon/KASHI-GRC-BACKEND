@@ -82,6 +82,20 @@ public class AuditControlInstance extends BaseEntity {
     @Column(name = "description_snapshot", columnDefinition = "TEXT")
     private String descriptionSnapshot;
 
+    /**
+     * Frozen copy of AuditControl.evidenceGuidance, taken when the engagement
+     * was created. Snapshotted rather than read live for the same reason every
+     * other *Snapshot column here is: editing the library must not silently
+     * change what an in-flight or already-signed-off engagement was assessed
+     * against.
+     *
+     * Null on rows created before this column existed, and on controls whose
+     * library entry has no guidance — in both cases getControlInstance falls
+     * back to rolling up the mapped tests.
+     */
+    @Column(name = "evidence_guidance_snapshot", columnDefinition = "TEXT")
+    private String evidenceGuidanceSnapshot;
+
     /** Snapshotted section breadcrumb for display: "A.9 / A.9.1 / A.9.1.1" */
     @Column(name = "section_breadcrumb_snapshot", length = 500)
     private String sectionBreadcrumbSnapshot;

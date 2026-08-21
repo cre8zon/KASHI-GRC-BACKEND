@@ -273,8 +273,36 @@ public class WorkflowInstanceController {
     @GetMapping("/tasks/user/{userId}")
     @Operation(summary = "Get pending tasks for a user — their workflow inbox")
     public ResponseEntity<ApiResponse<List<TaskInstanceResponse>>> getPendingTasks(@PathVariable Long userId) {
+        requireSelf(userId);
         log.debug("[WF-TASK] GET PENDING | userId={}", userId);
         return ResponseEntity.ok(ApiResponse.success(service.getPendingTasksForUser(userId)));
+    }
+
+    /**
+     * The userId in the path is the caller's own, or the request is refused.
+     *
+     * These endpoints took the id straight from the URL and returned that
+     * user's tasks, with no check that it was the caller. SecurityConfig is
+     * anyRequest().authenticated() and there is no method security anywhere in
+     * the project, so any logged-in account could read any other account's
+     * inbox — across tenants, including an external auditor reading the
+     * client's staff. TaskInstance has no tenant column, so tenancy did not
+     * accidentally contain it either.
+     *
+     * Nothing in the frontend passes anyone else's id: workflowsApi.tasks
+     * .pending and .all are defined and never called, and the inbox uses
+     * /v1/workflows/my-tasks. So this closes a hole without removing a
+     * capability anybody was using.
+     */
+    private void requireSelf(Long userId) {
+        Long me = utilityService.getLoggedInDataContext().getId();
+        if (!me.equals(userId)) {
+            log.warn("[WF-TASK] Refused cross-user task read | caller={} requested={}", me, userId);
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "TASKS_NOT_YOURS",
+                    "You can only view your own tasks",
+                    HttpStatus.FORBIDDEN);
+        }
     }
 
     @GetMapping("/tasks/my-next")
@@ -324,6 +352,7 @@ public class WorkflowInstanceController {
     @GetMapping("/tasks/user/{userId}/all")
     @Operation(summary = "Get all tasks for a user — complete task history across all statuses")
     public ResponseEntity<ApiResponse<List<TaskInstanceResponse>>> getAllTasks(@PathVariable Long userId) {
+        requireSelf(userId);
         log.debug("[WF-TASK] GET ALL | userId={}", userId);
         return ResponseEntity.ok(ApiResponse.success(service.getAllTasksForUser(userId)));
     }
@@ -558,13 +587,33 @@ public class WorkflowInstanceController {
     @GetMapping("/steps/{stepInstanceId}/eligible-users")
     @Operation(summary = "Users eligible to be assigned at this step")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getEligibleUsers(
-            @PathVariable Long stepInstanceId) {
+            @PathVariable Long stepInstanceId,
+            @RequestParam(required = false) String side) {
 
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
         // 1. Load current step instance
         com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
         if (si == null) return ResponseEntity.notFound().build();
+
+        // ── Mode 0: caller asked for a specific side ──────────────────────────
+        // The sections screen has TWO pickers — auditor and auditee — and both
+        // were fed from this one endpoint, resolved against whichever step
+        // happened to be current. Sitting on step 3 (AUDITEE), the auditor picker
+        // was therefore offering auditee-eligible users, and an auditor assigned
+        // from that list is then dropped by the ASSIGNMENT_SCOPED role filter at
+        // step 5 — which falls back to ROLE_BASED and fans the task out to every
+        // holder of the role in the tenant.
+        //
+        // With ?side=AUDITOR the answer comes from the step in THIS workflow that
+        // actually assigns that side, regardless of where the workflow currently
+        // sits.
+        if (side != null && !side.isBlank()) {
+            List<Map<String, Object>> users = service.getEligibleUsersForSide(si, side, tenantId);
+            log.info("[WF-ELIGIBLE] stepInstanceId={} side={} → {} users",
+                    stepInstanceId, side, users.size());
+            return ResponseEntity.ok(ApiResponse.success(users));
+        }
 
         // ── Mode 1: assignableSide configured on the step ─────────────────────
         if (si.getSnapAssignableSide() != null) {

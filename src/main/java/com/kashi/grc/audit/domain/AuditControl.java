@@ -76,6 +76,26 @@ public class AuditControl extends GlobalOrTenantEntity {
     private String controlTag;
 
     /**
+     * What evidence an auditor should expect to see for this control, authored
+     * once in the library and snapshotted into AuditControlInstance at
+     * engagement creation — the same contract as controlTag above.
+     *
+     * WHY IT LIVES ON THE CONTROL AND NOT ONLY ON TESTS
+     *   Evidence guidance already existed on AuditTest, and the control
+     *   instance Overview rolled it up from whichever tests were mapped. That
+     *   works when a control is defined entirely by its tests, and produces
+     *   nothing when a control has no tests mapped yet — which is most of a
+     *   library before it is fully built out. Authoring at control level makes
+     *   the guidance a property of the requirement rather than of the way it
+     *   happens to be tested.
+     *
+     * PRECEDENCE: the control's own guidance wins; the test rollup is the
+     * fallback when this is blank. See AuditInstanceController.getControlInstance.
+     */
+    @Column(name = "evidence_guidance", columnDefinition = "TEXT")
+    private String evidenceGuidance;
+
+    /**
      * KashiLink / UCF: the common control this framework requirement implements.
      * References common_controls.code — no FK, because the catalogue is global
      * (tenant_id NULL) while this table can be tenant-scoped.

@@ -70,6 +70,7 @@ public class AuditPolicyController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> getPolicy(@PathVariable Long id) {
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireReadablePolicy(policy);   // global policies stay visible to every tenant
 
         Map<String, Object> result = toPolicyDetailMap(policy);
 
@@ -139,6 +140,7 @@ public class AuditPolicyController {
             @PathVariable Long id, @RequestBody AuditPolicyRequest req) {
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
 
         if (req.getTitle() != null)        policy.setTitle(req.getTitle());
         if (req.getDescription() != null)  policy.setDescription(req.getDescription());
@@ -167,6 +169,7 @@ public class AuditPolicyController {
 
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
 
         policy.setStatus(AuditPolicy.PolicyStatus.APPROVED);
         policy.setApprovedById(userId);
@@ -199,6 +202,7 @@ public class AuditPolicyController {
 
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
 
         if (policy.getStatus() != AuditPolicy.PolicyStatus.DRAFT) {
             throw new BusinessException("INVALID_STATUS",
@@ -225,6 +229,7 @@ public class AuditPolicyController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> deprecatePolicy(@PathVariable Long id) {
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
         policy.setStatus(AuditPolicy.PolicyStatus.DEPRECATED);
         policyRepository.save(policy);
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", "DEPRECATED")));
@@ -280,21 +285,43 @@ public class AuditPolicyController {
     @Operation(summary = "Bulk delete policies by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeletePolicies(
             @RequestParam List<Long> ids) {
-        int deleted = 0;
+        boolean isSystem  = utilityService.isSystemUser();
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+
+        int deleted = 0, skipped = 0;
         for (Long id : ids) {
-            if (policyRepository.existsById(id)) {
-                policyControlMappingRepository.findByPolicyId(id)
-                        .forEach(policyControlMappingRepository::delete);
-                policyRepository.deleteById(id);
-                deleted++;
+            var found = policyRepository.findById(id);
+            if (found.isEmpty()) continue;
+
+            // Silently skipped rather than throwing, matching bulkDeleteControls:
+            // a bulk action must not abort halfway and leave the caller guessing
+            // which half went through. Previously existsById was the only test, so
+            // a list of ids deleted other tenants' policies and the global library.
+            AuditPolicy pol = found.get();
+            if (!isSystem && !java.util.Objects.equals(pol.getTenantId(), callerTenant)) {
+                skipped++;
+                continue;
             }
+
+            policyControlMappingRepository.findByPolicyId(id)
+                    .forEach(policyControlMappingRepository::delete);
+            policyRepository.deleteById(id);
+            deleted++;
         }
+        if (skipped > 0)
+            log.warn("[AUDIT-LIBRARY] Bulk delete skipped {} policies not owned by tenant {}", skipped, callerTenant);
         log.info("[AUDIT-LIBRARY] Bulk deleted {} policies", deleted);
-        return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted)));
+        return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted, "skipped", skipped)));
     }
 
     @DeleteMapping("/v1/audit/library/policies/{id}")
     public ResponseEntity<ApiResponse<Void>> deletePolicy(@PathVariable Long id) {
+        // Loaded first purely so ownership can be checked — deleteById(id) took the
+        // path variable straight to the database with nothing in between.
+        AuditPolicy policy = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
+
         policyControlMappingRepository.deleteByPolicyId(id);
         policyRepository.deleteById(id);
         log.info("[AUDIT-POLICY] Deleted id={}", id);
@@ -307,8 +334,16 @@ public class AuditPolicyController {
     @Operation(summary = "List policies mapped to a library control")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listControlPolicies(
             @PathVariable Long controlId) {
-        List<AuditPolicyControlMapping> mappings =
-                policyControlMappingRepository.findByControlId(controlId);
+        // Controls are shared across every tenant, so the mappings hanging off one
+        // control belong to many different companies. Returning them all meant a
+        // client opening a global control saw which policies OTHER clients had
+        // mapped to it, titles included. Keep this tenant's rows plus the global
+        // ones the platform ships.
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+        boolean isSystem  = utilityService.isSystemUser();
+        List<AuditPolicyControlMapping> mappings = isSystem
+                ? policyControlMappingRepository.findByControlId(controlId)
+                : policyControlMappingRepository.findVisibleByControlId(controlId, callerTenant);
 
         // BATCHED — was one policyRepository.findById() per row.
         List<Long> policyIds = mappings.stream().map(AuditPolicyControlMapping::getPolicyId).toList();
@@ -341,6 +376,9 @@ public class AuditPolicyController {
     @Operation(summary = "List controls mapped to a library policy")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listPolicyControls(
             @PathVariable Long policyId) {
+        requireReadablePolicy(policyRepository.findById(policyId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", policyId)));
+
         List<AuditPolicyControlMapping> mappings =
                 policyControlMappingRepository.findByPolicyId(policyId);
 
@@ -397,6 +435,13 @@ public class AuditPolicyController {
     @DeleteMapping("/v1/audit/library/controls/{controlId}/policies/{policyId}")
     public ResponseEntity<ApiResponse<Void>> unlinkControlPolicy(
             @PathVariable Long controlId, @PathVariable Long policyId) {
+        // The mapping belongs to whoever created it. Without this check one tenant
+        // could unlink another tenant's policy from a shared global control, and the
+        // owner would simply find the mapping gone.
+        AuditPolicy policy = policyRepository.findById(policyId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", policyId));
+        requireOwnedPolicy(policy);
+
         policyControlMappingRepository.findByPolicyIdAndControlId(policyId, controlId)
                 .ifPresent(policyControlMappingRepository::delete);
         return ResponseEntity.ok(ApiResponse.success());
@@ -420,6 +465,23 @@ public class AuditPolicyController {
             @PathVariable Long engagementId, @PathVariable Long policyInstanceId) {
         AuditPolicyInstance instance = policyInstanceRepository.findById(policyInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", policyInstanceId));
+
+        // Loaded by id alone, and the engagementId in the path was never used —
+        // so any authenticated user could read any tenant's policy instance by
+        // guessing an id, with a path prefix that looked scoped but was not.
+        Long caller = utilityService.getLoggedInDataContext().getTenantId();
+        if (!utilityService.isSystemUser()
+                && !java.util.Objects.equals(instance.getTenantId(), caller)) {
+            log.warn("[AUDIT-POLICY] Refused cross-tenant policy-instance read | id={} caller={}",
+                    policyInstanceId, caller);
+            throw new BusinessException("POLICY_ACCESS_DENIED",
+                    "You can only view policy instances belonging to your organisation",
+                    HttpStatus.FORBIDDEN);
+        }
+        if (!java.util.Objects.equals(instance.getEngagementId(), engagementId)) {
+            throw new ResourceNotFoundException("AuditPolicyInstance", policyInstanceId);
+        }
+
         return ResponseEntity.ok(ApiResponse.success(toPolicyInstanceMap(instance)));
     }
 
@@ -523,6 +585,49 @@ public class AuditPolicyController {
 
     // ── Serializers ───────────────────────────────────────────────────────────
 
+    // ══════════════════════════════════════════════════════════════════════
+    // TENANT OWNERSHIP
+    //
+    // Policies are the one library entity a client genuinely owns and edits —
+    // controls, tests, sections and templates are framework structure and stay
+    // system-authored. That makes this the surface where a missing ownership
+    // check is most damaging, and most of these handlers had none: updatePolicy,
+    // deletePolicy, bulkDeletePolicies, deprecatePolicy and getPolicy all loaded
+    // by id alone, so any authenticated user of any tenant could read, rewrite or
+    // delete another company's policy, and could edit the global ones too.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Throws unless the caller may modify this policy. Platform Admin may touch global rows. */
+    private void requireOwnedPolicy(AuditPolicy policy) {
+        if (utilityService.isSystemUser()) return;
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(policy.getTenantId(), callerTenant)) return;
+
+        // Global policies (tenantId null) are readable by everyone but writable
+        // only by Platform Admin — a client that wants its own version uses
+        // new-version, which creates a tenant-owned copy.
+        log.warn("[AUDIT-POLICY] Refused cross-tenant access | policyId={} policyTenant={} caller={}",
+                policy.getId(), policy.getTenantId(), callerTenant);
+        throw new BusinessException("POLICY_ACCESS_DENIED",
+                policy.getTenantId() == null
+                        ? "Global policies are maintained by the platform and cannot be edited"
+                        : "You can only work with policies belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
+
+    /** Read guard — same rule, but global rows are allowed through. */
+    private void requireReadablePolicy(AuditPolicy policy) {
+        if (utilityService.isSystemUser()) return;
+        if (policy.getTenantId() == null) return;                 // global library, readable by all
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(policy.getTenantId(), callerTenant)) return;
+
+        log.warn("[AUDIT-POLICY] Refused cross-tenant read | policyId={} caller={}",
+                policy.getId(), callerTenant);
+        throw new BusinessException("POLICY_ACCESS_DENIED",
+                "You can only view policies belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
     private Map<String, Object> toPolicySummaryMap(AuditPolicy p) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",                    p.getId());
@@ -541,6 +646,12 @@ public class AuditPolicyController {
         m.put("controlTags",           p.getControlTags());
         m.put("frameworkRefs",         p.getFrameworkRefs());
         m.put("tenantId",              p.getTenantId());
+        // origin/editable let the UI show a Global badge and hide Edit/Delete on rows
+        // the server would refuse anyway. The guards are the boundary; this exists so
+        // the interface stops offering actions that end in a 403.
+        boolean globalP = p.getTenantId() == null;
+        m.put("origin",   globalP ? "GLOBAL" : "ORG");
+        m.put("editable", !globalP || utilityService.isSystemUser());
         m.put("createdAt",             p.getCreatedAt());
         return m;
     }

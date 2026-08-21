@@ -94,6 +94,21 @@ public class AccessContext {
     private boolean  canEdit;
     private boolean  canAct;
 
+    /**
+     * Authority to force this step past its outstanding work.
+     *
+     * Deliberately separate from canAct. canAct means "you have a task here and
+     * may action it", and the frontend also derives EDIT mode from it
+     * (canEdit = stepAction ? canAct : canEdit). Folding override authority into
+     * canAct would put every tab form into edit mode for anyone holding the
+     * override permission, on every step — the opposite of what override is for.
+     *
+     * True only when the user holds workflow:step:override AND the step is on
+     * their own side, mirroring requireSameSideToOverride in the engine. If the
+     * two disagree the user gets a button that 403s, which is worse than none.
+     */
+    private boolean  canOverride;
+
     /** ACTOR | ASSIGNER | null */
     private TaskRole taskRole;
 

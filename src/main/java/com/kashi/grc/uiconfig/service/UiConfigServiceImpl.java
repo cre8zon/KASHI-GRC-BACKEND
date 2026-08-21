@@ -37,6 +37,18 @@ public class UiConfigServiceImpl implements UiConfigService {
     private final PermissionGrantRepository permissionGrantRepository;
     private final com.kashi.grc.usermanagement.service.user.UserService userService;
 
+    /**
+     * Escape hatch for the guest navigation rule in isNavVisible.
+     *
+     * Defaults on, because the safe failure for an outsider is seeing too
+     * little. It exists because the rule depends on ui_navigation rows being
+     * correctly classified with allowed_sides, which is data this code cannot
+     * verify — if that data is wrong the symptom is an empty auditor sidebar,
+     * and recovering from it should be a property flip rather than a redeploy.
+     */
+    @org.springframework.beans.factory.annotation.Value("${kashi.guest.nav-strict:true}")
+    private boolean guestNavStrict;
+
     // ── Bootstrap (single call after login) ───────────────────────
 
     @Override
@@ -355,6 +367,27 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     private boolean isNavVisible(UiNavigation item,
                                  Set<String> sides, Set<String> perms, Set<String> features) {
+        // ── External auditors: nothing is visible unless it says AUDITOR ─────
+        // Everywhere else in this method an unset gate means "no requirement,
+        // so allow" — the right default for a config table describing one
+        // organisation's own screens. It is the wrong default for someone from
+        // another company: a nav row nobody has classified would be shown to a
+        // guest, and the modules an auditor was never hired for are exactly the
+        // rows least likely to have been classified. So for a guest the default
+        // inverts, and allowed_sides must name AUDITOR explicitly.
+        //
+        // If an auditor's sidebar comes up empty, the cause is ui_navigation
+        // rows lacking AUDITOR in allowed_sides rather than a bug here; set
+        // kashi.guest.nav-strict=false to fall back to the old behaviour while
+        // the rows are corrected.
+        if (guestNavStrict && com.kashi.grc.common.config.multitenancy.AccessScope.isGuest()) {
+            if (item.getAllowedSides() == null || item.getAllowedSides().isBlank()) return false;
+            boolean auditorSide = Arrays.stream(item.getAllowedSides().split(","))
+                    .map(String::trim)
+                    .anyMatch("AUDITOR"::equalsIgnoreCase);
+            if (!auditorSide) return false;
+        }
+
         // Feature entitlement first — cheapest, tenant-wide exclusion. A row with
         // a required_feature the tenant lacks is neither shown nor route-resolved.
         if (item.getRequiredFeature() != null && !item.getRequiredFeature().isBlank()

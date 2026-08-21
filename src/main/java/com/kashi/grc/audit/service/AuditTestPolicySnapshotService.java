@@ -165,9 +165,15 @@ public class AuditTestPolicySnapshotService {
                                Set<Long> originalControlIds,
                                Map<Long, Long> originalToInstanceId) {
 
-        // Find all control→test library mappings for these controls
+        // Find all control→test library mappings for these controls.
+        //
+        // Same tenant filter as snapshotPolicies below. Tests are system-authored
+        // today so the mappings are almost all global, but the column exists and
+        // linkControlTest stamps it — leaving this unfiltered means the day anyone
+        // creates a tenant-scoped test mapping, it silently reaches every tenant.
         List<AuditControlTestMapping> allMappings = originalControlIds.stream()
-                .flatMap(cid -> controlTestMappingRepository.findByControlIdOrderByOrderNoAsc(cid).stream())
+                .flatMap(cid -> controlTestMappingRepository
+                        .findVisibleByControlId(cid, tenantId).stream())
                 .collect(Collectors.toList());
 
         if (allMappings.isEmpty()) {
@@ -267,9 +273,17 @@ public class AuditTestPolicySnapshotService {
                                   Set<Long> originalControlIds,
                                   Map<Long, Long> originalToInstanceId) {
 
-        // Find all policy→control library mappings for these controls
+        // Find all policy→control library mappings for these controls.
+        //
+        // TENANT FILTER: controls are shared across every tenant, so one control
+        // carries the policy mappings of every company that linked a policy to it.
+        // Without this filter, creating an engagement snapshotted OTHER tenants'
+        // policies into it as policy instances — not a transient read leak but
+        // rows written into the client's engagement, visible to their auditors.
+        // Global mappings (tenantId null) are the platform's own and apply to all.
         List<AuditPolicyControlMapping> allMappings = originalControlIds.stream()
-                .flatMap(cid -> policyControlMappingRepository.findByControlId(cid).stream())
+                .flatMap(cid -> policyControlMappingRepository
+                        .findVisibleByControlId(cid, tenantId).stream())
                 .collect(Collectors.toList());
 
         if (allMappings.isEmpty()) {

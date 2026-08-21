@@ -57,6 +57,13 @@ public class UtilityService {
     private final EntityManager entityManager;
     private final UserTenantMembershipRepository membershipRepository;
 
+    // ObjectProvider, not a direct reference, deliberately. UtilityService sits
+    // underneath nearly every service in the project; AuditScopeService lives in
+    // the audit module above it. Injecting the bean directly would point a
+    // low-level class at a high-level one and make a future cycle a matter of
+    // when, not if. Resolving it on use keeps the edge lazy and breakable.
+    private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.audit.service.AuditScopeService> auditScopeProvider;
+
     // ── Per-request user cache ────────────────────────────────────────────────
     // ThreadLocal because Tomcat reuses threads across requests. The cache is only
     // valid for the duration of a single HTTP request; RequestUserCacheFilter clears
@@ -71,6 +78,16 @@ public class UtilityService {
         REQUEST_USER_CACHE.remove();
         com.kashi.grc.workflow.service.WorkflowAccessService.clearPermissionCache();
         com.kashi.grc.uiconfig.service.UiConfigServiceImpl.clearScreenConfigCache();
+        // TenantFeatureService's ThreadLocal was never cleared by anything,
+        // despite its javadoc saying the tenant filter did it. Tomcat reuses
+        // threads, so tenant A's enabled feature set was being served to
+        // tenant B's next request on the same thread — a cross-tenant leak
+        // with nothing to do with guests, and one that would have quietly
+        // defeated any feature narrowing built on top of it.
+        com.kashi.grc.uiconfig.service.TenantFeatureService.clear();
+        // The resolved row scope must not outlive its request either, or the
+        // next caller on this thread inherits another identity's filters.
+        com.kashi.grc.common.config.multitenancy.AccessScope.clear();
     }
 
     public PageDetails getpageDetails(Map<String, String> allParams) {
@@ -169,9 +186,61 @@ public class UtilityService {
 
         user = applyActiveMembership(em, user);
 
+        publishAccessScope(user);
+
         // Cache for the remainder of this request
         REQUEST_USER_CACHE.set(user);
         return user;
+    }
+
+    /**
+     * Resolves this request's row scope and parks it on the thread.
+     *
+     * WHY HERE
+     *   applyActiveMembership above is the only code in the system that loads
+     *   the membership, and therefore the only code that knows this identity is
+     *   an outsider rather than an employee. Resolving the scope anywhere else
+     *   means loading the membership a second time, and every place that
+     *   forgets to is a hole.
+     *
+     * WHY IT IS RESOLVED EVEN FOR HOME MEMBERS
+     *   So that consumers can distinguish "unrestricted" from "not yet
+     *   resolved". A null scope means the request never authenticated; an
+     *   unrestricted scope means it did and is entitled to everything. Without
+     *   the distinction, a bug that skipped resolution would look identical to
+     *   a legitimate employee and fail open.
+     *
+     * The HOME path costs one indexed membership lookup that
+     * applyActiveMembership has usually already warmed, and builds no sets.
+     */
+    private void publishAccessScope(User user) {
+        var auditScope = auditScopeProvider.getIfAvailable();
+        if (auditScope == null) {
+            // Only reachable if the audit module is absent from the build.
+            // Unrestricted is the correct answer there: with no audit module
+            // there are no engagements and no guests to scope.
+            com.kashi.grc.common.config.multitenancy.AccessScope.set(
+                    user.getVendorId() != null
+                            ? com.kashi.grc.common.config.multitenancy.AccessScope.Scope
+                              .vendor(user.getId(), user.getTenantId(), user.getVendorId())
+                            : com.kashi.grc.common.config.multitenancy.AccessScope.Scope
+                              .home(user.getId(), user.getTenantId()));
+            return;
+        }
+
+        var scope = auditScope.resolveScope(user.getId(), user.getTenantId(), user.getVendorId());
+        com.kashi.grc.common.config.multitenancy.AccessScope.set(scope);
+
+        if (scope.vendorId() != null) {
+            log.debug("[ACCESS-SCOPE] Vendor userId={} tenantId={} vendorId={}",
+                    user.getId(), user.getTenantId(), scope.vendorId());
+        }
+        if (scope.guest()) {
+            log.debug("[ACCESS-SCOPE] Guest userId={} tenantId={} firmTenantId={} engagements={} users={}",
+                    user.getId(), user.getTenantId(), scope.firmTenantId(),
+                    scope.engagementIds() == null ? "ALL" : scope.engagementIds().size(),
+                    scope.userIds() == null ? "ALL" : scope.userIds().size());
+        }
     }
 
     /**

@@ -23,12 +23,14 @@ public interface FirmAccessGrantRepository extends JpaRepository<FirmAccessGrant
     /**
      * Revoking a grant must take the firm's people with it, or the client would
      * remove the firm and its auditors would keep working.
+     *
+     * That statement used to live here, matching on
+     * user_tenant_memberships.grant_id. UserTenantMembership has no grantId
+     * field and nothing ever populated the column, so it revoked nobody while
+     * reporting success. It has been removed rather than repaired: the firm,
+     * not the grant, is what memberships actually record, so the revoke belongs
+     * next to that data as UserTenantMembershipRepository.revokeFirm(tenantId,
+     * firmTenantId). Leaving a second, subtly broken revoke here would only
+     * invite someone to call it.
      */
-    @Modifying
-    @Query(value = """
-            UPDATE user_tenant_memberships
-               SET status = 'REVOKED', updated_at = NOW()
-             WHERE grant_id = :grantId AND status <> 'REVOKED'
-            """, nativeQuery = true)
-    int revokeMembershipsForGrant(@Param("grantId") Long grantId);
 }

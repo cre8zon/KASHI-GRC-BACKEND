@@ -41,6 +41,7 @@ public class AuditInstanceController {
 
     private final AuditControlInstanceRepository            controlRepo;
     private final com.kashi.grc.audit.service.ControlAccessGuard controlAccessGuard;
+    private final com.kashi.grc.audit.service.AuditScopeService     auditScopeService;
     private final AuditTestInstanceRepository               testRepo;
     private final AuditPolicyInstanceRepository             policyRepo;
     private final AuditControlInstanceTestMappingRepository ctrlTestMappingRepo;
@@ -65,15 +66,23 @@ public class AuditInstanceController {
 
         Map<String, Object> result = buildControlMap(ctrl);
 
-        // AuditControlInstance has no evidence-guidance column of its own — the
-        // guidance lives on each mapped AuditTestInstance. Roll them up here so
-        // the Overview tab's "Evidence required" field stops rendering empty.
-        // Kept out of buildControlMap so recordControlTestResult stays query-free.
-        List<Long> guidanceTestIds = ctrlTestMappingRepo
-                .findByControlInstanceIdOrderByOrderNoAsc(id).stream()
-                .map(AuditControlInstanceTestMapping::getTestInstanceId)
-                .distinct()
-                .collect(Collectors.toList());
+        // PRECEDENCE: the control's own guidance wins; the mapped tests are only a
+        // fallback. Evidence guidance used to live solely on AuditTestInstance and
+        // was rolled up here, which produced nothing for a control with no tests
+        // mapped yet — the common case in a library still being built. Controls now
+        // carry their own, so the rollup runs only when that is blank. Existing
+        // engagements have a null snapshot and therefore behave exactly as before.
+        //
+        // The extra queries are skipped entirely when the snapshot is present, so
+        // the authored path is also the cheap one.
+        Object ownGuidance = result.get("evidenceGuidanceSnapshot");
+        boolean hasOwnGuidance = ownGuidance instanceof String str && !str.isBlank();
+
+        List<Long> guidanceTestIds = hasOwnGuidance ? List.of() : ctrlTestMappingRepo
+                                                                  .findByControlInstanceIdOrderByOrderNoAsc(id).stream()
+                                                                  .map(AuditControlInstanceTestMapping::getTestInstanceId)
+                                                                  .distinct()
+                                                                  .collect(Collectors.toList());
         if (!guidanceTestIds.isEmpty()) {
             String rolledUpGuidance = testRepo.findAllById(guidanceTestIds).stream()
                     .map(AuditTestInstance::getEvidenceGuidanceSnapshot)
@@ -222,6 +231,14 @@ public class AuditInstanceController {
         var ctx  = utilityService.getLoggedInDataContext();
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
+
+        // Its siblings (submitControlEvidence, recordControlTestResult) both call
+        // ControlAccessGuard; this one loaded by raw id and wrote, so any caller
+        // could reassign any control instance in any tenant. Recording a result is
+        // the closest existing authority — whoever may conclude on the control may
+        // decide who provides its evidence.
+        controlAccessGuard.requireCanRecordResult(ctrl, ctx.getId());
+
         ctrl.setAuditeeAssignedUserId(body.get("auditeeUserId"));
         controlRepo.save(ctrl);
         return ResponseEntity.ok(ApiResponse.success());
@@ -582,6 +599,19 @@ public class AuditInstanceController {
                 policyCtrlMappingRepo.findByPolicyInstanceIdAndControlInstanceId(id, controlId)
                         .orElseThrow(() -> new ResourceNotFoundException("PolicyControlMapping", id));
 
+        // Two path ids and nothing else — the mapping was reachable from any
+        // tenant. Checked against the control instance rather than the mapping
+        // because that is the row carrying tenant and engagement.
+        var ctxUser = utilityService.getLoggedInDataContext();
+        var ctrlInst = controlRepo.findById(controlId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", controlId));
+        if (!java.util.Objects.equals(ctrlInst.getTenantId(), ctxUser.getTenantId())) {
+            throw new com.kashi.grc.common.exception.BusinessException("CONTROL_ACCESS_DENIED",
+                    "You can only modify controls belonging to your organisation",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        auditScopeService.requireEngagementVisible(ctrlInst.getEngagementId());
+
         mapping.setReviewContribution(
                 AuditPolicyInstanceControlMapping.ReviewContribution.valueOf(body.get("contribution")));
         policyCtrlMappingRepo.save(mapping);
@@ -667,9 +697,10 @@ public class AuditInstanceController {
         m.put("controlNameSnapshot",      c.getControlNameSnapshot());
         m.put("descriptionSnapshot",      c.getDescriptionSnapshot());
         m.put("testProcedureSnapshot",    c.getTestProcedure());
-        // No evidence-guidance column on AuditControlInstance — getControlInstance
-        // overwrites this by rolling up the mapped tests' evidenceGuidanceSnapshot.
-        m.put("evidenceGuidanceSnapshot", null);
+        // Authored on the library control and frozen here at engagement creation.
+        // Null on rows created before the column existed, and on controls with no
+        // guidance authored — getControlInstance then falls back to the test rollup.
+        m.put("evidenceGuidanceSnapshot", c.getEvidenceGuidanceSnapshot());
         m.put("controlTagSnapshot",       c.getControlTagSnapshot());
         m.put("testTypeSnapshot",         c.getTestTypeSnapshot());
         m.put("frameworkRefSnapshot",     c.getFrameworkRefSnapshot());

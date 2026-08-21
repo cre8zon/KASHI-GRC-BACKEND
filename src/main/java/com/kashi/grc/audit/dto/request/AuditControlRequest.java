@@ -12,4 +12,6 @@ public class AuditControlRequest {
     private String frameworkRef;
     private AuditControl.TestType testType;
     private String controlTag;   // for KashiGuard rule matching
+    /** Evidence the auditor should expect for this control; snapshotted at engagement creation. */
+    private String evidenceGuidance;
 }

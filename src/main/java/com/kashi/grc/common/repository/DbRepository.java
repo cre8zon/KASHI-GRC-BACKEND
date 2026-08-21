@@ -262,6 +262,7 @@ public class DbRepository {
             PageDetails pd) {
 
         List<Predicate> predicates = new ArrayList<>(basePredicates.apply(cb, root));
+        applyGuestScope(cb, root, predicates);
         Map<String, Path<?>> fields = searchableFields.apply(cb, root);
 
         // filterBy — exact match (equality, case-insensitive)
@@ -348,6 +349,159 @@ public class DbRepository {
         }
 
         if (!orders.isEmpty()) cq.orderBy(orders);
+    }
+
+    /**
+     * ── EXTERNAL AUDITOR ROW SCOPE ──────────────────────────────────────────
+     *
+     * Every list endpoint in the platform funnels through buildPredicates,
+     * which makes this the one place a row filter can be added once and
+     * inherited everywhere — including by modules that do not exist yet. That
+     * property is the whole reason it lives here. Filtering endpoint by
+     * endpoint was the alternative, and its failure mode is that every new list
+     * ships open until somebody remembers, silently.
+     *
+     * ── WHY THE METAMODEL AND NOT A LIST OF CLASSES ────────────────────────
+     * A hardcoded map of entity to column needs editing every time an
+     * audit-scoped entity is added, and forgetting to edit it leaks data
+     * rather than breaking a build. So the rule is expressed as a property of
+     * the schema instead: if an entity carries an engagementId, it belongs to
+     * an engagement, and a guest may see it only for engagements they are
+     * staffed on. Ten entities satisfy that today. The eleventh is scoped the
+     * moment it is mapped, with no change here and nothing to remember.
+     *
+     * ── WHY HOME MEMBERS PAY NOTHING ───────────────────────────────────────
+     * isGuest() is a ThreadLocal read. For an ordinary user this returns before
+     * touching the metamodel, so the query built is identical to the one built
+     * before this method existed — no new predicate, no new join, no measurable
+     * cost on the path that carries ~every request.
+     *
+     * ── WHAT THIS DOES NOT COVER ───────────────────────────────────────────
+     * Native SQL (11 places project-wide) and repository methods that do not
+     * route through this class. Those are enumerable and guarded individually.
+     * This is the default, not the only line of defence.
+     */
+    private <E> void applyGuestScope(CriteriaBuilder cb, Root<E> root, List<Predicate> predicates) {
+        String entity = root.getModel().getName();
+
+        if (com.kashi.grc.common.config.multitenancy.AccessScope.isVendor()) {
+            applyVendorScope(cb, root, predicates, entity);
+            return;
+        }
+        if (!com.kashi.grc.common.config.multitenancy.AccessScope.isGuest()) return;
+
+
+        // The engagement is scoped on its own id; everything belonging to one
+        // is scoped on the foreign key.
+        if ("AuditEngagement".equals(entity)) {
+            predicates.add(inOrNothing(cb, root.get("id"),
+                    com.kashi.grc.common.config.multitenancy.AccessScope.engagementIds()));
+            return;
+        }
+
+        // A guest sees the client's own staff and their own firm's colleagues,
+        // never a rival firm's auditors working the same client.
+        if ("User".equals(entity)) {
+            predicates.add(inOrNothing(cb, root.get("id"),
+                    com.kashi.grc.common.config.multitenancy.AccessScope.userIds()));
+            return;
+        }
+
+        // Issue has no engagementId, so the metamodel rule below cannot reach it.
+        // The set is derived from the findings escalated into issues — see
+        // AuditScopeService.visibleIssueIds.
+        if ("Issue".equals(entity)) {
+            predicates.add(inOrNothing(cb, root.get("id"),
+                    com.kashi.grc.common.config.multitenancy.AccessScope.issueIds()));
+            return;
+        }
+
+        boolean hasEngagement = root.getModel().getSingularAttributes().stream()
+                .anyMatch(a -> "engagementId".equals(a.getName()));
+
+        if (hasEngagement) {
+            predicates.add(inOrNothing(cb, root.get("engagementId"),
+                    com.kashi.grc.common.config.multitenancy.AccessScope.engagementIds()));
+        }
+    }
+
+    /**
+     * ── VENDOR-SIDE ROW SCOPE ───────────────────────────────────────────────
+     *
+     * A vendor's staff are users of the CLIENT's tenant — that is how they log
+     * in and answer questionnaires. The consequence is that every tenant-scoped
+     * query in the platform treats them as insiders, so a vendor user who
+     * guessed or was sent a URL could read the client's audit engagements,
+     * controls, findings and issues. Only one endpoint
+     * (AssessmentController.getVendorAssessments) ever filtered by vendor, and
+     * it did so by hand.
+     *
+     * Two rules, both derived from the schema rather than from a list:
+     *
+     *   1. Anything carrying vendorId is theirs only — assessments, cycles,
+     *      contracts, documents, action items. Note the predicate is
+     *      "= mine", NOT "= mine OR NULL": a null vendorId means an internal
+     *      org record, which is precisely what must stay hidden.
+     *
+     *   2. Anything belonging to an audit engagement is refused outright. A
+     *      vendor is a subject of third-party risk management, not a
+     *      participant in the client's internal audit, so there is no subset of
+     *      it that is legitimately theirs — an empty predicate is the honest
+     *      answer rather than a filter.
+     *
+     * User is deliberately exempt from rule 1 even though it carries vendorId.
+     * Assignment pickers on a vendor assessment have to show the client's
+     * contacts, and scoping User would empty them and break the questionnaire
+     * flow. Vendor staff seeing org staff names is a far smaller exposure than
+     * the audit programme, and narrowing it belongs with that flow, not here.
+     */
+    private <E> void applyVendorScope(CriteriaBuilder cb, Root<E> root,
+                                      List<Predicate> predicates, String entity) {
+        Long vendorId = com.kashi.grc.common.config.multitenancy.AccessScope.vendorId();
+
+        // Rule 2 — the audit module is closed to vendors.
+        if ("AuditEngagement".equals(entity)) {
+            predicates.add(cb.disjunction());
+            return;
+        }
+        boolean belongsToEngagement = root.getModel().getSingularAttributes().stream()
+                .anyMatch(a -> "engagementId".equals(a.getName()));
+        if (belongsToEngagement) {
+            predicates.add(cb.disjunction());
+            return;
+        }
+
+        // Rule 1 — their own vendor's rows only.
+        if ("User".equals(entity)) return;                 // see note above
+
+        boolean hasVendor = root.getModel().getSingularAttributes().stream()
+                .anyMatch(a -> "vendorId".equals(a.getName()));
+        if (hasVendor) {
+            predicates.add(vendorId == null
+                    ? cb.disjunction()
+                    : cb.equal(root.get("vendorId"), vendorId));
+            return;
+        }
+
+        // The vendor's own record, so their profile screen still resolves.
+        if ("Vendor".equals(entity) && vendorId != null) {
+            predicates.add(cb.equal(root.get("id"), vendorId));
+        }
+    }
+
+    /**
+     * IN (:ids), or a predicate matching nothing when the set is empty.
+     *
+     * The empty case is a guest admitted to the tenant but not yet staffed on
+     * anything. Emitting IN () is invalid SQL and dropping the predicate would
+     * show them everything, so the empty case is made explicit rather than
+     * left to fall through. A null set means unrestricted and never arrives
+     * here for a guest.
+     */
+    private Predicate inOrNothing(CriteriaBuilder cb, Path<?> path, java.util.Set<Long> ids) {
+        if (ids == null)   return cb.conjunction();
+        if (ids.isEmpty()) return cb.disjunction();
+        return path.in(ids);
     }
 
     private <E> long count(
