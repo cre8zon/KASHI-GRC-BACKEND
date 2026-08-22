@@ -146,6 +146,7 @@ public class AuditLibraryController {
                 .frameworkRef(req.getFrameworkRef())
                 .testType(req.getTestType() != null ? req.getTestType() : AuditControl.TestType.DOCUMENT_REVIEW)
                 .controlTag(req.getControlTag() != null ? req.getControlTag().toUpperCase().trim() : null)
+                .evidenceGuidance(blankToNull(req.getEvidenceGuidance()))
                 .tenantId(tenantId)
                 .createdBy(ctx.getId())
                 .build();
@@ -187,6 +188,10 @@ public class AuditLibraryController {
         if (req.getFrameworkRef() != null) control.setFrameworkRef(req.getFrameworkRef());
         if (req.getTestType()     != null) control.setTestType(req.getTestType());
         if (req.getControlTag()   != null) control.setControlTag(req.getControlTag().toUpperCase().trim());
+        // Unlike the fields above, an empty string here means "remove the guidance".
+        // Treating blank as "no change" would make the field impossible to clear from
+        // the UI once set, because the form always posts a string.
+        if (req.getEvidenceGuidance() != null) control.setEvidenceGuidance(blankToNull(req.getEvidenceGuidance()));
 
         controlRepository.save(control);
         log.info("[AUDIT-LIBRARY] Control updated | id={}", controlId);
@@ -337,6 +342,12 @@ public class AuditLibraryController {
             @RequestParam(required = false) Long newParentId) {
 
         var ctx = utilityService.getLoggedInDataContext();
+
+        // The tenantId below is the CALLER's, not the section's — passing it in
+        // was never a check that the section belonged to them.
+        requireOwnedSection(sectionRepository.findById(sectionId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditSection", sectionId)));
+
         sectionService.moveSection(sectionId, newParentId, ctx.getTenantId());
 
         AuditSection moved = sectionRepository.findById(sectionId)
@@ -404,10 +415,16 @@ public class AuditLibraryController {
             @RequestParam(defaultValue = "false")  boolean mandatory,
             @RequestParam(required = false)        Integer orderNo) {
 
-        sectionRepository.findById(sectionId)
+        AuditSection targetSection = sectionRepository.findById(sectionId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditSection", sectionId));
         controlRepository.findById(controlId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControl", controlId));
+
+        // audit_section_control_mappings has no tenant column, so a row written
+        // against a global section is visible to every tenant on the instance.
+        // Until that column exists this is the only thing standing between one
+        // org tailoring their programme and them silently editing everyone's.
+        requireOwnedSection(targetSection);
 
         AuditSectionControlMapping mapping = sectionControlMappingRepository
                 .findBySectionIdAndControlId(sectionId, controlId)
@@ -462,6 +479,9 @@ public class AuditLibraryController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> removeControlFromSection(
             @PathVariable Long sectionId,
             @PathVariable Long controlId) {
+
+        requireOwnedSection(sectionRepository.findById(sectionId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditSection", sectionId)));
 
         sectionControlMappingRepository
                 .findBySectionIdAndControlId(sectionId, controlId)
@@ -716,6 +736,8 @@ public class AuditLibraryController {
         AuditTemplate template = templateRepository.findById(templateId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTemplate", templateId));
 
+        requireOwnedTemplate(template);
+
         if ("PUBLISHED".equals(template.getStatus()))
             throw new BusinessException("TEMPLATE_ALREADY_PUBLISHED", "Template is already published");
 
@@ -764,6 +786,14 @@ public class AuditLibraryController {
         AuditTemplate template = templateRepository.findById(templateId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTemplate", templateId));
 
+        // Ownership, not just status. The PUBLISHED check below is a workflow
+        // guard — it stops edits to a live template, and it happens to block most
+        // global ones because global templates are normally PUBLISHED. That is
+        // protection by coincidence: a global template sitting in DRAFT was
+        // writable by any org admin, and audit_template_section_mappings has no
+        // tenant column, so the added row would have been visible to every tenant.
+        requireOwnedTemplate(template);
+
         if ("PUBLISHED".equals(template.getStatus()) && !utilityService.isSystemUser())
             throw new BusinessException("TEMPLATE_PUBLISHED",
                     "Cannot modify a published template. Unpublish it first.");
@@ -798,6 +828,14 @@ public class AuditLibraryController {
 
         AuditTemplate template = templateRepository.findById(templateId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTemplate", templateId));
+
+        // Ownership, not just status. The PUBLISHED check below is a workflow
+        // guard — it stops edits to a live template, and it happens to block most
+        // global ones because global templates are normally PUBLISHED. That is
+        // protection by coincidence: a global template sitting in DRAFT was
+        // writable by any org admin, and audit_template_section_mappings has no
+        // tenant column, so the added row would have been visible to every tenant.
+        requireOwnedTemplate(template);
 
         if ("PUBLISHED".equals(template.getStatus()) && !utilityService.isSystemUser())
             throw new BusinessException("TEMPLATE_PUBLISHED",
@@ -1095,6 +1133,47 @@ public class AuditLibraryController {
     // Private helpers
     // ══════════════════════════════════════════════════════════════════════════
 
+    // ══════════════════════════════════════════════════════════════════════
+    // GLOBAL STRUCTURE IS READ-ONLY TO TENANTS
+    //
+    // Templates, sections and their control mappings are framework structure,
+    // authored by the platform. Most handlers here already check ownership;
+    // these helpers cover the ones that did not, where an org admin could
+    // reshape the shared library for every tenant on the instance.
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void requireOwnedSection(AuditSection section) {
+        if (utilityService.isSystemUser()) return;
+        Long caller = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(section.getTenantId(), caller)) return;
+
+        log.warn("[AUDIT-LIBRARY] Refused write to section {} (tenant {}) by tenant {}",
+                section.getId(), section.getTenantId(), caller);
+        throw new BusinessException("SECTION_ACCESS_DENIED",
+                section.getTenantId() == null
+                        ? "This section belongs to the global library and cannot be modified"
+                        : "You can only modify sections belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
+
+    private void requireOwnedTemplate(AuditTemplate template) {
+        if (utilityService.isSystemUser()) return;
+        Long caller = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(template.getTenantId(), caller)) return;
+
+        log.warn("[AUDIT-LIBRARY] Refused write to template {} (tenant {}) by tenant {}",
+                template.getId(), template.getTenantId(), caller);
+        throw new BusinessException("TEMPLATE_ACCESS_DENIED",
+                template.getTenantId() == null
+                        ? "This template belongs to the global library and cannot be modified"
+                        : "You can only modify templates belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
+    /** Empty textarea posts "" — stored as NULL so blank and absent behave alike. */
+    private static String blankToNull(String v) {
+        return (v == null || v.isBlank()) ? null : v.trim();
+    }
+
     private Map<String, Object> buildControlMap(AuditControl c) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",           c.getId());
@@ -1104,7 +1183,14 @@ public class AuditLibraryController {
         m.put("frameworkRef", c.getFrameworkRef());
         m.put("testType",     c.getTestType() != null ? c.getTestType().name() : null);
         m.put("controlTag",   c.getControlTag());
+        m.put("evidenceGuidance", c.getEvidenceGuidance());
         m.put("tenantId",     c.getTenantId());
+        // origin/editable let the UI show a Global badge and hide Edit/Delete on rows
+        // the server would refuse anyway. The guards are the boundary; this exists so
+        // the interface stops offering actions that end in a 403.
+        boolean globalC = c.getTenantId() == null;
+        m.put("origin",   globalC ? "GLOBAL" : "ORG");
+        m.put("editable", !globalC || utilityService.isSystemUser());
         m.put("createdAt",    c.getCreatedAt());
         return m;
     }
@@ -1192,6 +1278,10 @@ public class AuditLibraryController {
         row.put("testType",     c.getTestType());
         row.put("controlTag",   c.getControlTag());
         row.put("frameworkRef", c.getFrameworkRef());
+        // The template builder's Edit Control modal hydrates from this map, not
+        // from buildControlMap — so a field added only there saves correctly and
+        // then comes back empty on reopen. Both serializers have to agree.
+        row.put("evidenceGuidance", c.getEvidenceGuidance());
     }
 
     /** Original — still used by any callers that need per-node control loading. */

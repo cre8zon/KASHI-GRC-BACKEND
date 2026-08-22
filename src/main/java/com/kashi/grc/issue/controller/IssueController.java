@@ -43,6 +43,7 @@ public class IssueController {
     private final com.kashi.grc.workflow.repository.WorkflowInstanceRepository instanceRepository;
     // ADDED
     private final IssueRepository                                            issueRepository;
+    private final com.kashi.grc.audit.service.AuditScopeService              auditScope;
     private final AuditFindingRepository                                     findingRepository;
 
     @Value("${app.ingest.token:}")
@@ -130,6 +131,11 @@ public class IssueController {
     @GetMapping("/{id}")
     @Operation(summary = "Get a single issue with full detail")
     public ResponseEntity<ApiResponse<IssueResponse>> getById(@PathVariable Long id) {
+        // Reachable by URL. A guest is legitimately inside this tenant, so the
+        // tenant check below passes for every issue the client has ever raised —
+        // including ones from vendor assessments and rival firms' audits. Only the
+        // link back to a finding on their own engagement narrows it.
+        auditScope.requireIssueVisible(id);
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         return ResponseEntity.ok(ApiResponse.success(issueService.getById(id, tenantId)));
     }
@@ -194,13 +200,29 @@ public class IssueController {
             @RequestHeader(value = "X-Ingest-Token", required = false) String token,
             @Valid @RequestBody IssueIngestRequest req) {
 
-        if (token == null || token.isBlank() || !token.equals(ingestToken)) {
+        // Constant-time compare. String.equals returns early on the first differing
+        // character, which leaks the shared secret's prefix to anyone able to time
+        // the response — and this endpoint is unauthenticated by design.
+        boolean tokenOk = token != null && !token.isBlank()
+                && ingestToken != null && !ingestToken.isBlank()
+                && java.security.MessageDigest.isEqual(
+                token.getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                ingestToken.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        if (!tokenOk) {
             log.warn("[INGEST] Rejected — invalid or missing X-Ingest-Token from source={}", req.getSource());
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
                     .body(ApiResponse.error("UNAUTHORIZED", "Invalid or missing X-Ingest-Token"));
         }
 
         Long tenantId = resolveTenantFromToken(token);
+        if (tenantId == null) {
+            log.error("[INGEST] Rejected — token does not encode a tenant. Expected " +
+                    "kashi.ingest.token in the form tenant_<id>_<secret>. source={}", req.getSource());
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(ApiResponse.error("INGEST_TENANT_UNRESOLVED",
+                            "Ingest token does not identify a tenant"));
+        }
         log.info("[INGEST] Received | source={} | externalId={} | tenantId={}",
                 req.getSource(), req.getExternalId(), tenantId);
         IssueResponse response = issueService.ingest(req, tenantId);
@@ -300,6 +322,11 @@ public class IssueController {
     @Operation(summary = "Full chronological history for an issue across ALL workflow cycles")
     public ResponseEntity<ApiResponse<List<WorkflowHistoryResponse>>> getHistory(
             @PathVariable Long id) {
+        // Reachable by URL. A guest is legitimately inside this tenant, so the
+        // tenant check below passes for every issue the client has ever raised —
+        // including ones from vendor assessments and rival firms' audits. Only the
+        // link back to a finding on their own engagement narrows it.
+        auditScope.requireIssueVisible(id);
         var ctx = utilityService.getLoggedInDataContext();
         // Fetch ALL workflow instances for this issue (covers reopen cycles)
         List<com.kashi.grc.workflow.domain.WorkflowInstance> instances =
@@ -327,6 +354,11 @@ public class IssueController {
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getLinkedFindings(
             @PathVariable Long id) {
 
+        // Reachable by URL. A guest is legitimately inside this tenant, so the
+        // tenant check below passes for every issue the client has ever raised —
+        // including ones from vendor assessments and rival firms' audits. Only the
+        // link back to a finding on their own engagement narrows it.
+        auditScope.requireIssueVisible(id);
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         issueRepository.findById(id)
                 .filter(i -> i.getTenantId().equals(tenantId))
@@ -380,6 +412,16 @@ public class IssueController {
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    /**
+     * Tenant encoded in the ingest token, or null when it is not.
+     *
+     * WAS: fell back to {@code return 1L}. A token in any other shape silently
+     * wrote every ingested issue into tenant 1 — the platform admin tenant — where
+     * it sat in someone else's issue register looking legitimate. Landing another
+     * organisation's vulnerability data in the wrong tenant is worse than the
+     * integration failing loudly, so the caller now gets a 401 and the operator
+     * gets a log line naming the expected format.
+     */
     private Long resolveTenantFromToken(String token) {
         try {
             String[] parts = token.split("_");
@@ -387,6 +429,6 @@ public class IssueController {
                 return Long.parseLong(parts[1]);
             }
         } catch (Exception ignored) {}
-        return 1L;
+        return null;
     }
 }

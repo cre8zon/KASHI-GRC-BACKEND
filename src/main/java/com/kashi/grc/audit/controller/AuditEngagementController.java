@@ -94,6 +94,8 @@ public class AuditEngagementController {
     private final AuditProjectTemplateRepository        projectTemplateRepository;
     private final AuditProjectInstanceRepository        projectInstanceRepository;
     private final AuditEngagementRepository             engagementRepository;
+    private final com.kashi.grc.audit.service.AuditScopeService auditScopeService;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final AuditSectionInstanceRepository        sectionInstanceRepository;
     private final AuditControlInstanceRepository        controlInstanceRepository;
     private final AuditFindingRepository                findingRepository;
@@ -286,6 +288,7 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> publishProject(@PathVariable Long projectId) {
         AuditProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditProject", projectId));
+        requireOwnedProject(project);
         project.setPublishStatus(AuditProject.PublishStatus.PUBLISHED);
         projectRepository.save(project);
         log.info("[AUDIT-PROJECT] Published | id={}", projectId);
@@ -297,6 +300,7 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> unpublishProject(@PathVariable Long projectId) {
         AuditProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditProject", projectId));
+        requireOwnedProject(project);
         project.setPublishStatus(AuditProject.PublishStatus.DRAFT);
         projectRepository.save(project);
         log.info("[AUDIT-PROJECT] Unpublished | id={}", projectId);
@@ -314,6 +318,7 @@ public class AuditEngagementController {
             @RequestBody Map<String, String> body) {
         AuditProject project = projectRepository.findById(projectId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditProject", projectId));
+        requireOwnedProject(project);
         AuditProject.Visibility vis = AuditProject.Visibility.valueOf(body.get("visibility").toUpperCase());
         project.setVisibility(vis);
         projectRepository.save(project);
@@ -342,6 +347,13 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> grantTenantAccess(
             @PathVariable Long projectId, @PathVariable Long tenantId) {
         var ctx = utilityService.getLoggedInDataContext();
+
+        // Deciding which tenants may see a programme is a platform decision. With
+        // no check here, any org admin could grant THEMSELVES access to any global
+        // programme, or grant a competitor access to one of theirs.
+        requireOwnedProject(projectRepository.findById(projectId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditProject", projectId)));
+
         if (projectTenantAccessRepository.existsByProjectIdAndTenantId(projectId, tenantId)) {
             return ResponseEntity.ok(ApiResponse.success(Map.of("alreadyGranted", true)));
         }
@@ -362,6 +374,60 @@ public class AuditEngagementController {
         return ResponseEntity.ok(ApiResponse.success(Map.of("projectId", projectId, "tenantId", tenantId, "revoked", true)));
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // OWNERSHIP GUARDS
+    //
+    // These handlers loaded by raw path id and wrote. AuditEngagement extends
+    // TenantAwareEntity and AuditProject is global-or-tenant, but neither was
+    // checked, so an id was the only thing standing between a caller and another
+    // company's engagement — or the global project catalogue.
+    // ══════════════════════════════════════════════════════════════════════
+
+    /** Engagement must belong to the caller's tenant, and be within a guest's scope. */
+    private void requireOwnedEngagement(AuditEngagement e) {
+        var ctx = utilityService.getLoggedInDataContext();
+        if (!java.util.Objects.equals(e.getTenantId(), ctx.getTenantId())) {
+            log.warn("[AUDIT-ENGAGEMENT] Refused cross-tenant write | engagementId={} owner={} caller={}",
+                    e.getId(), e.getTenantId(), ctx.getTenantId());
+
+            // Name the owning tenant IF — and only if — this caller already holds a
+            // usable membership there. An external auditor opening their own task
+            // from a link that lost the tenant is the common case, and without this
+            // the frontend has to guess: search the inbox, or ask them to pick from
+            // their client list. Gated on membership so it discloses nothing to
+            // someone who could not have switched there anyway.
+            java.util.Map<String, Object> hint = membershipRepository
+                    .findByUserIdAndTenantId(ctx.getId(), e.getTenantId())
+                    .filter(m -> m.isUsable())
+                    .<java.util.Map<String, Object>>map(m -> java.util.Map.of(
+                            "tenantId", e.getTenantId(),
+                            "switchable", true))
+                    .orElse(null);
+
+            throw new BusinessException("ENGAGEMENT_ACCESS_DENIED",
+                    "You can only modify engagements belonging to your organisation",
+                    HttpStatus.FORBIDDEN, hint);
+        }
+        // An external auditor is legitimately inside this tenant, so the check
+        // above passes for every engagement in it — only the scope narrows them
+        // to the ones they are staffed on.
+        auditScopeService.requireEngagementVisible(e.getId());
+    }
+
+    /** Global projects (tenantId null) are platform-owned and read-only to tenants. */
+    private void requireOwnedProject(AuditProject p) {
+        if (utilityService.isSystemUser()) return;
+        Long caller = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(p.getTenantId(), caller)) return;
+
+        log.warn("[AUDIT-PROJECT] Refused write | projectId={} owner={} caller={}",
+                p.getId(), p.getTenantId(), caller);
+        throw new BusinessException("PROJECT_ACCESS_DENIED",
+                p.getTenantId() == null
+                        ? "This programme belongs to the global catalogue and cannot be modified"
+                        : "You can only modify programmes belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
     /** Shared project → map helper used by listProjects + getProject */
     private Map<String, Object> toProjectMap(AuditProject p) {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -1094,9 +1160,14 @@ public class AuditEngagementController {
         // subset. Using the repository directly avoids hardcoding field lists here.
         if (allParams.containsKey("projectInstanceId")) {
             Long projectInstanceId = Long.parseLong(allParams.get("projectInstanceId"));
+            var visibleIds = auditScopeService.visibleEngagementIds(
+                    utilityService.getLoggedInDataContext().getId(), tenantId);
             List<AuditEngagement> engs = engagementRepository.findByProjectInstanceId(projectInstanceId)
                     .stream()
                     .filter(e -> e.getTenantId().equals(tenantId))
+                    // The project fast path bypasses the criteria query entirely,
+                    // so it needs the same rule applied here.
+                    .filter(e -> visibleIds == null || visibleIds.contains(e.getId()))
                     .toList();
             var pd = new com.kashi.grc.common.dto.PageDetails();
             pd.setTake(engs.size() > 0 ? engs.size() : 100);
@@ -1111,6 +1182,22 @@ public class AuditEngagementController {
                 (cb, root) -> {
                     var preds = new ArrayList<jakarta.persistence.criteria.Predicate>();
                     preds.add(cb.equal(root.get("tenantId"), tenantId));
+
+                    // External auditors see ONLY the engagements they are staffed
+                    // on. Tenant scope alone showed them every engagement in the
+                    // client, including internal audits and other firms' work.
+                    // Null for HOME members, so the client's own staff are
+                    // unaffected and their query is unchanged.
+                    var visibleIds = auditScopeService.visibleEngagementIds(
+                            utilityService.getLoggedInDataContext().getId(), tenantId);
+                    if (visibleIds != null) {
+                        // Empty set = a guest with no assignments yet. An empty IN
+                        // list is invalid SQL, so match nothing explicitly rather
+                        // than drop the predicate and show everything.
+                        preds.add(visibleIds.isEmpty()
+                                ? cb.disjunction()
+                                : root.get("id").in(visibleIds));
+                    }
                     if (allParams.containsKey("projectId"))
                         preds.add(cb.equal(root.get("projectId"),
                                 Long.parseLong(allParams.get("projectId"))));
@@ -1177,6 +1264,7 @@ public class AuditEngagementController {
 
         AuditEngagement e = engagementRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id));
+        requireOwnedEngagement(e);
 
         // Only allow patching these safe mutable fields — ignore anything else
         if (fields.containsKey("name"))         e.setName((String) fields.get("name"));
@@ -1223,8 +1311,11 @@ public class AuditEngagementController {
     @GetMapping("/engagements/{id}")
     @Operation(summary = "Get engagement detail — flat response for UniversalModulePage compatibility")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getEngagement(@PathVariable Long id) {
+        // A filtered list without a guarded record is not a boundary — the detail
+        // page is reachable by URL, so the data would sit one guessed id away.
         AuditEngagement e = engagementRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id));
+        requireOwnedEngagement(e);   // tenant + guest engagement scope, in one place
 
         // Flat map — same pattern as buildTemplateMap() in AuditLibraryController.
         // UniversalModulePage reads entity.id, entity.name, entity.status etc. directly,
@@ -1322,6 +1413,7 @@ public class AuditEngagementController {
             @PathVariable Long id, @RequestBody Map<String, String> body) {
         AuditEngagement e = engagementRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id));
+        requireOwnedEngagement(e);
         e.setStatus(AuditEngagement.Status.valueOf(body.get("status").toUpperCase()));
         engagementRepository.save(e);
         Map<String, Object> result = new LinkedHashMap<>();
@@ -1421,6 +1513,12 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<Void>> reopenSection(
             @PathVariable Long id, @PathVariable Long sid) {
         var ctx = utilityService.getLoggedInDataContext();
+
+        // reopenSection loads the section instance by id alone and clears its
+        // submission — the engagement id in the path was decorative.
+        requireOwnedEngagement(engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id)));
+
         service.reopenSection(id, sid, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success());
     }

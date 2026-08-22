@@ -74,7 +74,11 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {
         log.warn("Business exception [{}]: {}", ex.getErrorCode(), ex.getMessage());
         return ResponseEntity.status(ex.getHttpStatus())
-                .body(ApiResponse.error(ex.getErrorCode(), ex.getMessage()));
+                .body(ApiResponse.error(com.kashi.grc.common.dto.ErrorResponse.builder()
+                        .code(ex.getErrorCode())
+                        .message(ex.getMessage())
+                        .details(ex.getDetails())   // null for the vast majority; @JsonInclude drops it
+                        .build()));
     }
 
     // ── Spring Security ───────────────────────────────────────────

@@ -132,7 +132,12 @@ public class WorkflowAccessService {
 
         // ── Merge all into final context ──────────────────────────────────────
 
+        // Same flag on the task path. Without it, arriving from the inbox — which
+        // always carries a taskId — produced no override affordance at all, even
+        // for a lead holding the permission, because this path never considered
+        // override.
         return mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
+                resolveCanOverride(user, si.getSnapSide(), resolvedPermissions),
                 si.getSnapName(),
                 si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
                 Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()),
@@ -157,6 +162,7 @@ public class WorkflowAccessService {
         String activeStepAction = null;
         String activeStepLabel  = null;
         boolean canAct = false;
+        String  activeStepSide = null;
         List<String> availableActions = null;
         Long activeTaskId = null;
         Long activeStepInstanceId = null;
@@ -190,6 +196,7 @@ public class WorkflowAccessService {
                     activeStepAction = currentStep.getSnapStepAction() != null
                             ? currentStep.getSnapStepAction().name() : null;
                     activeStepLabel  = currentStep.getSnapName();
+                    activeStepSide   = currentStep.getSnapSide();
 
                     // ── Check if user can act on this step ──────────────────
                     // Path A: user has an open task (PENDING or IN_PROGRESS)
@@ -212,10 +219,21 @@ public class WorkflowAccessService {
                         availableActions = resolveAvailableActions(minimalBase, stepOverride, sodViolations);
 
                     } else {
-                        // Path B: no task, but user has workflow:step:override permission.
-                        // They can approve/advance the step directly without a task.
-                        if (resolvedPermissions.contains("workflow:step:override")) {
-                            canAct = true;
+                        // Path B: no task, but the user may override this step.
+                        //
+                        // canAct is deliberately NOT set here any more. It used
+                        // to be, and that conflated two different things: the
+                        // frontend derives EDIT mode from canAct
+                        // (canEdit = stepAction ? canAct : canEdit), so anyone
+                        // holding the override permission got every tab form in
+                        // edit mode on every step, whether or not they had any
+                        // business editing it.
+                        //
+                        // canAct now means one thing: "you hold a task here".
+                        // canOverride carries the override authority, and the
+                        // action gate accepts either — so the button still
+                        // appears, without the edit-mode side effect.
+                        if (resolveCanOverride(user, activeStepSide, resolvedPermissions)) {
                             // No taskId — frontend sends stepInstanceId to override endpoint
                             availableActions = List.of("APPROVE", "REJECT", "SEND_BACK");
                         }
@@ -240,6 +258,10 @@ public class WorkflowAccessService {
                 .canView(canView)
                 .canEdit(canEdit && sodViolations.stream().noneMatch(v -> "HARD".equals(v.getConflictType())))
                 .canAct(canAct)
+                // Independent of canAct: someone may hold override authority
+                // while having no task here, and must not thereby gain edit
+                // rights on every tab.
+                .canOverride(resolveCanOverride(user, activeStepSide, effectivePermissions))
                 .taskId(activeTaskId)
                 .stepInstanceId(activeStepInstanceId)
                 .stepAction(activeStepAction)
@@ -343,7 +365,13 @@ public class WorkflowAccessService {
         REQUEST_PERMISSION_CACHE.remove();
     }
 
-    private List<String> resolvePermissions(User user) {
+    /**
+     * Public so enforcement uses the SAME resolution the UI is driven from —
+     * role_permissions ∪ permission_grants ∪ user_permission_overrides. Reading
+     * user.getRoles().getPermissions() sees only the seeded rows and misses
+     * everything granted through the RBAC screen.
+     */
+    public List<String> resolvePermissions(User user) {
         // Cache within the HTTP request — view-context may be called multiple times
         // (once for module context, once for task context). The 3 DB queries
         // (role perms, grants, overrides) only need to run once per request.
@@ -536,9 +564,42 @@ public class WorkflowAccessService {
         return new ArrayList<>(result);
     }
 
+    /**
+     * May this user force this step through?
+     *
+     * Mirrors WorkflowEngineService.requireSameSideToOverride exactly: the
+     * permission, plus the step being on the caller's own side. SYSTEM steps are
+     * exempt there, so they are exempt here. Keeping the two in step is the
+     * whole point — a button the server will refuse is worse than no button.
+     */
+    private boolean resolveCanOverride(User user, String stepSide, List<String> permissions) {
+        boolean hasPerm = permissions != null && permissions.contains("workflow:step:override");
+
+        java.util.Set<String> userSides = user.getRoles() == null ? java.util.Set.of()
+                : user.getRoles().stream()
+                  .map(r -> r.getSide() != null ? r.getSide().name() : null)
+                  .filter(java.util.Objects::nonNull)
+                  .collect(java.util.stream.Collectors.toSet());
+
+        boolean sideOk = stepSide == null || "SYSTEM".equalsIgnoreCase(stepSide)
+                || userSides.stream().anyMatch(s -> s.equalsIgnoreCase(stepSide));
+
+        boolean result = hasPerm && sideOk;
+
+        // Logged at INFO on purpose while this is being commissioned: the two
+        // inputs live in different places (permission_grants for the grant,
+        // step_instances.snap_side for the step) and a false result is otherwise
+        // indistinguishable between "no permission" and "wrong side".
+        log.info("[OVERRIDE-CHK] userId={} stepSide={} userSides={} hasPerm={} sideOk={} → canOverride={}",
+                user.getId(), stepSide, userSides, hasPerm, sideOk, result);
+
+        return result;
+    }
+
     private AccessContext mergeContext(AccessContext base, StepUiOverride override,
                                        List<String> permissions, List<String> availableActions,
                                        List<AccessContext.SodViolation> sodViolations,
+                                       boolean canOverride,
                                        String stepLabel, String stepAction,
                                        boolean snapAutoCompleteActorOnSubmit,
                                        Long taskInstanceId) {
@@ -556,6 +617,7 @@ public class WorkflowAccessService {
                 .canView(base.isCanView())
                 .canEdit(base.isCanEdit() && sodViolations.stream().noneMatch(v -> "HARD".equals(v.getConflictType())))
                 .canAct(base.isCanAct())
+                .canOverride(canOverride)
                 .taskId(taskInstanceId)
                 .taskRole(base.getTaskRole())
                 .stepStatus(base.getStepStatus())

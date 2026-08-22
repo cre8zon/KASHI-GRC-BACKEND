@@ -56,6 +56,7 @@ import java.util.List;
 public class AuditFindingController {
 
     private final AuditFindingRepository         findingRepository;
+    private final com.kashi.grc.audit.service.AuditScopeService auditScope;
     private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
@@ -186,6 +187,11 @@ public class AuditFindingController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
         return ResponseEntity.ok(ApiResponse.success(toMap(f)));
     }
 
@@ -199,6 +205,11 @@ public class AuditFindingController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
 
         if (body.containsKey("title"))          f.setTitle(getString(body, "title"));
         if (body.containsKey("description"))    f.setDescription(getString(body, "description"));
@@ -229,6 +240,11 @@ public class AuditFindingController {
         AuditFinding f = findingRepository.findByIdAndTenantId(id, ctx.getTenantId())
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
 
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
+
         f.setStatus(AuditFinding.Status.IN_REMEDIATION);
         f.setRemediationStartedAt(LocalDateTime.now());
         if (body != null && body.containsKey("remediationPlan"))
@@ -249,6 +265,11 @@ public class AuditFindingController {
         var ctx = utilityService.getLoggedInDataContext();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, ctx.getTenantId())
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
 
         f.setStatus(AuditFinding.Status.CLOSED);
         f.setValidatedAt(LocalDateTime.now());
@@ -274,6 +295,11 @@ public class AuditFindingController {
         AuditFinding f = findingRepository.findByIdAndTenantId(id, ctx.getTenantId())
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
 
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
+
         f.setStatus(AuditFinding.Status.ACCEPTED_RISK);
         f.setAcceptedRisk(true);
         f.setAcceptedRiskBy(ctx.getId());
@@ -293,6 +319,11 @@ public class AuditFindingController {
         var ctx = utilityService.getLoggedInDataContext();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, ctx.getTenantId())
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
         f.setStatus(AuditFinding.Status.CLOSED);
         f.setClosedAt(LocalDateTime.now());
         f.setClosedBy(ctx.getId());
@@ -308,6 +339,11 @@ public class AuditFindingController {
         var ctx = utilityService.getLoggedInDataContext();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, ctx.getTenantId())
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
         f.setStatus(AuditFinding.Status.OPEN);
         f.setClosedAt(null); f.setClosedBy(null);
         findingRepository.save(f);
@@ -322,6 +358,11 @@ public class AuditFindingController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(f.getEngagementId());
         findingRepository.delete(f);
         return ResponseEntity.ok(ApiResponse.success());
     }
@@ -340,6 +381,11 @@ public class AuditFindingController {
 
         AuditFinding finding = findingRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
+
+        // A guest reaches this by URL, and tenant alone does not stop them: the
+        // finding belongs to the client tenant they are legitimately inside. Only
+        // the engagement narrows it to their own work.
+        auditScope.requireEngagementVisible(finding.getEngagementId());
 
         if (finding.getLinkedIssueId() != null) {
             throw new BusinessException("ALREADY_ESCALATED",

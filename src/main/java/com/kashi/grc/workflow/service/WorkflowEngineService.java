@@ -110,6 +110,10 @@ public class WorkflowEngineService {
     private final WorkflowStepUserRepository          stepUserRepository;
     private final WorkflowInstanceRepository      instanceRepository;
     private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
+    private final com.kashi.grc.audit.repository.AuditEngagementRepository auditEngagementRepository;
+    // No cycle: WorkflowAccessService holds no reference back to this class, so
+    // plain constructor injection is safe here (unlike issueService above).
+    private final com.kashi.grc.workflow.service.WorkflowAccessService workflowAccessService;
     private final StepInstanceRepository          stepInstanceRepository;
     private final TaskInstanceRepository          taskInstanceRepository;
     private final WorkflowTaskActionRepository    actionRepository;
@@ -119,6 +123,43 @@ public class WorkflowEngineService {
     private final UtilityService                  utilityService;
     private final com.kashi.grc.usermanagement.repository.RoleRepository roleRepository;
     private final com.kashi.grc.usermanagement.repository.UserRepository  userRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+
+    /**
+     * Refuses an action when the actor's membership in the workflow's tenant
+     * has been revoked or has expired.
+     *
+     * WHY IT WAS NEEDED
+     *   TaskInstance carries no tenant column and performAction validated only
+     *   ownership and step state, so nothing on this path ever consulted the
+     *   membership. A client could revoke an audit firm and every auditor from
+     *   that firm would still be able to APPROVE or REJECT every task already
+     *   sitting in their inbox — revocation flipped a status row and stopped
+     *   nothing they had already been handed.
+     *
+     * WHY IT ONLY FAILS ON A ROW THAT EXISTS AND IS UNUSABLE
+     *   A MISSING membership row falls through and is allowed. Memberships were
+     *   backfilled onto an existing user base, and requiring one here would
+     *   lock out any employee the backfill skipped, mid-engagement, with no
+     *   obvious cause. That matches how login already behaves: it only rejects
+     *   a membership it can see is dead. The hole being closed is the revoked
+     *   auditor, and this closes exactly that without widening to a case that
+     *   does not need it.
+     */
+    private void requireMembershipStillValid(Long performedBy, Long workflowTenantId) {
+        if (performedBy == null || workflowTenantId == null) return;
+
+        membershipRepository.findByUserIdAndTenantId(performedBy, workflowTenantId)
+                .filter(m -> !m.isUsable())
+                .ifPresent(m -> {
+                    log.warn("[WORKFLOW-ACTION] Refused — membership {} for userId={} in tenantId={} is {}",
+                            m.getId(), performedBy, workflowTenantId, m.getStatus());
+                    throw new BusinessException("MEMBERSHIP_INACTIVE",
+                            "Your access to this organization has ended",
+                            org.springframework.http.HttpStatus.FORBIDDEN);
+                });
+    }
+
     private final com.kashi.grc.usermanagement.service.user.UserDisplayNameService userDisplayNameService;
     private final com.kashi.grc.workflow.automation.AutomatedActionRegistry automatedActionRegistry;
     // ObjectProvider, not a direct dependency — KafkaEventPublisher only
@@ -588,6 +629,8 @@ public class WorkflowEngineService {
             throw new BusinessException("TASK_TERMINAL",
                     "Task is already in terminal state: " + task.getStatus());
 
+        requireTaskOwnership(task, performedBy);
+
         // Pessimistic write lock — serialises concurrent approvals on the same step.
         // Without this, two actors approving within milliseconds of each other both
         // read status=IN_PROGRESS, both satisfy isStepApprovalSatisfied(), and both
@@ -604,6 +647,8 @@ public class WorkflowEngineService {
         if (instance.getStatus() != WorkflowStatus.IN_PROGRESS)
             throw new BusinessException("INSTANCE_NOT_ACTIVE",
                     "Workflow is not IN_PROGRESS. Current: " + instance.getStatus());
+
+        requireMembershipStillValid(performedBy, instance.getTenantId());
 
         // ── NO live blueprint read here ───────────────────────────────────────
         // All routing uses instance.getWorkflowId() and stepInstance.getSnap*() fields.
@@ -1567,11 +1612,180 @@ public class WorkflowEngineService {
      * SYSTEM steps are the one exception: they are automated, have no human side,
      * and a stuck one has to be clearable by whoever is around.
      */
+    /**
+     * The permission the endpoint always claimed to require.
+     *
+     * WorkflowInstanceController's javadoc says "requires workflow:step:override
+     * (checked via @PreAuthorize or service layer)" — but there is no
+     * @PreAuthorize on the method, none anywhere in this codebase, and
+     * SecurityConfig gates these routes with .authenticated() only. So the
+     * permission existed in the RBAC screen and in documentation while any
+     * authenticated user could call this and force a step through.
+     *
+     * Matched against BOTH permission naming styles: this table holds
+     * colon-style names (workflow:step:override) alongside uppercase codes
+     * (WORKFLOW_VIEW), and extractPermissions collects getCode(). Matching one
+     * form only would deny users who genuinely hold the grant.
+     */
+    /**
+     * A task may only be actioned by the person it is assigned to.
+     *
+     * performAction validated existence, terminal state and instance status, then
+     * dispatched — so anyone holding workflow:task:act could complete ANY task in
+     * reach by passing its id, including another person's evidence submission.
+     * The button was hidden from them (canAct checks assignment) but the endpoint
+     * was open: protection at render time only.
+     *
+     * On an audit trail this matters more than usual — completion is attributed
+     * to the assignee, so an unauthorised call records work as having been done
+     * by someone who did not do it.
+     *
+     * Deliberately NOT exempting override holders: forcing a step is a separate,
+     * attributed act with its own endpoint, not something to do silently in a
+     * colleague's name.
+     */
+    private void requireTaskOwnership(TaskInstance task, Long performedBy) {
+        if (task.getAssignedUserId() == null) return;            // unassigned — nothing to violate
+        if (task.getAssignedUserId().equals(performedBy)) return;
+
+        log.warn("[WORKFLOW] Task action denied — taskId={} is assigned to {} but was actioned by {}",
+                task.getId(), task.getAssignedUserId(), performedBy);
+
+        throw new BusinessException("TASK_NOT_YOURS",
+                "This task is assigned to someone else. If you need to move the step on "
+                        + "without them, use override.",
+                org.springframework.http.HttpStatus.FORBIDDEN);
+    }
+
+    /**
+     * GUEST or HOME, for an AUDITOR-side step on an audit engagement.
+     *
+     * Side alone cannot separate an EXTERNAL firm's auditors from the client's
+     * own internal auditors — both are AUDITOR-side users in the client's
+     * tenant. EXTERNAL engagement → the firm's people, who hold GUEST
+     * memberships here. INTERNAL → the client's own staff, HOME.
+     *
+     * Returns null for everything else, preserving tenant-wide behaviour for
+     * non-audit workflows and for AUDITEE / ORGANIZATION steps, where the
+     * distinction does not apply: the auditee is always the client's own people
+     * regardless of who audits them.
+     */
+    /**
+     * Users eligible to be assigned on a given SIDE of this workflow.
+     *
+     * Answers for the step in this workflow that actually assigns that side,
+     * rather than for whichever step happens to be current — a sections screen
+     * viewed during step 3 (AUDITEE) still needs the auditor list from step 4/5.
+     *
+     * Applies the same membership scope task assignment uses, so an EXTERNAL
+     * engagement offers only the audit firm's guests and an INTERNAL one only
+     * the client's own staff. Offering someone here who would then be filtered
+     * out at assignment time is how a section ends up assigned to a person the
+     * workflow will not route to.
+     */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> getEligibleUsersForSide(StepInstance si, String side, Long tenantId) {
+        WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
+                .orElse(null);
+        if (instance == null) return List.of();
+
+        // Every step of this workflow on the requested side, nearest first — a
+        // workflow may assign the same side at more than one step.
+        List<WorkflowStep> steps = stepRepository
+                .findByWorkflowIdOrderByStepOrderAsc(instance.getWorkflowId()).stream()
+                .filter(s -> side.equalsIgnoreCase(s.getSide())
+                        || side.equalsIgnoreCase(s.getAssignableSide()))
+                .toList();
+
+        java.util.LinkedHashSet<Long> roleIds = new java.util.LinkedHashSet<>();
+        for (WorkflowStep s : steps) {
+            if (s.getAssignableRoleId() != null) roleIds.add(s.getAssignableRoleId());
+            stepRoleRepository.findByStepId(s.getId())
+                    .forEach(ar -> roleIds.add(ar.getRoleId()));
+        }
+
+        // Nothing configured — fall back to every role on that side, which is the
+        // old behaviour and still better than an empty picker.
+        if (roleIds.isEmpty()) {
+            try {
+                roleIds.addAll(roleRepository.findAllForTenantBySide(tenantId,
+                                com.kashi.grc.usermanagement.domain.RoleSide.valueOf(side.toUpperCase()))
+                        .stream().map(r -> r.getId()).toList());
+            } catch (IllegalArgumentException ignored) {
+                return List.of();
+            }
+        }
+        if (roleIds.isEmpty()) return List.of();
+
+        String membershipType = resolveMembershipScope(instance, side);
+
+        java.util.LinkedHashSet<Long> userIds = new java.util.LinkedHashSet<>();
+        for (Long roleId : roleIds) {
+            userIds.addAll(membershipType != null
+                    ? dbRepository.findUserIdsByRoleAndTenant(roleId, tenantId, side, membershipType)
+                    : dbRepository.findUserIdsByRoleAndTenantAndSide(roleId, tenantId, side));
+        }
+        if (userIds.isEmpty()) return List.of();
+
+        // getUsersByRoles keys the id as "id", not "userId".
+        return getUsersByRoles(new java.util.ArrayList<>(roleIds), tenantId).stream()
+                .filter(m -> m.get("id") instanceof Number n && userIds.contains(n.longValue()))
+                .toList();
+    }
+
+    private String resolveMembershipScope(WorkflowInstance instance, String stepSide) {
+        if (!"AUDITOR".equalsIgnoreCase(stepSide)) return null;
+        if (!"AUDIT_ENGAGEMENT".equalsIgnoreCase(instance.getEntityType())) return null;
+
+        return auditEngagementRepository.findById(instance.getEntityId())
+                .map(e -> e.getAuditType() == com.kashi.grc.audit.domain.AuditTemplate.AuditType.EXTERNAL
+                        ? "GUEST" : "HOME")
+                .orElse(null);
+    }
+
+    private void requireOverridePermission(Long performedBy) {
+        // Resolved the same way the UI resolves it — role_permissions UNION
+        // permission_grants UNION user_permission_overrides. Reading
+        // user.getRoles().getPermissions() directly, as the first version of
+        // this did, sees only the seeded role_permissions rows and misses
+        // everything granted through the RBAC screen. AUDITEE_LEAD holds
+        // workflow:step:override there, so that version would have denied the
+        // very person this permission was granted to.
+        // The CONTEXT user, not a fresh findById.
+        //
+        // resolvePermissions walks user.getRoles(); a bare findById returns a
+        // proxy whose roles collection is lazy, and by the time it is touched the
+        // session is gone — LazyInitializationException, surfacing as a 500 on
+        // every override attempt. utilityService.getLoggedInDataContext() loads
+        // the user through the WITH_ROLES_PERMISSIONS entity graph, which is why
+        // resolveCanOverride (given that same user) worked while this did not.
+        com.kashi.grc.usermanagement.domain.User actor = utilityService.getLoggedInDataContext();
+        java.util.Set<String> held = actor != null && actor.getId().equals(performedBy)
+                ? new java.util.HashSet<>(workflowAccessService.resolvePermissions(actor))
+                : new java.util.HashSet<>();
+
+        boolean allowed = held.contains("workflow:step:override")
+                || held.contains("WORKFLOW_STEP_OVERRIDE");
+
+        if (!allowed) {
+            log.warn("[WORKFLOW] Override denied — userId={} lacks workflow:step:override", performedBy);
+            throw new BusinessException("OVERRIDE_NOT_PERMITTED",
+                    "You do not have permission to override a workflow step.",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+    }
+
     private void requireSameSideToOverride(StepInstance si, Long performedBy) {
         String stepSide = si.getSnapSide();
         if (stepSide == null || "SYSTEM".equalsIgnoreCase(stepSide)) return;
 
-        java.util.Set<String> callerSides = userRepository.findById(performedBy)
+        // Context user again, for the same reason as requireOverridePermission:
+        // findById returns a proxy whose roles are lazy, and touching them
+        // outside the session throws. This guard never surfaced the bug only
+        // because the permission check above threw first.
+        com.kashi.grc.usermanagement.domain.User sideActor = utilityService.getLoggedInDataContext();
+        java.util.Set<String> callerSides = java.util.Optional.ofNullable(sideActor)
+                .filter(u -> u.getId().equals(performedBy))
                 .map(u -> u.getRoles().stream()
                         .map(r -> r.getSide() != null ? r.getSide().name() : null)
                         .filter(java.util.Objects::nonNull)
@@ -1600,6 +1814,7 @@ public class WorkflowEngineService {
                     "Step is not currently active — cannot override.");
         }
 
+        requireOverridePermission(performedBy);
         requireSameSideToOverride(si, performedBy);
 
         WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId())
@@ -1608,11 +1823,32 @@ public class WorkflowEngineService {
         StepStatus newStatus = "REJECT".equalsIgnoreCase(action)
                 ? StepStatus.REJECTED : StepStatus.APPROVED;
 
-        String overrideNote = "Step override by userId=" + performedBy
-                + (remarks != null && !remarks.isBlank() ? ": " + remarks : "");
+        // Name the person, not the id. "Step override by userId=169" tells a
+        // reader nothing without a second lookup, and this note is what shows on
+        // the step for the rest of the engagement.
+        String actorName = userRepository.findById(performedBy)
+                .map(u -> u.getFullName() != null && !u.getFullName().isBlank()
+                        ? u.getFullName().trim() : u.getEmail())
+                .orElse("userId=" + performedBy);
+
+        String overrideNote = "Overridden by " + actorName
+                + (remarks != null && !remarks.isBlank() ? " — " + remarks : "");
+
+        // How much was still outstanding when it was forced through. Counted
+        // BEFORE expiring, or it is always zero — and "overridden with 43 tasks
+        // still open" is a different fact from "overridden with 1".
+        int stillPending = taskInstanceRepository
+                .findByStepInstanceIdAndStatus(si.getId(), TaskStatus.PENDING).size();
 
         // Expire all pending tasks on this step
         expirePendingTasks(si, null);
+
+        // Attribution on the step itself. The tasks are gone from every inbox,
+        // so without this the override leaves no visible trace on the record.
+        si.setOverriddenBy(performedBy);
+        si.setOverriddenAt(java.time.LocalDateTime.now());
+        si.setOverrideExpiredTasks(stillPending);
+        si.setOverrideReason(remarks != null && !remarks.isBlank() ? remarks : null);
 
         // Complete the step
         completeStep(si, newStatus, overrideNote);
@@ -1624,8 +1860,10 @@ public class WorkflowEngineService {
         eventPublisher.publishEvent(new WorkflowEvent.StepCompleted(
                 instance.getId(), si.getId(), si.getSnapName(), newStatus.name(), performedBy));
 
-        log.info("[WORKFLOW-OVERRIDE] Step {} | stepInstanceId={} | by={}",
-                newStatus, stepInstanceId, performedBy);
+        log.info("[WORKFLOW-OVERRIDE] Step {} | stepInstanceId={} | by={} ({}) | "
+                        + "expiredTasks={} | reason={}",
+                newStatus, stepInstanceId, performedBy, actorName, stillPending,
+                remarks != null ? remarks : "-");
 
         if (newStatus == StepStatus.APPROVED) {
             // Advance to next step
@@ -1950,6 +2188,20 @@ public class WorkflowEngineService {
             stepProgress.put("visited",         !instances_for_step.isEmpty());
             stepProgress.put("timesVisited",    instances_for_step.size());
             stepProgress.put("currentStatus",   latestSI != null ? latestSI.getStatus().name() : "PENDING");
+            // Override attribution. The timeline reads this map, not
+            // StepInstanceResponse, so the fields have to be added in both
+            // places or the banner never appears where people actually look.
+            // Null on a normal completion.
+            if (latestSI != null && latestSI.getOverriddenBy() != null) {
+                stepProgress.put("overriddenBy",     latestSI.getOverriddenBy());
+                stepProgress.put("overriddenByName", userRepository.findById(latestSI.getOverriddenBy())
+                        .map(u -> u.getFullName() != null && !u.getFullName().isBlank()
+                                ? u.getFullName().trim() : u.getEmail())
+                        .orElse("User " + latestSI.getOverriddenBy()));
+                stepProgress.put("overriddenAt",         latestSI.getOverriddenAt());
+                stepProgress.put("overrideExpiredTasks", latestSI.getOverrideExpiredTasks());
+                stepProgress.put("overrideReason",       latestSI.getOverrideReason());
+            }
             stepProgress.put("iterations",      iterations);
             progress.add(stepProgress);
         }
@@ -2750,7 +3002,17 @@ public class WorkflowEngineService {
                     if ("VENDOR".equalsIgnoreCase(si.getSnapSide())) {
                         uids = dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId());
                     } else if (si.getSnapSide() != null) {
-                        uids = dbRepository.findUserIdsByRoleAndTenantAndSide(ar.getRoleId(), tenantId, si.getSnapSide());
+                        // Without membershipType, an EXTERNAL engagement's Evidence
+                        // Review fans out to every AUDITOR-side user in the tenant —
+                        // so the client's own internal auditors receive tasks to
+                        // review an external firm's audit, which defeats the
+                        // independence the engagement exists to demonstrate.
+                        String membershipType = resolveMembershipScope(instance, si.getSnapSide());
+                        uids = membershipType != null
+                                ? dbRepository.findUserIdsByRoleAndTenant(
+                                ar.getRoleId(), tenantId, si.getSnapSide(), membershipType)
+                                : dbRepository.findUserIdsByRoleAndTenantAndSide(
+                                ar.getRoleId(), tenantId, si.getSnapSide());
                         if (uids.isEmpty()) {
                             // No users for this role on this side — skip entirely.
                             // NO fallback to tenant-wide — that would assign wrong-side users
@@ -3550,6 +3812,21 @@ public class WorkflowEngineService {
                   .map(this::toTaskResponse)
                   .collect(java.util.stream.Collectors.groupingBy(TaskInstanceResponse::getStepInstanceId));
 
+        // 1 query: who overrode any step on this page. Batched for the same
+        // reason as the rest of this method — a findById per overridden step
+        // would reintroduce the N+1 this was written to remove. Usually empty.
+        java.util.Set<Long> overriderIds = stepsByInstanceId.values().stream()
+                .flatMap(List::stream)
+                .map(StepInstance::getOverriddenBy)
+                .filter(java.util.Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        Map<Long, String> overrideNames = overriderIds.isEmpty() ? Map.of()
+                : userRepository.findAllById(overriderIds).stream()
+                  .collect(java.util.stream.Collectors.toMap(
+                          com.kashi.grc.usermanagement.domain.User::getId,
+                          u -> u.getFullName() != null && !u.getFullName().isBlank()
+                               ? u.getFullName().trim() : u.getEmail()));
+
         // 1 query: every workflow name needed on the page
         List<Long> workflowIds = instances.stream().map(WorkflowInstance::getWorkflowId).distinct().toList();
         Map<Long, Workflow> workflowById = workflowRepository.findAllById(workflowIds)
@@ -3567,6 +3844,14 @@ public class WorkflowEngineService {
                             .status(si.getStatus()).startedAt(si.getStartedAt())
                             .completedAt(si.getCompletedAt()).slaDueAt(si.getSlaDueAt())
                             .iterationCount(si.getIterationCount()).remarks(si.getRemarks())
+                            // Null on a normal completion; the UI shows the
+                            // override banner only when these are present.
+                            .overriddenBy(si.getOverriddenBy())
+                            .overriddenByName(si.getOverriddenBy() == null ? null
+                                    : overrideNames.get(si.getOverriddenBy()))
+                            .overriddenAt(si.getOverriddenAt())
+                            .overrideExpiredTasks(si.getOverrideExpiredTasks())
+                            .overrideReason(si.getOverrideReason())
                             .taskInstances(tasksByStepInstanceId.getOrDefault(si.getId(), List.of()))
                             .build()
             ).toList();

@@ -197,7 +197,14 @@ public class AuditorAccessController {
                 .toList();
 
         // Without this the firm would be removed while its auditors kept working.
-        int revoked = grantRepo.revokeMembershipsForGrant(id);
+        //
+        // This used to call revokeMembershipsForGrant(id), which matched on
+        // user_tenant_memberships.grant_id. UserTenantMembership has no such
+        // field and assignAuditor never wrote one, so the statement revoked
+        // nothing while the notifications below told every auditor their access
+        // had ended. The firm is the real unit of revocation anyway: a grant
+        // admits a firm, so withdrawing it must remove everyone that firm placed.
+        int revoked = membershipRepo.revokeFirm(actor.getTenantId(), grant.getFirmTenantId());
 
         String clientName = tenantRepo.findById(actor.getTenantId())
                 .map(Tenant::getName).orElse("a client");

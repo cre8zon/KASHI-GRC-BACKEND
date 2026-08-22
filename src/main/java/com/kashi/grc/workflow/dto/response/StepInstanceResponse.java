@@ -9,5 +9,9 @@ public class StepInstanceResponse {
     private String stepName; private Integer stepOrder; private StepStatus status;
     private LocalDateTime startedAt; private LocalDateTime completedAt;
     private LocalDateTime slaDueAt; private Integer iterationCount; private String remarks;
+    /** Set only when the step was forced through; null on a normal completion. */
+    private Long overriddenBy; private String overriddenByName;
+    private LocalDateTime overriddenAt; private Integer overrideExpiredTasks;
+    private String overrideReason;
     private List<TaskInstanceResponse> taskInstances;
 }

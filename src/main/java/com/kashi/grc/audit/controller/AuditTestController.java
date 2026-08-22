@@ -142,11 +142,35 @@ public class AuditTestController {
                 .body(ApiResponse.success(Map.of("id", test.getId(), "name", test.getName())));
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // TESTS ARE SYSTEM-AUTHORED
+    //
+    // A test carries automationType, automationKey and controlTag — the three
+    // fields the integration runner and the evidence-reuse engine match on. None
+    // of these handlers checked ownership, so any org admin could rewrite or
+    // delete a GLOBAL test and take its automationKey with it, breaking
+    // automated evidence collection for every tenant on the instance.
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void requireOwnedTest(AuditTest test) {
+        if (utilityService.isSystemUser()) return;
+        Long caller = utilityService.getLoggedInDataContext().getTenantId();
+        if (java.util.Objects.equals(test.getTenantId(), caller)) return;
+
+        log.warn("[AUDIT-TEST] Refused write to test {} (tenant {}) by tenant {}",
+                test.getId(), test.getTenantId(), caller);
+        throw new com.kashi.grc.common.exception.BusinessException("TEST_ACCESS_DENIED",
+                test.getTenantId() == null
+                        ? "This test belongs to the global library and cannot be modified"
+                        : "You can only modify tests belonging to your organisation",
+                HttpStatus.FORBIDDEN);
+    }
     @PutMapping("/v1/audit/library/tests/{id}")
     public ResponseEntity<ApiResponse<Map<String, Object>>> updateTest(
             @PathVariable Long id, @RequestBody AuditTestRequest req) {
         AuditTest test = testRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTest", id));
+        requireOwnedTest(test);
 
         if (req.getName() != null)         test.setName(req.getName());
         if (req.getDescription() != null)  test.setDescription(req.getDescription());
@@ -170,22 +194,40 @@ public class AuditTestController {
     @Operation(summary = "Bulk delete tests by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteTests(
             @RequestParam List<Long> ids) {
-        int deleted = 0;
+        boolean isSystem  = utilityService.isSystemUser();
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+
+        int deleted = 0, skipped = 0;
         for (Long id : ids) {
-            if (testRepository.existsById(id)) {
-                // Remove control-test mappings first
-                controlTestMappingRepository.findByTestIdOrderByOrderNoAsc(id)
-                        .forEach(controlTestMappingRepository::delete);
-                testRepository.deleteById(id);
-                deleted++;
+            var found = testRepository.findById(id);
+            if (found.isEmpty()) continue;
+
+            // Skipped rather than thrown so a bulk action never aborts halfway.
+            if (!isSystem && !java.util.Objects.equals(found.get().getTenantId(), callerTenant)) {
+                skipped++;
+                continue;
             }
+
+            // Remove control-test mappings first
+            controlTestMappingRepository.findByTestIdOrderByOrderNoAsc(id)
+                    .forEach(controlTestMappingRepository::delete);
+            testRepository.deleteById(id);
+            deleted++;
         }
+        if (skipped > 0)
+            log.warn("[AUDIT-LIBRARY] Bulk delete skipped {} tests not owned by tenant {}", skipped, callerTenant);
         log.info("[AUDIT-LIBRARY] Bulk deleted {} tests", deleted);
-        return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted)));
+        return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted, "skipped", skipped)));
     }
 
     @DeleteMapping("/v1/audit/library/tests/{id}")
     public ResponseEntity<ApiResponse<Void>> deleteTest(@PathVariable Long id) {
+        // Loaded solely to check ownership — deleteById(id) previously took the
+        // path variable straight to the database.
+        AuditTest test = testRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditTest", id));
+        requireOwnedTest(test);
+
         controlTestMappingRepository.deleteByTestId(id);
         testRepository.deleteById(id);
         log.info("[AUDIT-TEST] Deleted test id={}", id);
@@ -298,6 +340,11 @@ public class AuditTestController {
     @DeleteMapping("/v1/audit/library/controls/{controlId}/tests/{testId}")
     public ResponseEntity<ApiResponse<Void>> unlinkControlTest(
             @PathVariable Long controlId, @PathVariable Long testId) {
+        // Unlinking a global control↔test mapping removes that test from every
+        // tenant's next engagement, silently.
+        requireOwnedTest(testRepository.findById(testId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditTest", testId)));
+
         controlTestMappingRepository.findByControlIdAndTestId(controlId, testId)
                 .ifPresent(controlTestMappingRepository::delete);
         return ResponseEntity.ok(ApiResponse.success());
@@ -421,6 +468,10 @@ public class AuditTestController {
         m.put("controlTag",       t.getControlTag());
         m.put("automationType",   t.getAutomationType() != null ? t.getAutomationType().name() : null);
         m.put("automationKey",    t.getAutomationKey());
+        // See AuditPolicyController — lets the UI badge global rows and hide Edit.
+        boolean globalT = t.getTenantId() == null;
+        m.put("origin",   globalT ? "GLOBAL" : "ORG");
+        m.put("editable", !globalT || utilityService.isSystemUser());
         m.put("frequency",        t.getFrequency() != null ? t.getFrequency().name() : null);
         m.put("testProcedure",    t.getTestProcedure());
         m.put("evidenceGuidance", t.getEvidenceGuidance());

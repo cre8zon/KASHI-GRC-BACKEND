@@ -169,6 +169,29 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_sod_rules_json", columnDefinition = "JSON")
     private String snapSodRulesJson;
 
+    // ── Override attribution ──────────────────────────────────────────────
+    // A step forced past its outstanding work is a different event from one that
+    // completed normally, and the distinction has to survive on the record: the
+    // pending tasks are expired, so without this the only trace is a note
+    // reading "Step override by userId=169" and an inbox that quietly emptied.
+    //
+    // Whoever holds workflow:step:override for that side — the lead auditee on
+    // AUDITEE steps, the lead auditor on AUDITOR steps — is answerable for it,
+    // so the record names them.
+
+    @Column(name = "overridden_by")
+    private Long overriddenBy;
+
+    @Column(name = "overridden_at")
+    private java.time.LocalDateTime overriddenAt;
+
+    /** How many tasks were still outstanding when it was forced through. */
+    @Column(name = "override_expired_tasks")
+    private Integer overrideExpiredTasks;
+
+    @Column(name = "override_reason", columnDefinition = "TEXT")
+    private String overrideReason;
+
     // ── Migration SQL ─────────────────────────────────────────────────────────
     // ALTER TABLE step_instances
     //   ADD COLUMN snap_ui_override_json JSON NULL

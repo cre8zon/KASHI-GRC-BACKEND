@@ -44,6 +44,34 @@ import java.util.Map;
 public class CommonControlController {
 
     private final CommonControlService service;
+    private final com.kashi.grc.common.util.UtilityService utilityService;
+
+
+    // ══════════════════════════════════════════════════════════════════════
+    // THE UCF CATALOGUE IS PLATFORM DATA
+    //
+    // common_controls and their framework mappings are the crosswalk that makes
+    // one piece of evidence satisfy SOC 2, ISO 27001 and RBI at once. They are
+    // global by definition — there is no tenant column to check, which is
+    // exactly why every write here needs an explicit system-user gate rather
+    // than an ownership comparison. Without it any org admin could rewrite or
+    // deactivate a common control and change cross-framework mapping for every
+    // tenant on the instance.
+    //
+    // Reads stay open: the catalogue is meant to be browsed, and the tag picker
+    // on the control form calls it on every keystroke.
+    // ══════════════════════════════════════════════════════════════════════
+
+    private void requirePlatformAdmin(String action) {
+        if (utilityService.isSystemUser()) return;
+
+        var ctx = utilityService.getLoggedInDataContext();
+        log.warn("[UCF] Refused {} by non-platform user | userId={} tenantId={}",
+                action, ctx.getId(), ctx.getTenantId());
+        throw new com.kashi.grc.common.exception.BusinessException("UCF_ADMIN_ONLY",
+                "The common control catalogue is maintained by the platform",
+                org.springframework.http.HttpStatus.FORBIDDEN);
+    }
 
     // ── Catalogue ───────────────────────────────────────────────────────────
 
@@ -92,6 +120,7 @@ public class CommonControlController {
     @PostMapping("/controls")
     @Operation(summary = "Create a catalogue node")
     public ResponseEntity<ApiResponse<NodeResponse>> create(@Valid @RequestBody NodeRequest req) {
+        requirePlatformAdmin("create");
         return ResponseEntity.ok(ApiResponse.success(service.createNode(req)));
     }
 
@@ -101,6 +130,7 @@ public class CommonControlController {
                     + "frozen engagement snapshots already reference them.")
     public ResponseEntity<ApiResponse<NodeResponse>> update(
             @PathVariable String code, @Valid @RequestBody NodeRequest req) {
+        requirePlatformAdmin("update");
         return ResponseEntity.ok(ApiResponse.success(service.updateNode(code, req)));
     }
 
@@ -109,6 +139,7 @@ public class CommonControlController {
             description = "Never a hard delete — the code may already be frozen into an "
                     + "engagement's matched_tags_snapshot. Blocked while library rows use it.")
     public ResponseEntity<ApiResponse<Void>> deactivate(@PathVariable String code) {
+        requirePlatformAdmin("deactivate");
         service.deactivateNode(code);
         return ResponseEntity.ok(ApiResponse.success());
     }
@@ -119,6 +150,7 @@ public class CommonControlController {
     @Operation(summary = "Add a crosswalk row")
     public ResponseEntity<ApiResponse<MappingResponse>> createMapping(
             @Valid @RequestBody MappingRequest req) {
+        requirePlatformAdmin("createMapping");
         return ResponseEntity.ok(ApiResponse.success(service.createMapping(req)));
     }
 
@@ -132,12 +164,14 @@ public class CommonControlController {
     @Operation(summary = "Correct a crosswalk relationship")
     public ResponseEntity<ApiResponse<MappingResponse>> updateMapping(
             @PathVariable Long id, @Valid @RequestBody MappingRequest req) {
+        requirePlatformAdmin("updateMapping");
         return ResponseEntity.ok(ApiResponse.success(service.updateMapping(id, req)));
     }
 
     @DeleteMapping("/mappings/{id}")
     @Operation(summary = "Deactivate a crosswalk row")
     public ResponseEntity<ApiResponse<Void>> deleteMapping(@PathVariable Long id) {
+        requirePlatformAdmin("deleteMapping");
         service.deleteMapping(id);
         return ResponseEntity.ok(ApiResponse.success());
     }
