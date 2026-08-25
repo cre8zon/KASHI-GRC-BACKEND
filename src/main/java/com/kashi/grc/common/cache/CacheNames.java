@@ -49,4 +49,18 @@ public final class CacheNames {
     // See AuditReferenceListCacheService.
     public static final String AUDIT_TEMPLATE_LIST = "auditTemplateList";
     public static final String WORKFLOW_BLUEPRINT_LIST = "workflowBlueprintList";
+
+    /**
+     * Library list endpoints. These were never cached — every policy/test list
+     * request went to the database, and with ~250ms of round-trip latency to
+     * Aiven that is the floor no projection can get under.
+     *
+     * Cached values are List<Map<String,Object>> deliberately, NOT the summary
+     * records: the Redis serializer uses DefaultTyping.NON_FINAL, records are
+     * final, so no @class marker is written and they would deserialise as
+     * LinkedHashMap and fail on cast. Maps are also exactly what the endpoint
+     * returns, so nothing is converted twice.
+     */
+    public static final String AUDIT_POLICY_LIST = "auditPolicyList";
+    public static final String AUDIT_TEST_LIST   = "auditTestList";
 }

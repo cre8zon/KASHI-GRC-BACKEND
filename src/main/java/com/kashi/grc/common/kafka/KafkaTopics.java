@@ -65,6 +65,16 @@ public final class KafkaTopics {
      */
     public static final String AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED = "kashigrc.audit.engagement-snapshot-requested";
 
+    /**
+     * Bulk adoption of the platform policy library by one tenant.
+     *
+     * Async because the work is per-policy and unbounded: each adoption copies
+     * the policy, carries its control mappings across and writes an exclusion
+     * for each original. At ~250ms per round trip that is minutes for a library
+     * of a few hundred, well past any request timeout.
+     */
+    public static final String AUDIT_POLICY_BULK_ADOPT_REQUESTED = "kashigrc.audit.policy-bulk-adopt-requested";
+
     // ── Future topics (declared when implemented) ─────────────────────
     // public static final String WORKFLOW_EVENTS    = "kashigrc.workflow.events";
     // public static final String AUDIT_TRAIL        = "kashigrc.audit.trail";

@@ -524,9 +524,18 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .apiEndpoint(a.getApiEndpoint()).httpMethod(a.getHttpMethod())
                 .payloadTemplateJson(a.getPayloadTemplateJson())
                 .allowedStatusesJson(a.getAllowedStatusesJson())
-                .requiresConfirmation(a.getRequiresConfirmation())
+                // Boolean.TRUE.equals, not a raw unbox. UiActionResponse declares these
+                // as primitive booleans while UiAction stores them as nullable Boolean,
+                // so any ui_actions row with a NULL in these columns threw NPE and took
+                // the whole screen-config response with it — one bad row broke the
+                // entire screen, not just its own action.
+                //
+                // requiresAssignment was already guarded; the other two were not, and
+                // the entity's @Builder.Default = false does not help because Hibernate
+                // sets the field directly when loading, bypassing the builder.
+                .requiresConfirmation(Boolean.TRUE.equals(a.getRequiresConfirmation()))
                 .confirmationMessage(a.getConfirmationMessage())
-                .requiresRemarks(a.getRequiresRemarks())
+                .requiresRemarks(Boolean.TRUE.equals(a.getRequiresRemarks()))
                 .requiresAssignment(Boolean.TRUE.equals(a.getRequiresAssignment()))
                 .sortOrder(a.getSortOrder())
                 .build();

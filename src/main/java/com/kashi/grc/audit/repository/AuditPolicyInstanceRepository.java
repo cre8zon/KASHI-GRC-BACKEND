@@ -17,5 +17,10 @@ public interface AuditPolicyInstanceRepository
 
     List<AuditPolicyInstance> findByOriginalPolicyId(Long originalPolicyId);
 
+    /** How many engagements hold an instance of this library policy. Guards
+     *  deletion: original_policy_id is an indexed column, NOT a foreign key, so
+     *  nothing at the database level stops a delete from stranding them. */
+    long countByOriginalPolicyId(Long originalPolicyId);
+
     List<AuditPolicyInstance> findByTenantIdOrderByTitleSnapshotAsc(Long tenantId);
 }

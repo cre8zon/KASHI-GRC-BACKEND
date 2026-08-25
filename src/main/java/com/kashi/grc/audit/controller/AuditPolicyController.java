@@ -33,6 +33,14 @@ import java.util.stream.Collectors;
 public class AuditPolicyController {
 
     private final AuditPolicyRepository                       policyRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
+    private final com.kashi.grc.audit.service.AuditLibraryCacheService libraryCache;
+    private final com.kashi.grc.audit.csv.AuditCsvImportExtension csvImportExtension;
+    private final com.kashi.grc.audit.service.AuditPolicyWorkflowService policyWorkflow;
+    private final com.kashi.grc.audit.service.AuditPolicyBulkAdoptService bulkAdoptService;
+    private final com.kashi.grc.audit.service.PolicyVariableResolver policyVariables;
+    /** Optional: KafkaEventPublisher is @ConditionalOnProperty. */
+    private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaPublisher;
     private final AuditPolicyControlMappingRepository         policyControlMappingRepository;
     private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditPolicyInstanceRepository               policyInstanceRepository;
@@ -48,21 +56,38 @@ public class AuditPolicyController {
     @Operation(summary = "List all policies in the library")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listPolicies(
             @RequestParam(required = false) String search,
-            @RequestParam(required = false) String status) {
+            @RequestParam(required = false) String status,
+            /** GLOBAL | ORG — omit for both. Lets the list separate the platform
+             *  library from the tenant's own copies, which otherwise interleave
+             *  alphabetically and are hard to tell apart at 40+ rows. */
+            @RequestParam(required = false) String origin) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
-        List<AuditPolicy> policies;
-        if (search != null && !search.isBlank()) {
-            policies = policyRepository.searchByTitle(tenantId, search);
-        } else if (status != null && !status.isBlank()) {
-            policies = policyRepository.findByTenantIdAndStatus(tenantId,
-                    AuditPolicy.PolicyStatus.valueOf(status));
-        } else {
-            policies = policyRepository.findByTenantIdOrderByTitleAsc(tenantId);
-        }
+        // Projection, not entities. This endpoint used to load full AuditPolicy
+        // rows — content_body included, the whole policy document as HTML — for
+        // every policy, then map them down to a summary that discards the content.
+        // 39 policies took 8-10 seconds for a screen with eight short columns, and
+        // the perf log showed only 3 queries: the cost was the payload, not the
+        // round trips. findSummariesForTenant selects the columns explicitly so the
+        // document never leaves MySQL.
+        // Cached per tenant + filter combination. Status parsing and the
+        // projection both live in the cache service so a hit does neither.
+        var cached = libraryCache.policyList(tenantId, search, status, origin);
 
-        return ResponseEntity.ok(ApiResponse.success(
-                policies.stream().map(this::toPolicySummaryMap).collect(Collectors.toList())));
+        // `editable` is added HERE, not in the cache. It derives from
+        // isSystemUser(), a property of the USER, while the cache key is per
+        // TENANT — caching it would serve a platform admin's "true" to an org
+        // user in the same tenant. Copied rather than mutated: the cached maps
+        // are shared, and writing into them would poison the entry for the next
+        // caller (and, on a local cache, permanently).
+        boolean sysUser = utilityService.isSystemUser();
+        List<Map<String, Object>> out = cached.stream().map(m -> {
+            Map<String, Object> copy = new java.util.LinkedHashMap<>(m);
+            copy.put("editable", !"GLOBAL".equals(m.get("origin")) || sysUser);
+            return copy;
+        }).collect(Collectors.toList());
+
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     @GetMapping("/v1/audit/library/policies/{id}")
@@ -74,7 +99,16 @@ public class AuditPolicyController {
 
         Map<String, Object> result = toPolicyDetailMap(policy);
 
-        List<AuditPolicyControlMapping> mappings = policyControlMappingRepository.findByPolicyId(id);
+        // Same leak as listControlPolicies: a GLOBAL policy carries the mappings of
+        // every tenant that linked it to one of their controls, so returning them all
+        // showed each client which controls the others had mapped it to.
+        boolean sysUser  = utilityService.isSystemUser();
+        Long callerTid   = utilityService.getLoggedInDataContext().getTenantId();
+        List<AuditPolicyControlMapping> mappings = policyControlMappingRepository.findByPolicyId(id).stream()
+                .filter(m -> sysUser
+                        || m.getTenantId() == null
+                        || java.util.Objects.equals(m.getTenantId(), callerTid))
+                .toList();
         result.put("linkedControlCount", mappings.size());
         result.put("linkedControlMappings", mappings.stream().map(m -> {
             Map<String, Object> mm = new LinkedHashMap<>();
@@ -131,6 +165,11 @@ public class AuditPolicyController {
 
         policyRepository.save(policy);
         log.info("[AUDIT-POLICY] Created | id={} title={}", policy.getId(), policy.getTitle());
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.success(Map.of("id", policy.getId(), "title", policy.getTitle())));
     }
@@ -157,6 +196,11 @@ public class AuditPolicyController {
             policy.setReviewFrequencyMonths(req.getReviewFrequencyMonths());
 
         policyRepository.save(policy);
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(toPolicySummaryMap(policy)));
     }
 
@@ -170,6 +214,28 @@ public class AuditPolicyController {
         AuditPolicy policy = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
         requireOwnedPolicy(policy);
+
+        // ── Separation of duties ─────────────────────────────────────────────
+        //
+        // The Policy Approval workflow puts a HARD SoD rule on step 3: the person
+        // who drafted a policy cannot approve it. This endpoint bypassed that
+        // entirely — one call and the drafter approves their own document,
+        // whatever the workflow says.
+        //
+        // Enforced against createdBy rather than the workflow actor because that
+        // holds even when no workflow is running, which is the case this bypass
+        // was reachable in.
+        //
+        // Platform admins are exempt: they approve platform library content that
+        // they authored, and there is no second party in that model. The exemption
+        // is deliberate and narrow — it does NOT apply to a tenant policy.
+        if (!utilityService.isSystemUser()
+                && java.util.Objects.equals(policy.getCreatedBy(), userId)) {
+            throw new BusinessException("POLICY_SOD_VIOLATION",
+                    "You drafted this policy, so you cannot approve it. "
+                            + "Ask a second approver to review and approve.",
+                    HttpStatus.FORBIDDEN);
+        }
 
         policy.setStatus(AuditPolicy.PolicyStatus.APPROVED);
         policy.setApprovedById(userId);
@@ -186,10 +252,19 @@ public class AuditPolicyController {
         }
 
         policyRepository.save(policy);
+        // Completes the approval step, closing the workflow. Non-fatal when no
+        // Policy Approval blueprint is configured for the tenant.
+        policyWorkflow.onApproved(policy, utilityService.getLoggedInDataContext().getId());
+
         log.info("[AUDIT-POLICY] Approved | id={} | workflowInstanceId={}",
                 id, policy.getWorkflowInstanceId());
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(
-                Map.of("id", id, "status", "APPROVED",
+                responseMap("id", id, "status", "APPROVED",
                         "workflowInstanceId", policy.getWorkflowInstanceId())));
     }
 
@@ -219,9 +294,136 @@ public class AuditPolicyController {
         policyRepository.save(policy);
         log.info("[AUDIT-POLICY] Sent for review | id={} | workflowInstanceId={}",
                 id, policy.getWorkflowInstanceId());
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(
-                Map.of("id", id, "status", policy.getStatus(),
+                responseMap("id", id, "status", policy.getStatus(),
                         "workflowInstanceId", policy.getWorkflowInstanceId())));
+    }
+
+    /**
+     * Owner review — the missing middle of the lifecycle.
+     *
+     * Until now the only path out of UNDER_REVIEW was approvePolicy, so a
+     * three-role workflow had nothing for the reviewer to DO: step 2 could only
+     * ever complete by override. This is the action that closes it.
+     *
+     * Status does NOT change. Review is an act, not a state — the policy stays
+     * UNDER_REVIEW until someone approves or sends it back. What changes is the
+     * workflow: the section carrying POLICY_REVIEWED completes and the engine
+     * advances to the approval step.
+     *
+     * @param outcome REVIEWED (ready for approval) or CHANGES_REQUESTED (back to
+     *                the drafter). Recorded either way — "the owner asked for
+     *                changes on 3 March" is exactly what an auditor wants to see.
+     */
+    @PostMapping("/v1/audit/library/policies/{id}/review")
+    @Operation(summary = "Record owner review of a policy under review")
+    @Transactional
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reviewPolicy(
+            @PathVariable Long id,
+            @RequestParam(defaultValue = "REVIEWED") String outcome,
+            @RequestParam(required = false) String remarks) {
+
+        AuditPolicy policy = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
+
+        if (policy.getStatus() != AuditPolicy.PolicyStatus.UNDER_REVIEW) {
+            throw new BusinessException("INVALID_STATUS",
+                    "Only policies that are under review can be reviewed",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        boolean changesRequested = "CHANGES_REQUESTED".equalsIgnoreCase(outcome);
+        if (changesRequested) {
+            // Back to the drafter. DRAFT is the honest state — the document is
+            // being written again, and leaving it UNDER_REVIEW would show a
+            // reviewer a queue item nobody is acting on.
+            policy.setStatus(AuditPolicy.PolicyStatus.DRAFT);
+        }
+        policyRepository.save(policy);
+
+        policyWorkflow.onReviewed(policy, changesRequested,
+                utilityService.getLoggedInDataContext().getId(), remarks);
+
+        log.info("[AUDIT-POLICY] Review recorded | id={} outcome={}", id, outcome);
+        libraryCache.evictLibraryLists();
+
+        return ResponseEntity.ok(ApiResponse.success(responseMap(
+                "id", id, "outcome", changesRequested ? "CHANGES_REQUESTED" : "REVIEWED",
+                "status", policy.getStatus().name())));
+    }
+
+    /**
+     * Unpublish — APPROVED back to DRAFT. Platform side only.
+     *
+     * WHY THIS IS NOT "deprecate"
+     *   Deprecate means "this was in force and is now withdrawn" — it stays in
+     *   the register as history, and engagements that snapshotted it keep their
+     *   copy. Unpublish means "this should not have gone out": a typo in a
+     *   platform template, a clause published early. The document goes back to
+     *   being worked on.
+     *
+     * WHY PLATFORM ONLY
+     *   The platform team maintains the shared library the way it maintains the
+     *   control and test libraries — a tenant unpublishing their own approved
+     *   policy would be rewriting their own compliance history, which is what
+     *   deprecate plus a new version exists for.
+     *
+     * DELIBERATELY REFUSED on a policy that has already been adopted or
+     * snapshotted: tenants hold copies and engagements hold instances, and
+     * silently un-approving the source underneath them would leave those copies
+     * descended from a document that is no longer published.
+     */
+    @PostMapping("/v1/audit/library/policies/{id}/unpublish")
+    @Operation(summary = "Return an approved platform policy to draft (platform admins only)")
+    @Transactional
+    public ResponseEntity<ApiResponse<Map<String, Object>>> unpublishPolicy(@PathVariable Long id) {
+        if (!utilityService.isSystemUser()) {
+            throw new BusinessException("PLATFORM_ADMIN_ONLY",
+                    "Only platform administrators can unpublish a policy",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        AuditPolicy policy = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+
+        if (policy.getTenantId() != null) {
+            throw new BusinessException("POLICY_NOT_GLOBAL",
+                    "Only platform policies can be unpublished. Use Deprecate for an organisation policy.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        if (policy.getStatus() != AuditPolicy.PolicyStatus.APPROVED) {
+            throw new BusinessException("INVALID_STATUS",
+                    "Only an approved policy can be unpublished",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        long adopted = policyRepository.countByPreviousVersionId(id);
+        if (adopted > 0) {
+            throw new BusinessException("POLICY_ALREADY_ADOPTED",
+                    adopted + " organisation" + (adopted == 1 ? " has" : "s have")
+                            + " already adopted this policy. Deprecate it instead —"
+                            + " unpublishing would orphan their copies.",
+                    HttpStatus.CONFLICT,
+                    java.util.Map.of("adoptedCopies", adopted));
+        }
+
+        policy.setStatus(AuditPolicy.PolicyStatus.DRAFT);
+        policy.setApprovedById(null);
+        policy.setApprovedAt(null);
+        policyRepository.save(policy);
+
+        log.info("[AUDIT-POLICY] Unpublished | id={} by={}", id,
+                utilityService.getLoggedInDataContext().getId());
+        libraryCache.evictLibraryLists();
+
+        return ResponseEntity.ok(ApiResponse.success(responseMap(
+                "id", id, "status", "DRAFT")));
     }
 
     @PostMapping("/v1/audit/library/policies/{id}/deprecate")
@@ -232,6 +434,11 @@ public class AuditPolicyController {
         requireOwnedPolicy(policy);
         policy.setStatus(AuditPolicy.PolicyStatus.DEPRECATED);
         policyRepository.save(policy);
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(Map.of("id", id, "status", "DEPRECATED")));
     }
 
@@ -273,6 +480,11 @@ public class AuditPolicyController {
         policyRepository.save(newVersion);
         log.info("[AUDIT-POLICY] New version created | sourceId={} newId={} version={}",
                 source.getId(), newVersion.getId(), newVersion.getVersion());
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.status(org.springframework.http.HttpStatus.CREATED)
                 .body(ApiResponse.success(Map.of(
                         "id",      newVersion.getId(),
@@ -284,7 +496,23 @@ public class AuditPolicyController {
     @Transactional
     @Operation(summary = "Bulk delete policies by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeletePolicies(
-            @RequestParam List<Long> ids) {
+            // Body, not @RequestParam. handleBulkAction posts { ids: [...] } as
+            // JSON, so query-param binding received nothing and the call failed
+            // before reaching the loop. Same mismatch as customise-all.
+            // @RequestParam kept as a fallback so any existing caller using
+            // ?ids=1,2,3 still works.
+            @RequestBody(required = false) Map<String, Object> body,
+            @RequestParam(required = false) List<Long> ids) {
+
+        if ((ids == null || ids.isEmpty()) && body != null && body.get("ids") instanceof List<?> raw) {
+            ids = raw.stream()
+                    .map(o -> o instanceof Number n ? n.longValue() : Long.valueOf(String.valueOf(o)))
+                    .toList();
+        }
+        if (ids == null || ids.isEmpty()) {
+            throw new BusinessException("NO_IDS", "Select at least one policy to delete",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
         boolean isSystem  = utilityService.isSystemUser();
         Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
 
@@ -311,6 +539,11 @@ public class AuditPolicyController {
         if (skipped > 0)
             log.warn("[AUDIT-LIBRARY] Bulk delete skipped {} policies not owned by tenant {}", skipped, callerTenant);
         log.info("[AUDIT-LIBRARY] Bulk deleted {} policies", deleted);
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted, "skipped", skipped)));
     }
 
@@ -322,9 +555,56 @@ public class AuditPolicyController {
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
         requireOwnedPolicy(policy);
 
+        // ── The guards the UI implied but the server never enforced ──────────
+        //
+        // allowed_statuses_json on DELETE_POLICY restricts this to DRAFT and
+        // DEPRECATED, but that is a rendering rule: a direct API call bypassed it
+        // entirely. Same shape as the approvePolicy bypass — a restriction that
+        // exists only in the button.
+        boolean platformAdmin = utilityService.isSystemUser();
+
+        if (!platformAdmin && policy.getStatus() == AuditPolicy.PolicyStatus.APPROVED) {
+            // Deleting your own approved policy destroys the register entry: the
+            // approval record, the version history, the workflow trail. Deprecate
+            // keeps all of it and reaches the same place.
+            throw new BusinessException("POLICY_APPROVED_CANNOT_DELETE",
+                    "An approved policy cannot be deleted — deprecate it instead, "
+                            + "which keeps its approval and version history.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        // Engagement instances snapshot everything they need, so deleting the
+        // library policy does NOT break them — original_policy_id is an indexed
+        // column, not a foreign key. What breaks is the trail back: that column
+        // becomes a number pointing at nothing, and "which library policy did
+        // this come from?" stops answering.
+        //
+        // Refused rather than warned, because the damage is silent and only
+        // surfaces when someone tries to trace an instance months later. A
+        // platform admin may still do it — they own the library and may be
+        // clearing out a mistake.
+        long instances = policyInstanceRepository.countByOriginalPolicyId(id);
+        if (instances > 0 && !platformAdmin) {
+            throw new BusinessException("POLICY_IN_USE",
+                    instances + " engagement" + (instances == 1 ? "" : "s")
+                            + " already include this policy. Deprecate it instead — deleting"
+                            + " it would leave those instances pointing at nothing.",
+                    HttpStatus.CONFLICT,
+                    java.util.Map.of("engagementInstances", instances));
+        }
+        if (instances > 0) {
+            log.warn("[AUDIT-POLICY] Platform admin deleting policy {} with {} engagement instances",
+                    id, instances);
+        }
+
         policyControlMappingRepository.deleteByPolicyId(id);
         policyRepository.deleteById(id);
         log.info("[AUDIT-POLICY] Deleted id={}", id);
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -341,9 +621,26 @@ public class AuditPolicyController {
         // ones the platform ships.
         Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
         boolean isSystem  = utilityService.isSystemUser();
-        List<AuditPolicyControlMapping> mappings = isSystem
+        // findAllVisibleIncludingExclusions, not findVisibleByControlId: this is the
+        // one screen that must SHOW exclusions, so a tenant can see what they
+        // excluded and restore it. Everywhere else — including engagement
+        // snapshotting — uses the resolving variant.
+        List<AuditPolicyControlMapping> raw = isSystem
                 ? policyControlMappingRepository.findByControlId(controlId)
-                : policyControlMappingRepository.findVisibleByControlId(controlId, callerTenant);
+                : policyControlMappingRepository
+                  .findAllVisibleIncludingExclusions(controlId, callerTenant);
+
+        // A platform row whose policy this tenant has excluded must not be listed
+        // as active — the exclusion row stands in for it.
+        java.util.Set<Long> excludedIds = raw.stream()
+                .filter(m -> m.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED)
+                .map(AuditPolicyControlMapping::getPolicyId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        List<AuditPolicyControlMapping> mappings = raw.stream()
+                .filter(m -> m.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED
+                        || !(m.getTenantId() == null && excludedIds.contains(m.getPolicyId())))
+                .toList();
 
         // BATCHED — was one policyRepository.findById() per row.
         List<Long> policyIds = mappings.stream().map(AuditPolicyControlMapping::getPolicyId).toList();
@@ -357,6 +654,9 @@ public class AuditPolicyController {
             row.put("policyId",    m.getPolicyId());
             row.put("controlId",   m.getControlId());
             row.put("mappingType", m.getMappingType());
+            // Drives the collapsed "excluded" section and the Restore action.
+            row.put("excluded",
+                    m.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED);
             row.put("mappingNote", m.getMappingNote());
             AuditPolicy p = policiesById.get(m.getPolicyId());
             if (p != null) {
@@ -365,6 +665,18 @@ public class AuditPolicyController {
                 row.put("policyVersion",  p.getVersion());
                 row.put("policyStatus",   p.getStatus());
                 row.put("nextReviewDate", p.getNextReviewDate());
+
+                // Ownership, so the control screen can tell a platform policy from
+                // one of the tenant's own. Without it every mapped policy looked
+                // identical, and the tenant could not see which of them they were
+                // allowed to unlink — the server refuses unlink on a global policy,
+                // so the UI was offering a button that always 403s.
+                boolean globalPol = p.getTenantId() == null;
+                row.put("policyOrigin",      globalPol ? "GLOBAL" : "ORG");
+                row.put("policyUnlinkable",  !globalPol || utilityService.isSystemUser());
+                // Non-null when this policy is a tenant copy of a platform one, which
+                // is what makes it SUPERSEDE that platform policy at snapshot time.
+                row.put("supersedesPolicyId", p.getPreviousVersionId());
             }
             return row;
         }).collect(Collectors.toList());
@@ -427,23 +739,107 @@ public class AuditPolicyController {
         mapping.setMappingType(AuditPolicyControlMapping.MappingType.valueOf(mappingType));
         if (note != null) mapping.setMappingNote(note);
         policyControlMappingRepository.save(mapping);
+        // Optional workflow section — "controls linked". Never required, so a
+        // policy can still be approved before anyone maps it.
+        policyRepository.findById(policyId)
+                .ifPresent(p -> policyWorkflow.onControlLinked(p, userId));
+
+
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
 
         return ResponseEntity.ok(ApiResponse.success(
                 Map.of("mappingId", mapping.getId(), "policyId", policyId, "controlId", controlId)));
     }
 
+    /**
+     * Restore a platform policy this tenant had excluded.
+     *
+     * Deletes the EXCLUSION row only. The global mapping was never touched — a
+     * tenant cannot delete platform data — so removing the exclusion is all that
+     * is needed for it to resolve back into scope.
+     */
+    @DeleteMapping("/v1/audit/library/controls/{controlId}/policies/{policyId}/exclusion")
+    @Operation(summary = "Restore a platform policy previously excluded by this organisation")
+    @Transactional
+    public ResponseEntity<ApiResponse<Void>> restorePolicyExclusion(
+            @PathVariable Long controlId, @PathVariable Long policyId) {
+        var ctx = utilityService.getLoggedInDataContext();
+        if (ctx.getTenantId() == null) {
+            throw new BusinessException("POLICY_NO_TENANT",
+                    "Platform administrators edit global mappings directly",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        policyControlMappingRepository.findByControlIdAndTenantId(controlId, ctx.getTenantId()).stream()
+                .filter(m -> java.util.Objects.equals(m.getPolicyId(), policyId)
+                        && m.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED)
+                .forEach(policyControlMappingRepository::delete);
+
+        log.info("[AUDIT-POLICY] Exclusion restored | policyId={} controlId={} tenantId={}",
+                policyId, controlId, ctx.getTenantId());
+        libraryCache.evictLibraryLists();
+        return ResponseEntity.ok(ApiResponse.success());
+    }
+
     @DeleteMapping("/v1/audit/library/controls/{controlId}/policies/{policyId}")
     public ResponseEntity<ApiResponse<Void>> unlinkControlPolicy(
             @PathVariable Long controlId, @PathVariable Long policyId) {
-        // The mapping belongs to whoever created it. Without this check one tenant
-        // could unlink another tenant's policy from a shared global control, and the
-        // owner would simply find the mapping gone.
+        var ctx = utilityService.getLoggedInDataContext();
         AuditPolicy policy = policyRepository.findById(policyId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", policyId));
-        requireOwnedPolicy(policy);
 
+        // ── Two different operations behind one gesture ─────────────────────
+        //
+        // Removing YOUR policy from a control deletes the mapping — it is yours.
+        //
+        // Removing a PLATFORM policy cannot delete anything: the row is global,
+        // shared by every tenant, and deleting it would remove the mapping for
+        // everyone. It used to be refused outright, which left a tenant with a
+        // platform policy on their control and no way to say "not applicable to
+        // us". So it now records an EXCLUSION — a tenant-owned row that resolves
+        // the global one away for this tenant only, and is reversible.
+        //
+        // Same click for the user; the system records the correct thing.
+        if (policy.getTenantId() == null && !utilityService.isSystemUser()) {
+            if (ctx.getTenantId() == null) {
+                throw new BusinessException("POLICY_NO_TENANT",
+                        "Platform administrators edit global mappings directly",
+                        HttpStatus.UNPROCESSABLE_ENTITY);
+            }
+            // Idempotent: excluding twice is the same as excluding once.
+            boolean already = policyControlMappingRepository
+                    .findByControlIdAndTenantId(controlId, ctx.getTenantId()).stream()
+                    .anyMatch(m -> java.util.Objects.equals(m.getPolicyId(), policyId)
+                            && m.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED);
+
+            if (!already) {
+                AuditPolicyControlMapping exclusion = new AuditPolicyControlMapping();
+                exclusion.setPolicyId(policyId);
+                exclusion.setControlId(controlId);
+                exclusion.setMappingType(AuditPolicyControlMapping.MappingType.EXCLUDED);
+                exclusion.setMappingNote("Excluded by " + ctx.getFullName());
+                exclusion.setTenantId(ctx.getTenantId());
+                exclusion.setCreatedBy(ctx.getId());
+                policyControlMappingRepository.save(exclusion);
+                log.info("[AUDIT-POLICY] Platform policy excluded | policyId={} controlId={} tenantId={}",
+                        policyId, controlId, ctx.getTenantId());
+            }
+            libraryCache.evictLibraryLists();
+            return ResponseEntity.ok(ApiResponse.success());
+        }
+
+        // Their own policy (or Platform Admin on a global row) — a real unlink.
+        requireOwnedPolicy(policy);
         policyControlMappingRepository.findByPolicyIdAndControlId(policyId, controlId)
                 .ifPresent(policyControlMappingRepository::delete);
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -585,6 +981,274 @@ public class AuditPolicyController {
 
     // ── Serializers ───────────────────────────────────────────────────────────
 
+    /**
+     * Adopt a global policy as this organisation's own.
+     *
+     * WHY THIS EXISTS
+     *   Global policies are platform-maintained and refused to tenant edits, which
+     *   left a client looking at a policy they wanted to use with no way forward —
+     *   Deprecate and New version both 403, and nothing offered them a path. This
+     *   is that path: it copies the global policy into the caller's tenant as a
+     *   DRAFT they own outright and may edit freely.
+     *
+     * WHY A COPY AND NOT AN OVERLAY
+     *   A policy is the organisation's own document — its wording, owner and review
+     *   cycle diverge from the platform template the moment it is adopted, and it is
+     *   the artefact an auditor asks to see. That is the one library entity where a
+     *   real copy is the honest model. Controls, tests and templates stay shared,
+     *   because those are framework structure rather than the client's own text.
+     *
+     * previousVersionId points back at the global source so the lineage is
+     * recoverable — "this started life as the platform's POL-03".
+     */
+    // Absolute path: this controller has NO class-level @RequestMapping — every
+    // sibling endpoint spells out /v1/audit/library/... in full. A relative path
+    // here registered at /policies/{id}/customise, so the real URL matched no
+    // handler and Spring fell through to static-resource lookup:
+    //   NoResourceFoundException: No static resource v1/audit/library/policies/27/customise
+    /**
+     * Policy-only CSV import, for the tenant policy list.
+     *
+     * Separate from /v1/audit/library/tests-policies/import, which also writes
+     * the shared TEST library and is a platform-admin tool. This one refuses any
+     * row type other than POLICY / POLICY_CONTROL_MAPPING and reports them as
+     * errors rather than applying them silently.
+     *
+     * Imported policies land as DRAFT — a bulk upload must not publish approved
+     * policies, and with the approval workflow live each one goes through review.
+     */
+    @PostMapping("/v1/audit/library/policies/import")
+    @Operation(summary = "Bulk import policies from CSV (policy rows only)")
+    public ResponseEntity<ApiResponse<com.kashi.grc.common.dto.CsvImportResult>> importPoliciesCsv(
+            @RequestParam("file") org.springframework.web.multipart.MultipartFile file) {
+        var ctx = utilityService.getLoggedInDataContext();
+        var result = csvImportExtension.importPoliciesOnly(file, ctx.getTenantId(), ctx.getId());
+        libraryCache.evictLibraryLists();
+        return ResponseEntity.ok(ApiResponse.success(result));
+    }
+
+    /**
+     * Adopt every platform policy this organisation has not already adopted.
+     *
+     * ASYNC. ~39 policies, each writing a copy, its mappings and an exclusion,
+     * at the ~250ms round-trip this deployment actually has, is minutes of work —
+     * past any request timeout. Returns 202 and does the work on the Kafka path,
+     * the same shape as engagement provisioning.
+     *
+     * Falls back to running inline when Kafka is disabled, so the feature still
+     * works in a local setup rather than silently accepting a request that never
+     * happens. ObjectProvider because KafkaEventPublisher is
+     * @ConditionalOnProperty — injecting it directly would fail startup with
+     * kashi.kafka.enabled=false.
+     *
+     * BODY (from the adopt dialog, all optional):
+     *   approve   — true: copies land APPROVED, stamped with this caller and now.
+     *   ownerTeam — stamped on every copy.
+     *
+     * Documented as body fields rather than javadoc parameter tags: they
+     * stopped being method parameters when this moved to @RequestBody, and the
+     * stale tags referenced identifiers that no longer existed.
+     */
+    @PostMapping("/v1/audit/library/policies/customise-all")
+    @Operation(summary = "Adopt every platform policy not already customised by this organisation")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> customiseAllPolicies(
+            // Body, not @RequestParam. The list-action form posts a JSON body
+            // (api({ data: payload })), so query-param binding silently received
+            // nothing and every option fell back to its default — which is why
+            // "adopt all" ran with approve=false however the dialog was answered.
+            @RequestBody(required = false) Map<String, Object> body) {
+
+        boolean approve   = body != null && Boolean.TRUE.equals(body.get("approve"));
+        String  ownerTeam = body == null ? null : (String) body.get("ownerTeam");
+
+        var ctx = utilityService.getLoggedInDataContext();
+        Long tenantId = ctx.getTenantId();
+        if (tenantId == null) {
+            throw new BusinessException("POLICY_NO_TENANT",
+                    "Platform administrators maintain the global library directly",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        // ownerId, a real user, not just a team string.
+        //
+        // PolicyVariableResolver prefers ownerTeam over ownerId when both are
+        // set, so a stray team string would mask a correctly assigned owner.
+        // Accountability for a policy attaches to a PERSON; the team is context.
+        //
+        // Defaults to the caller when the dialog leaves it blank — someone is
+        // adopting these into their own register, and an unowned policy is a gap
+        // nobody is looking at.
+        Long ownerId = ctx.getId();
+        if (body != null && body.get("ownerId") != null) {
+            try {
+                ownerId = Long.valueOf(String.valueOf(body.get("ownerId")));
+            } catch (NumberFormatException ignored) { /* keep the caller */ }
+        }
+
+
+        var publisher = kafkaPublisher.getIfAvailable();
+        if (publisher != null) {
+            publisher.publish(
+                    com.kashi.grc.common.kafka.KafkaTopics.AUDIT_POLICY_BULK_ADOPT_REQUESTED,
+                    "AUDIT_POLICY_BULK_ADOPT_REQUESTED",
+                    String.valueOf(tenantId),
+                    responseMap("tenantId", tenantId, "actorUserId", ctx.getId(),
+                            "approve", approve, "ownerTeam", ownerTeam,
+                            "ownerId", ownerId),
+                    tenantId, ctx.getId());
+
+            log.info("[AUDIT-POLICY] Bulk adopt queued | tenantId={} approve={}", tenantId, approve);
+            return ResponseEntity.accepted().body(ApiResponse.success(responseMap(
+                    "queued", true,
+                    "message", "Adopting the platform policy library. This runs in the "
+                            + "background — refresh the list in a moment.")));
+        }
+
+        // Kafka off — run inline. Same service, so the per-policy transaction
+        // isolation is identical; only the thread differs.
+        var result = bulkAdoptService.adoptAll(tenantId, ctx.getId(), approve, ownerTeam, ownerId);
+        return ResponseEntity.ok(ApiResponse.success(responseMap(
+                "queued",   false,
+                "created",  result.created(),
+                "skipped",  result.skipped(),
+                "failed",   result.failed(),
+                "problems", result.problems())));
+    }
+
+    @PostMapping("/v1/audit/library/policies/{id}/customise")
+    @Operation(summary = "Copy a global policy into the caller's organisation as an editable draft")
+    @Transactional
+    public ResponseEntity<ApiResponse<Map<String, Object>>> customisePolicy(@PathVariable Long id) {
+        var ctx = utilityService.getLoggedInDataContext();
+        Long userId   = ctx.getId();
+        Long tenantId = ctx.getTenantId();
+
+        AuditPolicy source = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+
+        // Only global policies need adopting. Copying one you already own would
+        // silently create a duplicate — that is what New version is for.
+        if (source.getTenantId() != null) {
+            throw new BusinessException("POLICY_ALREADY_OWNED",
+                    "This policy already belongs to your organisation — use New version to revise it",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        if (tenantId == null) {
+            throw new BusinessException("POLICY_NO_TENANT",
+                    "Platform administrators edit global policies directly",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        // Multiple copies are ALLOWED, deliberately.
+        //
+        // I blocked a second customise at first, on two grounds. One was wrong:
+        // the exclusion rows no longer collide, because the insert below skips a
+        // pair this tenant has already excluded. The other was a judgement about
+        // policies being governing documents — real, but not the platform's call
+        // to enforce at copy time. Every template-copy feature people expect
+        // (Asana, Notion) copies freely, and there are legitimate reasons for two:
+        // separate legal entities, a regional variant, or simply starting over
+        // after mangling the first draft.
+        //
+        // Copying is cheap and reversible — the copy lands as DRAFT and reaches no
+        // engagement until it is approved. The real risk is two APPROVED copies
+        // mapped to the SAME control, which duplicates policy instances at
+        // snapshot time. That is a mapping problem and belongs where mappings are
+        // made, not here: blocking the copy would not prevent it anyway, since two
+        // separately authored policies can collide the same way.
+        //
+        // The ref stays unique automatically — uniqueRefForTenant appends a
+        // numeric suffix, so a second copy is POL-03-META-2.
+        long existingCopies = policyRepository
+                .countByPreviousVersionIdAndTenantId(source.getId(), tenantId);
+
+        AuditPolicy copy = AuditPolicy.builder()
+                .title(source.getTitle())
+                .policyRef(uniqueRefForTenant(source.getPolicyRef(), tenantId))
+                .description(source.getDescription())
+                .version(1)
+                .previousVersionId(source.getId())   // lineage back to the global source
+                .contentType(source.getContentType())
+                .contentBody(source.getContentBody())
+                .externalUrl(source.getExternalUrl())
+                .evidenceRecordId(source.getEvidenceRecordId())
+                .status(AuditPolicy.PolicyStatus.DRAFT)
+                .ownerId(userId)                     // the adopting org owns it, not the platform
+                .ownerTeam(source.getOwnerTeam())
+                .reviewFrequencyMonths(source.getReviewFrequencyMonths())
+                .controlTags(source.getControlTags())
+                .frameworkRefs(source.getFrameworkRefs())
+                .createdBy(userId)
+                .tenantId(tenantId)
+                .build();
+        policyRepository.save(copy);
+
+        // Carry the global control mappings over as tenant-owned rows, so the copy
+        // arrives already linked to the same controls. Without this the client
+        // adopts a policy and silently loses every mapping the platform had set up.
+        int carried = 0;
+        for (AuditPolicyControlMapping m : policyControlMappingRepository.findByPolicyId(source.getId())) {
+            if (m.getTenantId() != null) continue;      // another tenant's mapping — not ours to copy
+            AuditPolicyControlMapping mc = new AuditPolicyControlMapping();
+            mc.setPolicyId(copy.getId());
+            mc.setControlId(m.getControlId());
+            mc.setMappingType(m.getMappingType());
+            mc.setMappingNote(m.getMappingNote());
+            mc.setTenantId(tenantId);
+            mc.setCreatedBy(userId);
+            policyControlMappingRepository.save(mc);
+            carried++;
+
+            // AUTO-EXCLUDE the original on the same control.
+            //
+            // Without this the control carries both the platform policy and the
+            // copy, and the engagement snapshots the same document twice —
+            // identical titles, differing only by id, one of them reviewed and
+            // one left NOT_REVIEWED. Adopting a policy plainly means "ours
+            // instead of theirs", so the system records that rather than making
+            // the user click it on every control the policy touches.
+            //
+            // The note is written for the auditor who asks why the platform
+            // policy is not on this control.
+            // Skip if this tenant already excluded this pair — the widened unique
+            // key now permits the row, but a duplicate would still throw.
+            boolean alreadyExcluded = policyControlMappingRepository
+                    .findByControlIdAndTenantId(m.getControlId(), tenantId).stream()
+                    .anyMatch(x -> java.util.Objects.equals(x.getPolicyId(), source.getId())
+                            && x.getMappingType() == AuditPolicyControlMapping.MappingType.EXCLUDED);
+            if (alreadyExcluded) continue;
+
+            AuditPolicyControlMapping ex = new AuditPolicyControlMapping();
+            ex.setPolicyId(source.getId());
+            ex.setControlId(m.getControlId());
+            ex.setMappingType(AuditPolicyControlMapping.MappingType.EXCLUDED);
+            ex.setMappingNote("Superseded by " + copy.getPolicyRef());
+            ex.setTenantId(tenantId);
+            ex.setCreatedBy(userId);
+            policyControlMappingRepository.save(ex);
+        }
+
+        log.info("[AUDIT-POLICY] Global policy adopted | sourceId={} newId={} tenantId={} mappingsCopied={}",
+                source.getId(), copy.getId(), tenantId, carried);
+
+        // Library lists are cached; every mutation invalidates them. Placed at
+        // the return rather than the top so a handler that throws (an ownership
+        // refusal, a validation failure) does not clear a cache it never changed.
+        libraryCache.evictLibraryLists();
+
+        return ResponseEntity.status(HttpStatus.CREATED)
+                .body(ApiResponse.success(Map.of(
+                        "id",              copy.getId(),
+                        "sourcePolicyId",  source.getId(),
+                        "mappingsCopied",  carried,
+                        "policyRef",       copy.getPolicyRef(),
+                        // How many copies of this platform policy the tenant had
+                        // BEFORE this one. Lets the client say "this is your 2nd
+                        // copy" rather than silently making another.
+                        "existingCopies",  existingCopies,
+                        "status",          copy.getStatus().name())));
+    }
+
     // ══════════════════════════════════════════════════════════════════════
     // TENANT OWNERSHIP
     //
@@ -596,6 +1260,44 @@ public class AuditPolicyController {
     // by id alone, so any authenticated user of any tenant could read, rewrite or
     // delete another company's policy, and could edit the global ones too.
     // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * A copy must not reuse the platform policy's reference.
+     *
+     * WHY THIS MATTERS BEYOND TIDINESS
+     *   policyRef is not decoration — CSV import upserts on it.
+     *   AuditCsvImportService resolves an existing policy via
+     *   findByPolicyRefForTenant, which is global-aware and returns BOTH the
+     *   platform row and the tenant copy when they share a ref. A re-import can
+     *   then update the wrong one, silently and long after the copy was made.
+     *
+     *   It plays no part in evidence reuse (tag-based, see EvidenceReuseEngine)
+     *   or in automation (AuditTest.automationKey), so changing it breaks neither.
+     *
+     * NOT applied to new-version: a new version of a policy is the same policy
+     * and must keep its reference. Only an adopted COPY needs a distinct one.
+     *
+     * SHAPE: POL-03 → POL-03-META, using the tenant code so the origin stays
+     * legible. Falls back to the tenant id when a tenant has no code, and adds a
+     * numeric suffix if that is taken too — customising the same policy twice
+     * must not collide.
+     */
+    private String uniqueRefForTenant(String sourceRef, Long tenantId) {
+        if (sourceRef == null || sourceRef.isBlank()) return sourceRef;
+
+        String suffix = tenantRepository.findById(tenantId)
+                .map(t -> t.getCode() != null && !t.getCode().isBlank()
+                        ? t.getCode().toUpperCase().trim()
+                        : String.valueOf(tenantId))
+                .orElse(String.valueOf(tenantId));
+
+        String candidate = sourceRef + "-" + suffix;
+        int n = 2;
+        while (policyRepository.existsByPolicyRefAndTenantId(candidate, tenantId)) {
+            candidate = sourceRef + "-" + suffix + "-" + n++;
+        }
+        return candidate;
+    }
 
     /** Throws unless the caller may modify this policy. Platform Admin may touch global rows. */
     private void requireOwnedPolicy(AuditPolicy policy) {
@@ -628,6 +1330,60 @@ public class AuditPolicyController {
                 "You can only view policies belonging to your organisation",
                 HttpStatus.FORBIDDEN);
     }
+    /**
+     * Same JSON shape as the entity overload, built from the list projection.
+     * Kept as an overload rather than replacing the entity version, because the
+     * detail endpoint still needs the full entity (it returns contentBody).
+     */
+    private Map<String, Object> toPolicySummaryMap(com.kashi.grc.audit.repository.AuditPolicySummary p) {
+        Map<String, Object> m = new java.util.HashMap<>();
+        m.put("id",                    p.id());
+        m.put("title",                 p.title());
+        m.put("policyRef",             p.policyRef());
+        m.put("description",           p.description());
+        m.put("version",               p.version());
+        m.put("status",                p.status() != null ? p.status().name() : null);
+        m.put("contentType",           p.contentType() != null ? p.contentType().name() : null);
+        m.put("ownerId",               p.ownerId());
+        m.put("ownerTeam",             p.ownerTeam());
+        m.put("approvedAt",            p.approvedAt());
+        m.put("effectiveDate",         p.effectiveDate());
+        m.put("nextReviewDate",        p.nextReviewDate());
+        m.put("reviewFrequencyMonths", p.reviewFrequencyMonths());
+        m.put("controlTags",           p.controlTags());
+        m.put("frameworkRefs",         p.frameworkRefs());
+        m.put("tenantId",              p.tenantId());
+        m.put("createdAt",             p.createdAt());
+
+        boolean globalP = p.tenantId() == null;
+        m.put("origin",   globalP ? "GLOBAL" : "ORG");
+        m.put("editable", !globalP || utilityService.isSystemUser());
+        return m;
+    }
+
+    /**
+     * Null-tolerant response map.
+     *
+     * Map.of() throws NullPointerException on a null VALUE, not just a null key.
+     * sendForReview and approvePolicy both returned
+     * Map.of(..., "workflowInstanceId", policy.getWorkflowInstanceId()) — and that
+     * is null whenever no policy workflow is configured for the tenant, which is
+     * the normal case for a library policy that is simply approved by hand.
+     *
+     * The failure was nastier than a 500: the status change had already been
+     * saved and committed, so the policy DID move to UNDER_REVIEW while the user
+     * saw "an unexpected error occurred" and reasonably assumed it had not.
+     *
+     * HashMap, not Map.ofEntries + filter: a null workflowInstanceId is
+     * meaningful to the client ("no workflow attached"), so it should be present
+     * in the JSON as null rather than silently absent.
+     */
+    private static Map<String, Object> responseMap(Object... kv) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < kv.length; i += 2) m.put(String.valueOf(kv[i]), kv[i + 1]);
+        return m;
+    }
+
     private Map<String, Object> toPolicySummaryMap(AuditPolicy p) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",                    p.getId());
@@ -658,11 +1414,24 @@ public class AuditPolicyController {
 
     private Map<String, Object> toPolicyDetailMap(AuditPolicy p) {
         Map<String, Object> m = toPolicySummaryMap(p);
-        m.put("contentBody",        p.getContentBody());
+        // Placeholders resolved on the way OUT, never baked into content_body.
+        // {{approver_name}} and {{approval_date}} do not exist until the policy is
+        // approved, so no copy-time substitution could produce them — and a baked
+        // {{company_name}} would need a bulk find-and-replace after a rename.
+        m.put("contentBody", policyVariables.resolve(p.getContentBody(), p,
+                utilityService.getLoggedInDataContext().getTenantId()));
+        // The unresolved source, for the editor — editing the RESOLVED text would
+        // silently bake the values in and destroy the placeholders.
+        m.put("contentBodyRaw",     p.getContentBody());
         m.put("externalUrl",        p.getExternalUrl());
         m.put("evidenceRecordId",   p.getEvidenceRecordId());
         m.put("approvedById",       p.getApprovedById());
         m.put("workflowInstanceId", p.getWorkflowInstanceId());
+        // Drives ui_actions.requires_assignment. Without it that flag is inert —
+        // the gate reads this field and treats "absent" as "allowed", so an
+        // action marked assignment-scoped was visible to everyone.
+        m.put("isAssignedToCurrentUser",
+                policyWorkflow.isCurrentActor(p, utilityService.getLoggedInDataContext().getId()));
         m.put("previousVersionId",  p.getPreviousVersionId());
         return m;
     }

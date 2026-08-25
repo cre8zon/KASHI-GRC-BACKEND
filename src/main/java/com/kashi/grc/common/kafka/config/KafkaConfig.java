@@ -318,4 +318,32 @@ public class KafkaConfig {
                 .replicas(1)
                 .build();
     }
+
+    /**
+     * Bulk policy adoption.
+     *
+     * Keyed by TENANT, so one tenant's adoption run stays on one partition and
+     * two runs for the same tenant cannot interleave — which matters here,
+     * because the "already adopted?" check and the copy that satisfies it are
+     * not one atomic step. Concurrent runs for the same tenant could both see
+     * "not adopted" and both copy.
+     *
+     * The engagement topic keys by engagementId for the opposite reason: each
+     * engagement is independent and round-robin is fine.
+     */
+    @Bean
+    public NewTopic auditPolicyBulkAdoptTopic() {
+        return TopicBuilder.name(KafkaTopics.AUDIT_POLICY_BULK_ADOPT_REQUESTED)
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
+
+    @Bean
+    public NewTopic auditPolicyBulkAdoptTopicDlt() {
+        return TopicBuilder.name(KafkaTopics.AUDIT_POLICY_BULK_ADOPT_REQUESTED + "-dlt")
+                .partitions(3)
+                .replicas(1)
+                .build();
+    }
 }

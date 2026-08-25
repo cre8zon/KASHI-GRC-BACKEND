@@ -300,6 +300,12 @@ public class AuditTestPolicySnapshotService {
         Map<Long, AuditPolicy> policyMap = policyRepository.findAllById(uniquePolicyIds)
                 .stream().collect(Collectors.toMap(AuditPolicy::getId, p -> p));
 
+        // NOTE: supersession used to live here, keyed on previousVersionId. It is
+        // now handled upstream by exclusion rows resolved inside
+        // findVisibleByControlId, so the mappings arriving here are already the
+        // correct set. One mechanism instead of two, and the tenant can SEE it
+        // on the control screen rather than it being implied by a hidden column.
+
         // Build approved policy instances in memory, batch-insert in one round-trip.
         // Same IDENTITY-batching issue as snapshotTests() above — was the other
         // ~19s of the ~46s this whole method used to cost.
@@ -310,6 +316,7 @@ public class AuditTestPolicySnapshotService {
         for (Long policyId : uniquePolicyIds) {
             AuditPolicy policy = policyMap.get(policyId);
             if (policy == null) continue;
+
             if (policy.getStatus() != AuditPolicy.PolicyStatus.APPROVED &&
                     policy.getStatus() != AuditPolicy.PolicyStatus.UNDER_REVIEW) {
                 log.debug("[AUDIT-SNAPSHOT] Skipping policy {} — status={}", policyId, policy.getStatus());
