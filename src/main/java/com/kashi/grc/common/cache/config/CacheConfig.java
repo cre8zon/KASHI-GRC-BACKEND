@@ -162,6 +162,13 @@ public class CacheConfig implements CachingConfigurer {
         perCache.put(CacheNames.AUDIT_TEMPLATE_LIST,     defaults.entryTtl(Duration.ofMinutes(15)));
         perCache.put(CacheNames.WORKFLOW_BLUEPRINT_LIST, defaults.entryTtl(Duration.ofMinutes(15)));
 
+        // Library lists change only when someone edits the library, and every
+        // mutating endpoint evicts explicitly, so the TTL is a backstop rather
+        // than the mechanism. 10 minutes bounds the damage if an eviction path
+        // is ever missed.
+        perCache.put(CacheNames.AUDIT_POLICY_LIST, defaults.entryTtl(Duration.ofMinutes(10)));
+        perCache.put(CacheNames.AUDIT_TEST_LIST,   defaults.entryTtl(Duration.ofMinutes(10)));
+
         return RedisCacheManager.builder(connectionFactory)
                 .cacheDefaults(defaults)
                 .withInitialCacheConfigurations(perCache)

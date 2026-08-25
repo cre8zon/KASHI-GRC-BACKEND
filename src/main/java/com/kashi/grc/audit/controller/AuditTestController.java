@@ -50,6 +50,7 @@ public class AuditTestController {
 
     private final AuditTestRepository                       testRepository;
     private final AuditControlTestMappingRepository         controlTestMappingRepository;
+    private final com.kashi.grc.audit.service.AuditLibraryCacheService libraryCache;
     private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditTestInstanceRepository               testInstanceRepository;
     private final AuditControlInstanceTestMappingRepository controlInstanceTestMappingRepository;
@@ -68,12 +69,27 @@ public class AuditTestController {
             @RequestParam(required = false) String search) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
-        List<AuditTest> tests = search != null && !search.isBlank()
-                ? testRepository.searchByName(tenantId, search)
-                : testRepository.findByTenantIdIsNullOrTenantId(tenantId);
+        // Projection, not entities. This endpoint loaded full AuditTest rows —
+        // test_procedure and evidence_guidance included, both TEXT — and took
+        // 30-36 seconds for a screen showing seven short columns. The perf log
+        // showed 3 queries, so the cost was the payload, not the round trips.
+        //
+        // NOTE: this narrows the list response. toTestMap emits testProcedure and
+        // evidenceGuidance; the summary does not. Both are still returned by
+        // GET /tests/{id} and by create/update, and nothing in the frontend reads
+        // either field off the list — returning them here is what made it slow.
+        var cached = libraryCache.testList(tenantId, search);
 
-        return ResponseEntity.ok(ApiResponse.success(
-                tests.stream().map(this::toTestMap).collect(Collectors.toList())));
+        // See AuditPolicyController.listPolicies — `editable` is per USER and the
+        // cache key is per TENANT, so it is added after the read, onto a copy.
+        boolean sysUser = utilityService.isSystemUser();
+        List<Map<String, Object>> out = cached.stream().map(m -> {
+            Map<String, Object> copy = new java.util.LinkedHashMap<>(m);
+            copy.put("editable", !"GLOBAL".equals(m.get("origin")) || sysUser);
+            return copy;
+        }).collect(Collectors.toList());
+
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     @GetMapping("/v1/audit/library/tests/{id}")
@@ -138,6 +154,9 @@ public class AuditTestController {
 
         testRepository.save(test);
         log.info("[AUDIT-TEST] Created test | id={} name={}", test.getId(), test.getName());
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.status(HttpStatus.CREATED)
                 .body(ApiResponse.success(Map.of("id", test.getId(), "name", test.getName())));
     }
@@ -186,6 +205,9 @@ public class AuditTestController {
         if (req.getEvidenceGuidance() != null) test.setEvidenceGuidance(req.getEvidenceGuidance());
 
         testRepository.save(test);
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(toTestMap(test)));
     }
 
@@ -217,6 +239,9 @@ public class AuditTestController {
         if (skipped > 0)
             log.warn("[AUDIT-LIBRARY] Bulk delete skipped {} tests not owned by tenant {}", skipped, callerTenant);
         log.info("[AUDIT-LIBRARY] Bulk deleted {} tests", deleted);
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted, "skipped", skipped)));
     }
 
@@ -231,6 +256,9 @@ public class AuditTestController {
         controlTestMappingRepository.deleteByTestId(id);
         testRepository.deleteById(id);
         log.info("[AUDIT-TEST] Deleted test id={}", id);
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -333,6 +361,9 @@ public class AuditTestController {
         if (note != null) mapping.setMappingNote(note);
         controlTestMappingRepository.save(mapping);
 
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(
                 Map.of("mappingId", mapping.getId(), "controlId", controlId, "testId", testId)));
     }
@@ -347,6 +378,9 @@ public class AuditTestController {
 
         controlTestMappingRepository.findByControlIdAndTestId(controlId, testId)
                 .ifPresent(controlTestMappingRepository::delete);
+        // See AuditPolicyController — library lists are cached, mutations evict.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -456,6 +490,31 @@ public class AuditTestController {
     }
 
     // ── Serializers ────────────────────────────────────────────────────────────
+
+    /**
+     * List overload. Same key set as the entity version minus testProcedure and
+     * evidenceGuidance — see AuditTestSummary for why those are absent.
+     */
+    private Map<String, Object> toTestMap(com.kashi.grc.audit.repository.AuditTestSummary t) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id",               t.id());
+        m.put("name",             t.name());
+        m.put("testRef",          t.testRef());
+        m.put("description",      t.description());
+        m.put("frameworkRef",     t.frameworkRef());
+        m.put("frameworkTestId",  t.frameworkTestId());
+        m.put("controlTag",       t.controlTag());
+        m.put("automationType",   t.automationType() != null ? t.automationType().name() : null);
+        m.put("automationKey",    t.automationKey());
+        m.put("frequency",        t.frequency()      != null ? t.frequency().name()      : null);
+
+        boolean globalT = t.tenantId() == null;
+        m.put("origin",   globalT ? "GLOBAL" : "ORG");
+        m.put("editable", !globalT || utilityService.isSystemUser());
+        m.put("tenantId",         t.tenantId());
+        m.put("createdAt",        t.createdAt());
+        return m;
+    }
 
     private Map<String, Object> toTestMap(AuditTest t) {
         Map<String, Object> m = new LinkedHashMap<>();

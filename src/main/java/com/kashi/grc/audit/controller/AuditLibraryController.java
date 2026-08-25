@@ -77,6 +77,7 @@ import java.util.stream.Collectors;
 public class AuditLibraryController {
 
     private final AuditControlRepository                controlRepository;
+    private final com.kashi.grc.audit.service.AuditLibraryCacheService libraryCache;
     private final AuditSectionRepository                sectionRepository;
     private final AuditTemplateRepository               templateRepository;
     private final AuditProjectRepository                projectRepository;
@@ -1329,13 +1330,25 @@ public class AuditLibraryController {
      * Extends the existing TEMPLATE/SECTION/CONTROL CSV format with new row types.
      * POST /v1/audit/library/tests-policies/import
      */
-    @PostMapping("/library/tests-policies/import")
+    // Class-level @RequestMapping is already "/v1/audit/library", so a path
+    // starting "/library" registered at /v1/audit/library/LIBRARY/... and no
+    // request ever reached it — Spring fell through to static-resource lookup:
+    //   NoResourceFoundException: No static resource v1/audit/library/tests-policies/import
+    // The javadoc above always documented the correct URL.
+    @PostMapping("/tests-policies/import")
     @Operation(summary = "Import tests, policies, and their control mappings from extended CSV")
     public ResponseEntity<ApiResponse<CsvImportResult>> importTestsPoliciesCsv(
             @RequestParam("file") org.springframework.web.multipart.MultipartFile file) {
         var ctx = utilityService.getLoggedInDataContext();
         CsvImportResult result = csvImportExtension.importTestsPoliciesAndMappings(
                 file, ctx.getTenantId(), ctx.getId());
+
+        // A CSV import writes tests, policies AND their mappings in one pass, so
+        // both cached lists are stale afterwards. This is the mutation most likely
+        // to be forgotten, because it lives in a different controller from the
+        // endpoints that serve those lists.
+        libraryCache.evictLibraryLists();
+
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
@@ -1343,7 +1356,8 @@ public class AuditLibraryController {
      * Download a worked example CSV showing all row types including TEST, POLICY, and MAPPING rows.
      * GET /v1/audit/library/tests-policies/csv-example
      */
-    @GetMapping("/library/tests-policies/csv-example")
+    // Same double-prefix as the import endpoint above.
+    @GetMapping("/tests-policies/csv-example")
     @Operation(summary = "Download an example CSV showing all test/policy/mapping row types")
     public ResponseEntity<byte[]> downloadTestsPoliciesCsvExample() {
         byte[] bytes = AuditCsvImportExtension.EXAMPLE_CSV_CONTENT

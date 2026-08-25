@@ -96,8 +96,42 @@ public class AuditCsvImportExtension {
      * @param tenantId  tenant (null for global/Platform Admin)
      * @param createdBy user performing the import
      */
+    /**
+     * Policy-only import.
+     *
+     * Same parser, restricted to POLICY rows ONLY. Anything else in the file is
+     * REFUSED rather than quietly imported, because the two
+     * imports have different audiences: the combined importer is a platform-admin
+     * tool that writes the shared test library, while this one is offered to
+     * tenants from their policy list. A tenant uploading a spreadsheet that
+     * happens to contain TEST rows should be told, not silently have those rows
+     * applied.
+     *
+     * Control mappings are excluded deliberately. A mapping row silently decides
+     * which controls a policy covers, and that determines what an engagement
+     * snapshots — too consequential to arrive as a side effect of a spreadsheet
+     * upload. Import the policies, then link controls on the Linked Controls tab
+     * where the platform/custom distinction and the exclusion behaviour are
+     * visible.
+     */
+    public CsvImportResult importPoliciesOnly(
+            MultipartFile file, Long tenantId, Long createdBy) {
+        return importRows(file, tenantId, createdBy, java.util.Set.of("POLICY"));
+    }
+
     public CsvImportResult importTestsPoliciesAndMappings(
             MultipartFile file, Long tenantId, Long createdBy) {
+        return importRows(file, tenantId, createdBy, null);   // null = all row types
+    }
+
+    /**
+     * @param allowedTypes null to accept every row type, or the set a caller
+     *                     permits. A disallowed row is logged as an ERROR and
+     *                     counted as a failure — never applied.
+     */
+    private CsvImportResult importRows(
+            MultipartFile file, Long tenantId, Long createdBy,
+            java.util.Set<String> allowedTypes) {
 
         log.info("[AUDIT-CSV-EXT] Import started | tenantId={} file={}", tenantId,
                 file.getOriginalFilename());
@@ -146,6 +180,17 @@ public class AuditCsvImportExtension {
                 totalRows++;
                 String[] cols = splitCsvLine(line);
                 String type   = getCsvValue(cols, colIdx, "type");
+
+                if (allowedTypes != null && type != null
+                        && !allowedTypes.contains(type.toUpperCase())) {
+                    importLog.add(CsvImportResult.ImportLogEntry.builder()
+                            .status("ERROR")
+                            .message("Row type " + type + " is not allowed in a policy import — "
+                                    + "this file may be for the full library importer")
+                            .build());
+                    failureCount++;
+                    continue;
+                }
 
                 try {
                     switch (type.toUpperCase()) {

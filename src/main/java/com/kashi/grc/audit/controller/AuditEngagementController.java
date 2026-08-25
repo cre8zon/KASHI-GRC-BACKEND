@@ -428,6 +428,15 @@ public class AuditEngagementController {
                         : "You can only modify programmes belonging to your organisation",
                 HttpStatus.FORBIDDEN);
     }
+
+    /** Null-tolerant response map — Map.of throws on null VALUES. See
+     *  AuditPolicyController.responseMap for the failure this prevents. */
+    private static Map<String, Object> responseMap(Object... kv) {
+        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        for (int i = 0; i + 1 < kv.length; i += 2) m.put(String.valueOf(kv[i]), kv[i + 1]);
+        return m;
+    }
+
     /** Shared project → map helper used by listProjects + getProject */
     private Map<String, Object> toProjectMap(AuditProject p) {
         Map<String, Object> m = new LinkedHashMap<>();
@@ -1768,7 +1777,9 @@ public class AuditEngagementController {
 
         log.info("[AUDIT-ENG] Activated | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(
-                Map.of("id", id, "status", e.getStatus(), "actualStart", e.getActualStart())));
+                // responseMap, not Map.of: actualStart is null until the engagement
+                // is actually started, and Map.of throws NPE on a null value.
+                responseMap("id", id, "status", e.getStatus(), "actualStart", e.getActualStart())));
     }
 
     @PostMapping("/engagements/{id}/start-evidence-review")
@@ -1842,7 +1853,8 @@ public class AuditEngagementController {
 
         log.info("[AUDIT-ENG] Completed | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(
-                Map.of("id", id, "status", e.getStatus(), "completedAt", e.getCompletedAt())));
+                // completedAt is nullable for the same reason — see responseMap.
+                responseMap("id", id, "status", e.getStatus(), "completedAt", e.getCompletedAt())));
     }
 
     @PostMapping("/engagements/{id}/cancel")
