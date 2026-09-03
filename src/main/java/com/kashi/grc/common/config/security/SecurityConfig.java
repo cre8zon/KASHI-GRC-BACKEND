@@ -91,6 +91,26 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST,   "/v1/tenants/*/roles").authenticated()
                         .requestMatchers(HttpMethod.DELETE, "/v1/tenants/*/roles/*").authenticated()
                         // ── PLATFORM-ADMIN BOUNDARY (writes + all other admin) ──────
+                        // ── CONTENT PLATFORM ────────────────────────────
+                        // The public read API is consumed by www.digiosec.com,
+                        // which has no session and no user — it is a static build
+                        // fetching JSON. The admin side is platform-owned content,
+                        // so it takes the same SIDE_SYSTEM boundary as /v1/admin/**.
+                        //
+                        // The three POSTs are listed individually rather than as a
+                        // blanket permitAll on the prefix, so a public endpoint added
+                        // later is closed by default — which is the whole point of
+                        // the pattern-based boundary.
+                        .requestMatchers(HttpMethod.GET,  "/v1/content/public/**").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/content/public/posts/*/view").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/content/public/posts/*/helpful").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/content/public/newsletter/**").permitAll()
+                        .requestMatchers("/v1/content/admin/**").hasAuthority("SIDE_SYSTEM")
+                        // Everything else under /public/** is refused outright. An
+                        // unlisted method there would otherwise fall through to
+                        // .anyRequest().authenticated() — closed to anonymous callers,
+                        // but open to every authenticated user of every tenant.
+                        .requestMatchers("/v1/content/public/**").denyAll()
                         .requestMatchers(
                                 "/v1/admin/**",
                                 "/v1/tenants/**"
@@ -105,7 +125,26 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration config = new CorsConfiguration();
-        config.setAllowedOrigins(List.of("https://app.digiosec.com", "http://localhost:3000", "http://localhost:58343"));
+        config.setAllowedOrigins(List.of(
+                "https://app.digiosec.com",
+                "http://localhost:3000",
+                "http://localhost:58343",
+                "https://app.kashiguard.com",
+                "https://www.kashiguard.com",
+                "https://kashiguard.com",
+                "https://kashigrc-website-khaki.vercel.app/"
+        ));
+        // The public content site. Easy to conclude it is unnecessary — the site
+        // is prerendered and the build fetches this API from Node, where CORS does
+        // not apply. That is true of the BUILD. Once a visitor lands and the app
+        // hydrates, client-side navigation runs the route loader in the browser,
+        // and the view beacon and the helpful POST both fire from the page.
+        //
+        // Without these, every page works perfectly on first load and only
+        // navigation between articles breaks — in production, not in testing.
+        config.addAllowedOrigin("https://www.digiosec.com");
+        config.addAllowedOrigin("https://digiosec.com");
+        config.addAllowedOrigin("http://localhost:5174");
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
         config.setExposedHeaders(List.of("Authorization"));
@@ -119,8 +158,7 @@ public class SecurityConfig {
 
     @Bean
     public AuthenticationProvider authenticationProvider() {
-        DaoAuthenticationProvider provider = new DaoAuthenticationProvider();
-        provider.setUserDetailsService(userDetailsService);
+        DaoAuthenticationProvider provider = new DaoAuthenticationProvider(userDetailsService);
         provider.setPasswordEncoder(passwordEncoder());
         return provider;
     }

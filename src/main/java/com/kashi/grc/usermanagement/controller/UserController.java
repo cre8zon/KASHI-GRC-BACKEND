@@ -23,6 +23,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -56,6 +57,7 @@ import java.util.Map;
 public class UserController {
 
     private final UserService userService;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final UtilityService utilityService;
 
     // ── CREATE ────────────────────────────────────────────────────
@@ -132,9 +134,48 @@ public class UserController {
         String membershipType = allParams.get("membershipType");
         if (membershipType != null && membershipType.isBlank()) membershipType = null;
 
+        // Which audit firm. A client can have several invited at once, and
+        // membershipType=GUEST alone returns all of their auditors in one list —
+        // choosing the wrong one grants Firm A visibility into Firm B's
+        // engagement.
+        Long firmTenantId = null;
+        String firmStr = allParams.get("firmTenantId");
+        if (firmStr != null && !firmStr.isBlank()) {
+            try { firmTenantId = Long.parseLong(firmStr); } catch (NumberFormatException ignored) {}
+        }
+
         return ResponseEntity.ok(ApiResponse.success(
                 userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles,
-                        vendorId, roleId, tenantId, membershipType)));
+                        vendorId, roleId, tenantId, membershipType, firmTenantId)));
+    }
+
+    /**
+     * Audit firms with at least one active auditor invited into this tenant.
+     *
+     * Feeds the firm picker on the engagement form, so an external lead auditor
+     * is chosen firm-first rather than from a flat list where nothing says who
+     * belongs to whom.
+     *
+     * Scoped to the CALLER's tenant — a client sees only the firms they have
+     * invited, never the platform-wide list.
+     */
+    @GetMapping("/audit-firms")
+    @Operation(summary = "Audit firms with active auditors in this organisation")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listAuditFirms() {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        if (tenantId == null) return ResponseEntity.ok(ApiResponse.success(List.of()));
+
+        List<Map<String, Object>> firms = membershipRepository.findActiveFirmsForTenant(tenantId)
+                .stream()
+                .map(r -> {
+                    Map<String, Object> m = new java.util.LinkedHashMap<>();
+                    m.put("id",           r.firmTenantId());
+                    m.put("name",         r.firmName());
+                    m.put("auditorCount", r.auditorCount());
+                    return m;
+                })
+                .toList();
+        return ResponseEntity.ok(ApiResponse.success(firms));
     }
 
     // ── UPDATE ────────────────────────────────────────────────────

@@ -25,7 +25,8 @@ import java.util.*;
  *
  * check_key:      AWS_S3_PUBLIC_ACCESS_BLOCK   ← matches the seeded catalog row
  * integration_key: AWS
- * control_tag:    NET-01.2  (public-exposure prevention leaf)
+ * control_tag:    IAM-03.1  (Least privilege / RBAC design)
+ *                 was NET-01.2, which is "Firewall ruleset review" — unrelated
  * capability:     PUBLIC_ACCESS_BLOCK
  *
  * Uses ONLY the s3 artifact already in your pom.xml — no new dependency.
@@ -40,7 +41,8 @@ public class AwsS3PublicAccessBlockCheck implements IntegrationCheck {
 
     private final ObjectMapper objectMapper;
 
-    private static final String TAG = "NET-01.2";
+    /** Advisory only — IntegrationRunner uses the tenant catalogue row. */
+    private static final String TAG = "IAM-03.1";
 
     @Override public String checkKey()       { return "AWS_S3_PUBLIC_ACCESS_BLOCK"; }
     @Override public String integrationKey() { return "AWS"; }

@@ -143,8 +143,29 @@ public class IntegrationRunner {
         EvidenceRecord record = EvidenceRecord.builder()
                 .tenantId(tenantId)
                 .title(result.evidenceTitle() + " — " + runAt.toLocalDate())
-                .controlTag(result.controlTag() != null
-                        ? result.controlTag().toUpperCase() : tenantCheck.getControlTag())
+                /*
+                 * ALWAYS the tenant's catalogue row, never the check's own tag.
+                 *
+                 * This previously preferred result.controlTag(), which let each
+                 * check class decide the tag from a hardcoded constant. Three of
+                 * them were wrong and had been writing evidence nothing could
+                 * match:
+                 *
+                 *   AwsGuardDutyCheck            MON-01.2  no MON domain exists
+                 *   AwsS3PublicAccessBlockCheck  NET-01.2  firewall ruleset review
+                 *   AwsIamPasswordPolicyCheck    IAM-03.1  least privilege
+                 *
+                 * ~195 evidence records landed on tags TagExpansionService cannot
+                 * expand, so they reached no test at all.
+                 *
+                 * tenantCheck.getControlTag() is authoritative: it is what the
+                 * engagement snapshot freezes, what integration_runs already
+                 * records below, and the value a tenant may legitimately
+                 * customise. A check has no business overriding it — the check
+                 * knows how to query AWS, not which UCF leaf this customer maps
+                 * that to.
+                 */
+                .controlTag(tenantCheck.getControlTag())
                 .collectionType(EvidenceRecord.CollectionType.AUTOMATED)
                 .integrationKey(tenantCheck.getCheckKey())
                 .rawPayload(result.rawPayload())

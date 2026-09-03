@@ -54,7 +54,20 @@ public interface IntegrationCheck {
             String summary,          // human-readable: "All 47 admins have MFA" | "3 missing: ..."
             String rawPayload,       // full JSON API response stored as audit evidence
             String evidenceTitle,    // auto-generated title for EvidenceRecord
-            String controlTag        // tag to propagate (usually from check config)
+            /*
+             * ADVISORY ONLY. IntegrationRunner ignores this and uses the
+             * tenant's integration_checks / tenant_integration_checks row.
+             *
+             * It used to win, and three checks carried a wrong constant, so
+             * evidence landed on tags no test could match. A check knows how to
+             * query AWS; it does not know which UCF leaf a given customer maps
+             * that to, and that mapping is tenant-customisable.
+             *
+             * Keep it accurate for logs and the ERROR path, but do not rely on
+             * it to route evidence. A new check should set it to the same value
+             * as its catalogue row.
+             */
+            String controlTag
     ) {
         /** Convenience factory for PASS */
         public static CheckResult pass(String summary, String rawPayload, String title, String tag) {

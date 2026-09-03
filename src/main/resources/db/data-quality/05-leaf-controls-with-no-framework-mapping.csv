@@ -1,0 +1,5 @@
+code,domain,title,iso27001_citation_TO_ADD,soc2_citation_TO_ADD,dpdpa_citation_TO_ADD
+CRY-02.3,CRY,Certificate lifecycle management,,,
+IAM-02.5,IAM,Session timeout and lockout,,,
+TPR-03.3,TPR,Vendor offboarding and data return,,,
+VUL-02.2,VUL,Patch exception handling,,,

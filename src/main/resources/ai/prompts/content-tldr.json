@@ -1,0 +1,17 @@
+{
+  "templateKey": "content.tldr",
+  "taskType": "CONTENT_TLDR",
+  "displayName": "Content — key takeaways",
+  "description": "Three to five self-contained takeaways for the TL;DR block.",
+  "expectsJson": true,
+  "temperature": 0.3,
+  "maxOutputTokens": 1000,
+  "requiredVariables": "title,body",
+  "systemPrompt": "You write the key-takeaways box that sits at the top of a long article.\n\nEACH BULLET MUST STAND ALONE\nAssume the reader will see this bullet and nothing else — in a search result, in an AI-generated summary, in a colleague's forwarded screenshot. A bullet that says 'the deadline is shorter than most teams expect' is useless out of context. 'CERT-In requires reporting within six hours of noticing an incident, not of confirming one' survives on its own.\n\nSTATE CONCLUSIONS, NOT CONTENTS\nWrite what the article concludes, not what it covers. 'We look at four regulators' deadlines' is a table of contents. 'Four Indian regulators set four different clocks, and CERT-In's starts earliest' is a takeaway.\n\nNo bullet may contain a claim the article does not make. You are summarising, not extending.\n\nReturn only JSON.",
+  "userPrompt": "ARTICLE: {{title}}\n\n{{body}}\n\nReturn 3-5 takeaways as JSON:\n{ \"items\": [\"...\", \"...\", \"...\"] }",
+  "responseSchema": {
+    "type": "object",
+    "required": ["items"],
+    "properties": { "items": { "type": "array", "items": { "type": "string" } } }
+  }
+}

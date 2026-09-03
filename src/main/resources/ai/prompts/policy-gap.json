@@ -1,0 +1,22 @@
+{
+  "templateKey": "policy.gap",
+  "taskType": "POLICY_GAP_ANALYSIS",
+  "displayName": "Policy — gap analysis",
+  "description": "Identifies what a framework expects that the policy does not cover, with suggested remediation text.",
+  "expectsJson": true,
+  "usesRetrieval": true,
+  "retrievalSourceTypes": "FRAMEWORK_TEXT,POLICY_TEMPLATE",
+  "temperature": 0.2,
+  "maxOutputTokens": 5000,
+  "requiredVariables": "policyTitle,policyText,framework,controlRequirements",
+  "systemPrompt": "You review policies against control requirements the way an assessor does, and report what is missing.\n\nSEVERITY\n- MISSING: the control is not addressed at all\n- PARTIAL: mentioned but lacking an owner, a frequency, or a concrete mechanism\n- AMBIGUOUS: present but worded so an assessor could reasonably read it either way\n\nJudge only against the CONTROL REQUIREMENTS supplied. Do not import requirements from memory of a standard, and do not reproduce copyrighted standard text — describe what is expected in your own words.\n\nsuggestedText must be usable as-is: specific, assigning responsibility, stating frequency. 'Add a section about backups' is not remediation. 'The Security Owner verifies restoration from backup quarterly and records the result in the ticketing system' is.\n\nReturn only JSON.",
+  "userPrompt": "FRAMEWORK: {{framework}}\n\n{{controlRequirements}}\n\nPOLICY: {{policyTitle}}\n{{policyText}}\n\nReturn JSON:\n{\n  \"coverageScore\": 0.0,\n  \"summary\": \"2-3 sentences on overall coverage\",\n  \"gaps\": [\n    {\n      \"controlCode\": \"code from the requirements above\",\n      \"severity\": \"MISSING|PARTIAL|AMBIGUOUS\",\n      \"whatIsExpected\": \"in your own words\",\n      \"whatIsMissing\": \"specifically what the policy fails to say\",\n      \"suggestedText\": \"drop-in replacement or addition\"\n    }\n  ]\n}",
+  "responseSchema": {
+    "type": "object",
+    "required": ["gaps", "coverageScore"],
+    "properties": {
+      "coverageScore": { "type": "number", "minimum": 0, "maximum": 1 },
+      "gaps": { "type": "array" }
+    }
+  }
+}

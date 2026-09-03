@@ -1,0 +1,79 @@
+[
+  {
+    "id": "draft-001-grounding-is-used",
+    "description": "The draft must use the supplied organisation facts rather than writing generically. Grounded in REAL KashiGRC IAM controls and their ISO 27001:2022 / SOC 2 citations. This is the case that catches a broken PolicyContextAssembler \u2014 the most likely silent regression in the module.",
+    "templateKey": "policy.draft",
+    "taskType": "POLICY_DRAFT",
+    "allowedReferences": [
+      "IAM-01.1",
+      "IAM-01.2",
+      "IAM-01.3",
+      "IAM-01.4"
+    ],
+    "variables": {
+      "title": "Access Control Policy",
+      "orgContext": "ORGANISATION CONTEXT\n- Legal name: Northwind Data Systems Private Limited\n- Referred to in body text as: Northwind\n- Industry: B2B SaaS\n- Approximate headcount: 140\n- Headquarters: India\n- Frameworks in scope: SOC2, ISO27001, DPDP\n\nTECHNICAL ESTATE (reference these specifically instead of writing generically)\n- Cloud providers: AWS\n- Identity provider: Okta\n- Device management: Jamf\n\nACCOUNTABLE ROLES (name these where the policy assigns responsibility)\n- Security owner: Meera Raghavan (Head of Security)\n\nDRAFTING CONVENTIONS\n- Tone: FORMAL\n- Spelling: BRITISH\n\nSTATEMENTS THAT MUST NOT APPEAR\nThe following are factually untrue of this organisation. Never assert them:\nNorthwind does not process cardholder data. Northwind operates no on-premise infrastructure.\n\nACCURACY RULE\nUse only the facts above. Where a required detail is absent, insert a clearly marked placeholder such as [[RETENTION PERIOD]] rather than inventing a value.",
+      "controlRequirements": "CONTROL REQUIREMENTS\nThis policy must satisfy the following controls. Address every one.\n\n[IAM-01.1] Joiner provisioning and approval\n  Framework citations: SOC2 CC6.2, ISO27001 A.5.18\n  Domain: IAM\n\n[IAM-01.2] Mover / role-change access update\n  Framework citations: SOC2 CC6.3, ISO27001 A.5.18\n  Domain: IAM\n\n[IAM-01.3] Leaver deprovisioning within SLA\n  Framework citations: SOC2 CC6.3, ISO27001 A.5.18\n  Domain: IAM\n\n[IAM-01.4] Unique identifiers, no shared accounts\n  Framework citations: SOC2 CC6.2, ISO27001 A.5.16\n  Domain: IAM\n\nREFERENCE RULE \u2014 STRICT\nYou may cite ONLY the control codes listed above, exactly as written.",
+      "frameworks": "SOC2, ISO27001"
+    },
+    "assertions": [
+      {
+        "strategy": "CONTAINS",
+        "expected": "Northwind"
+      },
+      {
+        "strategy": "CONTAINS",
+        "expected": "Okta"
+      },
+      {
+        "strategy": "NOT_CONTAINS",
+        "expected": "cardholder,on-premise,PCI DSS"
+      },
+      {
+        "strategy": "NOT_CONTAINS",
+        "expected": "[Company Name],{{,XYZ Corp,Acme"
+      },
+      {
+        "strategy": "JSON_PATH",
+        "path": "purpose"
+      },
+      {
+        "strategy": "JSON_MIN_SIZE",
+        "path": "sections",
+        "minSize": 3
+      },
+      {
+        "strategy": "NO_FABRICATION",
+        "path": "suggestedControls"
+      }
+    ]
+  },
+  {
+    "id": "draft-002-no-invention-when-context-is-empty",
+    "description": "With no org profile the model must use placeholders, not invent a plausible company. Catches the failure mode where a missing profile silently produces confident fiction.",
+    "templateKey": "policy.draft",
+    "taskType": "POLICY_DRAFT",
+    "allowedReferences": [
+      "BCP-01.1"
+    ],
+    "variables": {
+      "title": "Business Continuity and Backup Policy",
+      "orgContext": "ORGANISATION CONTEXT\nNo organisation profile has been completed. Write the policy generically, using the placeholder [[ORGANISATION NAME]] wherever the company is named. Do not invent company-specific facts, systems, locations or role holders.",
+      "controlRequirements": "CONTROL REQUIREMENTS\nThis policy must satisfy the following controls. Address every one.\n\n[BCP-01.1] Backup schedule and scope\n  Framework citations: SOC2 A1.2, ISO27001 A.8.13, DPDPA S.8(5)\n  Domain: BCP\n\nREFERENCE RULE \u2014 STRICT\nYou may cite ONLY the control codes listed above, exactly as written."
+    },
+    "assertions": [
+      {
+        "strategy": "CONTAINS",
+        "expected": "[[ORGANISATION NAME]]"
+      },
+      {
+        "strategy": "NOT_CONTAINS",
+        "expected": "AWS,Azure,Okta,Acme,Contoso"
+      },
+      {
+        "strategy": "NO_FABRICATION",
+        "path": "suggestedControls"
+      }
+    ]
+  }
+]

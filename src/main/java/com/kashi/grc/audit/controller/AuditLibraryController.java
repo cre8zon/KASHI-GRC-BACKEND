@@ -635,6 +635,7 @@ public class AuditLibraryController {
                 .build();
 
         templateRepository.save(template);
+        auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
         log.info("[AUDIT-LIBRARY] Template created | id={} | name=\"{}\" | tenantId={}",
                 template.getId(), template.getName(), tenantId);
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(buildTemplateMap(template)));
@@ -670,6 +671,7 @@ public class AuditLibraryController {
         if (req.getAuditType()    != null) template.setAuditType(req.getAuditType());
 
         templateRepository.save(template);
+        auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
         log.info("[AUDIT-LIBRARY] Template updated | id={}", templateId);
         return ResponseEntity.ok(ApiResponse.success(buildTemplateMap(template)));
     }
@@ -700,6 +702,7 @@ public class AuditLibraryController {
                 .filter(pt -> templateId.equals(pt.getTemplateId()))
                 .forEach(projectTemplateRepository::delete);
         templateRepository.delete(template);
+        auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
 
         log.info("[AUDIT-LIBRARY] Template deleted | id={} | name=\"{}\"", templateId, template.getName());
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", templateId)));
@@ -722,6 +725,7 @@ public class AuditLibraryController {
                         .filter(pt -> id.equals(pt.getTemplateId()))
                         .forEach(projectTemplateRepository::delete);
                 templateRepository.delete(t);
+                auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
             });
             deleted++;
         }
@@ -750,6 +754,7 @@ public class AuditLibraryController {
         template.setPublishedAt(LocalDateTime.now());
         template.setUnpublishedAt(null);
         templateRepository.save(template);
+        auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
 
         log.info("[AUDIT-LIBRARY] Template published | id={}", templateId);
         return ResponseEntity.ok(ApiResponse.success(buildTemplateMap(template)));
@@ -772,6 +777,7 @@ public class AuditLibraryController {
         template.setStatus("DRAFT");
         template.setUnpublishedAt(LocalDateTime.now());
         templateRepository.save(template);
+        auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
 
         log.info("[AUDIT-LIBRARY] Template unpublished | id={}", templateId);
         return ResponseEntity.ok(ApiResponse.success(buildTemplateMap(template)));

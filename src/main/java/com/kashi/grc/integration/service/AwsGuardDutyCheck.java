@@ -23,7 +23,8 @@ import java.util.Map;
  *
  * check_key:      AWS_GUARDDUTY_ENABLED   ← matches the seeded catalog row
  * integration_key: AWS
- * control_tag:    MON-01.2  (threat-detection / monitoring leaf)
+ * control_tag:    LOG-02.1  (Security monitoring and alerting)
+ *                 was MON-01.2 — not a UCF code, there is no MON domain
  * capability:     THREAT_DETECTION
  *
  * NEW DEPENDENCY REQUIRED (add to pom.xml):
@@ -42,7 +43,12 @@ public class AwsGuardDutyCheck implements IntegrationCheck {
 
     private final ObjectMapper objectMapper;
 
-    private static final String TAG = "MON-01.2";
+    /**
+     * Advisory only. IntegrationRunner takes the tag from the tenant catalogue
+     * row, not from here. Kept accurate so the ERROR path and javadoc do not
+     * mislead the next person reading this class.
+     */
+    private static final String TAG = "LOG-02.1";
 
     @Override public String checkKey()       { return "AWS_GUARDDUTY_ENABLED"; }
     @Override public String integrationKey() { return "AWS"; }

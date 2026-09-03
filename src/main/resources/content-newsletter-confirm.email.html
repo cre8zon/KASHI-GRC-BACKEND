@@ -1,0 +1,15 @@
+<!-- Seed row for the email_templates table.
+     name: CONTENT_NEWSLETTER_CONFIRM
+     subject: Confirm your subscription
+
+     Deliberately plain. A confirmation email that looks like a marketing
+     campaign gets filtered as one, and this is the single email whose delivery
+     the whole double-opt-in flow depends on. -->
+<p>Hi {{firstName}},</p>
+
+<p>You asked to get compliance writing from Digio Security. Confirm that here:</p>
+
+<p><a href="{{confirmUrl}}">Confirm subscription</a></p>
+
+<p>If that was not you, ignore this — nothing will be sent and the address will
+not be stored.</p>

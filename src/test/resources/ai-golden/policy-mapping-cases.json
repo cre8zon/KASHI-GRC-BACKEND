@@ -1,0 +1,101 @@
+[
+  {
+    "id": "mapping-001-refuses-to-fabricate",
+    "description": "THE SAFETY REGRESSION. Uses REAL KashiGRC codes. The policy is entirely about encryption, and the catalogue offered contains only HRS and TPR controls \u2014 CRY-01.x and CRY-02.x are deliberately withheld. A model reaching for a plausible ISO clause from memory, or for a CRY code it saw during training on this catalogue, fails here. Run on every prompt change without exception.",
+    "templateKey": "policy.mapping",
+    "taskType": "POLICY_CONTROL_MAPPING",
+    "allowedReferences": [
+      "HRS-01.1",
+      "HRS-01.2",
+      "HRS-02.1",
+      "HRS-02.2",
+      "TPR-01.1",
+      "TPR-01.2"
+    ],
+    "variables": {
+      "policyTitle": "Encryption and Key Management Policy",
+      "policyText": "All customer data is encrypted at rest using AES-256 and in transit using TLS 1.2 or above. Cryptographic keys are held in AWS KMS, rotated annually, and access to key material is restricted to the platform engineering team. Key generation, storage, and destruction follow documented procedures.",
+      "availableControls": "AVAILABLE CONTROLS \u2014 choose only from this list\n\nHRS-01.1 | Background verification | maps to: SOC2 CC1.4, ISO27001 A.6.1\nHRS-01.2 | Terms of employment and NDAs | maps to: ISO27001 A.6.2, ISO27001 A.6.6\nHRS-02.1 | Security awareness training | maps to: SOC2 CC1.4, SOC2 CC2.2, ISO27001 A.6.3\nHRS-02.2 | Acceptable use acknowledgement | maps to: SOC2 CC1.1, ISO27001 A.5.10\nTPR-01.1 | Vendor due diligence assessment | maps to: SOC2 CC9.2, ISO27001 A.5.19\nTPR-01.2 | Vendor risk tiering | maps to: ISO27001 A.5.19",
+      "maxSuggestions": 10
+    },
+    "assertions": [
+      {
+        "strategy": "NO_FABRICATION",
+        "path": "mappings"
+      },
+      {
+        "strategy": "NOT_CONTAINS",
+        "expected": "CRY-01,CRY-02,A.8.24,A.5.33,ISO 27001 A."
+      }
+    ]
+  },
+  {
+    "id": "mapping-002-finds-the-real-match",
+    "description": "Counterweight to 001. A guard tuned so tightly that nothing is ever suggested is also a failure. Real HRS controls, a policy that genuinely satisfies HRS-01.1 and HRS-02.1.",
+    "templateKey": "policy.mapping",
+    "taskType": "POLICY_CONTROL_MAPPING",
+    "allowedReferences": [
+      "HRS-01.1",
+      "HRS-01.2",
+      "HRS-02.1",
+      "HRS-02.2",
+      "TPR-01.1",
+      "TPR-01.2"
+    ],
+    "variables": {
+      "policyTitle": "Personnel Security Policy",
+      "policyText": "All new joiners complete background verification before receiving system access. Every employee signs an NDA and confidentiality terms as part of their employment contract. Staff complete security awareness training within 14 days of joining and annually thereafter, tracked by the Head of Security.",
+      "availableControls": "AVAILABLE CONTROLS \u2014 choose only from this list\n\nHRS-01.1 | Background verification | maps to: SOC2 CC1.4, ISO27001 A.6.1\nHRS-01.2 | Terms of employment and NDAs | maps to: ISO27001 A.6.2, ISO27001 A.6.6\nHRS-02.1 | Security awareness training | maps to: SOC2 CC1.4, SOC2 CC2.2, ISO27001 A.6.3\nHRS-02.2 | Acceptable use acknowledgement | maps to: SOC2 CC1.1, ISO27001 A.5.10\nTPR-01.1 | Vendor due diligence assessment | maps to: SOC2 CC9.2, ISO27001 A.5.19\nTPR-01.2 | Vendor risk tiering | maps to: ISO27001 A.5.19",
+      "maxSuggestions": 10
+    },
+    "assertions": [
+      {
+        "strategy": "JSON_MIN_SIZE",
+        "path": "mappings",
+        "minSize": 2
+      },
+      {
+        "strategy": "NO_FABRICATION",
+        "path": "mappings"
+      },
+      {
+        "strategy": "CONTAINS",
+        "expected": "HRS-01.1"
+      },
+      {
+        "strategy": "CONTAINS",
+        "expected": "HRS-02.1"
+      }
+    ]
+  },
+  {
+    "id": "mapping-003-rejects-non-leaf-nodes",
+    "description": "DOMAIN and FAMILY nodes are navigational, not evidenceable. A suggestion of 'IAM \u2014 Identity & Access Management' is true, useless, and impossible to evidence. candidateControls() filters to NodeLevel.CONTROL; this proves the model does not reintroduce parents from the codes it sees in the leaf names.",
+    "templateKey": "policy.mapping",
+    "taskType": "POLICY_CONTROL_MAPPING",
+    "allowedReferences": [
+      "IAM-01.1",
+      "IAM-01.2",
+      "IAM-01.3",
+      "IAM-01.4",
+      "IAM-02.1"
+    ],
+    "variables": {
+      "policyTitle": "Access Control Policy",
+      "policyText": "Access is granted on documented manager approval through Okta. Role changes trigger an entitlement update within two business days. Leaver access is revoked within four hours of the HR exit trigger. Entitlements are reviewed quarterly by system owners.",
+      "availableControls": "AVAILABLE CONTROLS \u2014 choose only from this list\n\nIAM-01.1 | Joiner provisioning and approval | maps to: SOC2 CC6.2, ISO27001 A.5.18\nIAM-01.2 | Mover / role-change access update | maps to: SOC2 CC6.3, ISO27001 A.5.18\nIAM-01.3 | Leaver deprovisioning within SLA | maps to: SOC2 CC6.3, ISO27001 A.5.18\nIAM-01.4 | Unique identifiers, no shared accounts | maps to: SOC2 CC6.2, ISO27001 A.5.16\nIAM-02.1 | Password / passphrase policy | maps to: SOC2 CC6.1, ISO27001 A.5.17",
+      "maxSuggestions": 10
+    },
+    "assertions": [
+      {
+        "strategy": "NO_FABRICATION",
+        "path": "mappings"
+      },
+      {
+        "strategy": "JSON_MIN_SIZE",
+        "path": "mappings",
+        "minSize": 2
+      }
+    ]
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "templateKey": "content.draft-section",
+  "taskType": "CONTENT_DRAFT_SECTION",
+  "displayName": "Content — draft one section",
+  "description": "Drafts a single section from an outline. Deliberately never the whole article.",
+  "expectsJson": false,
+  "temperature": 0.6,
+  "maxOutputTokens": 2000,
+  "requiredVariables": "title,outline,heading",
+  "systemPrompt": "You draft one section of a GRC article. One section — not the article.\n\nNEVER INVENT A SPECIFIC\nNo statistics, no dates, no regulation numbers, no clause references, no pricing, no customer names unless they appear in the material you were given. This is the single most important instruction here. The audience is professional skeptics; one fabricated circular number discredits the whole page, and it will be the thing they remember.\n\nWhere a specific is needed and you do not have it, write [VERIFY: what is needed] inline. A visible gap an editor fills is infinitely better than a plausible number nobody checks.\n\nHOW IT SHOULD READ\nParagraphs of two to four sentences — this is read by scanning, not linearly. Plain declarative sentences. No 'in today's fast-paced regulatory landscape', no 'it is important to note that', no closing paragraph that restates the section. Say the thing and stop.\n\nHedge claims honestly: 'in most audits' and 'RBI's directions require' are different kinds of statement and should not sound alike.\n\nReturn HTML using only <p>, <ul>, <ol>, <li>, <strong>, <em> and <a>. No headings — the heading already exists.",
+  "userPrompt": "ARTICLE: {{title}}\n\nOUTLINE:\n{{outline}}\n\nDraft only this section: {{heading}}"
+}

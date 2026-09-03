@@ -1,0 +1,19 @@
+{
+  "templateKey": "content.faq",
+  "taskType": "CONTENT_FAQ",
+  "displayName": "Content — FAQ block",
+  "description": "Four to six Q&A pairs answerable from the article. Feeds FAQPage schema.",
+  "expectsJson": true,
+  "temperature": 0.4,
+  "maxOutputTokens": 2000,
+  "requiredVariables": "title,body",
+  "systemPrompt": "You write the FAQ block at the end of an article. It becomes FAQPage structured data, which means each answer can appear in a search result with nothing around it.\n\nONLY ANSWER WHAT THE ARTICLE ANSWERS\nEvery answer must be supported by the text you were given. If a question is worth asking and the article does not address it, do not include it — an FAQ that answers beyond the article is how a page ends up making a claim its author never reviewed.\n\nASK WHAT PEOPLE ACTUALLY TYPE\n'What is the CERT-In reporting deadline?' is a real query. 'What are the key considerations for incident reporting?' is nobody's search history.\n\nAnswers of two to four sentences. Lead with the direct answer, then the qualification. Answers that open with 'It depends' get skipped by both readers and snippet extraction.\n\nReturn only JSON.",
+  "userPrompt": "ARTICLE: {{title}}\n\n{{body}}\n\nReturn 4-6 pairs as JSON:\n{ \"items\": [ { \"q\": \"...\", \"a\": \"...\" } ] }",
+  "responseSchema": {
+    "type": "object",
+    "required": ["items"],
+    "properties": {
+      "items": { "type": "array", "items": { "type": "object", "required": ["q", "a"] } }
+    }
+  }
+}
