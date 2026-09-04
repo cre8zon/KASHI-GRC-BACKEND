@@ -84,13 +84,13 @@ public class QdrantVectorStore implements VectorStore {
             }
 
             rest.put()
-                .uri("/collections/{c}", cfg.getCollection())
-                .body(Map.of(
-                        "vectors", Map.of("size", dimensions, "distance", "Cosine"),
-                        // Deferred indexing: bulk ingestion writes far faster when the
-                        // HNSW graph is built once at the end rather than per point.
-                        "optimizers_config", Map.of("indexing_threshold", 20000)))
-                .retrieve().body(String.class);
+                    .uri("/collections/{c}", cfg.getCollection())
+                    .body(Map.of(
+                            "vectors", Map.of("size", dimensions, "distance", "Cosine"),
+                            // Deferred indexing: bulk ingestion writes far faster when the
+                            // HNSW graph is built once at the end rather than per point.
+                            "optimizers_config", Map.of("indexing_threshold", 20000)))
+                    .retrieve().body(String.class);
 
             log.info("[AI-QDRANT] created collection '{}' dim={} distance=Cosine", cfg.getCollection(), dimensions);
             ensurePayloadIndexes();
@@ -102,22 +102,50 @@ public class QdrantVectorStore implements VectorStore {
     }
 
     /**
-     * Index the filter fields. Without these, the tenant filter degrades to a
-     * full payload scan — which still returns CORRECT results, so nothing looks
-     * broken, while search latency grows linearly with the corpus. The kind of
-     * problem that only shows up once you have customers.
+     * Index every field used in a filter.
+     *
+     * For the SEARCH filters (scope, sourceType, retrievable) a missing index is
+     * a performance problem only: the tenant filter degrades to a full payload
+     * scan, which still returns CORRECT results while latency grows linearly
+     * with the corpus. The kind of problem that only shows up once you have
+     * customers.
+     *
+     * sourceId is DIFFERENT and was missing from this list. Qdrant refuses a
+     * delete-by-filter on an unindexed field outright:
+     *
+     *   400 Bad Request: Index required but not found for "sourceId" of one of
+     *   the following types: [integer]
+     *
+     * So every deleteBySource call failed, and re-ingesting a document could
+     * never clear its old chunks. Not slow — broken.
+     *
+     * sourceId is an entity id, so it must be indexed as INTEGER. Indexing it as
+     * keyword would create the index and still fail the filter, because the
+     * error names the type it requires.
      */
     private void ensurePayloadIndexes() {
-        for (String field : List.of("scope", "sourceType", "retrievable")) {
+        for (String field : List.of("scope", "sourceType", "sourceId", "retrievable")) {
             try {
                 rest.put()
-                    .uri("/collections/{c}/index?wait=true", cfg.getCollection())
-                    .body(Map.of("field_name", field, "field_schema", "retrievable".equals(field) ? "bool" : "keyword"))
-                    .retrieve().body(String.class);
+                        .uri("/collections/{c}/index?wait=true", cfg.getCollection())
+                        .body(Map.of("field_name", field, "field_schema", payloadSchemaFor(field)))
+                        .retrieve().body(String.class);
             } catch (Exception e) {
+                // Creating an index that already exists is a normal no-op on
+                // restart, which is why this stays at debug. A genuine failure
+                // surfaces later as the 400 above, on the first delete.
                 log.debug("[AI-QDRANT] payload index '{}' not created (may already exist): {}", field, e.getMessage());
             }
         }
+    }
+
+    /** Qdrant needs the declared type to match how the value is stored. */
+    private static String payloadSchemaFor(String field) {
+        return switch (field) {
+            case "retrievable" -> "bool";
+            case "sourceId"    -> "integer";
+            default            -> "keyword";
+        };
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
@@ -140,9 +168,9 @@ public class QdrantVectorStore implements VectorStore {
             }
 
             rest.put()
-                .uri("/collections/{c}/points?wait=true", cfg.getCollection())
-                .body(Map.of("points", body))
-                .retrieve().body(String.class);
+                    .uri("/collections/{c}/points?wait=true", cfg.getCollection())
+                    .body(Map.of("points", body))
+                    .retrieve().body(String.class);
 
             log.debug("[AI-QDRANT] upserted {} point(s)", points.size());
 
@@ -222,9 +250,9 @@ public class QdrantVectorStore implements VectorStore {
         if (vectorIds == null || vectorIds.isEmpty()) return;
         try {
             rest.post()
-                .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
-                .body(Map.of("points", vectorIds))
-                .retrieve().body(String.class);
+                    .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
+                    .body(Map.of("points", vectorIds))
+                    .retrieve().body(String.class);
         } catch (Exception e) {
             log.error("[AI-QDRANT] delete by ids failed: {}", e.getMessage());
         }
@@ -234,11 +262,11 @@ public class QdrantVectorStore implements VectorStore {
     public void deleteBySource(String sourceType, Long sourceId) {
         try {
             rest.post()
-                .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
-                .body(Map.of("filter", Map.of("must", List.of(
-                        Map.of("key", "sourceType", "match", Map.of("value", sourceType)),
-                        Map.of("key", "sourceId",   "match", Map.of("value", sourceId))))))
-                .retrieve().body(String.class);
+                    .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
+                    .body(Map.of("filter", Map.of("must", List.of(
+                            Map.of("key", "sourceType", "match", Map.of("value", sourceType)),
+                            Map.of("key", "sourceId",   "match", Map.of("value", sourceId))))))
+                    .retrieve().body(String.class);
         } catch (Exception e) {
             log.error("[AI-QDRANT] delete by source failed: {}", e.getMessage());
         }
@@ -253,10 +281,10 @@ public class QdrantVectorStore implements VectorStore {
     public void deleteByScope(String scope) {
         try {
             rest.post()
-                .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
-                .body(Map.of("filter", Map.of("must", List.of(
-                        Map.of("key", "scope", "match", Map.of("value", scope))))))
-                .retrieve().body(String.class);
+                    .uri("/collections/{c}/points/delete?wait=true", cfg.getCollection())
+                    .body(Map.of("filter", Map.of("must", List.of(
+                            Map.of("key", "scope", "match", Map.of("value", scope))))))
+                    .retrieve().body(String.class);
             log.info("[AI-QDRANT] purged all points for scope '{}'", scope);
         } catch (Exception e) {
             log.error("[AI-QDRANT] delete by scope failed: {}", e.getMessage());
