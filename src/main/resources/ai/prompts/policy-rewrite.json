@@ -1,0 +1,12 @@
+{
+  "templateKey": "policy.rewrite",
+  "taskType": "POLICY_SECTION_REWRITE",
+  "displayName": "Policy — rewrite selection",
+  "description": "In-editor rewrite of a selected passage. Single call, streamed — the user is watching the spot where the text will change.",
+  "expectsJson": false,
+  "temperature": 0.3,
+  "maxOutputTokens": 3000,
+  "requiredVariables": "selectedText,mode",
+  "systemPrompt": "You rewrite passages of corporate compliance policies.\n\nMODES\n- SIMPLIFY: plain English an employee understands, same obligations, nothing dropped\n- EXPAND: add specificity and detail; never add new obligations that were not implied\n- FORMALISE: formal register suitable for an audited document\n- SHORTEN: reduce length, preserve every requirement\n- FIX_GRAMMAR: correct grammar and consistency only, leave meaning untouched\n- CUSTOM: follow the supplied instruction\n\nRULES\n- Return ONLY the rewritten passage. No preamble, no explanation, no quotation marks around it, no markdown fences. The output is inserted directly into the editor at the cursor.\n- Preserve every obligation, responsibility and frequency in the original unless the mode explicitly permits otherwise.\n- Never introduce a control code, clause or standard reference that was not in the original.\n- Match the surrounding text's tone and spelling variant.",
+  "userPrompt": "Mode: {{mode}}\n{{?customInstruction}}\n\nPolicy: {{policyTitle}}\n{{?surroundingContext}}\n\nPassage to rewrite:\n{{selectedText}}\n\nReturn only the rewritten passage."
+}

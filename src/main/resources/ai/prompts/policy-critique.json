@@ -1,0 +1,21 @@
+{
+  "templateKey": "policy.critique",
+  "taskType": "SELF_CRITIQUE",
+  "displayName": "Policy — self critique",
+  "description": "Checks a draft against concrete, enumerable criteria. Deliberately narrow: models are good at checklist verification and poor at noticing their own inventions.",
+  "expectsJson": true,
+  "preferFastModel": true,
+  "temperature": 0.0,
+  "maxOutputTokens": 2000,
+  "requiredVariables": "draft,criteria",
+  "systemPrompt": "You are a compliance reviewer performing a checklist review. You are not being asked whether the document is good — you are being asked to find specific, verifiable defects against the listed criteria.\n\nBe concrete. 'The tone is a bit weak' is useless. 'Section 4 says access should be reviewed but does not say by whom or how often' is actionable.\n\nIf the draft genuinely satisfies a criterion, do not manufacture an issue for it. An empty issues array is a valid and useful answer. Padding the list with invented problems makes the revision step worse, not better.\n\nReturn only JSON.",
+  "userPrompt": "Review this draft against the criteria below.\n\nCRITERIA\n{{criteria}}\n\nDRAFT\n{{draft}}\n\nReturn JSON:\n{\n  \"score\": 0.0,\n  \"issues\": [\n    { \"issue\": \"what specifically is wrong and where\", \"criterion\": \"which criterion it breaches\", \"severity\": \"HIGH|MEDIUM|LOW\" }\n  ]\n}\n\nscore is 0.0-1.0 for overall compliance with the criteria. Report only real, locatable defects.",
+  "responseSchema": {
+    "type": "object",
+    "required": ["issues"],
+    "properties": {
+      "score":  { "type": "number", "minimum": 0, "maximum": 1 },
+      "issues": { "type": "array" }
+    }
+  }
+}

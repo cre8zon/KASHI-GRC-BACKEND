@@ -100,11 +100,6 @@
 			<artifactId>guardduty</artifactId>
 		</dependency>
 
-		<!-- Spring Boot Mail for DataSource/Activation support -->
-		<dependency>
-			<groupId>org.springframework.boot</groupId>
-			<artifactId>spring-boot-starter-mail</artifactId>
-		</dependency>
 		<dependency>
 			<groupId>org.springframework.boot</groupId>
 			<artifactId>spring-boot-configuration-processor</artifactId>
@@ -217,6 +212,11 @@
 			<version>3.10.1</version>
 		</dependency>
 		<dependency>
+			<groupId>com.github.gotson</groupId>
+			<artifactId>webp-imageio</artifactId>
+			<version>0.2.2</version>
+		</dependency>
+		<dependency>
 			<groupId>io.minio</groupId>
 			<artifactId>minio</artifactId>
 			<version>${minio.version}</version>
@@ -275,22 +275,11 @@
 			<version>5.9</version>
 		</dependency>
 
-		<!-- Apache POI for XLSX -->
-		<dependency>
-			<groupId>org.apache.poi</groupId>
-			<artifactId>poi-ooxml</artifactId>
-			<version>5.2.5</version>
-		</dependency>
-
 		<!-- Apache Commons CSV for CSV export -->
 		<dependency>
 			<groupId>org.apache.commons</groupId>
 			<artifactId>commons-csv</artifactId>
 			<version>1.10.0</version>
-		</dependency>
-		<dependency>
-			<groupId>org.springframework.kafka</groupId>
-			<artifactId>spring-kafka</artifactId>
 		</dependency>
 		<dependency>
 			<groupId>org.testcontainers</groupId>

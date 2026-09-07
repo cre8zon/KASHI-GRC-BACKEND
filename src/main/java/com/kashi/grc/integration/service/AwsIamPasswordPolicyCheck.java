@@ -23,7 +23,8 @@ import java.util.Map;
  *
  * check_key:      AWS_IAM_PASSWORD_POLICY   ← matches the seeded catalog row
  * integration_key: AWS
- * control_tag:    IAM-03.1  (password-policy leaf)
+ * control_tag:    IAM-02.1  (Authentication credential requirements)
+ *                 was IAM-03.1, which is least privilege — not credentials
  * capability:     PASSWORD_POLICY
  *
  * NEW DEPENDENCY: same `iam` artifact as AwsRootMfaCheck (only add it once).
@@ -39,7 +40,8 @@ public class AwsIamPasswordPolicyCheck implements IntegrationCheck {
 
     private final ObjectMapper objectMapper;
 
-    private static final String TAG = "IAM-03.1";
+    /** Advisory only — IntegrationRunner uses the tenant catalogue row. */
+    private static final String TAG = "IAM-02.1";
 
     @Override public String checkKey()       { return "AWS_IAM_PASSWORD_POLICY"; }
     @Override public String integrationKey() { return "AWS"; }

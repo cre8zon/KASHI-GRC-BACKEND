@@ -4,6 +4,7 @@ import com.kashi.grc.audit.domain.AuditPolicy;
 import com.kashi.grc.audit.repository.AuditPolicyRepository;
 import com.kashi.grc.audit.repository.AuditTestRepository;
 import com.kashi.grc.common.cache.CacheNames;
+import com.kashi.grc.usermanagement.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.CacheEvict;
@@ -49,6 +50,25 @@ public class AuditLibraryCacheService {
 
     private final AuditPolicyRepository policyRepository;
     private final AuditTestRepository   testRepository;
+    private final UserRepository        userRepository;
+
+    /**
+     * Dates as ISO strings, never as temporal objects.
+     *
+     * The Redis serializer runs with DefaultTyping.NON_FINAL. A LocalDate inside
+     * a Map<String,Object> is written with a type id the reader cannot match back
+     * to the declared Object, so EVERY cached read failed:
+     *
+     *   SerializationException: Unexpected token (START_OBJECT), expected
+     *   VALUE_STRING ... that contains type id (for subtype of java.lang.Object)
+     *
+     * ResilientRedisCache swallows that as a miss, so the cache appeared to work
+     * while never returning anything — which is why these lists still cost a full
+     * database round trip on every request.
+     */
+    private static Object iso(Object temporal) {
+        return temporal == null ? null : temporal.toString();
+    }
 
     // ── Policies ────────────────────────────────────────────────────────────
 
@@ -73,8 +93,23 @@ public class AuditLibraryCacheService {
         log.debug("[LIBRARY-CACHE] MISS policyList tenantId={} search={} status={} origin={}",
                 tenantId, search, status, origin);
 
-        return policyRepository.findSummariesForTenant(tenantId, search, statusFilter, origin)
-                .stream()
+        var rows = policyRepository.findSummariesForTenant(tenantId, search, statusFilter, origin);
+
+        // Owner names in ONE query, not one per row.
+        //
+        // The OWNER column renders ownerTeam, which is null on nearly every
+        // adopted policy, so it showed "—" while the document itself read
+        // "Owner: <name>" from ownerId. Two different fields; a policy that has
+        // an owner should not display as unowned.
+        java.util.Map<Long, String> ownerNames = new java.util.HashMap<>();
+        var ownerIds = rows.stream().map(p -> p.ownerId())
+                .filter(java.util.Objects::nonNull).distinct().toList();
+        if (!ownerIds.isEmpty()) {
+            userRepository.findAllById(ownerIds)
+                    .forEach(u -> ownerNames.put(u.getId(), u.getFullName()));
+        }
+
+        return rows.stream()
                 .map(p -> {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("id",                    p.id());
@@ -86,14 +121,19 @@ public class AuditLibraryCacheService {
                     m.put("contentType",           p.contentType() != null ? p.contentType().name() : null);
                     m.put("ownerId",               p.ownerId());
                     m.put("ownerTeam",             p.ownerTeam());
-                    m.put("approvedAt",            p.approvedAt());
-                    m.put("effectiveDate",         p.effectiveDate());
-                    m.put("nextReviewDate",        p.nextReviewDate());
+                    // What the OWNER column shows: the team when set, otherwise
+                    // the accountable person.
+                    m.put("ownerName", p.ownerTeam() != null && !p.ownerTeam().isBlank()
+                            ? p.ownerTeam()
+                            : ownerNames.get(p.ownerId()));
+                    m.put("approvedAt",            iso(p.approvedAt()));
+                    m.put("effectiveDate",         iso(p.effectiveDate()));
+                    m.put("nextReviewDate",        iso(p.nextReviewDate()));
                     m.put("reviewFrequencyMonths", p.reviewFrequencyMonths());
                     m.put("controlTags",           p.controlTags());
                     m.put("frameworkRefs",         p.frameworkRefs());
                     m.put("tenantId",              p.tenantId());
-                    m.put("createdAt",             p.createdAt());
+                    m.put("createdAt",             iso(p.createdAt()));
                     m.put("origin",                p.tenantId() == null ? "GLOBAL" : "ORG");
                     return m;
                 })
@@ -122,7 +162,7 @@ public class AuditLibraryCacheService {
                     m.put("automationKey",   t.automationKey());
                     m.put("frequency",       t.frequency()      != null ? t.frequency().name()      : null);
                     m.put("tenantId",        t.tenantId());
-                    m.put("createdAt",       t.createdAt());
+                    m.put("createdAt",       iso(t.createdAt()));
                     m.put("origin",          t.tenantId() == null ? "GLOBAL" : "ORG");
                     return m;
                 })

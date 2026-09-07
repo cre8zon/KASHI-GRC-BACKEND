@@ -41,6 +41,7 @@ public class UserServiceImpl implements UserService {
     private final UserRepository  userRepository;
     private final RoleRepository  roleRepository;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
     private final com.kashi.grc.usermanagement.service.role.MembershipRoleSync membershipRoleSync;
     private final UserAttributeRepository attributeRepository;
     private final DelegationRepository delegationRepository;
@@ -266,12 +267,16 @@ public class UserServiceImpl implements UserService {
     @Override
     @Transactional(readOnly = true)
     public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam) {
-        return listUsers(pageDetails, side, noRoles, vendorIdParam, roleIdParam, tenantIdParam, null);
+        // Both trailing filters default to null: this overload exists for callers
+        // that want every user, and neither membership type nor audit firm
+        // narrowing applies to them.
+        return listUsers(pageDetails, side, noRoles, vendorIdParam, roleIdParam, tenantIdParam,
+                null, null);
     }
 
     @Override
     @Transactional(readOnly = true)
-    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam, String membershipType) {
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam, String membershipType, Long firmTenantId) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -306,6 +311,7 @@ public class UserServiceImpl implements UserService {
         final Long finalRoleId = roleIdParam;
         final String finalMembershipType =
                 (membershipType != null && !membershipType.isBlank()) ? membershipType.toUpperCase() : null;
+        final Long finalFirmTenantId = firmTenantId;
 
         return dbRepository.findAll(
                 User.class,
@@ -321,10 +327,10 @@ public class UserServiceImpl implements UserService {
                     // would have auditors in their tenant with no way to see or
                     // revoke them.
                     if (!isSystemUser) {
-                        predicates.add(cb.exists(membershipOf(cb, root, tenantId, finalMembershipType)));
+                        predicates.add(cb.exists(membershipOf(cb, root, tenantId, finalMembershipType, finalFirmTenantId)));
                     } else if (tenantIdParam != null) {
                         // SYSTEM caller drilling into one specific tenant
-                        predicates.add(cb.exists(membershipOf(cb, root, effectiveTenantId, finalMembershipType)));
+                        predicates.add(cb.exists(membershipOf(cb, root, effectiveTenantId, finalMembershipType, finalFirmTenantId)));
                     }
                     // else: SYSTEM caller with no tenantIdParam — unscoped, all tenants
                     // Filter by role side — only users who have at least one role with this side
@@ -412,7 +418,7 @@ public class UserServiceImpl implements UserService {
             jakarta.persistence.criteria.CriteriaBuilder cb,
             jakarta.persistence.criteria.Root<User> userRoot,
             Long tenantId,
-            String membershipType) {
+            String membershipType, Long firmTenantId) {
 
         jakarta.persistence.criteria.Subquery<Long> sub =
                 cb.createQuery(Long.class).subquery(Long.class);
@@ -428,6 +434,16 @@ public class UserServiceImpl implements UserService {
                         cb.literal(java.time.LocalDateTime.now()))));
         if (membershipType != null) {
             preds.add(cb.equal(m.get("membershipType"), membershipType));
+        }
+        // Narrow to ONE audit firm.
+        //
+        // A client can have several firms invited at once. membershipType=GUEST
+        // alone returns auditors from all of them in a single undifferentiated
+        // list, and picking the wrong one puts a person from Firm A on an
+        // engagement Firm B is running — an access-control mistake that surfaces
+        // only when the wrong people are already reading the evidence.
+        if (firmTenantId != null) {
+            preds.add(cb.equal(m.get("firmTenantId"), firmTenantId));
         }
         sub.select(m.get("userId")).where(preds.toArray(new jakarta.persistence.criteria.Predicate[0]));
         return sub;
@@ -696,6 +712,15 @@ public class UserServiceImpl implements UserService {
         return UserResponse.builder()
                 .userId(user.getId())
                 .tenantId(user.getTenantId())
+                // Firm attribution for invited auditors. Resolved from the
+                // membership in the CALLER's tenant — the same person can be a
+                // guest in several clients, so "their firm" is only meaningful
+                // relative to who is asking.
+                //
+                // Null for home staff, which is exactly how the UI distinguishes
+                // internal from external in the lookup.
+                .firmTenantId(firmIdFor(user))
+                .firmName(firmNameFor(user))
                 .vendorId(user.getVendorId())
                 .email(user.getEmail())
                 .firstName(user.getFirstName())
@@ -747,5 +772,28 @@ public class UserServiceImpl implements UserService {
                         .ifPresent(attr -> result.put(key, attr.getAttributeValue()))
         );
         return result;
+    }
+
+    /** The firm this user is a guest of, in the CALLER's tenant. Null for staff. */
+    private Long firmIdFor(User user) {
+        Long callerTenant = utilityService.getLoggedInDataContext().getTenantId();
+        if (callerTenant == null || user.getId() == null) return null;
+        return membershipRepository.findByUserIdAndTenantId(user.getId(), callerTenant)
+                .map(m -> m.getFirmTenantId())
+                .orElse(null);
+    }
+
+    /**
+     * Firm display name.
+     *
+     * NOTE: one extra lookup per user in a list response. Acceptable at lookup
+     * sizes (a search box returns a handful) but NOT for a full user export — if
+     * this ever shows up in a slow-query log, batch it the way
+     * AuditLibraryCacheService batches owner names.
+     */
+    private String firmNameFor(User user) {
+        Long firmId = firmIdFor(user);
+        if (firmId == null) return null;
+        return tenantRepository.findById(firmId).map(t -> t.getName()).orElse(null);
     }
 }

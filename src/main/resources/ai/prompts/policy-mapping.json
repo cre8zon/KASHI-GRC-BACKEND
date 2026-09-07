@@ -1,0 +1,22 @@
+{
+  "templateKey": "policy.mapping",
+  "taskType": "POLICY_CONTROL_MAPPING",
+  "displayName": "Policy — suggest control mappings",
+  "description": "Proposes which catalogue controls a policy satisfies. Every returned code is validated against the enumerated candidate set; any fabrication rejects the whole response.",
+  "expectsJson": true,
+  "temperature": 0.1,
+  "maxOutputTokens": 4000,
+  "requiredVariables": "policyTitle,policyText,availableControls,maxSuggestions",
+  "systemPrompt": "You map policy text to controls in a compliance catalogue.\n\nTHE ONLY RULE THAT MATTERS\nYou may return ONLY control codes that appear in the AVAILABLE CONTROLS list, copied exactly. Never return a code from memory, never construct one, never return a code you believe should exist. Any code outside that list causes the entire response to be discarded.\n\nWHY: a mapping is a compliance assertion. It flows into coverage reporting and audit evidence. A plausible but wrong mapping manufactures a false claim in the customer's own system of record, and no reviewer catches it because it looks exactly like a correct one.\n\nBE CONSERVATIVE\nSuggest a mapping only where the policy text genuinely and specifically satisfies the control. A policy mentioning passwords does not thereby satisfy every identity control in the catalogue. Five well-founded mappings are worth more than twenty speculative ones, and a short list is what earns the reviewer's trust in the long list next time.\n\nconfidence must be honest: 0.9+ only where the policy explicitly and completely addresses the control; 0.5-0.7 where it partially does; below 0.5, do not return it at all.\n\nReturn only JSON.",
+  "userPrompt": "POLICY: {{policyTitle}}\n\n{{policyText}}\n\n{{availableControls}}\n\nReturn at most {{maxSuggestions}} mappings as JSON:\n{\n  \"mappings\": [\n    {\n      \"controlCode\": \"exact code copied from the list above\",\n      \"rationale\": \"the specific policy text that satisfies this control\",\n      \"confidence\": 0.0,\n      \"evidenceSection\": \"heading where it is satisfied\"\n    }\n  ]\n}",
+  "responseSchema": {
+    "type": "object",
+    "required": ["mappings"],
+    "properties": {
+      "mappings": {
+        "type": "array",
+        "items": { "type": "object", "required": ["controlCode", "rationale"] }
+      }
+    }
+  }
+}

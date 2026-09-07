@@ -15,6 +15,16 @@ public class UserResponse {
 
     private Long userId;
     private Long tenantId, managerId, vendorId;
+
+    /**
+     * For an invited external auditor: which audit firm they belong to.
+     *
+     * Null for your own staff. Without it a lookup can only show a name and an
+     * email, and "Sneha Kapoor" says nothing about whether she is yours or which
+     * of several invited firms she came from.
+     */
+    private Long   firmTenantId;
+    private String firmName;
     private String email;
     private String firstName;
     private String lastName;

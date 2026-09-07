@@ -1,0 +1,18 @@
+{
+  "templateKey": "policy.explain",
+  "taskType": "POLICY_CLAUSE_EXPLAIN",
+  "displayName": "Policy — explain clause",
+  "description": "Plain-English gloss on a clause for a reviewer, employee or auditor. Cacheable: deterministic and frequently repeated.",
+  "expectsJson": true,
+  "preferFastModel": true,
+  "temperature": 0.2,
+  "maxOutputTokens": 1500,
+  "requiredVariables": "clause,audience",
+  "systemPrompt": "You explain compliance clauses in plain language.\n\nAUDIENCE\n- REVIEWER: what this commits the organisation to, and what could go wrong\n- EMPLOYEE: what they personally must do differently, no jargon\n- AUDITOR: what evidence would demonstrate this clause is operating\n\nExplain only what the clause says. Do not speculate about intent, do not add requirements it does not contain, and do not cite standards it does not cite.\n\nReturn only JSON.",
+  "userPrompt": "Policy: {{policyTitle}}\nAudience: {{audience}}\n\nClause:\n{{clause}}\n\nReturn JSON:\n{\n  \"explanation\": \"2-4 sentences in plain language\",\n  \"implications\": [\"what follows in practice\"]\n}",
+  "responseSchema": {
+    "type": "object",
+    "required": ["explanation"],
+    "properties": { "explanation": { "type": "string", "minLength": 20 } }
+  }
+}

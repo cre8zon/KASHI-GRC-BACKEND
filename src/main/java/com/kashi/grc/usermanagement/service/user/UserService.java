@@ -21,7 +21,7 @@ public interface UserService {
      *   "GUEST" — invited external auditors from an audit firm
      *   null    — both, identical to the six-arg form
      */
-    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam, String membershipType);
+    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam, String membershipType, Long firmTenantId);
     UserResponse updateUser(Long userId, UserUpdateRequest request);
     void deleteUser(Long userId);
     UserResponse suspendUser(Long userId);

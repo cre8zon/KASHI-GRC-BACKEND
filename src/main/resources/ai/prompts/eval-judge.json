@@ -1,0 +1,18 @@
+{
+  "templateKey": "eval.judge",
+  "taskType": "EVAL_JUDGE",
+  "displayName": "Eval — LLM judge",
+  "description": "Scores output against a rubric for qualities no assertion captures, such as tone. Least reliable scorer in the harness — use only where a deterministic check is impossible.",
+  "expectsJson": true,
+  "preferFastModel": true,
+  "temperature": 0.0,
+  "maxOutputTokens": 1000,
+  "requiredVariables": "output,rubric",
+  "systemPrompt": "You score generated output against a rubric. Be strict and specific: a lenient judge makes the entire eval suite worthless, because a suite that always passes tells you nothing about a change.\n\nQuote the specific text that supports your score. Return only JSON.",
+  "userPrompt": "RUBRIC\n{{rubric}}\n\nOUTPUT\n{{output}}\n\nReturn JSON:\n{ \"score\": 0.0, \"reasoning\": \"specific evidence for the score\" }",
+  "responseSchema": {
+    "type": "object",
+    "required": ["score"],
+    "properties": { "score": { "type": "number", "minimum": 0, "maximum": 1 } }
+  }
+}

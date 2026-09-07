@@ -122,7 +122,30 @@ public class CacheConfig implements CachingConfigurer {
         redisObjectMapper.activateDefaultTyping(
                 ptv,
                 com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping.NON_FINAL,
-                com.fasterxml.jackson.annotation.JsonTypeInfo.As.PROPERTY);
+                // WRAPPER_ARRAY, not PROPERTY.
+                //
+                // As.PROPERTY writes the type as a "@class" field INSIDE the JSON
+                // object — which is impossible for a root-level List, because a
+                // JSON array has nowhere to put a property. Every cache whose
+                // value is a collection therefore round-tripped asymmetrically:
+                // written as [{"@class":...}], read by a reader demanding a type
+                // id as the FIRST ARRAY ELEMENT. Hence, on every single read:
+                //
+                //   expected VALUE_STRING: need String, Number of Boolean value
+                //   that contains type id ... line: 1, column: 2
+                //
+                // Column 2 is the character right after the opening bracket, which
+                // is what made this look like a data problem rather than a shape
+                // one. It is not the values — it is the root.
+                //
+                // WRAPPER_ARRAY writes ["java.util.ArrayList",[...]] uniformly for
+                // lists, maps and POJOs alike, which is what the reader expects and
+                // why it is the conventional choice for a Redis value serializer.
+                //
+                // Evidence this was the cause: the ONLY keys that survived in Redis
+                // were the two caches switched to an untyped serializer. No typed
+                // cache had ever stored a readable entry.
+                com.fasterxml.jackson.annotation.JsonTypeInfo.As.WRAPPER_ARRAY);
 
         GenericJackson2JsonRedisSerializer jsonSerializer =
                 new GenericJackson2JsonRedisSerializer(redisObjectMapper);
@@ -166,8 +189,45 @@ public class CacheConfig implements CachingConfigurer {
         // mutating endpoint evicts explicitly, so the TTL is a backstop rather
         // than the mechanism. 10 minutes bounds the damage if an eviction path
         // is ever missed.
-        perCache.put(CacheNames.AUDIT_POLICY_LIST, defaults.entryTtl(Duration.ofMinutes(10)));
-        perCache.put(CacheNames.AUDIT_TEST_LIST,   defaults.entryTtl(Duration.ofMinutes(10)));
+        // ── These two caches use a serializer WITHOUT default typing ────────
+        //
+        // Every read of them failed with:
+        //   SerializationException: Unexpected token (START_OBJECT), expected
+        //   VALUE_STRING ... that contains type id (for subtype of java.lang.Object)
+        //
+        // The shared serializer runs activateDefaultTyping(NON_FINAL, As.PROPERTY).
+        // A JSON array cannot carry a type PROPERTY, so the root List falls back
+        // to wrapper-array form and the reader then demands a type-id string as
+        // the first element. The stored value did not have one, so it failed at
+        // line 1, column 2 — every time, on every read.
+        //
+        // Typing exists so an Object-typed cache value can be reconstructed as
+        // its original class. These two caches do not need that: they hold
+        // List<Map<String,Object>> of plain scalars, and plain Jackson
+        // reconstructs exactly that — ArrayList of LinkedHashMap — with no type
+        // information at all.
+        //
+        // I tried ISO-formatting the dates first, on the theory that the temporal
+        // values were the problem. They were not; the failure is structural and
+        // at the root, before any value is read. (The ISO change is still worth
+        // keeping — it makes the cached JSON smaller and matches the response.)
+        //
+        // Old entries written by the previous serializer will fail once more,
+        // be swallowed as a miss by ResilientRedisCache, and be replaced. No
+        // flush required, though flushing makes the first read faster.
+        // objectMapper.copy(), NOT a bare new ObjectMapper(): the same reasoning
+        // as redisObjectMapper above — it inherits JavaTimeModule and every other
+        // registration Spring has applied. The only difference is that typing is
+        // never activated on this one.
+        ObjectMapper plainMapper = objectMapper.copy();
+
+        RedisCacheConfiguration untypedListConfig = defaults
+                .entryTtl(Duration.ofMinutes(10))
+                .serializeValuesWith(RedisSerializationContext.SerializationPair
+                        .fromSerializer(new GenericJackson2JsonRedisSerializer(plainMapper)));
+
+        perCache.put(CacheNames.AUDIT_POLICY_LIST, untypedListConfig);
+        perCache.put(CacheNames.AUDIT_TEST_LIST,   untypedListConfig);
 
         return RedisCacheManager.builder(connectionFactory)
                 .cacheDefaults(defaults)

@@ -1,0 +1,12 @@
+{
+  "templateKey": "policy.revise",
+  "taskType": "SELF_CRITIQUE",
+  "displayName": "Policy — revise from critique",
+  "description": "Applies the critique's issues to the draft. Surgical by design: a free rewrite regresses parts that were already correct.",
+  "expectsJson": false,
+  "temperature": 0.2,
+  "maxOutputTokens": 8000,
+  "requiredVariables": "draft,issues",
+  "systemPrompt": "You revise compliance documents to fix specific, identified defects.\n\nFix exactly what is listed. Do not restructure, do not restyle, do not improve wording that was not flagged. Everything not named in the issues must survive unchanged — a reviewer has already read this draft, and unannounced edits elsewhere destroy their confidence in the diff.\n\nNever add a control code, clause or standard reference that was not already present.\n\nReturn the corrected document in the same format you received it, and nothing else.",
+  "userPrompt": "Fix these issues:\n{{issues}}\n\nDOCUMENT\n{{draft}}\n\nReturn the corrected document only."
+}

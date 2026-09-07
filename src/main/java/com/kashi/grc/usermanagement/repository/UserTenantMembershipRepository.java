@@ -8,7 +8,8 @@ import org.springframework.data.repository.query.Param;
 import java.util.List;
 import java.util.Optional;
 
-public interface UserTenantMembershipRepository extends JpaRepository<UserTenantMembership, Long> {
+public interface UserTenantMembershipRepository extends JpaRepository<UserTenantMembership, Long>,
+        UserTenantMembershipRepositoryCustom {
 
     /** Every tenant this identity can act in, usable or not — the account screen shows all. */
     List<UserTenantMembership> findByUserId(Long userId);
@@ -24,6 +25,7 @@ public interface UserTenantMembershipRepository extends JpaRepository<UserTenant
 
     /** Everyone a given firm has inside a given client — the unit of firm-level revoke. */
     List<UserTenantMembership> findByTenantIdAndFirmTenantId(Long tenantId, Long firmTenantId);
+
 
     /**
      * Role ids for one membership. Roles are global rows, so the membership is

@@ -1,0 +1,20 @@
+{
+  "templateKey": "content.meta",
+  "taskType": "CONTENT_META",
+  "displayName": "Content — meta title and description",
+  "description": "Search-result title and description, within the length limits that actually get rendered.",
+  "expectsJson": true,
+  "temperature": 0.4,
+  "maxOutputTokens": 600,
+  "requiredVariables": "title,opening,focusKeyword",
+  "systemPrompt": "You write the title and description that appear in a search result.\n\nHARD LIMITS\nmetaTitle: 50-60 characters. metaDescription: 140-158 characters. Past those, search engines truncate mid-word and the last thing the reader sees is an ellipsis. Count the characters.\n\nWRITE FOR THE CLICK, NOT THE CRAWLER\nThe description is not a summary — it is the argument for opening the page rather than the one above it. Lead with the specific thing this article knows that the others do not. Keyword stuffing has not worked for a decade and reads as spam to the compliance professional you are trying to reach.\n\nIf a focus keyword is given, it should appear naturally in the title. If it will not fit naturally, leave it out — an awkward title costs more clicks than the keyword earns.\n\nReturn only JSON.",
+  "userPrompt": "TITLE: {{title}}\nFOCUS KEYWORD: {{focusKeyword}}\n\nOPENING:\n{{opening}}\n\nReturn JSON:\n{ \"metaTitle\": \"...\", \"metaDescription\": \"...\", \"titleLength\": 0, \"descriptionLength\": 0 }",
+  "responseSchema": {
+    "type": "object",
+    "required": ["metaTitle", "metaDescription"],
+    "properties": {
+      "metaTitle": { "type": "string" },
+      "metaDescription": { "type": "string" }
+    }
+  }
+}

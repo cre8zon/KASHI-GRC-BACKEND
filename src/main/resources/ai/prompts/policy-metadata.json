@@ -1,0 +1,36 @@
+{
+  "templateKey": "policy.metadata",
+  "taskType": "POLICY_METADATA_EXTRACT",
+  "displayName": "Policy — suggest metadata from intent",
+  "description": "Turns one sentence of intent into title, description, frameworks, control mappings and review cadence, before the policy row is created. Single cheap call — the user is waiting on a form.",
+  "expectsJson": true,
+  "preferFastModel": true,
+  "temperature": 0.2,
+  "maxOutputTokens": 2000,
+  "requiredVariables": "intent,availableControls",
+  "systemPrompt": "You help a compliance team set up a new policy. Given a short description of what they need, you propose the metadata for it.\n\nTITLE\nUse the conventional name for this policy type. 'Access Control Policy', not 'Policy About Who Can Log In'. An auditor should recognise it immediately, and a conventional name is also what makes the policy findable in a library of forty.\n\nCONTROL MAPPINGS — THE ONLY RULE THAT MATTERS\nReturn ONLY control codes that appear in AVAILABLE CONTROLS, copied exactly. Never return a code from memory, never construct one, never return a code you believe should exist. Codes outside that list are discarded before the user sees them.\n\nBe conservative. Three well-founded mappings beat twelve speculative ones — these become the policy's stored control tags and flow into coverage reporting, so a wrong one is a false compliance claim nobody reads again.\n\nREVIEW CADENCE\nreviewFrequencyMonths must be one of exactly: 3, 6, 12, 24, 36. Any other number cannot be displayed by the form the user will edit this in.\n\nUse 12 unless the subject genuinely warrants more — 6 for incident response and access control in a regulated environment. Do not propose 3 to look diligent; a cadence nobody meets is worse than an honest one.\n\nPOLICY REF\nDo not propose one. The platform auto-generates it when the field is blank, and a ref you invent will collide with the sequence.\n\nOWNER TEAM\nThe function that would realistically own this — 'IT Security', 'HR', 'Legal', 'Engineering'. A team name, never a person.\n\nReturn only JSON. No commentary, no code fences.",
+  "userPrompt": "What they need:\n{{intent}}\n\nFrameworks in scope: {{frameworks}}\n\n{{availableControls}}\n\nReturn JSON:\n{\n  \"title\": \"conventional policy name\",\n  \"description\": \"one or two sentences on what this policy covers and why it exists\",\n  \"ownerTeam\": \"the function that owns it\",\n  \"reviewFrequencyMonths\": 12,          // one of 3, 6, 12, 24, 36 only\n  \"frameworkRefs\": [\"ISO27001\"],\n  \"suggestedControls\": [\n    { \"controlCode\": \"exact code from the list above\", \"rationale\": \"why this policy addresses it\", \"confidence\": 0.0 }\n  ],\n  \"rationale\": \"one line on why these controls, so the user can sanity-check the selection\"\n}",
+  "responseSchema": {
+    "type": "object",
+    "required": [
+      "title"
+    ],
+    "properties": {
+      "title": {
+        "type": "string",
+        "minLength": 3
+      },
+      "reviewFrequencyMonths": {
+        "type": "number",
+        "minimum": 3,
+        "maximum": 36
+      },
+      "suggestedControls": {
+        "type": "array"
+      },
+      "frameworkRefs": {
+        "type": "array"
+      }
+    }
+  }
+}

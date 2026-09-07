@@ -1,0 +1,22 @@
+{
+  "templateKey": "content.internal-links",
+  "taskType": "CONTENT_INTERNAL_LINKS",
+  "displayName": "Content — suggest internal links",
+  "description": "Proposes links from this draft to other published posts. Every returned slug is validated against the enumerated candidate set; any fabrication rejects the whole response.",
+  "expectsJson": true,
+  "temperature": 0.1,
+  "maxOutputTokens": 2000,
+  "requiredVariables": "title,body,availablePosts",
+  "systemPrompt": "You suggest internal links between articles on one website.\n\nTHE ONLY RULE THAT MATTERS\nYou may return ONLY slugs that appear in the AVAILABLE POSTS list, copied exactly. Never return a slug from memory, never construct one from a title, never return a slug you believe should exist. Any slug outside that list causes the entire response to be discarded.\n\nWHY: a suggested link becomes a real anchor in a published article. A plausible but non-existent slug is a 404 on a live page, shipped under a named author's byline, on a site whose entire argument is that we are careful with detail.\n\nWHAT MAKES A GOOD SUGGESTION\nLink where a reader would genuinely want more depth on a specific point, not wherever a keyword happens to appear. The anchor text should describe what is on the other end, so it reads naturally and tells a search engine what the target page is about. 'see our guide to SOC 2 observation periods' is useful; 'click here' and 'SOC 2' are not.\n\nBe conservative. Three well-placed links are worth more than fifteen, and an article stuffed with internal links reads like SEO rather than writing.\n\nReturn only JSON.",
+  "userPrompt": "ARTICLE: {{title}}\n\n{{body}}\n\n{{availablePosts}}\n\nReturn at most 6 suggestions as JSON:\n{\n  \"links\": [\n    {\n      \"slug\": \"exact slug copied from the list above\",\n      \"anchorText\": \"the words to turn into a link\",\n      \"nearbyText\": \"a short quote from the article showing where this belongs\",\n      \"rationale\": \"why a reader at this point wants that page\"\n    }\n  ]\n}",
+  "responseSchema": {
+    "type": "object",
+    "required": ["links"],
+    "properties": {
+      "links": {
+        "type": "array",
+        "items": { "type": "object", "required": ["slug", "anchorText"] }
+      }
+    }
+  }
+}

@@ -59,6 +59,18 @@ public class PolicyVariableResolver {
     public String resolve(String body, AuditPolicy policy, Long tenantId) {
         if (body == null || body.isEmpty() || !body.contains("{{")) return body;
 
+        // A GLOBAL policy is a TEMPLATE — leave its placeholders alone.
+        //
+        // Resolving them against the READER's tenant made a platform admin see
+        // their own tenant name written into every global policy — not what the
+        // template says and not what any tenant will receive. It also hid the
+        // placeholders from the people who maintain them: a typo'd
+        // {{company_nmae}} is invisible if it renders as a company name.
+        //
+        // Tenants are unaffected — they read their own adopted copy, which is
+        // tenant-owned and still resolves.
+        if (policy != null && policy.getTenantId() == null) return body;
+
         Map<String, String> vars = buildVars(policy, tenantId);
 
         Matcher m = PLACEHOLDER.matcher(body);

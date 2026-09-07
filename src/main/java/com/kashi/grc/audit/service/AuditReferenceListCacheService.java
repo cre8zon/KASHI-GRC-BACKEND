@@ -11,6 +11,7 @@ import com.kashi.grc.workflow.service.WorkflowEngineService;
 import jakarta.persistence.criteria.Predicate;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.cache.annotation.CacheEvict;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
@@ -55,6 +56,26 @@ public class AuditReferenceListCacheService {
 
     private final DbRepository dbRepository;
     private final WorkflowEngineService workflowEngineService;
+
+
+    /**
+     * Drop the whole template list cache.
+     *
+     * NOTHING called this before, which is why publishing a template appeared to
+     * do nothing: the row was updated, the client refetched, and the server
+     * answered from a list built before the publish. It corrected itself 15
+     * minutes later when the TTL expired — the "changes take ages to show up"
+     * symptom.
+     *
+     * allEntries because the key includes isSystem, tenantId, paging and every
+     * filter parameter. One template changing invalidates every page and every
+     * filter combination that could contain it, and working out which is more
+     * expensive than rebuilding a list that is cheap to build.
+     */
+    @CacheEvict(cacheNames = CacheNames.AUDIT_TEMPLATE_LIST, allEntries = true)
+    public void evictTemplateList() {
+        log.debug("[AUDIT-REF-CACHE] Template list cache evicted");
+    }
 
     @Cacheable(cacheNames = CacheNames.AUDIT_TEMPLATE_LIST)
     public PaginatedResponse<Map<String, Object>> listTemplates(
