@@ -77,7 +77,32 @@ public class ContentAdminController {
     @GetMapping("/posts/{id}")
     public ApiResponse<Post> get(@PathVariable Long id) {
         accessService.assertCanView(requirePost(id));
-        return ApiResponse.success(postService.require(id));
+        // requireForEditing, not require: the editor must see the working copy
+        // laid over the live values, or it reopens showing the published text
+        // and the next autosave stages a "change" back to it.
+        return ApiResponse.success(postService.requireForEditing(id));
+    }
+
+    /**
+     * Release the working copy of a live post.
+     *
+     * Separate from /publish, which moves a draft post to PUBLISHED. This one
+     * applies banked edits to a post that is already live — different
+     * precondition, different failure modes, so a different endpoint rather
+     * than a flag on the existing one.
+     */
+    @PostMapping("/posts/{id}/publish-changes")
+    public ApiResponse<Post> publishChanges(@PathVariable Long id) {
+        accessService.assertCanPublish();
+        return ApiResponse.success(postService.publishDraft(id));
+    }
+
+    /** Throw the working copy away. The live article was never touched. */
+    @DeleteMapping("/posts/{id}/draft")
+    public ApiResponse<Void> discardDraft(@PathVariable Long id) {
+        accessService.assertCanEdit(requirePost(id));
+        postService.discardDraft(id);
+        return ApiResponse.success(null);
     }
 
     /**
@@ -242,6 +267,20 @@ public class ContentAdminController {
                                             @RequestPart("altText") String altText,
                                             @RequestPart(value = "caption", required = false) String caption) {
         return ApiResponse.success(mediaService.upload(file, altText, caption));
+    }
+
+    /**
+     * MediaService.delete and PostRepository.countMediaUsages both existed
+     * already, complete with the usage guard. Only the mapping was missing, so
+     * a DELETE reached a path that Spring knew about (from the PUT below) and
+     * came back 405 rather than 404 — which is why it read like a routing
+     * problem rather than an absent endpoint.
+     */
+    @DeleteMapping("/media/{id}")
+    public ApiResponse<Void> deleteMedia(@PathVariable Long id) {
+        accessService.assertCanManageTaxonomy();
+        mediaService.delete(id);
+        return ApiResponse.success(null);
     }
 
     @PutMapping("/media/{id}")

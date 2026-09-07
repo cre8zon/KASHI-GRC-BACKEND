@@ -59,6 +59,25 @@ public class Post extends BaseEntity {
     @Column(name = "slug", nullable = false, unique = true, length = 200)
     private String slug;
 
+    /**
+     * True once a human has typed a slug, after which it stops following the
+     * title.
+     *
+     * The old behaviour generated the slug once, at create, from whatever the
+     * title was — which is "Untitled". Retitling never touched it, so a
+     * finished draft sat at /blog/untitled-2 and the only fix was noticing and
+     * editing by hand.
+     *
+     * Auto-following forever is the other wrong answer: after publication a
+     * slug change costs a redirect and leaks a little authority at every hop,
+     * so a typo fix in a headline must not silently move a live URL. Following
+     * until first publish or first manual edit, whichever comes first, is the
+     * behaviour that is right in both halves of a post's life.
+     */
+    @Builder.Default
+    @Column(name = "slug_locked", nullable = false)
+    private Boolean slugLocked = false;
+
     @Column(name = "title", nullable = false, length = 512)
     private String title;
 
@@ -263,4 +282,26 @@ public class Post extends BaseEntity {
      */
     @Column(name = "definition_summary", columnDefinition = "TEXT")
     private String definitionSummary;
+
+    /**
+     * Not a column — populated on read so the editor knows which tags are on.
+     *
+     * Tags live in content_post_tags and the zero-FK convention rules out a
+     * @ManyToMany, so nothing about them was reaching the admin. The result was
+     * not a cosmetic bug: SettingsPanel read post.tagIds, always got undefined,
+     * and so every tag click sent an array containing ONLY the tag just
+     * clicked — silently replacing the whole set. Two tags in, one tag out.
+     */
+    @Transient
+    private java.util.List<Long> tagIds;
+
+    /**
+     * Set only on the editor's view of a live post that has a working copy.
+     *
+     * Transient, like tagIds — the flag is derived from whether a row exists in
+     * content_post_drafts, and storing it on the post would be a second copy of
+     * that truth waiting to disagree with the first.
+     */
+    @Transient
+    private Boolean hasUnpublishedChanges;
 }

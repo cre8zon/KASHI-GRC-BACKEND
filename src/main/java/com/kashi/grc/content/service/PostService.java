@@ -1,6 +1,7 @@
 package com.kashi.grc.content.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
@@ -8,9 +9,11 @@ import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.content.domain.ContentEnums.PostStatus;
 import com.kashi.grc.content.domain.ContentEnums.SchemaType;
 import com.kashi.grc.content.domain.Post;
+import com.kashi.grc.content.domain.PostDraft;
 import com.kashi.grc.content.domain.PostRevision;
 import com.kashi.grc.content.domain.PostTag;
 import com.kashi.grc.content.dto.PostDtos.PostUpsertRequest;
+import com.kashi.grc.content.repository.PostDraftRepository;
 import com.kashi.grc.content.repository.PostRepository;
 import com.kashi.grc.content.repository.PostRevisionRepository;
 import com.kashi.grc.content.repository.PostTagRepository;
@@ -55,6 +58,7 @@ public class PostService {
 
     private final PostRepository postRepository;
     private final PostRevisionRepository revisionRepository;
+    private final PostDraftRepository draftRepository;
     private final PostTagRepository postTagRepository;
     private final SlugService slugService;
     private final BlockService blockService;
@@ -67,8 +71,20 @@ public class PostService {
     // ── read ─────────────────────────────────────────────────────────────────
 
     public Post require(Long id) {
-        return postRepository.findById(id)
+        Post post = postRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("Post", id));
+        return withTags(post);
+    }
+
+    /**
+     * Attach the tag ids. Called on every path that hands a Post to the editor,
+     * so a save round-trips the same shape it was given.
+     */
+    private Post withTags(Post post) {
+        if (post != null && post.getId() != null) {
+            post.setTagIds(postTagRepository.findTagIdsByPostId(post.getId()));
+        }
+        return post;
     }
 
     public boolean slugAvailable(String slug, Long excludeId) {
@@ -105,22 +121,168 @@ public class PostService {
         insightsService.reindexLinks(saved);
 
         log.info("[CONTENT] created | id={} slug={}", saved.getId(), saved.getSlug());
-        return saved;
+        return withTags(saved);
+    }
+
+    /**
+     * Reverting a live article rewrites it under its readers, and unlike an
+     * edit there is no partial form of it worth banking. Blocked, with the two
+     * routes out named.
+     */
+    private void assertEditable(Post post) {
+        if (post.getStatus() == PostStatus.PUBLISHED) {
+            throw new BusinessException("POST_IS_LIVE",
+                    "This post is live. Unpublish it first, or make the change as a draft.");
+        }
     }
 
     /**
      * The autosave path. Called every two seconds while someone is typing, so
      * everything expensive is guarded by the hash comparison.
+     *
+     * ── LIVE POSTS FORK HERE ─────────────────────────────────────────────────
+     *
+     * There is one row per post and the public API reads it directly, so while
+     * a post is PUBLISHED its row IS the live article. Autosaving into it put a
+     * half-typed sentence in front of readers, and the build hook then shipped
+     * it about ninety seconds later.
+     *
+     * So a live post is not edited in place. The change is banked against it as
+     * a working copy and released deliberately.
      */
     @Transactional
     public Post update(Long id, PostUpsertRequest req) {
         Post post = require(id);
+        if (post.getStatus() == PostStatus.PUBLISHED) return stageDraft(post, req);
+        return applyUpdate(post, req);
+    }
+
+    /**
+     * Merge this change into the post's working copy.
+     *
+     * Merged, not replaced. Autosave sends only what changed — a title here, a
+     * meta description there — so overwriting the payload each time would drop
+     * every earlier edit in the session and leave a draft containing whichever
+     * field happened to be touched last.
+     */
+    private Post stageDraft(Post post, PostUpsertRequest req) {
+        Long actorId = currentUserId();
+        PostDraft draft = draftRepository.findByPostId(post.getId())
+                .orElseGet(() -> PostDraft.builder().postId(post.getId()).build());
+        try {
+            ObjectNode merged = draft.getPayloadJson() == null
+                    ? mapper.createObjectNode()
+                    : (ObjectNode) mapper.readTree(draft.getPayloadJson());
+
+            // Null means "leave alone" everywhere else in PostUpsertRequest, so
+            // it has to mean that here too.
+            ObjectNode incoming = mapper.valueToTree(req);
+            incoming.fields().forEachRemaining(e -> {
+                if (!e.getValue().isNull()) merged.set(e.getKey(), e.getValue());
+            });
+
+            draft.setPayloadJson(mapper.writeValueAsString(merged));
+            draft.setUpdatedById(actorId);
+            draftRepository.save(draft);
+            return withDraft(withTags(post), merged);
+        } catch (Exception e) {
+            throw new BusinessException("DRAFT_SAVE_FAILED",
+                    "Could not save your changes: " + e.getMessage());
+        }
+    }
+
+    /** Release the working copy: apply it, drop it, let the site rebuild. */
+    @Transactional
+    public Post publishDraft(Long id) {
+        Post post = require(id);
+        PostDraft draft = draftRepository.findByPostId(id)
+                .orElseThrow(() -> new BusinessException("NO_DRAFT",
+                        "There are no unpublished changes on this post"));
+        try {
+            PostUpsertRequest req = mapper.readValue(draft.getPayloadJson(), PostUpsertRequest.class);
+            Post updated = applyUpdate(post, req);
+            draftRepository.deleteByPostId(id);
+            log.info("[CONTENT] draft released | post={}", id);
+            return updated;
+        } catch (BusinessException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new BusinessException("DRAFT_PUBLISH_FAILED",
+                    "Could not publish those changes: " + e.getMessage());
+        }
+    }
+
+    /** Throw the working copy away. The live article was never touched. */
+    @Transactional
+    public void discardDraft(Long id) {
+        draftRepository.deleteByPostId(id);
+        log.info("[CONTENT] draft discarded | post={}", id);
+    }
+
+    /** The post as the EDITOR should see it: live values with the draft on top. */
+    @Transactional(readOnly = true)
+    public Post requireForEditing(Long id) {
+        Post post = withTags(require(id));
+        return draftRepository.findByPostId(id)
+                .map(d -> {
+                    try {
+                        return withDraft(post, (ObjectNode) mapper.readTree(d.getPayloadJson()));
+                    } catch (Exception e) {
+                        // A corrupt draft must not make the post unopenable.
+                        log.warn("[CONTENT] unreadable draft on post {} — ignoring", id);
+                        return post;
+                    }
+                })
+                .orElse(post);
+    }
+
+    /**
+     * Overlay the draft onto the post, for the editor only.
+     *
+     * Round-tripped through Jackson rather than mutated in place. The Post
+     * handed in is managed by the persistence context, and setting fields on it
+     * would flush the draft onto the live row at commit — the exact bug this
+     * whole table exists to prevent. A detached copy cannot do that.
+     */
+    private Post withDraft(Post post, ObjectNode payload) {
+        try {
+            ObjectNode asJson = mapper.valueToTree(post);
+            payload.fields().forEachRemaining(e -> asJson.set(e.getKey(), e.getValue()));
+            Post view = mapper.treeToValue(asJson, Post.class);
+            view.setHasUnpublishedChanges(true);
+            return view;
+        } catch (Exception e) {
+            log.warn("[CONTENT] could not overlay draft on post {}", post.getId(), e);
+            return post;
+        }
+    }
+
+    private Post applyUpdate(Post post, PostUpsertRequest req) {
+        Long id = post.getId();
         Long actorId = currentUserId();
 
         String previousHash = post.getBlocksHash();
         String previousBlocks = post.getContentBlocks();
 
-        // ── slug, and the redirect it may require ────────────────────────────
+        // ── slug: follows the title, until it does not ───────────────────────
+        //
+        // Ordering matters. An explicit slug in the request means someone typed
+        // one, which locks it; only when none was sent do we consider deriving
+        // a new one from the title.
+        if (req.getSlug() == null
+                && !Boolean.TRUE.equals(post.getSlugLocked())
+                && post.getStatus() != PostStatus.PUBLISHED
+                && post.getPublishedAt() == null
+                && req.getTitle() != null && !req.getTitle().isBlank()) {
+
+            String derived = slugService.slugify(req.getTitle());
+            if (!derived.isBlank() && !derived.equals(post.getSlug())) {
+                post.setSlug(slugService.unique(derived,
+                        candidate -> postRepository.existsBySlugAndIdNot(candidate, id)));
+            }
+        }
+
+        // ── an explicit slug, and the redirect it may require ────────────────
         if (req.getSlug() != null) {
             String desired = slugService.slugify(req.getSlug());
             if (desired.isBlank()) {
@@ -141,6 +303,9 @@ public class PostService {
                 }
                 post.setSlug(desired);
             }
+            // Typed once and it stops following — including if the title
+            // changes again tomorrow.
+            post.setSlugLocked(true);
         }
 
         applyEditableFields(post, req);
@@ -159,7 +324,7 @@ public class PostService {
         if (req.getTagIds() != null) replaceTags(saved.getId(), req.getTagIds());
         if (blocksChanged) insightsService.reindexLinks(saved);
 
-        return saved;
+        return withTags(saved);
     }
 
     /**
@@ -200,6 +365,8 @@ public class PostService {
     @Transactional
     public Post revert(Long postId, Long revisionId) {
         Post post = require(postId);
+        // Same rule. Reverting a live article rewrites it under its readers.
+        assertEditable(post);
         PostRevision revision = revisionRepository.findById(revisionId)
                 .orElseThrow(() -> new ResourceNotFoundException("PostRevision", revisionId));
         if (!Objects.equals(revision.getPostId(), postId)) {

@@ -80,6 +80,34 @@ public class StorageService {
     private static final long MAX_FILE_SIZE_BYTES = 50L * 1024 * 1024; // 50MB
     private static final int  WEBP_QUALITY         = 85;
     private static final int  MAX_IMAGE_DIMENSION  = 4096;
+
+    /**
+     * Say at startup which image encoder is actually available.
+     *
+     * The fallback from WebP to JPEG/PNG is silent by design — an upload must
+     * not fail because a native library is missing. Silent is right at runtime
+     * and useless at deploy time: without this line the only way to know
+     * whether the WebP writer registered is to upload something and inspect the
+     * stored mime type.
+     *
+     * It matters per environment, not per build. com.github.gotson:webp-imageio
+     * carries platform-specific natives, so the same jar can encode WebP on the
+     * x86_64 CI box and quietly fall back on an ARM production node.
+     */
+    @jakarta.annotation.PostConstruct
+    void reportImageEncoder() {
+        boolean webp = ImageIO.getImageWritersByMIMEType("image/webp").hasNext();
+        if (webp) {
+            log.info("[STORAGE] image encoder: WebP (quality {})", WEBP_QUALITY);
+        } else {
+            log.warn("[STORAGE] image encoder: NO WebP writer on this JVM — " +
+                            "uploads will be stored as JPEG, or PNG when they carry " +
+                            "transparency. Both are labelled correctly. Add " +
+                            "com.github.gotson:webp-imageio, and note it ships " +
+                            "platform-specific natives: os.arch={} os.name={}",
+                    System.getProperty("os.arch"), System.getProperty("os.name"));
+        }
+    }
     private static final Duration PUT_URL_TTL      = Duration.ofMinutes(15);
     private static final Duration GET_URL_TTL_LONG = Duration.ofHours(1);
     private static final Duration GET_URL_TTL_SHORT = Duration.ofMinutes(5);
@@ -234,9 +262,14 @@ public class StorageService {
         validateMimeType(file.getContentType());
         validateFileSize(file.getSize());
 
-        // Convert to WebP
-        byte[] webpBytes = convertToWebP(file.getBytes(), file.getOriginalFilename());
-        String s3Key = buildS3Key(tenantId, file.getOriginalFilename(), "webp");
+        // Encode, then take the extension and content type from what actually
+        // came out rather than from what we hoped would.
+        BufferedImage decoded = downscaleIfNeeded(
+                readImage(file.getBytes(), file.getOriginalFilename()), MAX_IMAGE_DIMENSION);
+        EncodedImage encoded = encode(decoded);
+
+        byte[] webpBytes = encoded.bytes();
+        String s3Key = buildS3Key(tenantId, file.getOriginalFilename(), encoded.extension());
         String sha256 = computeSha256(webpBytes);
 
         // Upload directly (server-side, no presigned URL needed here)
@@ -244,7 +277,7 @@ public class StorageService {
                 PutObjectRequest.builder()
                         .bucket(bucket)
                         .key(s3Key)
-                        .contentType("image/webp")
+                        .contentType(encoded.contentType())
                         .contentLength((long) webpBytes.length)
                         .serverSideEncryption(ServerSideEncryption.AWS_KMS)
                         .ssekmsKeyId(kmsKeyArn)
@@ -443,35 +476,174 @@ public class StorageService {
         // Downscale if needed (preserving aspect ratio)
         image = downscaleIfNeeded(image, MAX_IMAGE_DIMENSION);
 
-        // Write as WebP
-        // TwelveMonkeys 3.10+ supports WebP write via imageio-webp plugin
-        try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
-            var writers = ImageIO.getImageWritersByMIMEType("image/webp");
-            if (!writers.hasNext()) {
-                // Fallback: write as JPEG at quality 85 if WebP write not available
-                // Log a warning — add imageio-webp dependency to fix
-                log.warn("[STORAGE] WebP writer not found — falling back to JPEG. Add imageio-webp to classpath.");
-                var jpegWriters = ImageIO.getImageWritersByMIMEType("image/jpeg");
-                if (!jpegWriters.hasNext()) throw new IllegalStateException("No JPEG writer found");
-                var writer = jpegWriters.next();
-                var writeParam = writer.getDefaultWriteParam();
-                writeParam.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
-                writeParam.setCompressionQuality(WEBP_QUALITY / 100.0f);
-                writer.setOutput(ImageIO.createImageOutputStream(bos));
-                writer.write(null, new javax.imageio.IIOImage(image, null, null), writeParam);
-                return bos.toByteArray();
+        return encode(image).bytes();
+    }
+
+    /** Encoded bytes together with the format they are actually in. */
+    public record EncodedImage(byte[] bytes, String extension, String contentType) {}
+
+    /**
+     * Encode for the web, and report honestly what came out.
+     *
+     * ── TWO BUGS THIS REPLACES ───────────────────────────────────────────────
+     *
+     * 1. The JPEG fallback was handed the decoded image as-is. A PNG with
+     *    transparency decodes to a four-channel image and the JPEG writer
+     *    rejects it outright — "Bogus input colorspace" — so every upload with
+     *    an alpha channel failed. Anything in CMYK failed the same way.
+     *
+     * 2. Worse, and silent: when the fallback DID succeed, the caller still
+     *    named the object .webp and set Content-Type: image/webp on JPEG bytes.
+     *    Browsers sniff and render it anyway, which is why nobody noticed — but
+     *    a CDN doing format transforms, or a social scraper that trusts the
+     *    header, gets a file that lies about what it is.
+     *
+     * ── ON THE MISSING WEBP WRITER ───────────────────────────────────────────
+     *
+     * The old warning said to add imageio-webp to the classpath. It is already
+     * there and has been all along. TwelveMonkeys' WebP plugin is READ-only —
+     * it ships no writer. com.github.gotson:webp-imageio supplies one, with
+     * bundled native libwebp, and the startup probe reports which of the two
+     * situations this JVM is actually in.
+     *
+     * Where no WebP writer registers — an unsupported architecture, most
+     * likely — the outputs are JPEG and PNG, and they are labelled as such.
+     */
+    public EncodedImage encode(BufferedImage image) throws IOException {
+        var webpWriters = ImageIO.getImageWritersByMIMEType("image/webp");
+        if (webpWriters.hasNext()) {
+            try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+                var writer = webpWriters.next();
+                var params = writer.getDefaultWriteParam();
+
+                if (params.canWriteCompressed()) {
+                    params.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+
+                    // The TYPE has to be set before the QUALITY.
+                    //
+                    // The JPEG writer has one compression type and defaults to
+                    // it, so setCompressionQuality alone works — which is what
+                    // every example does, and what this was copied from. WebP
+                    // has two, Lossy and Lossless, and defaults to neither, so
+                    // the same two lines throw "No compression type set!".
+                    //
+                    // Read from getCompressionTypes rather than hardcoding
+                    // "Lossy": the string belongs to the writer, not the
+                    // format, and another WebP implementation may spell it
+                    // differently.
+                    String[] types = params.getCompressionTypes();
+                    if (types != null && types.length > 0) {
+                        String chosen = types[0];
+                        for (String t : types) {
+                            if (t.toLowerCase().contains("lossy")) { chosen = t; break; }
+                        }
+                        params.setCompressionType(chosen);
+                    }
+
+                    params.setCompressionQuality(WEBP_QUALITY / 100.0f);
+                }
+
+                // The ImageOutputStream has to be closed before the bytes are
+                // read, and the writer disposed.
+                //
+                // createImageOutputStream returns a MemoryCacheImageOutputStream
+                // that buffers internally; nothing reaches the
+                // ByteArrayOutputStream until it is flushed. Reading
+                // bos.toByteArray() while it is still open returns an EMPTY
+                // array — which is what "originalSize=1867389 → webpSize=0" in
+                // the log was, and why the upload succeeded, the row saved, and
+                // the image would not render.
+                //
+                // Nothing throws. A zero-byte object is a perfectly valid S3
+                // PUT.
+                try (var out = ImageIO.createImageOutputStream(bos)) {
+                    writer.setOutput(out);
+                    writer.write(null, new javax.imageio.IIOImage(image, null, null), params);
+                    out.flush();
+                } finally {
+                    writer.dispose();
+                }
+                byte[] bytes = bos.toByteArray();
+                if (bytes.length == 0) throw new IOException("WebP encoder produced no bytes");
+                return new EncodedImage(bytes, "webp", "image/webp");
+
+            } catch (Exception e) {
+                // Fall through to JPEG/PNG rather than failing the upload.
+                //
+                // A writer that registers is not a writer that works — this one
+                // registered cleanly at startup and then threw on the second
+                // line of its own configuration. Losing an image somebody just
+                // chose, because an optional size optimisation misbehaved, is
+                // the wrong trade. The fallbacks are correct, just larger.
+                log.warn("[STORAGE] WebP encode failed ({}) — falling back to JPEG/PNG",
+                        e.toString());
             }
-            var writer = writers.next();
-            var writeParam = writer.getDefaultWriteParam();
-            // WebP quality: 0.0 = smallest, 1.0 = lossless
-            if (writeParam.canWriteCompressed()) {
-                writeParam.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
-                writeParam.setCompressionQuality(WEBP_QUALITY / 100.0f);
-            }
-            writer.setOutput(ImageIO.createImageOutputStream(bos));
-            writer.write(null, new javax.imageio.IIOImage(image, null, null), writeParam);
-            return bos.toByteArray();
         }
+
+        // Transparency has to survive. Flattening a logo onto white and calling
+        // it a JPEG is lossy in a way the uploader cannot undo, so anything with
+        // an alpha channel goes out as PNG instead.
+        if (image.getColorModel().hasAlpha()) {
+            try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+                // ImageIO.write manages its own stream, so this branch was
+                // always correct — the guard is here so all three agree.
+                ImageIO.write(toType(image, BufferedImage.TYPE_INT_ARGB), "png", bos);
+                byte[] bytes = bos.toByteArray();
+                if (bytes.length == 0) throw new IOException("PNG encoder produced no bytes");
+                return new EncodedImage(bytes, "png", "image/png");
+            }
+        }
+
+        try (ByteArrayOutputStream bos = new ByteArrayOutputStream()) {
+            // TYPE_INT_RGB unconditionally: this is what makes CMYK and other
+            // exotic colour models encodable rather than an exception.
+            BufferedImage rgb = toType(image, BufferedImage.TYPE_INT_RGB);
+            var jpegWriters = ImageIO.getImageWritersByMIMEType("image/jpeg");
+            if (!jpegWriters.hasNext()) throw new IllegalStateException("No JPEG writer found");
+            var writer = jpegWriters.next();
+            var params = writer.getDefaultWriteParam();
+            params.setCompressionMode(javax.imageio.ImageWriteParam.MODE_EXPLICIT);
+            params.setCompressionQuality(WEBP_QUALITY / 100.0f);
+            // Identical to the WebP branch above, and identically broken until
+            // now — it had simply never run, because every upload failed before
+            // reaching it.
+            try (var out = ImageIO.createImageOutputStream(bos)) {
+                writer.setOutput(out);
+                writer.write(null, new javax.imageio.IIOImage(rgb, null, null), params);
+                out.flush();
+            } finally {
+                writer.dispose();
+            }
+            byte[] bytes = bos.toByteArray();
+            if (bytes.length == 0) throw new IOException("JPEG encoder produced no bytes");
+            return new EncodedImage(bytes, "jpg", "image/jpeg");
+        }
+    }
+
+    /** Decode, so callers can encode without decoding twice. */
+    public BufferedImage readImage(byte[] inputBytes, String originalFilename) throws IOException {
+        BufferedImage image;
+        try (InputStream is = new ByteArrayInputStream(inputBytes)) {
+            image = ImageIO.read(is);
+        }
+        if (image == null) {
+            throw new IllegalArgumentException("Could not decode image: " + originalFilename);
+        }
+        return image;
+    }
+
+    /** Redraw into a known type. White ground, so flattened alpha is not black. */
+    private BufferedImage toType(BufferedImage src, int type) {
+        if (src.getType() == type) return src;
+        BufferedImage out = new BufferedImage(src.getWidth(), src.getHeight(), type);
+        var g = out.createGraphics();
+        if (type == BufferedImage.TYPE_INT_RGB) {
+            g.setColor(java.awt.Color.WHITE);
+            g.fillRect(0, 0, src.getWidth(), src.getHeight());
+        }
+        g.drawImage(src, 0, 0, null);
+        g.dispose();
+        return out;
     }
 
     private BufferedImage downscaleIfNeeded(BufferedImage img, int maxDimension) {

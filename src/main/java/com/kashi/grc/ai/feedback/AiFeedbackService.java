@@ -74,10 +74,33 @@ public class AiFeedbackService {
         // Idempotent: a double-click on Accept must not double-count.
         if (req.getSuggestionKey() != null
                 && feedbackRepository.existsByInteractionIdAndSuggestionKey(
-                        req.getInteractionId(), req.getSuggestionKey())) {
+                req.getInteractionId(), req.getSuggestionKey())) {
             log.debug("[AI-FEEDBACK] duplicate for interaction {} key {} — ignored",
                     req.getInteractionId(), req.getSuggestionKey());
             return null;
+        }
+
+        // Reject a missing decision HERE, with a message that says what is wrong.
+        //
+        // decision maps to a nullable = false column, so a null arrived as a raw
+        // constraint violation — "Column 'decision' cannot be null" — surfacing to
+        // the user as "An unexpected error occurred" and telling whoever debugs it
+        // nothing about which caller sent the bad payload.
+        //
+        // Null also means the value did not MATCH the enum: Jackson maps an
+        // unrecognised string to null by default, so a caller sending "accepted"
+        // or "accept" looks identical to one sending nothing at all. The message
+        // lists the valid values for that reason.
+        if (req.getDecision() == null) {
+            // BusinessException, not IllegalArgumentException: GlobalExceptionHandler
+            // maps the former to a 400 and has no handler for the latter, which would
+            // fall through to a 500 — the same opaque failure this replaces.
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "AI_FEEDBACK_DECISION_REQUIRED",
+                    "feedback decision is required and must be one of: "
+                            + java.util.Arrays.toString(FeedbackDecision.values())
+                            + " (a value outside this set is received as null)",
+                    org.springframework.http.HttpStatus.BAD_REQUEST);
         }
 
         Double editRatio = null;

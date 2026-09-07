@@ -73,6 +73,7 @@ public class AiChatService {
     private final JsonSchemaGuard         jsonGuard;
     private final AiUsageService          usageService;
     private final AiInteractionRepository interactionRepository;
+    private final AiInteractionAuditWriter auditWriter;
     private final AiOrgProfileRepository  orgProfileRepository;
     private final AiInteractionRecorder   recorder;
     private final AiProperties            props;
@@ -328,7 +329,11 @@ public class AiChatService {
         long cost = usageService.computeCostMicros(provider.key(),
                 nz(response.promptTokens()), nz(response.completionTokens()));
 
-        AiInteraction interaction = interactionRepository.save(AiInteraction.builder()
+        // Saved via auditWriter, NOT interactionRepository directly: the caller may
+        // hold a read-only transaction (PolicyAiService.suggestMetadata does), and a
+        // read-only connection rejects the insert — failing a request whose model
+        // call had already succeeded. REQUIRES_NEW gives this its own connection.
+        AiInteraction interaction = auditWriter.save(AiInteraction.builder()
                 .taskType(call.taskType)
                 .pipelineName(call.pipelineName).stepIndex(call.stepIndex).stepName(call.stepName)
                 .promptTemplateKey(template.getTemplateKey()).promptTemplateVersion(template.getVersion())
@@ -357,13 +362,17 @@ public class AiChatService {
                 0, cost, status != InteractionStatus.SUCCESS, false);
 
         log.info("[AI-CHAT] {} | model={} tokens={} latency={}ms status={} interaction={}",
-                call.templateKey, model, response.totalTokens(), latency, status, interaction.getId());
+                call.templateKey, model, response.totalTokens(), latency, status,
+                interaction != null ? interaction.getId() : null);
 
         if (status == InteractionStatus.INVALID_OUTPUT && Boolean.TRUE.equals(template.getExpectsJson())) {
             throw GuardrailException.invalidOutput("the model's structured response could not be validated");
         }
 
-        return new AiResult(content, parsed, interaction.getId(),
+        // Null id when the audit write failed. The answer is still valid and is
+        // still returned — the caller loses only the ability to link back to a log
+        // row that does not exist.
+        return new AiResult(content, parsed, interaction != null ? interaction.getId() : null,
                 response.model(), response.totalTokens(), latency, false);
     }
 

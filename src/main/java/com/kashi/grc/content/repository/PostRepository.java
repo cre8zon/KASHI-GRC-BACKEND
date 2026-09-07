@@ -17,6 +17,35 @@ import java.util.Optional;
 
 public interface PostRepository extends JpaRepository<Post, Long> {
 
+    /**
+     * How many posts reference this media asset, anywhere.
+     *
+     * Three places, and missing any one of them turns a delete into a broken
+     * image somebody else finds months later:
+     *
+     *   hero_image_id   the article cover
+     *   og_image_id     the social card
+     *   content_blocks  every image and download block in the body
+     *
+     * The last one is why this is native SQL. mediaId lives inside a JSON
+     * array of blocks, so there is no column to join on. `$**.mediaId` collects
+     * every mediaId at any depth and JSON_CONTAINS asks whether ours is among
+     * them — JSON_SEARCH would not do, because it only matches strings and
+     * these are numbers.
+     *
+     * COALESCE covers a post whose blocks contain no media at all, where
+     * JSON_EXTRACT returns NULL rather than an empty array.
+     */
+    @Query(value = """
+            SELECT COUNT(*) FROM content_posts p
+            WHERE p.hero_image_id = :mediaId
+               OR p.og_image_id   = :mediaId
+               OR JSON_CONTAINS(
+                    COALESCE(JSON_EXTRACT(p.content_blocks, '$**.mediaId'), JSON_ARRAY()),
+                    CAST(:mediaId AS JSON))
+            """, nativeQuery = true)
+    long countMediaUsages(@Param("mediaId") Long mediaId);
+
     Optional<Post> findBySlug(String slug);
 
     /**
