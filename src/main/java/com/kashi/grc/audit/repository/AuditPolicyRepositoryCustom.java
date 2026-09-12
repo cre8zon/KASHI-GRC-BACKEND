@@ -12,7 +12,18 @@ import java.util.List;
 public interface AuditPolicyRepositoryCustom {
 
     /** Count policies visible to a tenant (global + tenant). */
-    long countForTenant(Long tenantId);
+    /** systemUser sees globals at ANY status; a tenant sees only APPROVED ones. */
+    long countForTenant(Long tenantId, boolean systemUser);
+
+    /**
+     * Ref-uniqueness check that works for GLOBAL policies too.
+     *
+     * The derived existsByPolicyRefAndTenantId(ref, null) generates
+     * "tenant_id = null" in SQL, which is never true — so for a global policy the
+     * duplicate check always passed and the generator could hand out a ref that
+     * already existed. Criteria lets us emit IS NULL instead.
+     */
+    boolean policyRefExists(String policyRef, Long tenantId);
 
     /** All policies visible to a tenant, ORDER BY title. */
     List<AuditPolicy> findByTenantIdOrderByTitleAsc(Long tenantId);
@@ -26,7 +37,7 @@ public interface AuditPolicyRepositoryCustom {
      */
     List<AuditPolicySummary> findSummariesForTenant(Long tenantId, String search,
                                                     AuditPolicy.PolicyStatus status,
-                                                    String origin);
+                                                    String origin, boolean systemUser);
 
     /** Policies visible to a tenant filtered by status. */
     List<AuditPolicy> findByTenantIdAndStatus(Long tenantId, AuditPolicy.PolicyStatus status);

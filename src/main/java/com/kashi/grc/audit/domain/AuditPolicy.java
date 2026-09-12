@@ -176,6 +176,15 @@ public class AuditPolicy extends GlobalOrTenantEntity {
     public enum PolicyStatus {
         DRAFT,
         UNDER_REVIEW,
+        /**
+         * Reviewed, awaiting final approval.
+         *
+         * Exists so the REVIEW step and the APPROVE step are distinguishable.
+         * Both used to sit in UNDER_REVIEW, and every action gated on that status
+         * matched at both — so a reviewer was offered the final Approve, skipping
+         * step 3 and its separation-of-duties rule entirely.
+         */
+        PENDING_APPROVAL,
         APPROVED,
         DEPRECATED
     }

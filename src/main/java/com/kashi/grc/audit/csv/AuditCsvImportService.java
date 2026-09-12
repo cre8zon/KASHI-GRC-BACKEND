@@ -639,7 +639,7 @@ public class AuditCsvImportService {
     }
 
     private String generatePolicyRef(Long tenantId) {
-        long count = policyRepository.countForTenant(tenantId) + 1;
+        long count = policyRepository.countForTenant(tenantId, tenantId == null) + 1;
         return String.format("POL-%04d", count);
     }
 

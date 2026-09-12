@@ -25,6 +25,7 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
+import com.kashi.grc.audit.service.GlobalPolicyLinter;
 
 @Slf4j
 @RestController
@@ -45,6 +46,8 @@ public class AuditPolicyController {
     private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditPolicyInstanceRepository               policyInstanceRepository;
     private final AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
+    private final com.kashi.grc.workflow.repository.WorkflowInstanceRepository workflowInstanceRepository;
+    private final GlobalPolicyLinter globalPolicyLinter;
     private final UtilityService                              utilityService;
     private final WorkflowEngineService                       workflowEngineService;
     private final WorkflowRepository                          workflowRepository;
@@ -72,7 +75,8 @@ public class AuditPolicyController {
         // document never leaves MySQL.
         // Cached per tenant + filter combination. Status parsing and the
         // projection both live in the cache service so a hit does neither.
-        var cached = libraryCache.policyList(tenantId, search, status, origin);
+        var cached = libraryCache.policyList(tenantId, search, status, origin,
+                utilityService.isSystemUser());
 
         // `editable` is added HERE, not in the cache. It derives from
         // isSystemUser(), a property of the USER, while the cache key is per
@@ -126,16 +130,47 @@ public class AuditPolicyController {
     @Operation(summary = "Create a new policy (starts as DRAFT)")
     public ResponseEntity<ApiResponse<Map<String, Object>>> createPolicy(
             @RequestBody AuditPolicyRequest req) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         Long userId   = utilityService.getLoggedInDataContext().getId();
+
+        // ── Scope: DERIVED from the side, not asked ──────────────────────────
+        //
+        // A platform admin authoring in the system side is writing for the
+        // platform library, which is tenant_id NULL. Taking tenantId straight
+        // from the context gave them tenant 1 — a private policy of the system
+        // tenant that no other organisation can see. That is how POL-009 ended up
+        // as a tenant-1 policy when it was meant to be global, and why there was
+        // no way to author a global policy at all.
+        //
+        // `scope` on the request is an explicit override for the rare case, not a
+        // question the UI needs to ask: absent, the side decides. A tenant user
+        // asking for GLOBAL is refused — scope is not theirs to choose.
+        boolean systemUser = utilityService.isSystemUser();
+        Long ctxTenantId   = utilityService.getLoggedInDataContext().getTenantId();
+
+        String scope = req.getScope() == null ? null : req.getScope().trim().toUpperCase();
+        if ("GLOBAL".equals(scope) && !systemUser) {
+            throw new BusinessException("POLICY_SCOPE_DENIED",
+                    "Only platform administrators can create platform-wide policies.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        Long tenantId;
+        if (scope != null) {
+            tenantId = "GLOBAL".equals(scope) ? null : ctxTenantId;
+        } else {
+            tenantId = systemUser ? null : ctxTenantId;
+        }
 
         String resolvedRef = req.getPolicyRef();
         if (resolvedRef == null || resolvedRef.isBlank()) {
-            long base = policyRepository.countForTenant(tenantId) + 1;
+            // tenantId == null means we are numbering in the GLOBAL namespace, and
+            // there the count must include DRAFT globals — otherwise two unapproved
+            // policies race for the same ref.
+            long base = policyRepository.countForTenant(tenantId, tenantId == null) + 1;
             String candidate;
             do {
                 candidate = String.format("POL-%03d", base++);
-            } while (policyRepository.existsByPolicyRefAndTenantId(candidate, tenantId));
+            } while (policyRepository.policyRefExists(candidate, tenantId));   // IS NULL-safe for global
             resolvedRef = candidate;
         }
 
@@ -237,6 +272,23 @@ public class AuditPolicyController {
                     HttpStatus.FORBIDDEN);
         }
 
+        // Guard the status here too, not only in the UI.
+        //
+        // This endpoint previously accepted a policy in ANY status — it checked
+        // separation of duties and nothing else. A DRAFT could be approved
+        // straight to APPROVED by anyone who called the API directly, skipping
+        // review entirely. The button gating hid that; it did not prevent it.
+        //
+        // UNDER_REVIEW stays accepted alongside PENDING_APPROVAL so policies
+        // already mid-flow when this deploys can still be approved.
+        if (policy.getStatus() != AuditPolicy.PolicyStatus.PENDING_APPROVAL
+                && policy.getStatus() != AuditPolicy.PolicyStatus.UNDER_REVIEW) {
+            throw new BusinessException("INVALID_STATUS",
+                    "Only a reviewed policy can be approved. Current status: "
+                            + policy.getStatus(),
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
         policy.setStatus(AuditPolicy.PolicyStatus.APPROVED);
         policy.setApprovedById(userId);
         policy.setApprovedAt(LocalDateTime.now());
@@ -251,10 +303,23 @@ public class AuditPolicyController {
             startPolicyWorkflowIfConfigured(policy, tenantId, userId);
         }
 
+        // Same rule as review: close the step first, and only mark the policy
+        // APPROVED if it actually closed. An approval that did not complete its
+        // workflow step is not an approval — it is a policy that merely looks
+        // approved while its audit trail says otherwise, which for a GRC tool is
+        // the worst of the three outcomes.
+        boolean stepMoved = policyWorkflow.onApproved(
+                policy, utilityService.getLoggedInDataContext().getId());
+
+        if (!stepMoved) {
+            throw new BusinessException("WORKFLOW_STEP_NOT_ADVANCED",
+                    "The approval step could not be completed, so the policy has not been "
+                            + "approved. This usually means the step is assigned to someone else — ask "
+                            + "them to action it, or use override.",
+                    HttpStatus.CONFLICT);
+        }
+
         policyRepository.save(policy);
-        // Completes the approval step, closing the workflow. Non-fatal when no
-        // Policy Approval blueprint is configured for the tenant.
-        policyWorkflow.onApproved(policy, utilityService.getLoggedInDataContext().getId());
 
         log.info("[AUDIT-POLICY] Approved | id={} | workflowInstanceId={}",
                 id, policy.getWorkflowInstanceId());
@@ -266,6 +331,55 @@ public class AuditPolicyController {
         return ResponseEntity.ok(ApiResponse.success(
                 responseMap("id", id, "status", "APPROVED",
                         "workflowInstanceId", policy.getWorkflowInstanceId())));
+    }
+
+    @PostMapping("/v1/audit/library/policies/{id}/cancel-workflow")
+    @Operation(summary = "Cancel the approval workflow and return the policy to DRAFT")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> cancelPolicyWorkflow(
+            @PathVariable Long id,
+            @RequestParam(required = false) String remarks) {
+
+        // Why a policy-level endpoint instead of the generic
+        // PATCH /v1/workflow-instances/{id}/cancel:
+        //
+        // The generic one cancels the INSTANCE and stops. It knows nothing about
+        // the policy, so the policy stayed UNDER_REVIEW with no workflow — the
+        // review and approve buttons still matched on status, while Edit content
+        // and Send for review (both DRAFT-only) did not. The policy was stranded
+        // in a review state with nothing to review it.
+        //
+        // Cancelling an approval means the approval did not happen, so the policy
+        // belongs back in DRAFT. Doing both here keeps the status and the workflow
+        // from disagreeing.
+
+        AuditPolicy policy = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);   // only the owning tenant (or SYSTEM for a global) may cancel
+
+        Long userId = utilityService.getLoggedInDataContext().getId();
+        Long instanceId = policy.getWorkflowInstanceId();
+
+        if (instanceId != null) {
+            try {
+                workflowEngineService.cancelInstance(instanceId, userId, remarks);
+            } catch (Exception ex) {
+                // An instance that is already cancelled, or missing, must not block
+                // the policy from being freed — that is the trap this exists to undo.
+                log.warn("[AUDIT-POLICY] Cancel instance failed (continuing) | policyId={} instanceId={} | {}",
+                        id, instanceId, ex.getMessage());
+            }
+        }
+
+        policy.setWorkflowInstanceId(null);
+        policy.setStatus(AuditPolicy.PolicyStatus.DRAFT);
+        policyRepository.save(policy);
+        libraryCache.evictLibraryLists();
+
+        log.info("[AUDIT-POLICY] Workflow cancelled | policyId={} | cancelledInstanceId={} | status=DRAFT",
+                id, instanceId);
+
+        return ResponseEntity.ok(ApiResponse.success(responseMap(
+                "id", id, "status", "DRAFT", "cancelledInstanceId", instanceId)));
     }
 
     @PostMapping("/v1/audit/library/policies/{id}/send-for-review")
@@ -287,11 +401,46 @@ public class AuditPolicyController {
 
         policy.setStatus(AuditPolicy.PolicyStatus.UNDER_REVIEW);
 
-        if (policy.getWorkflowInstanceId() == null) {
+        // Start a workflow when there is no LIVE one — not merely when the field
+        // is null.
+        //
+        // Cancelling an instance marks it CANCELLED and expires its tasks, but
+        // leaves audit_policies.workflow_instance_id pointing at it. This guard
+        // read that pointer as "a workflow exists", so after a cancel the policy
+        // could never start another: send-for-review moved the status and
+        // silently attached nothing. Cancel was unusable as a recovery path,
+        // which is exactly what it is for.
+        if (!hasLiveWorkflow(policy)) {
+            policy.setWorkflowInstanceId(null);   // drop the dead pointer first
             startPolicyWorkflowIfConfigured(policy, tenantId, userId);
         }
 
         policyRepository.save(policy);
+
+        // Complete the DRAFTING step.
+        //
+        // The blueprint is Draft → Review → Approve, and the workflow starts at
+        // step 1. Sending for review IS the end of drafting, but nothing fired the
+        // event, so the instance sat on "Draft policy" with a pending task while
+        // the policy status had already moved to UNDER_REVIEW. Progress read 0/3
+        // with a task assigned to the person who had just finished that work.
+        //
+        // AuditPolicyWorkflowService.onDrafted existed for exactly this and was
+        // never called. Fired AFTER save so the step advances against the
+        // committed status, and non-fatal by design — a missing blueprint must not
+        // fail the send.
+        boolean stepMoved = policyWorkflow.onDrafted(policy, userId);
+
+        if (!stepMoved) {
+            // The instance has already started, so the policy is not stranded:
+            // Cancel workflow returns it to DRAFT cleanly. Better that than
+            // UNDER_REVIEW with step 1 still open.
+            throw new BusinessException("WORKFLOW_STEP_NOT_ADVANCED",
+                    "The drafting step could not be completed, so the policy has not been "
+                            + "sent for review. Cancel the workflow and try again, or use override.",
+                    HttpStatus.CONFLICT);
+        }
+
         log.info("[AUDIT-POLICY] Sent for review | id={} | workflowInstanceId={}",
                 id, policy.getWorkflowInstanceId());
         // Library lists are cached; every mutation invalidates them. Placed at
@@ -299,9 +448,21 @@ public class AuditPolicyController {
         // refusal, a validation failure) does not clear a cache it never changed.
         libraryCache.evictLibraryLists();
 
-        return ResponseEntity.ok(ApiResponse.success(
-                responseMap("id", id, "status", policy.getStatus(),
-                        "workflowInstanceId", policy.getWorkflowInstanceId())));
+        // Lint AFTER the approval commits, never before.
+        //
+        // These are heuristics over prose and every one can be wrong on a
+        // legitimate policy ("aligned with ISO 27001:2022" is a literal date to a
+        // regex). Blocking approval on a guess would strand an author with no way
+        // through. The warnings ride back on the response for the UI to surface,
+        // and the approval stands either way.
+        List<GlobalPolicyLinter.Warning> lintWarnings =
+                globalPolicyLinter.lint(policy, resolveTenantName(tenantId));
+
+        Map<String, Object> approveBody = responseMap(
+                "id", id, "status", policy.getStatus(),
+                "workflowInstanceId", policy.getWorkflowInstanceId());
+        if (!lintWarnings.isEmpty()) approveBody.put("warnings", lintWarnings);
+        return ResponseEntity.ok(ApiResponse.success(approveBody));
     }
 
     /**
@@ -344,11 +505,32 @@ public class AuditPolicyController {
             // being written again, and leaving it UNDER_REVIEW would show a
             // reviewer a queue item nobody is acting on.
             policy.setStatus(AuditPolicy.PolicyStatus.DRAFT);
+        } else {
+            // Review passed → PENDING_APPROVAL. The document is no longer being
+            // reviewed, it is waiting on the approver, and the buttons now follow
+            // the step without a permission override to tell them apart.
+            policy.setStatus(AuditPolicy.PolicyStatus.PENDING_APPROVAL);
         }
-        policyRepository.save(policy);
-
-        policyWorkflow.onReviewed(policy, changesRequested,
+        // Move the WORKFLOW first, and only then the status.
+        //
+        // Previously the status was saved and the workflow nudged afterwards with
+        // its failures swallowed. When the step refused to move — wrong task, no
+        // section, no live task — the policy advanced anyway and the buttons
+        // followed it, offering the NEXT step's action while the step sat open.
+        // A non-technical user then needed SQL to get out. Now a step that cannot
+        // move blocks the status, and the user is told.
+        boolean stepMoved = policyWorkflow.onReviewed(policy, changesRequested,
                 utilityService.getLoggedInDataContext().getId(), remarks);
+
+        if (!stepMoved) {
+            throw new BusinessException("WORKFLOW_STEP_NOT_ADVANCED",
+                    "The review was recorded but the workflow step could not be completed. "
+                            + "This usually means the step is assigned to someone else — ask them to "
+                            + "action it, or use override. The policy status is unchanged.",
+                    HttpStatus.CONFLICT);
+        }
+
+        policyRepository.save(policy);
 
         log.info("[AUDIT-POLICY] Review recorded | id={} outcome={}", id, outcome);
         libraryCache.evictLibraryLists();
@@ -1426,7 +1608,23 @@ public class AuditPolicyController {
         m.put("externalUrl",        p.getExternalUrl());
         m.put("evidenceRecordId",   p.getEvidenceRecordId());
         m.put("approvedById",       p.getApprovedById());
-        m.put("workflowInstanceId", p.getWorkflowInstanceId());
+        // Report the pointer ONLY while the instance is live.
+        //
+        // cancelInstance marks the instance CANCELLED and expires its tasks but
+        // leaves this column set. The UI then reads a dead id as "there is a
+        // workflow": Cancel workflow stayed visible with nothing to cancel, and
+        // Send for review stayed hidden because the transition gate believed a
+        // workflow was already running. Both wrong, from one stale number.
+        //
+        // Nulling it here fixes both gates in one place. workflowStatus is sent
+        // alongside so the Workflow tab can still show what happened — the row
+        // is not lost, it is just no longer claimed as current.
+        boolean live = hasLiveWorkflow(p);
+        m.put("workflowInstanceId", live ? p.getWorkflowInstanceId() : null);
+        m.put("workflowInstanceIdHistoric", p.getWorkflowInstanceId());
+        m.put("workflowStatus", p.getWorkflowInstanceId() == null ? null
+                : workflowInstanceRepository.findById(p.getWorkflowInstanceId())
+                  .map(i -> i.getStatus().name()).orElse(null));
         // Drives ui_actions.requires_assignment. Without it that flag is inert —
         // the gate reads this field and treats "absent" as "allowed", so an
         // action marked assignment-scoped was visible to everyone.
@@ -1466,6 +1664,11 @@ public class AuditPolicyController {
 
     @Data
     public static class AuditPolicyRequest {
+        /**
+         * GLOBAL | ORG. Optional override — normally the side decides, so the UI
+         * does not need to ask. A tenant user sending GLOBAL is refused.
+         */
+        private String  scope;
         @NotBlank private String title;
         private String  policyRef;
         private String  description;
@@ -1485,5 +1688,36 @@ public class AuditPolicyController {
     public static class PolicyReviewRequest {
         @NotBlank private String reviewResult;
         private String auditorNotes;
+    }
+
+    /** Tenant display name for the linter. Null-safe: a missing name just
+     *  disables the name rule, it must not fail an approval. */
+    private String resolveTenantName(Long tenantId) {
+        if (tenantId == null) return null;
+        try {
+            return tenantRepository.findById(tenantId).map(t -> t.getName()).orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * True only while the attached instance can still be acted on.
+     *
+     * COMPLETED, REJECTED and CANCELLED are terminal — the policy is free to
+     * start a fresh approval. ON_HOLD is NOT terminal: it is a deliberate pause,
+     * and starting a second workflow behind it would leave two instances
+     * competing for one policy.
+     */
+    private boolean hasLiveWorkflow(AuditPolicy policy) {
+        Long instanceId = policy.getWorkflowInstanceId();
+        if (instanceId == null) return false;
+        return workflowInstanceRepository.findById(instanceId)
+                .map(i -> i.getStatus() == com.kashi.grc.workflow.enums.WorkflowStatus.PENDING
+                        || i.getStatus() == com.kashi.grc.workflow.enums.WorkflowStatus.IN_PROGRESS
+                        || i.getStatus() == com.kashi.grc.workflow.enums.WorkflowStatus.ON_HOLD)
+                // Pointer to an instance that no longer exists: treat as dead
+                // rather than blocking the policy forever.
+                .orElse(false);
     }
 }

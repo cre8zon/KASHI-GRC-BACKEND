@@ -52,6 +52,7 @@ import java.util.stream.Collectors;
 public class AuditTestPolicySnapshotService {
 
     private final com.kashi.grc.ucf.service.TagExpansionService tagExpansionService;
+    private final AuditFindingEscalationWriter                escalationWriter;
     private final AuditTestRepository                         testRepository;
     private final AuditControlTestMappingRepository           controlTestMappingRepository;
     private final AuditTestInstanceRepository                  testInstanceRepository;
@@ -556,11 +557,28 @@ public class AuditTestPolicySnapshotService {
      * Order: the auditee who owns the control, then the auditor who tested it,
      * then the engagement's lead auditor.
      */
+    /**
+     * Who owns the remediation of an auto-raised finding.
+     *
+     * Auditee first, then the engagement LEAD AUDITEE — never an auditor.
+     *
+     * The chain used to end at leadAuditorId, and automated checks run whether or
+     * not sections have been assigned, so on an engagement with no auditee yet
+     * every finding fell through to the lead auditor. That is backwards twice:
+     * remediation is the organisation's work, and step 3 of the remediation
+     * workflow is "Auditor Validates Remediation" — the same person would have
+     * validated their own fix, which is the separation of duties the policy
+     * workflow enforces by rule.
+     *
+     * assignedAuditorId is dropped from the chain entirely for the same reason.
+     * If no auditee exists at any level, return null: the caller already refuses
+     * to escalate an ownerless finding, and leaving it for manual assignment is
+     * better than handing it to the wrong side.
+     */
     private Long resolveOwner(AuditControlInstance control) {
         if (control.getAuditeeAssignedUserId() != null) return control.getAuditeeAssignedUserId();
-        if (control.getAssignedAuditorId()     != null) return control.getAssignedAuditorId();
         return engagementRepository.findById(control.getEngagementId())
-                .map(e -> e.getLeadAuditorId()).orElse(null);
+                .map(e -> e.getLeadAuditeeId()).orElse(null);
     }
 
     /** Who raised it — the auditor who tested, else the engagement lead. */
@@ -631,11 +649,19 @@ public class AuditTestPolicySnapshotService {
             req.setFrameworkRef(finding.getFrameworkRef());
             req.setOwnerId(finding.getOwnerId());
             req.setWorkflowId(findingWorkflowId(tenantId));
-            var issueResp = issueService.create(req, finding.getRaisedBy(), tenantId);
-            finding.setLinkedIssueId(issueResp.getId());
-            findingRepository.save(finding);
-            log.info("[AUDIT-DERIVE] Auto-escalated to issue | findingId={} issueId={}",
-                    finding.getId(), issueResp.getId());
+            // REQUIRES_NEW, via the writer. Calling issueService.create() directly
+            // joined THIS transaction, so its failure marked the whole thing
+            // rollback-only — and the catch below could not undo that. The caller
+            // logged "non-fatal" and then died at commit, taking the integration
+            // run with it.
+            Long issueId = escalationWriter.escalate(
+                    finding, req, finding.getRaisedBy(), tenantId);
+
+            if (issueId != null) {
+                // Keep the in-session entity consistent with what the writer
+                // committed, without saving it again from here.
+                finding.setLinkedIssueId(issueId);
+            }
         } catch (Exception ex) {
             log.warn("[AUDIT-DERIVE] Auto-escalate failed for finding {} — {}",
                     finding.getId(), ex.getMessage());

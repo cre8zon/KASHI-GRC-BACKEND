@@ -79,8 +79,15 @@ public class AuditLibraryCacheService {
      */
     @Cacheable(cacheNames = CacheNames.AUDIT_POLICY_LIST)
     @Transactional(readOnly = true)
+    // systemUser is part of the cache KEY, deliberately.
+    //
+    // It changes which rows come back — a platform admin sees global DRAFTs, a
+    // tenant does not. Leaving it out of the key would let one audience be
+    // served the other's cached list, which for a tenant means seeing platform
+    // work in progress.
     public List<Map<String, Object>> policyList(Long tenantId, String search,
-                                                String status, String origin) {
+                                                String status, String origin,
+                                                boolean systemUser) {
         AuditPolicy.PolicyStatus statusFilter = null;
         if (status != null && !status.isBlank()) {
             try {
@@ -93,7 +100,7 @@ public class AuditLibraryCacheService {
         log.debug("[LIBRARY-CACHE] MISS policyList tenantId={} search={} status={} origin={}",
                 tenantId, search, status, origin);
 
-        var rows = policyRepository.findSummariesForTenant(tenantId, search, statusFilter, origin);
+        var rows = policyRepository.findSummariesForTenant(tenantId, search, statusFilter, origin, systemUser);
 
         // Owner names in ONE query, not one per row.
         //
