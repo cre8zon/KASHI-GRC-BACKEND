@@ -298,7 +298,7 @@ public class RoleServiceImpl implements RoleService {
         userRepository.flush();
         // The @ManyToMany cannot write membership_id, and without it this role is
         // invisible to every membership-scoped picker.
-        membershipRoleSync.stamp(userId, tenantId);
+        membershipRoleSync.ensureHomeMembership(userId, tenantId);
         return buildUserResponse(saved);
     }
 
