@@ -32,19 +32,39 @@ public class AuditPolicyRepositoryImpl implements AuditPolicyRepositoryCustom {
      * library remains fully visible to whoever maintains it.
      */
     private Predicate visibleToTenant(CriteriaBuilder cb, Root<AuditPolicy> p, Long tenantId) {
+        return visibleToTenant(cb, p, tenantId, false);
+    }
+
+    /**
+     * A tenant sees their own rows plus APPROVED globals. A DRAFT global is the
+     * platform team working and must not appear in a client library.
+     *
+     * systemUser lifts the APPROVED restriction, and without it the platform
+     * cannot author at all: a newly created global policy is DRAFT, so the author
+     * could not see the thing they had just written — and could not approve what
+     * they could not open. The rule was written for tenants and then applied to
+     * the people who produce the content it governs.
+     *
+     * It only became reachable once creation started deriving tenant_id = NULL
+     * for platform admins; before that they wrote into their own tenant and the
+     * ownRows branch covered them.
+     */
+    private Predicate visibleToTenant(CriteriaBuilder cb, Root<AuditPolicy> p,
+                                      Long tenantId, boolean systemUser) {
         Predicate ownRows = cb.equal(p.get("tenantId"), tenantId);
-        Predicate publishedGlobals = cb.and(
-                cb.isNull(p.get("tenantId")),
+        Predicate globals = systemUser
+                ? cb.isNull(p.get("tenantId"))
+                : cb.and(cb.isNull(p.get("tenantId")),
                 cb.equal(p.get("status"), AuditPolicy.PolicyStatus.APPROVED));
-        return cb.or(ownRows, publishedGlobals);
+        return cb.or(ownRows, globals);
     }
 
     @Override
-    public long countForTenant(Long tenantId) {
+    public long countForTenant(Long tenantId, boolean systemUser) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);
         Root<AuditPolicy> p = cq.from(AuditPolicy.class);
-        cq.select(cb.count(p)).where(visibleToTenant(cb, p, tenantId));
+        cq.select(cb.count(p)).where(visibleToTenant(cb, p, tenantId, systemUser));
         Long r = em.createQuery(cq).getSingleResult();
         return r != null ? r : 0L;
     }
@@ -52,7 +72,7 @@ public class AuditPolicyRepositoryImpl implements AuditPolicyRepositoryCustom {
     @Override
     public List<AuditPolicySummary> findSummariesForTenant(Long tenantId, String search,
                                                            AuditPolicy.PolicyStatus status,
-                                                           String origin) {
+                                                           String origin, boolean systemUser) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<AuditPolicySummary> cq = cb.createQuery(AuditPolicySummary.class);
         Root<AuditPolicy> p = cq.from(AuditPolicy.class);
@@ -68,7 +88,7 @@ public class AuditPolicyRepositoryImpl implements AuditPolicyRepositoryCustom {
                 p.get("frameworkRefs"), p.get("tenantId"), p.get("createdAt")));
 
         List<Predicate> where = new java.util.ArrayList<>();
-        where.add(visibleToTenant(cb, p, tenantId));
+        where.add(visibleToTenant(cb, p, tenantId, systemUser));
         if (search != null && !search.isBlank()) {
             String like = "%" + search.toLowerCase() + "%";
             where.add(cb.or(
@@ -146,5 +166,19 @@ public class AuditPolicyRepositoryImpl implements AuditPolicyRepositoryCustom {
                 cb.equal(p.get("status"), AuditPolicy.PolicyStatus.APPROVED)
         );
         return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public boolean policyRefExists(String policyRef, Long tenantId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<AuditPolicy> p = cq.from(AuditPolicy.class);
+        // IS NULL, not "= null" — the whole reason this exists.
+        Predicate scope = tenantId == null
+                ? cb.isNull(p.get("tenantId"))
+                : cb.equal(p.get("tenantId"), tenantId);
+        cq.select(cb.count(p)).where(cb.and(cb.equal(p.get("policyRef"), policyRef), scope));
+        Long r = em.createQuery(cq).getSingleResult();
+        return r != null && r > 0;
     }
 }

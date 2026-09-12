@@ -72,6 +72,43 @@ public class KafkaEventPublisher {
                 .payload(payload)
                 .build();
 
+        // Publish AFTER the caller's transaction commits.
+        //
+        // Every producer here is inside a @Transactional business method, and
+        // send() went out immediately — so a consumer could read the row before
+        // it was committed and find nothing:
+        //
+        //   [AUDIT] Template snapshot dispatched via Kafka | engagementId=100
+        //   [AUDIT-ENGAGEMENT-SNAPSHOT-CONSUMER] Engagement 100 not found
+        //
+        // The engagement was created, so its sections and controls were never
+        // snapshotted and it stayed at snapshotStatus=PROVISIONING. It is a race,
+        // which is why it passed for a long time and then started failing as the
+        // database got slower — the same code, a wider window.
+        //
+        // afterCommit only: on rollback the event is DROPPED, which is correct.
+        // An event announcing a row that no longer exists is worse than no event.
+        //
+        // Outside a transaction (schedulers, consumers republishing) there is
+        // nothing to wait for, so it sends immediately as before.
+        if (org.springframework.transaction.support.TransactionSynchronizationManager
+                .isSynchronizationActive()) {
+            org.springframework.transaction.support.TransactionSynchronizationManager
+                    .registerSynchronization(
+                            new org.springframework.transaction.support.TransactionSynchronization() {
+                                @Override public void afterCommit() {
+                                    doSend(topic, eventType, key, envelope, tenantId);
+                                }
+                            });
+            return;
+        }
+
+        doSend(topic, eventType, key, envelope, tenantId);
+    }
+
+    /** The actual send. Same contract as before: NEVER throws. */
+    private void doSend(String topic, String eventType, String key,
+                        KafkaEventEnvelope envelope, Long tenantId) {
         Timer.Sample sample = Timer.start(meterRegistry);
 
         // CONTRACT: publish() NEVER throws. send() is async for delivery but
