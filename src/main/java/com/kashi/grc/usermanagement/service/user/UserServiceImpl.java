@@ -197,7 +197,7 @@ public class UserServiceImpl implements UserService {
         // which makes the user invisible to every membership-scoped picker.
         // Stamp them once, after the roles are flushed.
         userRepository.flush();
-        membershipRoleSync.stamp(savedUser.getId(), savedUser.getTenantId());
+        membershipRoleSync.ensureHomeMembership(savedUser.getId(), savedUser.getTenantId());
 
         if (request.getAttributes() != null) {
             request.getAttributes().forEach((k, v) -> attributeRepository.save(
