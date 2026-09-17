@@ -52,6 +52,7 @@ public class AuditInstanceController {
     private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final IssueService                              issueService;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepo;
+    private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepo;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROL INSTANCES — /v1/audit/control-instances/{id}
@@ -116,6 +117,26 @@ public class AuditInstanceController {
                 : testRepo.findAllById(testInstanceIds).stream()
                   .collect(Collectors.toMap(AuditTestInstance::getId, t -> t));
 
+        // Evidence badge data. entityIdsWithAnyLink is the existing batch lookup
+        // (any status, any collection type), so this stays at two queries no
+        // matter how many tests are mapped - no N+1 reintroduced.
+        java.util.Set<Long> testsWithEvidence =
+                evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", testInstanceIds);
+        boolean controlHasEvidence = !evidenceLinkRepo
+                .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", List.of(id)).isEmpty();
+
+        // Recording a result needs ASSIGNMENT, not just the permission - the same
+        // rule setTestResult enforces. Telling the client here is what lets the
+        // fieldwork tab render read-only instead of offering a Save that 400s.
+        var evCtx = utilityService.getLoggedInDataContext();
+        boolean evHasAssignPermission = evCtx.getRoles().stream()
+                .flatMap(r -> r.getPermissions().stream())
+                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
+        boolean evCanRecord = evHasAssignPermission
+                || controlRepo.findById(id)
+                .map(c -> controlAccessGuard.canAct(c, evCtx.getId(), false))
+                .orElse(false);
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",          m.getId());
@@ -123,11 +144,16 @@ public class AuditInstanceController {
             row.put("isRequired",         m.isRequired());
             row.put("orderNo",            m.getOrderNo());
             row.put("mappingNoteSnapshot",m.getMappingNoteSnapshot());
+            row.put("canRecordResult",    evCanRecord);
             AuditTestInstance t = testsById.get(m.getTestInstanceId());
             if (t != null) {
                 row.put("testNameSnapshot",        t.getTestNameSnapshot());
                 row.put("testRefSnapshot",         t.getTestRefSnapshot());
                 row.put("testResult",              t.getTestResult());
+                // Evidence in ANY form backing this test: work papers on the test
+                // itself plus whatever is attached to the control it sits under.
+                row.put("hasEvidence",
+                        testsWithEvidence.contains(m.getTestInstanceId()) || controlHasEvidence);
                 row.put("automationTypeSnapshot",  t.getAutomationTypeSnapshot());
                 row.put("controlTagSnapshot",      t.getControlTagSnapshot());
                 row.put("runAt",                   t.getRunAt());
@@ -212,6 +238,32 @@ public class AuditInstanceController {
         // Same hole as the auditee path: an unassigned control was testable by
         // anyone with the permission. Assignee, section auditor or lead auditor.
         controlAccessGuard.requireCanRecordResult(ctrl, ctx.getId());
+
+        // A positive conclusion must rest on something. INEFFECTIVE carries its own
+        // record (the finding), and NOT_APPLICABLE / NOT_TESTED are not conclusions,
+        // so only the effective results are gated.
+        boolean positiveConclusion =
+                req.getTestResult() == AuditControlInstance.TestResult.EFFECTIVE
+                        || req.getTestResult() == AuditControlInstance.TestResult.PARTIALLY_EFFECTIVE;
+        if (positiveConclusion && !Boolean.TRUE.equals(req.getEvidenceOverride())) {
+            List<Long> mappedTestIds = ctrlTestMappingRepo.findRequiredTestInstanceIdsByControlInstanceId(id);
+            boolean hasEvidence =
+                    !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", List.of(id)).isEmpty()
+                            || !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", mappedTestIds).isEmpty();
+            if (!hasEvidence) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "EVIDENCE_REQUIRED",
+                        "Attach evidence before concluding this control, or record an override reason");
+            }
+        }
+        if (Boolean.TRUE.equals(req.getEvidenceOverride())) {
+            if (req.getEvidenceOverrideReason() == null || req.getEvidenceOverrideReason().isBlank()) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "OVERRIDE_REASON_REQUIRED", "An override needs a reason");
+            }
+            log.warn("[CTRL-INST] Evidence gate overridden | id={} by={} reason={}",
+                    id, ctx.getId(), req.getEvidenceOverrideReason());
+        }
 
         ctrl.setTestResult(req.getTestResult());
         if (req.getTestNotes() != null) ctrl.setTestNotes(req.getTestNotes());
@@ -388,6 +440,28 @@ public class AuditInstanceController {
 
         AuditTestInstance.TestResult newResult =
                 AuditTestInstance.TestResult.valueOf(body.get("testResult"));
+
+        // Evidence gate. Only PASS is blocked: FAIL and EXCEPTION carry their own
+        // record via failureDetail/exceptionReason, and NOT_RUN is not a result.
+        // Runs BEFORE the write so a blocked call cannot cascade.
+        String overrideReason = body.get("evidenceOverrideReason");
+        boolean overridden = overrideReason != null && !overrideReason.isBlank();
+        if (newResult == AuditTestInstance.TestResult.PASS && !overridden) {
+            List<Long> mappedControlIds = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id);
+            boolean hasEvidence =
+                    !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", List.of(id)).isEmpty()
+                            || !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", mappedControlIds).isEmpty();
+            if (!hasEvidence) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "EVIDENCE_REQUIRED",
+                        "Attach a work paper or evidence before passing this test, "
+                                + "or record an override reason");
+            }
+        }
+        if (overridden) {
+            log.warn("[TEST-INSTANCE] Evidence gate overridden | id={} by={} reason={}",
+                    id, ctx.getId(), overrideReason);
+        }
 
         test.setTestResult(newResult);
         test.setRunAt(LocalDateTime.now());
@@ -685,6 +759,19 @@ public class AuditInstanceController {
     private Map<String, Object> buildControlMap(AuditControlInstance c) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",                       c.getId());
+        // The frontend's requires_assignment gate reads entity.isAssignedToCurrentUser
+        // and this endpoint never emitted it, so setting the flag on a ui_action was
+        // a no-op and every header button showed to anyone holding the permission.
+        // canAct covers assignee, section owner, engagement lead and workflow step.
+        // Either side: the PERMISSION on each ui_action already decides which side
+        // the user is (audit:control:record-test-result vs :submit-evidence), so
+        // this flag only needs to answer "assigned to THIS control". Auditor-only
+        // would have killed SUBMIT_EVIDENCE for the assigned auditee, whose
+        // assignment lives in auditeeAssignedUserId, not assignedAuditorId.
+        Long uid = utilityService.getLoggedInDataContext().getId();
+        boolean auditorSide = controlAccessGuard.canAct(c, uid, false);
+        m.put("isAssignedToCurrentUser", auditorSide || controlAccessGuard.canAct(c, uid, true));
+        m.put("canRecordResult",         auditorSide);
         m.put("engagementId",             c.getEngagementId());
         // Breadcrumb support
         if (c.getEngagementId() != null) {

@@ -91,6 +91,16 @@ public class IssueResponse {
     private Long   workflowInstanceId;
     private String workflowStatus;     // mirrors WorkflowInstance.status
 
+    // ── Source engagement (derived, not stored) ───────────────────────────────
+    // An issue escalated from an audit finding belongs to that finding's
+    // engagement. All three creation paths already store source_entity_id, so
+    // this is a join rather than a fourth copy of the same fact — nothing to
+    // keep in sync if a finding is ever re-parented. Null for every other
+    // source type.
+    private Long   sourceEngagementId;
+    private String sourceEngagementRef;
+    private String sourceEngagementName;
+
     // ── UI keys (from Screen Designer) ────────────────────────────────────────
     private String listScreenKey;
     private String detailScreenKey;

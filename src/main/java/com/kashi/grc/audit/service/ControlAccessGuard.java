@@ -47,6 +47,7 @@ import org.springframework.stereotype.Service;
 public class ControlAccessGuard {
 
     private final AuditSectionInstanceRepository sectionRepo;
+    private final com.kashi.grc.workflow.service.WorkflowAccessService workflowAccessService;
     private final AuditEngagementRepository      engagementRepo;
 
     /** Auditee actions: uploading evidence, marking a control submitted. */
@@ -90,6 +91,16 @@ public class ControlAccessGuard {
         // auditee side. ownerId remains a fallback for engagements created before
         // leadAuditeeId existed, which would otherwise have no auditee-side lead
         // and so no one able to act on an unassigned control.
+        // Tier 4 - workflow. Whoever the blueprint routes the live step to may
+        // act, plus override holders. This is what keeps the actor list
+        // configurable instead of fixed to the three assignment fields above:
+        // a new reviewer role needs a step, not a change here.
+        if (ctrl.getEngagementId() != null && workflowAccessService.canActOnEntity(
+                userId, "AUDIT_ENGAGEMENT", ctrl.getEngagementId(),
+                auditeeSide ? "AUDITEE" : "AUDITOR")) {
+            return true;
+        }
+
         return engagementRepo.findById(ctrl.getEngagementId())
                 .map(e -> auditeeSide
                         ? userId.equals(e.getLeadAuditeeId())

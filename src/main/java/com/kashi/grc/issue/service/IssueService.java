@@ -66,6 +66,8 @@ public class IssueService {
     private final UserRepository                                     userRepository;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
+    private final com.kashi.grc.audit.repository.AuditFindingRepository     auditFindingRepository;
+    private final com.kashi.grc.audit.repository.AuditEngagementRepository  auditEngagementRepository;
     private final ObjectMapper             objectMapper;
 
     /**
@@ -896,6 +898,24 @@ public class IssueService {
                     }).orElse(null);
         }
 
+        // Source engagement, for issues escalated from an audit finding.
+        // audit_findings carries engagement_id directly (idx_finding_engagement),
+        // so this is one hop - going via control_instance_id would drop findings
+        // that have none, which is a real case in the data.
+        Long   sourceEngagementId   = null;
+        String sourceEngagementRef  = null;
+        String sourceEngagementName = null;
+        if ("AUDIT_FINDING".equals(i.getSourceEntityType()) && i.getSourceEntityId() != null) {
+            var eng = auditFindingRepository.findById(i.getSourceEntityId())
+                    .map(f -> f.getEngagementId())
+                    .flatMap(auditEngagementRepository::findById);
+            if (eng.isPresent()) {
+                sourceEngagementId   = eng.get().getId();
+                sourceEngagementRef  = eng.get().getEngagementRef();
+                sourceEngagementName = eng.get().getName();
+            }
+        }
+
         // Compute slaDueInHours
         Long slaDueInHours = null;
         if (i.getDueAt() != null) {
@@ -915,6 +935,9 @@ public class IssueService {
                 .sourceEntityType(i.getSourceEntityType())
                 .sourceEntityId(i.getSourceEntityId())
                 .sourceDescription(i.getSourceDescription())
+                .sourceEngagementId(sourceEngagementId)
+                .sourceEngagementRef(sourceEngagementRef)
+                .sourceEngagementName(sourceEngagementName)
                 .externalId(i.getExternalId())
                 .externalSource(i.getExternalSource())
                 .cvssScore(i.getCvssScore())

@@ -76,6 +76,7 @@ public class WorkflowAccessService {
     private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
     // For AUDIT_ENGAGEMENT → resolve via parent AUDIT_PROJECT workflow instance
     private final AuditEngagementRepository auditEngagementRepository;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
 
     // ── Default workflow actions available per task role ──────────────────────
 
@@ -572,6 +573,61 @@ public class WorkflowAccessService {
      * exempt there, so they are exempt here. Keeping the two in step is the
      * whole point — a button the server will refuse is worse than no button.
      */
+    /**
+     * Can this user act on the live workflow step of an entity?
+     *
+     * Deliberately lighter than resolveForModule: no SoD evaluation and no UI
+     * override parsing, because guards call it per control instance and those
+     * costs add up. Same two paths resolveForModule uses - an open task on the
+     * step, or override authority - so the set of people who may act comes from
+     * the blueprint's step routing rather than from hardcoded role names.
+     *
+     * AUDIT_ENGAGEMENT has no instance of its own and delegates to its project's,
+     * mirroring resolveForModule.
+     *
+     * @param requiredSide AUDITOR / AUDITEE, or null to accept any step side.
+     */
+    public boolean canActOnEntity(Long userId, String entityType, Long entityId, String requiredSide) {
+        if (userId == null || entityId == null) return false;
+        User user = userRepository.findById(userId).orElse(null);
+        if (user == null) return false;
+
+        Optional<WorkflowInstance> activeInstance = instanceRepository
+                .findActiveByEntityTypeAndEntityId(entityType, entityId);
+        if (activeInstance.isEmpty() && "AUDIT_ENGAGEMENT".equals(entityType)) {
+            activeInstance = auditEngagementRepository.findById(entityId)
+                    .filter(e -> e.getProjectInstanceId() != null)
+                    .flatMap(e -> instanceRepository
+                            .findActiveByEntityTypeAndEntityId("AUDIT_PROJECT", e.getProjectInstanceId()));
+        }
+        if (activeInstance.isEmpty()) return false;
+
+        List<StepInstance> activeSteps = stepInstanceRepository
+                .findByWorkflowInstanceIdAndStatus(activeInstance.get().getId(), StepStatus.IN_PROGRESS);
+        if (activeSteps.isEmpty()) return false;
+
+        var openStatuses = List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS);
+        List<String> permissions = resolvePermissions(user);
+
+        for (StepInstance step : activeSteps) {
+            String stepSide = step.getSnapSide();
+            // A step routed to the auditee side must not authorise an auditor
+            // action. SYSTEM and unsided steps are treated as neutral.
+            boolean sideMatches = requiredSide == null || stepSide == null
+                    || "SYSTEM".equalsIgnoreCase(stepSide)
+                    || requiredSide.equalsIgnoreCase(stepSide);
+            if (!sideMatches) continue;
+
+            boolean hasOpenTask = taskInstanceRepository.findByStepInstanceId(step.getId()).stream()
+                    .anyMatch(t -> userId.equals(t.getAssignedUserId())
+                            && openStatuses.contains(t.getStatus()));
+            if (hasOpenTask) return true;
+
+            if (resolveCanOverride(user, stepSide, permissions)) return true;
+        }
+        return false;
+    }
+
     private boolean resolveCanOverride(User user, String stepSide, List<String> permissions) {
         boolean hasPerm = permissions != null && permissions.contains("workflow:step:override");
 
