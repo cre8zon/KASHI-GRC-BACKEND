@@ -1,22 +1,31 @@
-# LiveKit server for KashiGRC in-app calls.
-# Replace the key/secret (generate: openssl rand -hex 32) and keep the SAME
-# pair in the backend's LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
-port: 7880                 # signalling (behind Caddy on 443)
+# LiveKit server for KashiGRC in-app calls — calls.kashiguard.com
+#
+# Runs on the same droplet as the app, behind the existing nginx:
+#   https/wss  calls.kashiguard.com      → nginx :443 → LiveKit :7880 (signalling)
+#   TURN/TLS   turn.calls.kashiguard.com → LiveKit :5349 directly (its own TLS)
+#
+# The key NAME must equal the backend's LIVEKIT_API_KEY ("kashikey" — it is the
+# "iss" of every call token), and the secret must equal LIVEKIT_API_SECRET.
+port: 7880                   # signalling via nginx; keep 7880 CLOSED
 rtc:
-  tcp_port: 7881           # media over TCP when UDP is blocked
-  port_range_start: 50000  # media over UDP
+  tcp_port: 7881             # media over TCP when UDP is blocked
+  port_range_start: 50000    # media over UDP
   port_range_end: 60000
-  use_external_ip: true    # advertise the server's public IP
+  use_external_ip: true      # advertise the droplet's public IP
 turn:
-  enabled: true            # relay for networks that block direct media (relay ports UDP 30000-40000)
-  domain: turn.calls.example.com
+  enabled: true              # relay for networks that block direct media
+  domain: turn.calls.kashiguard.com
   tls_port: 5349
   udp_port: 3478
-  external_tls: true       # Caddy terminates TLS for the TURN domain
+  external_tls: false        # LiveKit does TURN/TLS itself (certbot cert)
+  cert_file: /etc/letsencrypt/live/calls.kashiguard.com/fullchain.pem
+  key_file: /etc/letsencrypt/live/calls.kashiguard.com/privkey.pem
+  relay_range_start: 30000
+  relay_range_end: 40000
 keys:
-  REPLACE_WITH_API_KEY: REPLACE_WITH_A_SECRET_OF_AT_LEAST_32_CHARACTERS
+  kashikey: REPLACE_WITH_THE_BACKEND_LIVEKIT_API_SECRET
 room:
-  empty_timeout: 300       # close a room 5 min after the last person leaves
+  empty_timeout: 300         # close a room 5 min after the last person leaves
   max_participants: 50
 logging:
   level: info

@@ -1,18 +1,13 @@
-# docker compose up -d   (on a VM with a public IP; open the ports below)
+# LiveKit only — the droplet's existing nginx handles HTTPS for
+# calls.kashiguard.com (see README.md, step 4).
+#   docker compose up -d
 services:
   livekit:
     image: livekit/livekit-server:v1.8
+    container_name: livekit
     command: --config /etc/livekit.yaml
     restart: unless-stopped
-    network_mode: host      # WebRTC needs the UDP range on the host
+    network_mode: host        # WebRTC needs the UDP ranges on the host
     volumes:
       - ./livekit.yaml:/etc/livekit.yaml:ro
-  caddy:
-    image: caddy:2
-    restart: unless-stopped
-    network_mode: host
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-volumes:
-  caddy_data:
+      - /etc/letsencrypt:/etc/letsencrypt:ro   # certificate for TURN/TLS

@@ -1,7 +1,0 @@
-# TLS certificates are issued automatically (Let's Encrypt).
-calls.dinfosek.com {
-  reverse_proxy 127.0.0.1:7880
-}
-turn.dinfosek.com {
-  reverse_proxy 127.0.0.1:5349
-}
