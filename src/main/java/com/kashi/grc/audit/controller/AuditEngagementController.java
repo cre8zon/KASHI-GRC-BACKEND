@@ -98,6 +98,7 @@ public class AuditEngagementController {
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final AuditSectionInstanceRepository        sectionInstanceRepository;
     private final AuditControlInstanceRepository        controlInstanceRepository;
+    private final com.kashi.grc.audit.service.ControlAccessGuard controlAccessGuard;
     private final AuditFindingRepository                findingRepository;
     private final AuditTemplateRepository               templateRepository;
     private final DbRepository                          dbRepository;
@@ -1582,6 +1583,13 @@ public class AuditEngagementController {
             @PathVariable Long id, @PathVariable Long cid,
             @RequestBody(required = false) Map<String, Object> body) {
         var ctx = utilityService.getLoggedInDataContext();
+        // Same guard as recording a result: sending evidence back is an auditor
+        // action on that control. The service only checked engagement membership,
+        // so anyone holding the permission could bounce any control in the tenant.
+        controlAccessGuard.requireCanRecordResult(
+                controlInstanceRepository.findById(cid)
+                        .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", cid)),
+                ctx.getId());
         String reason = body != null && body.get("reason") != null
                 ? body.get("reason").toString() : null;
         service.sendBackControlEvidence(id, cid, reason, ctx.getId(), ctx.getTenantId());

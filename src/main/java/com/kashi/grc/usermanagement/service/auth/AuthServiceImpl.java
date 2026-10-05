@@ -319,6 +319,9 @@ public class AuthServiceImpl implements AuthService {
     @Transactional
     public void requestPasswordReset(PasswordResetRequest request) {
         // Security: always succeed even if email doesn't exist (prevent enumeration)
+        if (userRepository.findByEmailAndIsDeletedFalse(request.getEmail()).isEmpty()) {
+            throw new ResourceNotFoundException("User", "email", request.getEmail());
+        }
         userRepository.findByEmailAndIsDeletedFalse(request.getEmail()).ifPresent(user -> {
             String token = generateSecureToken();
             user.setPasswordResetToken(token);

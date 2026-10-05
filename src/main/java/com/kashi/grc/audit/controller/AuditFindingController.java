@@ -60,6 +60,7 @@ public class AuditFindingController {
     private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
     private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
+    private final com.kashi.grc.audit.service.ControlAccessGuard controlAccessGuard;
     private final DbRepository                   dbRepository;
     private final UtilityService                 utilityService;
     // EXISTING
@@ -86,6 +87,16 @@ public class AuditFindingController {
         engagementRepository.findById(engagementId)
                 .filter(e -> e.getTenantId().equals(tenantId))
                 .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", engagementId));
+
+        // Raising a finding against a control is an auditor action on that control,
+        // so it answers to the same guard as recording a result. Without this the
+        // endpoint accepted any control in the tenant from anyone holding the
+        // permission - tenant ownership was the only check.
+        if (controlInstanceId != null) {
+            var guardCtrl = controlInstanceRepository.findById(controlInstanceId)
+                    .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", controlInstanceId));
+            controlAccessGuard.requireCanRecordResult(guardCtrl, userId);
+        }
 
         // Snapshot control ref if provided
         String controlRefSnapshot = null;

@@ -12,4 +12,10 @@ public class AuditControlTestRequest {
     private String testNotes;
     private String testProcedure;
     private Long   findingIssueId;   // Issue.id if a finding was raised
+
+    // Evidence gate escape hatch. Inquiry- and observation-only procedures can
+    // legitimately conclude with no artifact; requiring a reason keeps that
+    // visible instead of silently allowing unsupported conclusions.
+    private Boolean evidenceOverride;
+    private String  evidenceOverrideReason;
 }
