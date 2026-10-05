@@ -68,4 +68,40 @@ public class AssessmentQuestion extends GlobalOrTenantEntity {
      */
     @Column(name = "question_tag", length = 80)
     private String questionTag;
+
+    /**
+     * Does answering this question require a document to be attached?
+     *
+     * ── WHY THIS IS NOT is_mandatory ─────────────────────────────────────
+     * is_mandatory already exists, on section_question_mappings, and it means
+     * the ANSWER is required. That is a different requirement and the two are
+     * routinely independent: "Describe your incident response process" can be
+     * mandatory with no attachment, and "Attach your latest penetration test
+     * report, if one exists" can be optional but must come with the file when
+     * it is answered at all.
+     *
+     * Before this column the only signal was response_type = 'FILE_UPLOAD',
+     * which means something stronger — the file IS the answer and there is no
+     * text field at all. There was no way to say "answer this AND attach
+     * something", which is most of a real security questionnaire.
+     *
+     * ── WHY HERE AND NOT ON THE MAPPING ──────────────────────────────────
+     * weight and is_mandatory live on section_question_mappings because they
+     * are properties of using a question in a particular template. Whether a
+     * question needs evidence is a property of the QUESTION — "attach your ISO
+     * certificate" needs the certificate in every template it appears in — so
+     * it belongs beside question_tag, authored once in the library.
+     *
+     * The cost of that choice, stated rather than discovered later: there is no
+     * per-template override. If one template ever needs the same question
+     * without its evidence requirement, this has to move to the mapping and be
+     * snapshotted from there instead.
+     *
+     * Snapshotted into AssessmentQuestionInstance.requiresEvidence at
+     * instantiation, like questionTag, so changing it later does not rewrite
+     * the rules under a running assessment.
+     */
+    @Column(name = "requires_evidence", nullable = false)
+    @lombok.Builder.Default
+    private boolean requiresEvidence = false;
 }

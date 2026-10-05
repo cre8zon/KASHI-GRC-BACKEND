@@ -29,6 +29,7 @@ public class UiConfigServiceImpl implements UiConfigService {
     private final UiFormFieldRepository     formFieldRepository;
     private final UiActionRepository        actionRepository;
     private final DashboardWidgetRepository widgetRepository;
+    private final DashboardRepository dashboardRepository;
     private final FeatureFlagRepository     featureFlagRepository;
     private final com.kashi.grc.tenant.repository.TenantRepository tenantRepository;
     private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
@@ -57,7 +58,7 @@ public class UiConfigServiceImpl implements UiConfigService {
         // getLoggedInDataContext() returns the User entity directly.
         // Called once here — all sub-methods (getNavigation, getDashboardWidgets, etc.)
         // reuse the same cached result via UtilityService.REQUEST_USER_CACHE.
-        com.kashi.grc.usermanagement.domain.User currentUser =
+        User currentUser =
                 utilityService.getLoggedInDataContext();
         Long tenantId = currentUser.getTenantId();
 
@@ -97,7 +98,8 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
-    @Cacheable(cacheNames = CacheNames.UI_SCREEN)
+    // Per user: the result is filtered by the caller's sides and permissions.
+    @Cacheable(cacheNames = CacheNames.UI_SCREEN, keyGenerator = "tenantUserKeyGenerator")
     public ScreenConfigResponse getScreenConfig(String screenKey) {
         User currentUser = utilityService.getLoggedInDataContext();
         Long tenantId    = currentUser.getTenantId();
@@ -244,7 +246,7 @@ public class UiConfigServiceImpl implements UiConfigService {
             }
         }
 
-        Map<String, UiComponentResponse> componentMap = new java.util.LinkedHashMap<>();
+        Map<String, UiComponentResponse> componentMap = new LinkedHashMap<>();
         for (UiComponent c : components) {
             if (!c.isVisible()) continue;
             List<UiOption> options = optionsByKey.getOrDefault(c.getComponentKey(), List.of());
@@ -267,7 +269,8 @@ public class UiConfigServiceImpl implements UiConfigService {
     // NOTE: only applies to external calls through the Spring proxy — the
     // internal self-invocation from getScreenConfig() bypasses this cache,
     // which is fine since getScreenConfig()'s own result is cached as a whole.
-    @Cacheable(cacheNames = CacheNames.UI_ACTIONS)
+    // Per user: the result is filtered by the caller's sides and permissions.
+    @Cacheable(cacheNames = CacheNames.UI_ACTIONS, keyGenerator = "tenantUserKeyGenerator")
     public List<UiActionResponse> getActions(String screenKey, String entityStatus) {
         // Single call — result cached in ThreadLocal for this request.
         // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).
@@ -286,7 +289,8 @@ public class UiConfigServiceImpl implements UiConfigService {
 
     @Override
     @Transactional(readOnly = true)
-    @Cacheable(cacheNames = CacheNames.UI_DASHBOARD)
+    // Per user: the result is filtered by the caller's sides and permissions.
+    @Cacheable(cacheNames = CacheNames.UI_DASHBOARD, keyGenerator = "tenantUserKeyGenerator")
     public List<DashboardWidgetResponse> getDashboardWidgets() {
         // Single call — result cached in ThreadLocal for this request.
         // Previously called getLoggedInDataContext() twice (once for tenantId, once for user).
@@ -317,6 +321,134 @@ public class UiConfigServiceImpl implements UiConfigService {
     // ── Role/Permission helpers ───────────────────────────────────
 
     /** Extract all RoleSide names the user holds. */
+    // ═════════════════════════════════════════════════════════════════════════
+    // DASHBOARDS
+    //
+    // These live HERE rather than in DashboardController because extractSides,
+    // extractPermissions and isWidgetVisible are already here — and
+    // extractPermissions is not a thing to reimplement: it walks roles to
+    // permissions AND then applies the permission_grants table, which supports
+    // explicit REVOKE. A second copy would grant someone a widget their role
+    // had been specifically denied.
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Dashboards this caller may open, optionally narrowed to one module.
+     *
+     * A tenant's own dashboard SHADOWS the platform one of the same key, which
+     * is how an organisation customises a shipped dashboard without editing it.
+     */
+    public List<Map<String, Object>> listDashboards(String entityType, String scope) {
+        User user = utilityService.getLoggedInDataContext();
+        Set<String> sides = extractSides(user);
+        Set<String> perms = extractPermissions(user);
+
+        List<Dashboard> all =
+                dashboardRepository.findVisible(user.getTenantId(), user.getId());
+
+        Set<String> tenantKeys = all.stream()
+                .filter(d -> d.getTenantId() != null)
+                .map(Dashboard::getDashboardKey)
+                .collect(Collectors.toSet());
+
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Dashboard d : all) {
+            if (entityType != null && !entityType.equalsIgnoreCase(d.getEntityType())) continue;
+            if (scope != null && !scope.equalsIgnoreCase(d.getScope().name())) continue;
+            if (d.getTenantId() == null && tenantKeys.contains(d.getDashboardKey())) continue;
+            if (!isDashboardVisible(d, user, sides, perms)) continue;
+            out.add(dashboardSummary(d));
+        }
+        return out;
+    }
+
+    /**
+     * One dashboard with the widgets this caller may see.
+     *
+     * Widgets are filtered SERVER-SIDE. A widget the caller may not see must
+     * never reach the browser: its title alone ("Left without revocation
+     * evidence") leaks that the metric exists, and its dataEndpoint says where
+     * to go looking for the number.
+     */
+    public Map<String, Object> getDashboard(String key) {
+        User user = utilityService.getLoggedInDataContext();
+        Set<String> sides = extractSides(user);
+        Set<String> perms = extractPermissions(user);
+
+        Dashboard d =
+                dashboardRepository.findByKeyForTenant(key, user.getTenantId()).stream()
+                        .filter(x -> isDashboardVisible(x, user, sides, perms))
+                        .findFirst()
+                        // (name, field, value) — there is no (String, String)
+                        // overload; the two-arg one takes a Long id.
+                        .orElseThrow(() -> new com.kashi.grc.common.exception.ResourceNotFoundException(
+                                "Dashboard", "dashboardKey", key));
+
+        List<DashboardWidgetResponse> widgets = widgetRepository
+                .findByDashboardIdAndIsActiveTrueOrderBySortOrderAsc(d.getId()).stream()
+                .filter(w -> isWidgetVisible(w, sides, perms))
+                .map(this::toWidgetResponse)
+                .collect(Collectors.toList());
+
+        Map<String, Object> out = dashboardSummary(d);
+        out.put("widgets", widgets);
+        // Passed through, not resolved here: the frontend applies
+        // role_access_json with the SAME helper it uses for tabs and actions.
+        // One resolver, one behaviour.
+        out.put("roleAccessJson", d.getRoleAccessJson() != null ? d.getRoleAccessJson() : "{}");
+        return out;
+    }
+
+    /** The dashboard a module should open on, or the global one. */
+    public Map<String, Object> defaultDashboard(String entityType) {
+        List<Map<String, Object>> candidates = listDashboards(
+                entityType, entityType == null ? "GLOBAL" : null);
+        if (candidates.isEmpty()) return null;
+        return candidates.stream()
+                .filter(m -> Boolean.TRUE.equals(m.get("isDefault")))
+                .findFirst()
+                .orElse(candidates.get(0));
+    }
+
+    /**
+     * Ownership first, then side, then permission.
+     *
+     * A PERSONAL dashboard belongs to one person and is nobody else's business
+     * however many permissions they hold, so that check comes before — not
+     * alongside — the permission check.
+     */
+    private boolean isDashboardVisible(Dashboard d,
+                                       User user, Set<String> sides, Set<String> perms) {
+        if (!d.isVisibleTo(user.getId(), user.getTenantId())) return false;
+
+        if (d.getRequiredPermission() != null && !d.getRequiredPermission().isBlank()) {
+            boolean hasAny = Arrays.stream(d.getRequiredPermission().split(","))
+                    .map(String::trim).anyMatch(perms::contains);
+            if (!hasAny) return false;
+        }
+        if (d.getAllowedSidesJson() != null && !d.getAllowedSidesJson().isBlank()) {
+            return sides.stream().anyMatch(s -> d.getAllowedSidesJson().contains("\"" + s + "\""));
+        }
+        return true;
+    }
+
+    private Map<String, Object> dashboardSummary(Dashboard d) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("id",               d.getId());
+        m.put("dashboardKey",     d.getDashboardKey());
+        m.put("name",             d.getName());
+        m.put("description",      d.getDescription());
+        m.put("icon",             d.getIcon());
+        m.put("scope",            d.getScope());
+        m.put("entityType",       d.getEntityType());
+        m.put("isDefault",        d.isDefault());
+        m.put("gridCols",         d.getGridCols());
+        m.put("sortOrder",        d.getSortOrder());
+        m.put("platformProvided", d.isPlatformProvided());
+        m.put("editable",         !d.isPlatformProvided());
+        return m;
+    }
+
     private Set<String> extractSides(User user) {
         if (user.getRoles() == null) return Set.of();
         return user.getRoles().stream()
@@ -334,7 +466,7 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .filter(r -> r.getPermissions() != null)
                 .flatMap(r -> r.getPermissions().stream())
                 .map(p -> p.getCode())
-                .collect(Collectors.toCollection(java.util.HashSet::new));
+                .collect(Collectors.toCollection(HashSet::new));
 
         // Dynamic grants from permission_grants table (UI-managed, supports revoke)
         List<Long> roleIds = user.getRoles().stream()
@@ -537,6 +669,12 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .confirmationMessage(a.getConfirmationMessage())
                 .requiresRemarks(Boolean.TRUE.equals(a.getRequiresRemarks()))
                 .requiresAssignment(Boolean.TRUE.equals(a.getRequiresAssignment()))
+                .requiresSectionGate(Boolean.TRUE.equals(a.getRequiresSectionGate()))
+                // A String, so no unboxing hazard — null travels as null and
+                // the client reads that as "any step", which is what every row
+                // that predates the column means.
+                .allowedStepActions(a.getAllowedStepActions())
+                .completesSectionKey(a.getCompletesSectionKey())
                 .sortOrder(a.getSortOrder())
                 .build();
     }
@@ -549,6 +687,14 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .refreshIntervalSeconds(w.getRefreshIntervalSeconds())
                 .configJson(w.getConfigJson()).gridCols(w.getGridCols())
                 .sortOrder(w.getSortOrder()).clickThroughRoute(w.getClickThroughRoute())
+                // Added with the dashboards table. All nullable — a widget
+                // setting none of them renders exactly as widgets did before.
+                .dashboardId(w.getDashboardId())
+                .filtersJson(w.getFiltersJson())
+                .valueFormat(w.getValueFormat())
+                .thresholdsJson(w.getThresholdsJson())
+                .drillThroughJson(w.getDrillThroughJson())
+                .emptyMessage(w.getEmptyMessage())
                 .build();
     }
 

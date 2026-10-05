@@ -66,6 +66,8 @@ public class ActionItemBlueprintController {
                 .defaultPriority(req.getDefaultPriority() != null
                         ? req.getDefaultPriority() : ActionItem.Priority.MEDIUM)
                 .standardRef(req.getStandardRef())
+                .navKey(req.getNavKey())
+                .assignerNavKey(req.getAssignerNavKey())
                 .blueprintCode(req.getBlueprintCode())
                 .isActive(true)
                 .build();
@@ -98,6 +100,11 @@ public class ActionItemBlueprintController {
         bp.setResolutionRole(req.getResolutionRole());
         if (req.getDefaultPriority() != null) bp.setDefaultPriority(req.getDefaultPriority());
         bp.setStandardRef(req.getStandardRef());
+        // Set unconditionally, including to null: clearing the destination is a
+        // real gesture — it puts items from this blueprint back on nav_context,
+        // which is what you want while a module is mid-migration.
+        bp.setNavKey(req.getNavKey());
+        bp.setAssignerNavKey(req.getAssignerNavKey());
         if (req.getIsActive() != null) bp.setIsActive(req.getIsActive());
 
         blueprintRepository.save(bp);
@@ -131,6 +138,8 @@ public class ActionItemBlueprintController {
         private String                  resolutionRole;
         private ActionItem.Priority     defaultPriority;
         private String                  standardRef;
+        private String                  navKey;
+        private String                  assignerNavKey;
         private String                  blueprintCode;
         private Boolean                 isActive;
     }

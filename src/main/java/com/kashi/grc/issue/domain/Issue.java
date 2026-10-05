@@ -49,6 +49,7 @@ import java.time.LocalDateTime;
                 @Index(name = "idx_issue_due",             columnList = "due_at"),
                 @Index(name = "idx_issue_external",        columnList = "tenant_id,external_source,external_id"),
                 @Index(name = "idx_issue_workflow",        columnList = "workflow_instance_id"),
+                @Index(name = "idx_issue_vendor",          columnList = "vendor_id"),
         },
         uniqueConstraints = {
                 @UniqueConstraint(name = "uk_issue_external",
@@ -260,6 +261,33 @@ public class Issue extends TenantAwareEntity {
     /** Compliance framework reference e.g. "SOC2 CC6.1", "ISO 27001 A.8.1" */
     @Column(name = "framework_ref", length = 200)
     private String frameworkRef;
+
+    /**
+     * The vendor this issue belongs to, when it came from the TPRM side.
+     *
+     * This column is what makes vendor scoping work, and its absence is why
+     * vendors are currently refused issue access outright rather than filtered.
+     * DbRepository.applyVendorScope adds its predicate only when the entity has
+     * a vendorId attribute:
+     *
+     *     boolean hasVendor = root.getModel().getSingularAttributes().stream()
+     *             .anyMatch(a -> "vendorId".equals(a.getName()));
+     *
+     * Without it, Issue falls through every branch of that method and no
+     * predicate is added at all. With it, the generic rule scopes issues to the
+     * caller's own vendor with no change to DbRepository — the same way
+     * ActionItem already works.
+     *
+     * Null on every org-internal and audit issue, which is what keeps them
+     * invisible to vendors: the predicate compares vendor_id to the caller's
+     * own vendor, and NULL never equals a number.
+     *
+     * Deliberately a plain Long with no relationship, matching
+     * ActionItem.vendorId and audit_findings.linked_issue_id — a cross-module
+     * reference that should not make deleting a vendor fail.
+     */
+    @Column(name = "vendor_id")
+    private Long vendorId;
 
     // ── Workflow integration ───────────────────────────────────────────────────
 

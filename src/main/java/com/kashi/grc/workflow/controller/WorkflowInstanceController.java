@@ -629,7 +629,9 @@ public class WorkflowInstanceController {
                             .stream().map(r -> r.getId()).toList();
                 }
                 if (roleIds.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
-                List<Map<String, Object>> users = service.getUsersByRoles(roleIds, tenantId);
+                // Scoped: a VENDOR-side picker must not list other vendors' users.
+                List<Map<String, Object>> users =
+                        service.getUsersByRolesScoped(roleIds, tenantId, si, si.getSnapAssignableSide());
                 log.info("[WF-ELIGIBLE] stepInstanceId={} assignableSide={} assignableRoleId={} → {} users",
                         stepInstanceId, si.getSnapAssignableSide(), si.getSnapAssignableRoleId(), users.size());
                 return ResponseEntity.ok(ApiResponse.success(users));
@@ -662,7 +664,10 @@ public class WorkflowInstanceController {
                 .map(com.kashi.grc.workflow.domain.WorkflowStepRole::getRoleId)
                 .distinct().toList();
 
-        List<Map<String, Object>> users = service.getUsersByRoles(roleIds, tenantId);
+        // Scoped: same reason. The next step's actor roles can include vendor
+        // roles, and without this every vendor's holders of them came back.
+        List<Map<String, Object>> users =
+                service.getUsersByRolesScoped(roleIds, tenantId, si, null);
 
         log.debug("[WF-ELIGIBLE] stepInstanceId={} currentOrder={} → nextStepId={} roleIds={} → {} users",
                 stepInstanceId, si.getSnapStepOrder(), nextStepId, roleIds, users.size());
@@ -676,6 +681,11 @@ public class WorkflowInstanceController {
         var roles = service.getStepActorRoles(stepId);
         if (roles.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
         var roleIds = roles.stream().map(r -> r.getRoleId()).distinct().toList();
-        return ResponseEntity.ok(ApiResponse.success(service.getUsersByRoles(roleIds, tenantId)));
+        // The third and last path into this endpoint, and it needs the same
+        // scope: leaving one unscoped would mean the leak survives on whichever
+        // workflow happens to fall through to the fallback.
+        var si = service.getStepInstance(stepInstanceId);
+        return ResponseEntity.ok(ApiResponse.success(
+                service.getUsersByRolesScoped(roleIds, tenantId, si, null)));
     }
 }

@@ -200,6 +200,29 @@ public class UiFormField extends BaseEntity {
          *  Uses lookupEntityType and lookupApiPath columns. */
         LOOKUP,
 
+        /**
+         * Several of one entity — renders MultiEntityLookupField, which wraps
+         * LOOKUP's search and adds a chip list. Uses the same lookupEntityType
+         * and lookupApiPath columns.
+         *
+         * Value is an ARRAY of ids and is NOT joined, matching MULTI_SELECT's
+         * contract. The DTO field must therefore be a List, not a String: a
+         * String there produces
+         *   Cannot deserialize value of type java.util.ArrayList<java.lang.Long>
+         *   from String value
+         * on submit.
+         *
+         * This enum is the SINGLE SOURCE OF TRUTH for what may appear in
+         * ui_form_fields.field_type. A value present in the database but absent
+         * here does not fail — fromDb() below logs
+         *   [UI-FORM-FIELD] Unknown field_type='…' in DB — defaulting to TEXT
+         * and silently renders a text box, which is how MULTI_LOOKUP shipped as
+         * a plain input that accepted a typed name and then failed to
+         * deserialise. Adding a field type means changing this enum, the
+         * DynamicForm switch, and the seed — all three.
+         */
+        MULTI_LOOKUP,
+
         /** Add/remove list of text items — renders MultilineListInput */
         MULTILINE_LIST,
 
@@ -209,6 +232,32 @@ public class UiFormField extends BaseEntity {
         /** Chip/tag input with autocomplete — renders TagInput component.
          *  Uses tagSuggestions column for autocomplete list. */
         TAG,
+
+        /**
+         * Read-back of everything answered on EARLIER steps — renders nothing
+         * interactive and holds no value of its own.
+         *
+         * This is the wizard's review step. ui_form_fields.step_number has
+         * existed since the schema was written and nothing read it, so every
+         * DB-driven form was a single flat page while the hardcoded pages it
+         * replaces are wizards — VendorOnboardPage most visibly, whose fourth
+         * step is a review of the first three. Without this type a seeded
+         * four-step form either drops that step or shows a heading over an
+         * empty page.
+         *
+         * Structural, like SECTION_HEADER and DIVIDER: never registered with
+         * the form, never validated, never submitted. It reads the live form
+         * state and the field list, so it takes no configuration — put one on
+         * the last step and it summarises every step before it.
+         *
+         * Per the note on MULTI_LOOKUP above, adding a field type means
+         * changing THREE things: this enum, the DynamicForm switch, and the
+         * seed. And a fourth here, because field_type is a MySQL ENUM column:
+         * the value has to be added to the column definition or the INSERT is
+         * rejected. sql/72 does that with a dynamic ALTER that appends to
+         * whatever the column currently holds.
+         */
+        REVIEW_SUMMARY,
     }
 
     // ── Migration SQL ─────────────────────────────────────────────────────────

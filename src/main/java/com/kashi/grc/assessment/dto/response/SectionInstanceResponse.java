@@ -24,5 +24,18 @@ public class SectionInstanceResponse {
     private Long          submittedBy;
     private String        submittedByName;
     private LocalDateTime reopenedAt;
+
+    /**
+     * The REVIEWER's lock on this section, distinct from submittedAt which is
+     * the vendor responder's.
+     *
+     * Needed by the review assistant's screen: once the reviewer has locked a
+     * section, the assistant cannot change a verdict in it, and a UI that
+     * cannot see this state either lets them try and fail, or silently narrows
+     * on a field that is always undefined. Cleared by reviewer-reopen, which
+     * is the org CISO's gesture.
+     */
+    private LocalDateTime reviewerSubmittedAt;
+    private LocalDateTime reviewerReopenedAt;
     private List<QuestionInstanceResponse> questions;
 }

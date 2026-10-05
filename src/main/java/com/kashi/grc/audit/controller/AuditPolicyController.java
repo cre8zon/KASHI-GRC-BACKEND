@@ -52,6 +52,9 @@ public class AuditPolicyController {
     private final WorkflowEngineService                       workflowEngineService;
     private final WorkflowRepository                          workflowRepository;
     private final com.kashi.grc.workflow.service.WorkflowAccessService workflowAccessService;
+    private final com.kashi.grc.audit.service.ControlAccessGuard      controlAccessGuard;
+    private final com.kashi.grc.audit.service.AuditObligationService  obligationService;
+    private final com.kashi.grc.audit.service.AuditFieldworkService   fieldworkService;
 
     // ── Library — Policies CRUD ───────────────────────────────────────────────
 
@@ -1087,11 +1090,25 @@ public class AuditPolicyController {
         AuditPolicyInstance instance = policyInstanceRepository.findById(policyInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", policyInstanceId));
 
-        instance.setReviewResult(AuditPolicyInstance.ReviewResult.valueOf(req.getReviewResult()));
-        instance.setAuditorNotes(req.getAuditorNotes());
-        instance.setReviewedById(userId);
-        instance.setReviewedAt(LocalDateTime.now());
-        policyInstanceRepository.save(instance);
+        // The permission above says this caller is an auditor; it said nothing
+        // about WHICH policy. Loaded by id alone, the engagement in the path was
+        // never compared, so any reviewer could conclude any policy in any
+        // tenant. Same guard as PUT /v1/audit/policy-instances/{id}/review.
+        if (!java.util.Objects.equals(instance.getEngagementId(), engagementId)) {
+            throw new ResourceNotFoundException("AuditPolicyInstance", policyInstanceId);
+        }
+        controlAccessGuard.requireCanReviewPolicy(instance, userId);
+
+        // One implementation for every screen that records a policy review
+        // (AuditFieldworkService). This copy never raised the INADEQUATE
+        // policy-gap finding, so the same review raised one from the control's
+        // Fieldwork tab and none from the policy's own screen. Notes are written
+        // only when sent ('' clears them).
+        java.util.Map<String, String> fields = new java.util.HashMap<>();
+        fields.put("reviewResult", req.getReviewResult());
+        if (req.getAuditorNotes() != null) fields.put("auditorNotes", req.getAuditorNotes());
+        fieldworkService.reviewPolicy(instance, fields, userId,
+                utilityService.getLoggedInDataContext().getTenantId());
 
         log.info("[AUDIT-POLICY] Review recorded | instanceId={} result={}",
                 policyInstanceId, req.getReviewResult());
@@ -1108,6 +1125,9 @@ public class AuditPolicyController {
 
         List<Map<String, Object>> result = policyInstanceRepository.findAllById(policyInstanceIds)
                 .stream()
+                // Mapping rows carry no tenant; the policy instance does. Without
+                // this any tenant's policies were readable through a control id.
+                .filter(pi -> controlAccessGuard.isReadable(pi.getTenantId(), pi.getEngagementId()))
                 .map(pi -> {
                     Map<String, Object> row = toPolicyInstanceMap(pi);
                     policyInstanceControlMappingRepository

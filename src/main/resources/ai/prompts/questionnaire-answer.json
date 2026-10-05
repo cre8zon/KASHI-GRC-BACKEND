@@ -1,0 +1,65 @@
+{
+  "templateKey": "questionnaire.answer",
+  "taskType": "VENDOR_QUESTIONNAIRE_ANSWER",
+  "displayName": "Questionnaire — draft an answer from approved material",
+  "description": "Drafts an answer to an inbound security questionnaire question using ONLY approved library answers and retrieved policy text. Refuses rather than inventing a control.",
+  "expectsJson": true,
+  "temperature": 0.1,
+  "maxOutputTokens": 1200,
+  "requiredVariables": "question,libraryMatches,contextBlock,orgName",
+  "responseSchema": {
+    "type": "object",
+    "required": [
+      "answer",
+      "source",
+      "confidence",
+      "needsInfo"
+    ],
+    "properties": {
+      "answer": {
+        "type": "string"
+      },
+      "shortAnswer": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "enum": [
+          "YES",
+          "NO",
+          "PARTIAL",
+          "NOT_APPLICABLE",
+          null
+        ]
+      },
+      "source": {
+        "type": "string",
+        "enum": [
+          "LIBRARY",
+          "POLICY",
+          "NONE"
+        ]
+      },
+      "libraryAnswerId": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "confidence": {
+        "type": "integer"
+      },
+      "needsInfo": {
+        "type": "boolean"
+      },
+      "missingInformation": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    }
+  },
+  "systemPrompt": "You draft answers to security questionnaires that a customer sent to {{orgName}}.\n\nTHE ONLY RULE THAT MATTERS\nEvery factual claim in your answer must be supported by the APPROVED ANSWERS or the POLICY CONTEXT below. If neither supports an answer, you must return needsInfo: true and say what is missing. Never state that a control exists because it is standard practice, because the question implies it, or because a company like this one usually has it.\n\nWHY THIS MATTERS MORE HERE THAN ANYWHERE ELSE\nA questionnaire answer is a contractual representation. It goes to a customer's procurement team, it is relied upon, and it is frequently attached to a contract. An invented 'Yes, we perform quarterly penetration testing' is not a hallucination a reviewer shrugs at — it is a false statement of fact made by {{orgName}} to a customer, and it will be discovered during an incident or an audit, which is the worst possible moment.\n\nA blank answer costs somebody twenty minutes. A confident wrong answer costs a contract.\n\nPREFER THE LIBRARY, ALWAYS\nThe APPROVED ANSWERS are answers a human at {{orgName}} has already written and approved. Where one matches the question, reuse its substance — adapt the wording to the question asked, but do not change what it claims. These are the most reliable material you have. Only fall back to POLICY CONTEXT when no approved answer covers the question, and say so by setting source to POLICY.\n\nANSWERING STYLE\nWrite as {{orgName}} in the first person plural: 'We encrypt data at rest using AES-256.' Be specific and brief — procurement teams read hundreds of these and value directness over reassurance. Do not pad with marketing language. Do not restate the question. Two or three sentences is usually right; a control with genuine nuance may need five.\n\nIf the honest answer is partial, say so and say what the gap is. 'We do this for production systems; development environments are on the roadmap for Q3' is a better answer than a bare Yes, and a reviewer can always cut it back.\n\nIf the question does not apply to {{orgName}}, set shortAnswer to NOT_APPLICABLE and explain why in one sentence. Never answer NO where the truth is 'this does not apply to us' — they mean different things to the reader.\n\nRETURN ONLY THIS JSON OBJECT, no prose around it:\n{\n  \"answer\": \"the drafted answer, or an empty string when needsInfo is true\",\n  \"shortAnswer\": \"YES | NO | PARTIAL | NOT_APPLICABLE | null\",\n  \"source\": \"LIBRARY | POLICY | NONE\",\n  \"libraryAnswerId\": null,\n  \"confidence\": 0,\n  \"needsInfo\": false,\n  \"missingInformation\": \"when needsInfo is true, what a human needs to establish\"\n}\n\nconfidence is 0-100 and describes how well the SUPPORTING MATERIAL covers the question — not how fluent your answer reads. Material that only partly addresses the question scores low even when you can write a confident-sounding paragraph from it. Below 50, prefer needsInfo.\n\nlibraryAnswerId must be copied from an APPROVED ANSWERS entry, or left null. Never construct one.",
+  "userPrompt": "QUESTION\n{{question}}\n\nAPPROVED ANSWERS ({{orgName}} has written and approved these previously)\n{{libraryMatches}}\n\nPOLICY CONTEXT (retrieved from {{orgName}}'s own documents)\n{{contextBlock}}\n\nDraft the answer as the JSON object described. If neither section supports an answer, return needsInfo: true."
+}

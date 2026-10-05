@@ -204,6 +204,36 @@ public class AccessContext {
      */
     private boolean hasSections;
 
+    /**
+     * The section keys this task still owes — required, not yet completed.
+     *
+     * hasSections above is this list's emptiness, and for hiding COMPLETE_STEP
+     * that is all a client needs. It is not enough to decide WHICH button
+     * belongs on a step, which is the question an action that fires a named
+     * section gate has to answer:
+     *
+     *   "Publish section" fires SECTION_PUBLISHED and belongs only on the step
+     *   whose blueprint declares a PUBLISH_SECTION section, and only while that
+     *   section is still open.
+     *
+     * step_action cannot answer it — workflow 12 has three separate REVIEW
+     * steps, and a button scoped to REVIEW would appear on all of them. nav_key
+     * cannot either: there are about six nav keys across thirteen steps. The
+     * section key is the only identifier that is unique to the gate, stable
+     * across a cloned workflow (it is a blueprint key, not a row id), and
+     * already the thing the action's endpoint fires.
+     *
+     * Keys only, not the whole TaskSectionProgressResponse: this rides on every
+     * view-context call, the client needs an is-it-open test and nothing more,
+     * and /v1/compound-tasks/{id}/progress already serves the full shape to the
+     * one component that renders it.
+     *
+     * Null rather than empty when there is no task, matching nullIfEmpty on the
+     * fields above — a client that gets null and a client that gets [] must
+     * both read it as "nothing owed".
+     */
+    private List<String> openSectionKeys;
+
     // ── Nested types ──────────────────────────────────────────────────────────
 
     @Data

@@ -309,7 +309,31 @@ public class RoleServiceImpl implements RoleService {
         var user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
         user.getRoles().removeIf(r -> r.getId().equals(roleId));
-        return buildUserResponse(userRepository.save(user));
+        var saved = userRepository.save(user);
+
+        // ── THE MISSING HALF OF assignRoleToUser ─────────────────────────────
+        //
+        // assignRoleToUser flushes and then calls ensureHomeMembership, because
+        // the @ManyToMany cannot write user_roles.membership_id and a NULL there
+        // makes the role invisible to every membership-scoped picker. This
+        // method did the removal and stopped.
+        //
+        // That is not merely a missing stamp on the removed row — the removed
+        // row is gone. It is the SURVIVING rows that break. Hibernate maintains
+        // a @ManyToMany collection by deleting the join rows for the owner and
+        // re-inserting what remains, and the re-inserted rows come back with
+        // membership_id NULL, exactly as a fresh assignment would.
+        //
+        // So editing a user's roles — removing one of two — silently unstamped
+        // the one they kept, and the person vanished from every assignment
+        // dropdown in the product while still holding the role. The role page
+        // showed it, the picker did not, and nothing logged a problem.
+        //
+        // Same two lines as the assign path, for the same reason.
+        userRepository.flush();
+        membershipRoleSync.ensureHomeMembership(userId, tenantId);
+
+        return buildUserResponse(saved);
     }
 
     @Override

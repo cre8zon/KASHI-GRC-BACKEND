@@ -35,6 +35,21 @@ public class AuditPolicyInstanceControlMappingRepositoryImpl
     }
 
     @Override
+    public java.util.Map<Long, Long> countPoliciesByControlForEngagement(Long engagementId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<jakarta.persistence.Tuple> cq = cb.createTupleQuery();
+        Root<AuditPolicyInstanceControlMapping> m = cq.from(AuditPolicyInstanceControlMapping.class);
+        cq.multiselect(m.get("controlInstanceId"), cb.countDistinct(m.get("policyInstanceId")))
+                .where(cb.equal(m.get("engagementId"), engagementId))
+                .groupBy(m.get("controlInstanceId"));
+        java.util.Map<Long, Long> counts = new java.util.HashMap<>();
+        for (jakarta.persistence.Tuple t : em.createQuery(cq).getResultList()) {
+            counts.put(t.get(0, Long.class), t.get(1, Long.class));
+        }
+        return counts;
+    }
+
+    @Override
     public List<Long> findPolicyInstanceIdsByControlInstanceId(Long controlInstanceId) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);

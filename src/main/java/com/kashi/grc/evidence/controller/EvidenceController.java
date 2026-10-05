@@ -56,6 +56,11 @@ public class EvidenceController {
 
     private final EvidenceService  service;
     private final UtilityService   utilityService;
+    // Owning modules decide who may read / attach / review on their entity
+    // types (EvidenceTargetAccessPolicy). Unclaimed types: tenant check only,
+    // as before.
+    private final com.kashi.grc.evidence.spi.EvidenceTargetAccess targetAccess;
+    private final com.kashi.grc.evidence.repository.EvidenceLinkRepository linkRepository;
 
     // ── Evidence records ──────────────────────────────────────────────────────
 
@@ -99,6 +104,7 @@ public class EvidenceController {
             @RequestParam Long   entityId) {
 
         var ctx = utilityService.getLoggedInDataContext();
+        targetAccess.requireReadable(entityType, entityId);
         return ResponseEntity.ok(ApiResponse.success(
                 service.getLinksForEntity(entityType, entityId, ctx.getTenantId())));
     }
@@ -112,6 +118,7 @@ public class EvidenceController {
             @PathVariable Long testInstanceId) {
 
         var ctx = utilityService.getLoggedInDataContext();
+        targetAccess.requireReadable("AUDIT_TEST_INSTANCE", testInstanceId);
         return ResponseEntity.ok(ApiResponse.success(
                 service.getControlEvidenceUsedByTest(testInstanceId, ctx.getTenantId())));
     }
@@ -121,7 +128,11 @@ public class EvidenceController {
             description = "Used by the evidence review inbox and notification badge.")
     public ResponseEntity<ApiResponse<List<EvidenceLinkResponse>>> getPendingReview() {
         var ctx = utilityService.getLoggedInDataContext();
-        return ResponseEntity.ok(ApiResponse.success(service.getPendingReview(ctx.getTenantId())));
+        // Tenant-wide list: drop rows on targets the caller may not read (a guest
+        // auditor sees only the engagements they are staffed on).
+        return ResponseEntity.ok(ApiResponse.success(service.getPendingReview(ctx.getTenantId()).stream()
+                .filter(l -> targetAccess.isReadable(l.getTargetEntityType(), l.getTargetEntityId()))
+                .toList()));
     }
 
     @PostMapping("/{id}/links")
@@ -132,6 +143,7 @@ public class EvidenceController {
             @Valid @RequestBody ManualEvidenceLinkRequest req) {
 
         var ctx = utilityService.getLoggedInDataContext();
+        targetAccess.requireCanAttach(req.getTargetEntityType(), req.getTargetEntityId(), ctx.getId());
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(
                 service.manualLink(id, req, ctx.getId(), ctx.getTenantId())));
     }
@@ -145,6 +157,11 @@ public class EvidenceController {
             @Valid @RequestBody EvidenceLinkReviewRequest req) {
 
         var ctx = utilityService.getLoggedInDataContext();
+        // The link's TARGET decides who may judge it — e.g. only someone who may
+        // record the result of that audit control may accept evidence on it.
+        // An unknown/foreign link falls through to the service's own 404.
+        linkRepository.findByIdAndTenantId(linkId, ctx.getTenantId()).ifPresent(link ->
+                targetAccess.requireCanReview(link.getTargetEntityType(), link.getTargetEntityId(), ctx.getId()));
         return ResponseEntity.ok(ApiResponse.success(
                 service.reviewLink(linkId, req, ctx.getId(), ctx.getTenantId())));
     }

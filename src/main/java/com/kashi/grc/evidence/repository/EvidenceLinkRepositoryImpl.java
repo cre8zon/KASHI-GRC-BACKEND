@@ -60,6 +60,22 @@ public class EvidenceLinkRepositoryImpl implements EvidenceLinkRepositoryCustom 
     }
 
     @Override
+    public java.util.Set<Long> entityIdsWithLiveLink(String entityType, java.util.List<Long> entityIds) {
+        if (entityIds == null || entityIds.isEmpty()) return new java.util.HashSet<>();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<EvidenceLink> l = cq.from(EvidenceLink.class);
+        cq.select(l.get("targetEntityId")).distinct(true).where(
+                cb.equal(l.get("targetEntityType"), entityType),
+                l.get("targetEntityId").in(entityIds),
+                l.get("status").in(EvidenceLink.Status.PENDING_REVIEW,
+                        EvidenceLink.Status.ACCEPTED,
+                        EvidenceLink.Status.AUTOMATION_VERIFIED)
+        );
+        return new java.util.HashSet<>(em.createQuery(cq).getResultList());
+    }
+
+    @Override
     public long countAcceptedForEntity(String entityType, Long entityId) {
         CriteriaBuilder cb = em.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);

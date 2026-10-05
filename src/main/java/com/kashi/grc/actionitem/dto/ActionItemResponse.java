@@ -72,6 +72,13 @@ public class ActionItemResponse {
     // ── Navigation ────────────────────────────────────────────────────────────
     private String navContext;  // JSON passthrough — module sets this at creation
 
+    /**
+     * ui_navigation keys, resolved by the shared inbox resolver exactly as a
+     * workflow task's are. See ActionItem.navKey for why these exist.
+     */
+    private String navKey;
+    private String assignerNavKey;
+
     // ── NEW: Item UI rendering ─────────────────────────────────────────────────
     /**
      * Screen config key for the assignee's work UI.
@@ -100,6 +107,15 @@ public class ActionItemResponse {
     private String  acceptedRiskByName;
     private String  acceptedRiskNote;
     private LocalDateTime acceptedRiskAt;
+
+    // ── Escalation ────────────────────────────────────────────────────────────
+    // Set by AssessmentIssueEscalationService (and by the audit module's finding
+    // escalation) when this item has been raised as an Issue and handed to the
+    // external remediation workflow. Null for every item that has not been
+    // escalated, which is the overwhelming majority — the column is on
+    // ActionItem already; it simply was never carried out to the client, so the
+    // UI could not tell an escalated finding from an open one.
+    private Long linkedIssueId;
 
     // ── Computed ──────────────────────────────────────────────────────────────
     private boolean canResolve;   // true when calling user can mark RESOLVED

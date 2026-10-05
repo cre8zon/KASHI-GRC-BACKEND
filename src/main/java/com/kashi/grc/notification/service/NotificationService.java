@@ -5,6 +5,7 @@ import com.kashi.grc.common.kafka.KafkaEventPublisher;
 import com.kashi.grc.common.kafka.KafkaTopics;
 import com.kashi.grc.notification.domain.Notification;
 import com.kashi.grc.notification.repository.NotificationRepository;
+import com.kashi.grc.notification.spi.NotificationRouteContributor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.stereotype.Service;
@@ -58,10 +59,51 @@ public class NotificationService {
     /** Present only when kashi.kafka.enabled=true. */
     private final KafkaEventPublisher    kafkaPublisher;   // nullable
 
+    /**
+     * Where a notification opens, answered by the module that owns the entity.
+     *
+     * ObjectProvider rather than a constructor List for the reason spelled out
+     * in NotificationRouteContributor: this service is injected into most
+     * services in the product, so eager injection of anything that transitively
+     * reaches one of them fails the context at startup. Resolved lazily, per
+     * call, which costs a map lookup.
+     */
+    private final ObjectProvider<NotificationRouteContributor> routeContributors;
+
     public NotificationService(NotificationRepository notificationRepository,
-                               ObjectProvider<KafkaEventPublisher> kafkaPublisherProvider) {
+                               ObjectProvider<KafkaEventPublisher> kafkaPublisherProvider,
+                               ObjectProvider<NotificationRouteContributor> routeContributors) {
         this.notificationRepository = notificationRepository;
         this.kafkaPublisher         = kafkaPublisherProvider.getIfAvailable();
+        this.routeContributors      = routeContributors;
+    }
+
+    /**
+     * The route for one notification, or null when nothing can answer.
+     *
+     * Null is a normal outcome, not a failure: a module with no contributor
+     * keeps the client-side fallback it has always had. The point of writing it
+     * here is that the client stops GUESSING for the modules that have one.
+     *
+     * Wrapped in a catch because this runs on the path that saves the
+     * notification. A contributor that throws must cost its own route, never
+     * the notification — losing the message to decorate it would be a poor
+     * trade.
+     */
+    private String resolveActionUrl(String entityType, Long entityId, String type, Long userId) {
+        if (entityType == null || entityId == null) return null;
+        try {
+            return routeContributors.stream()
+                    .filter(c -> c.supports(entityType))
+                    .map(c -> c.routeFor(entityType, entityId, type, userId))
+                    .filter(java.util.Objects::nonNull)
+                    .findFirst()
+                    .orElse(null);
+        } catch (Exception e) {
+            log.warn("[NOTIFY] Route resolution failed for {}:{} — notification still sent | {}",
+                    entityType, entityId, e.getMessage());
+            return null;
+        }
     }
 
     @Transactional
@@ -113,6 +155,11 @@ public class NotificationService {
                 .message(message)
                 .entityType(entityType)
                 .entityId(entityId)
+                // Resolved per recipient, not per notification: the vendor user
+                // notified about a question and the organisation user notified
+                // about the same one want opposite screens, and sendToUsers
+                // calls this once per user precisely so each gets their own.
+                .actionUrl(resolveActionUrl(entityType, entityId, type, userId))
                 .sentAt(LocalDateTime.now())
                 .build();
         notificationRepository.save(n);

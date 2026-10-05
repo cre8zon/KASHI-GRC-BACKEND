@@ -11,4 +11,10 @@ import org.springframework.stereotype.Repository;
 @Repository
 public interface DashboardWidgetRepository
         extends JpaRepository<DashboardWidget, Long>, DashboardWidgetRepositoryCustom {
+
+    /** A single dashboard's widgets, in display order. */
+    java.util.List<DashboardWidget> findByDashboardIdAndIsActiveTrueOrderBySortOrderAsc(Long dashboardId);
+
+    /** Used when deleting a dashboard, to refuse if it still holds widgets. */
+    long countByDashboardId(Long dashboardId);
 }

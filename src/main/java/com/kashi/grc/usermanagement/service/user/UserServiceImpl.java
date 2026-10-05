@@ -45,6 +45,7 @@ public class UserServiceImpl implements UserService {
     private final com.kashi.grc.usermanagement.service.role.MembershipRoleSync membershipRoleSync;
     private final UserAttributeRepository attributeRepository;
     private final DelegationRepository delegationRepository;
+    private final com.kashi.grc.usermanagement.service.role.PermissionHolderService permissionHolderService;
 
     @org.springframework.beans.factory.annotation.Value("${kashi.app.base-url:https://app.kashigrc.com}")
     private String appBaseUrl;
@@ -277,6 +278,13 @@ public class UserServiceImpl implements UserService {
     @Override
     @Transactional(readOnly = true)
     public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam, String membershipType, Long firmTenantId) {
+        return listUsers(pageDetails, side, noRoles, vendorIdParam, roleIdParam, tenantIdParam,
+                membershipType, firmTenantId, null);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorIdParam, Long roleIdParam, Long tenantIdParam, String membershipType, Long firmTenantId, String permission) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         User loggedInUser = utilityService.getLoggedInDataContext();
 
@@ -312,6 +320,12 @@ public class UserServiceImpl implements UserService {
         final String finalMembershipType =
                 (membershipType != null && !membershipType.isBlank()) ? membershipType.toUpperCase() : null;
         final Long finalFirmTenantId = firmTenantId;
+        // Holders of the permission in the tenant this list is scoped to — the
+        // same tenant the membership filter uses. null = no permission filter.
+        final java.util.Set<Long> finalPermissionHolders = (permission != null && !permission.isBlank())
+                ? permissionHolderService.holderIds(
+                effectiveTenantId, permission)
+                : null;
 
         return dbRepository.findAll(
                 User.class,
@@ -392,6 +406,13 @@ public class UserServiceImpl implements UserService {
                         roleSub.select(roleSubRoot.get("id"))
                                 .where(cb.equal(rJoin.get("id"), finalRoleId));
                         predicates.add(cb.exists(roleSub));
+                    }
+                    // Permission filter — only people who hold it in the tenant
+                    // being listed. Resolved once, before the query (below).
+                    if (finalPermissionHolders != null) {
+                        predicates.add(finalPermissionHolders.isEmpty()
+                                ? cb.disjunction()
+                                : root.get("id").in(finalPermissionHolders));
                     }
                     return predicates;
                 },

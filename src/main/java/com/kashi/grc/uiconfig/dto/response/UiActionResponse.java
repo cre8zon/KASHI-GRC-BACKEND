@@ -20,5 +20,20 @@ public class UiActionResponse {
     private String  confirmationMessage;
     private boolean requiresRemarks;
     private boolean requiresAssignment;
+    /** See UiAction.requiresSectionGate. */
+    private boolean requiresSectionGate;
+    /**
+     * See UiAction.allowedStepActions. Comma-separated, OR semantics, null =
+     * any step. Sent as the raw string so the client splits it the same way it
+     * already splits allowed_sides, rather than the server inventing a second
+     * shape for the same idea.
+     */
+    private String  allowedStepActions;
+    /**
+     * See UiAction.completesSectionKey. Matched against
+     * AccessContext.openSectionKeys — the action shows only while that gate is
+     * still owed. Null = not tied to a gate.
+     */
+    private String  completesSectionKey;
     private Integer sortOrder;
 }

@@ -58,6 +58,7 @@ import java.time.LocalDateTime;
         @Index(name = "idx_ai_tenant_status", columnList = "tenant_id,status"),
         @Index(name = "idx_ai_blueprint",     columnList = "blueprint_id"),
         @Index(name = "idx_ai_vendor",        columnList = "vendor_id"),
+        @Index(name = "idx_ai_linked_issue",  columnList = "linked_issue_id"),
         @Index(name = "idx_ai_parent",        columnList = "parent_entity_type,parent_entity_id"),
 })
 @Getter @Setter
@@ -85,6 +86,44 @@ public class ActionItem extends TenantAwareEntity {
      * Prevents cross-vendor leaks when assignedGroupRole is used.
      * Set only for TPRM items. Null for org-internal items.
      */
+    /**
+     * Which ui_navigation row opens this item, for the person it is assigned to.
+     *
+     * ── WHY THIS EXISTS, AND WHY IT IS NAMED AFTER workflow_steps ────────────
+     * A workflow task and an action item are the same shape to whoever is
+     * looking at an inbox: a thing to do, an entity it is about, a place to go
+     * and some buttons when you get there. They were resolved by two unrelated
+     * mechanisms — a task through nav_key into ui_navigation, an action item
+     * through a nav_context JSON string with the route baked in by whichever
+     * controller created it.
+     *
+     * That second mechanism cannot be maintained. A route change means editing
+     * Java string literals in every module that raises an item and then a
+     * backfill for every row already written, which is exactly what sql/86 had
+     * to do. It also means one inbox cannot exist without two routing rules
+     * inside it.
+     *
+     * nav_key and assigner_nav_key are the same two columns workflow_steps
+     * carries, with the same meaning and the same resolution, so ONE resolver
+     * answers for both kinds of work. For an action item the "assigner" is
+     * whoever validates or reviews it rather than whoever assigned the step —
+     * the distinction that matters is the same one: the person doing the work
+     * and the person checking it may need different screens.
+     *
+     * nav_context stays, and stays authoritative where it is set, because it
+     * carries per-item detail a nav row cannot — which question to open, an
+     * openWork bypass. The resolver prefers nav_key for the ROUTE and keeps
+     * reading nav_context for those extras. Items written before this column
+     * existed have a null nav_key and fall back to nav_context exactly as
+     * before, so nothing has to be migrated for anything to keep working.
+     */
+    @Column(name = "nav_key", length = 100)
+    private String navKey;
+
+    /** The reviewer/validator's screen. See navKey. */
+    @Column(name = "assigner_nav_key", length = 100)
+    private String assignerNavKey;
+
     @Column(name = "vendor_id")
     private Long vendorId;
 
@@ -232,6 +271,22 @@ public class ActionItem extends TenantAwareEntity {
     @Column(name = "accepted_risk_note", columnDefinition = "TEXT")
     private String acceptedRiskNote;
 
+    /**
+     * The Issue this item was escalated into, if it was.
+     *
+     * Mirrors audit_findings.linked_issue_id exactly — a plain Long, no JPA
+     * relationship, no DB-level foreign key. Two reasons to copy that shape
+     * rather than improve on it: the escalation guard only needs "is there one,
+     * and which", and a real FK would make deleting an issue fail rather than
+     * orphan a link, which is the wrong trade for a soft cross-module
+     * reference.
+     *
+     * Null means never escalated. It is never cleared — an issue that is closed
+     * or cancelled keeps its link so the remediation's history stays readable.
+     */
+    @Column(name = "linked_issue_id")
+    private Long linkedIssueId;
+
     // ── Enums ──────────────────────────────────────────────────────────────
 
     public enum Status {
@@ -278,6 +333,22 @@ public class ActionItem extends TenantAwareEntity {
         AUDIT_EVIDENCE,
         RISK_GAP,
         EXCEPTION,
-        INCIDENT
+        INCIDENT,
+        // Audit engagement instances — per-instance delegation and send-back
+        // obligations (AuditObligationService). Deliberately NOT the existing
+        // CONTROL constant: that one belongs to the risk module's control
+        // instances, and reusing it would mix two id spaces in one column.
+        // EnumType.STRING, so position is irrelevant and no data migration is
+        // needed; the longest value is 22 characters against VARCHAR(30).
+        AUDIT_CONTROL_INSTANCE,
+        AUDIT_TEST_INSTANCE,
+        AUDIT_POLICY_INSTANCE,
+        // Collaboration workspaces (com.kashi.grc.collab): requests raised in a
+        // workspace (COLLAB_WORKSPACE, optionally under a COLLAB_PROGRAMME
+        // parent) and follow-ups from a meeting (COLLAB_MEETING). Who may see
+        // them is answered by CollabActionItemVisibility.
+        COLLAB_WORKSPACE,
+        COLLAB_PROGRAMME,
+        COLLAB_MEETING
     }
 }

@@ -30,12 +30,23 @@ public class BulkControlAssignRequest {
     private Long sectionInstanceId;
 
     // ── Auditor side ─────────────────────────────────────────────────────────
-    /** userId to assign as control auditor. Null = unassign. */
+    /** userId to assign as control auditor. Null = leave the auditor unchanged. */
     private Long auditorUserId;
 
+    /**
+     * true = CLEAR the auditor on every target control. Null was documented as
+     * "unassign" above but the service always treated it as "leave unchanged",
+     * so bulk unassign was impossible; it is an explicit flag instead, because
+     * null cannot mean both. Refused together with auditorUserId.
+     */
+    private Boolean unassignAuditor;
+
     // ── Auditee side ─────────────────────────────────────────────────────────
-    /** userId to assign as control evidence owner. Null = unassign. */
+    /** userId to assign as control evidence owner. Null = leave unchanged. */
     private Long auditeeUserId;
+
+    /** true = CLEAR the evidence owner on every target control. Refused with auditeeUserId. */
+    private Boolean unassignAuditee;
 
     /** Optional evidence due date for all assigned controls */
     private LocalDate evidenceDueDate;

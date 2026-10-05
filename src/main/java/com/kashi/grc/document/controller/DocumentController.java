@@ -62,6 +62,8 @@ import java.util.*;
 public class DocumentController {
 
     private final DocumentRepository     documentRepository;
+    private final org.springframework.context.ApplicationEventPublisher eventPublisher;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
     private final DocumentLinkRepository documentLinkRepository;
     private final StorageService         storageService;
     private final UtilityService         utilityService;
@@ -107,6 +109,13 @@ public class DocumentController {
     private final DocumentPreviewService previewService;
     private final com.kashi.grc.evidence.repository.EvidenceRecordRepository evidenceRecordRepository;
     private final com.kashi.grc.evidence.repository.EvidenceLinkRepository   evidenceLinkRepository;
+    /**
+     * Owning modules decide who may read / attach on their entity types
+     * (EvidenceTargetAccessPolicy) — e.g. only someone working an audit control
+     * may upload to or remove evidence from it. Unclaimed types: tenant check
+     * only, exactly as before.
+     */
+    private final com.kashi.grc.evidence.spi.EvidenceTargetAccess targetAccess;
 
     // ══════════════════════════════════════════════════════════════════════
     // STEP 1 of upload: Request presigned PUT URL
@@ -120,6 +129,10 @@ public class DocumentController {
 
         Long userId   = utilityService.getLoggedInDataContext().getId();
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // Refuse BEFORE handing out an upload URL, not after the file is in S3.
+        // linkDocument re-checks at confirm time, which is the binding check.
+        targetAccess.requireCanAttach(req.getEntityType(), req.getEntityId(), userId);
 
         // Image files must go through /upload-image (server-side WebP conversion)
         if (isImageMime(req.getMimeType())) {
@@ -247,6 +260,8 @@ public class DocumentController {
 
         Long userId   = utilityService.getLoggedInDataContext().getId();
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        targetAccess.requireCanAttach(entityType, entityId, userId);
 
         if (!isImageMime(file.getContentType())) {
             throw new BusinessException("NOT_AN_IMAGE",
@@ -408,6 +423,21 @@ public class DocumentController {
                                 && el.getTargetEntityId().equals(link.getEntityId()))
                   .toList();
 
+        // Removing evidence is work on each target it is removed FROM — so
+        // EVERYWHERE needs that right on every one of them, not only here.
+        Long callerId = utilityService.getLoggedInDataContext().getId();
+        targetAccess.requireCanAttach(link.getEntityType(), link.getEntityId(), callerId);
+        if (everywhere) {
+            toRemove.stream()
+                    .map(el -> new java.util.AbstractMap.SimpleEntry<String, Long>(el.getTargetEntityType(), el.getTargetEntityId()))
+                    .distinct()
+                    .forEach(t -> targetAccess.requireCanAttach(t.getKey(), t.getValue(), callerId));
+            documentLinkRepository.findByDocumentId(link.getDocumentId()).stream()
+                    .map(dl -> new java.util.AbstractMap.SimpleEntry<String, Long>(dl.getEntityType(), dl.getEntityId()))
+                    .distinct()
+                    .forEach(t -> targetAccess.requireCanAttach(t.getKey(), t.getValue(), callerId));
+        }
+
         List<Long> locked = toRemove.stream().filter(this::isLocked)
                 .map(el -> el.getId()).toList();
         if (!locked.isEmpty()) {
@@ -476,6 +506,7 @@ public class DocumentController {
             @RequestParam(required = false) String linkType) {
 
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        targetAccess.requireReadable(entityType, entityId);
 
         List<DocumentLink> links = linkType != null
                 ? documentLinkRepository.findActiveByEntity(entityType, entityId, linkType)
@@ -488,6 +519,16 @@ public class DocumentController {
         Map<Long, Document> documentsById = documentIds.isEmpty() ? Map.of()
                 : documentRepository.findAllById(documentIds).stream()
                   .collect(java.util.stream.Collectors.toMap(Document::getId, d -> d));
+
+        // Who uploaded each file — one lookup for the whole list.
+        java.util.Set<Long> uploaderIds = documentsById.values().stream()
+                .map(Document::getUploadedBy).filter(Objects::nonNull)
+                .collect(java.util.stream.Collectors.toSet());
+        Map<Long, String> uploaderNames = new java.util.HashMap<>();
+        if (!uploaderIds.isEmpty()) {
+            userRepository.findAllById(uploaderIds).forEach(u -> uploaderNames.put(u.getId(),
+                    u.getFullName() != null && !u.getFullName().isBlank() ? u.getFullName().trim() : u.getEmail()));
+        }
 
         List<Map<String, Object>> result = links.stream().map(lnk -> {
             Document doc = documentsById.get(lnk.getDocumentId());
@@ -506,6 +547,8 @@ public class DocumentController {
             m.put("status",        doc.getStatus());
             m.put("createdAt",     doc.getCreatedAt() != null ? doc.getCreatedAt().toString() : "");
             m.put("notes",         lnk.getNotes());
+            m.put("uploadedBy",     doc.getUploadedBy());
+            m.put("uploadedByName", doc.getUploadedBy() != null ? uploaderNames.get(doc.getUploadedBy()) : null);
             // Omit s3Key — never expose S3 keys to frontend (security)
             // Use /download-url endpoint to get a time-limited presigned GET URL
 
@@ -667,6 +710,10 @@ public class DocumentController {
 
     private DocumentLink linkDocument(Document doc, String entityType, Long entityId,
                                       String linkType, String notes, Long userId, Long tenantId) {
+        // The binding check for all three upload paths (confirm, image, link):
+        // may this caller put evidence on that target at all?
+        targetAccess.requireCanAttach(entityType, entityId, userId);
+
         // Idempotent — don't create duplicate links
         var existing = documentLinkRepository
                 .findByDocumentIdAndEntityTypeAndEntityIdAndLinkType(
@@ -686,6 +733,13 @@ public class DocumentController {
 
         log.info("[DOC-LINK] Created | docId={} | entity={}/{} | type={}",
                 doc.getId(), entityType, entityId, linkType);
+
+        // Reuse of an existing document is a deliberate choice of evidence —
+        // modules listening (audit controls) record it as submitted.
+        if ("REFERENCE".equalsIgnoreCase(linkType)) {
+            eventPublisher.publishEvent(new com.kashi.grc.document.event.DocumentReusedEvent(
+                    entityType, entityId, doc.getId(), userId, tenantId));
+        }
 
         // ── KashiLink ────────────────────────────────────────────────────────
         // Single choke point for all three upload paths (presigned confirm,

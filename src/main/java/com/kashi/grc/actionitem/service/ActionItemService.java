@@ -31,11 +31,24 @@ import java.util.Map;
 @RequiredArgsConstructor
 public class ActionItemService {
 
+    /**
+     * Entity types whose live items grant access to the entity they sit on —
+     * see ControlAccessGuard. Items on these types are created only by
+     * AuditObligationService, and their assignee can never be changed through
+     * the generic update path, because changing it would move the access grant
+     * to someone the delegator never chose.
+     */
+    public static final java.util.Set<ActionItem.EntityType> AUDIT_INSTANCE_TYPES = java.util.EnumSet.of(
+            ActionItem.EntityType.AUDIT_CONTROL_INSTANCE,
+            ActionItem.EntityType.AUDIT_TEST_INSTANCE,
+            ActionItem.EntityType.AUDIT_POLICY_INSTANCE);
+
     private final ActionItemRepository          actionItemRepository;
     private final ActionItemBlueprintRepository blueprintRepository;
     private final UserRepository                userRepository;
     private final SimpMessagingTemplate         messagingTemplate;
     private final NotificationService           notificationService;
+    private final org.springframework.context.ApplicationEventPublisher eventPublisher;
 
     // ── Create ────────────────────────────────────────────────────────────────
 
@@ -72,17 +85,35 @@ public class ActionItemService {
                                                             ? req.getPriority() : ActionItem.Priority.MEDIUM))
                 .dueAt(req.getDueAt() != null ? LocalDateTime.parse(req.getDueAt()) : null)
                 .navContext(req.getNavContext())
+                // Blueprint as the default, the caller as the override — the
+                // same precedence resolutionRole and priority use two lines
+                // below. This is what makes a KashiGuard finding's destination
+                // configurable: the rule names a blueprint, the blueprint names
+                // the screen, and nobody edits Java to move it.
+                .navKey(req.getNavKey() != null || blueprint == null
+                        ? req.getNavKey() : blueprint.getNavKey())
+                .assignerNavKey(req.getAssignerNavKey() != null || blueprint == null
+                        ? req.getAssignerNavKey() : blueprint.getAssignerNavKey())
                 .vendorId(req.getVendorId())
                 // NEW: item UI rendering
                 .itemScreenKey(req.getItemScreenKey())
                 .itemUiJson(req.getItemUiJson())
                 .status(ActionItem.Status.OPEN)
+                // Both were silently dropped before — see ActionItemRequest.
+                .remediationType(req.getRemediationType())
+                .severity(req.getSeverity())
                 .build();
 
         actionItemRepository.save(item);
         log.info("[ACTION-ITEM] Created id={} source={}/{} entity={}/{} assignedTo={}",
                 item.getId(), item.getSourceType(), item.getSourceId(),
                 item.getEntityType(), item.getEntityId(), item.getAssignedTo());
+
+        // Let interested modules react to an item raised on their own entity.
+        // Fire-and-forget by contract: a listener that fails must not undo the
+        // raise, so failures are the listener's to handle, not ours.
+        eventPublisher.publishEvent(
+                new com.kashi.grc.actionitem.event.ActionItemCreatedEvent(item, tenantId));
 
         ActionItemResponse response = toResponse(item, createdBy, List.of());
         pushToUser(item.getAssignedTo(), "ACTION_ITEM_CREATED", response);
@@ -94,12 +125,25 @@ public class ActionItemService {
      * Unchanged — idempotency guard preserved.
      */
     @Transactional
+    /** Back-compat overload — no nav keys, resolves through nav_context alone. */
     public ActionItemResponse createFromComment(EntityComment comment,
                                                 Long assignedTo,
                                                 String resolutionRole,
                                                 String navContextJson,
                                                 Long tenantId,
                                                 Long vendorId) {
+        return createFromComment(comment, assignedTo, resolutionRole, navContextJson,
+                tenantId, vendorId, null, null);
+    }
+
+    public ActionItemResponse createFromComment(EntityComment comment,
+                                                Long assignedTo,
+                                                String resolutionRole,
+                                                String navContextJson,
+                                                Long tenantId,
+                                                Long vendorId,
+                                                String navKey,
+                                                String assignerNavKey) {
         if (actionItemRepository.existsOpenForSource(ActionItem.SourceType.COMMENT, comment.getId())) {
             log.debug("[ACTION-ITEM] Skipping duplicate for comment={}", comment.getId());
             return null;
@@ -118,6 +162,8 @@ public class ActionItemService {
         req.setDescription(comment.getCommentText());
         req.setPriority(ActionItem.Priority.MEDIUM);
         req.setNavContext(navContextJson);
+        req.setNavKey(navKey);
+        req.setAssignerNavKey(assignerNavKey);
 
         return create(req, comment.getCreatedBy(), tenantId);
     }
@@ -147,6 +193,24 @@ public class ActionItemService {
             throw new ForbiddenException("Only the creator or admin can update this action item");
         }
 
+        // An audit-instance item is an access grant to one person. Re-pointing it
+        // here would hand that access to someone the delegator never chose, and
+        // an admin role is not the same authority as being allowed to act on the
+        // control. Dismiss it and delegate again from the record instead.
+        if (AUDIT_INSTANCE_TYPES.contains(item.getEntityType())) {
+            boolean reassigning = req.getAssignedTo() != null
+                    && !req.getAssignedTo().equals(item.getAssignedTo());
+            boolean groupAssigning = req.getAssignedGroupRole() != null
+                    && !req.getAssignedGroupRole().isBlank();
+            if (reassigning || groupAssigning) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "AUDIT_DELEGATION_REASSIGN",
+                        "An audit delegation cannot be reassigned. Revoke it and delegate again "
+                                + "from the record's Action items tab.",
+                        org.springframework.http.HttpStatus.CONFLICT);
+            }
+        }
+
         if (req.getTitle()             != null) item.setTitle(req.getTitle());
         if (req.getDescription()       != null) item.setDescription(req.getDescription());
         if (req.getDueAt()             != null) item.setDueAt(LocalDateTime.parse(req.getDueAt()));
@@ -172,6 +236,23 @@ public class ActionItemService {
                 .orElseThrow(() -> new ResourceNotFoundException("ActionItem", id));
 
         ActionItem.Status newStatus = update.getStatus();
+
+        // A closed audit delegation stays closed. Reopening it would re-grant
+        // access to the control — and the delegator it is reserved for may no
+        // longer have the right to hand that out (it lapses exactly when the
+        // control is reassigned away from them). Delegate again instead, which
+        // re-runs ControlAccessGuard on the delegator.
+        if (AUDIT_INSTANCE_TYPES.contains(item.getEntityType())
+                && newStatus == ActionItem.Status.OPEN
+                && (item.getStatus() == ActionItem.Status.RESOLVED
+                || item.getStatus() == ActionItem.Status.DISMISSED)) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "AUDIT_DELEGATION_REOPEN",
+                    "A closed audit delegation cannot be reopened. Delegate it again from the "
+                            + "record's Action items tab.",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+
         validateTransition(item, newStatus, userId, userRoles);
 
         item.setStatus(newStatus);
@@ -231,6 +312,43 @@ public class ActionItemService {
     // ── My open items ─────────────────────────────────────────────────────────
 
     @Transactional(readOnly = true)
+    /**
+     * The other half of getMyOpenItems: what this person has FINISHED.
+     *
+     * ── WHY THE INBOX NEEDED THIS ────────────────────────────────────────
+     * /action-items/my is hard-filtered to open, which is right for an inbox —
+     * an inbox is what is waiting, and mixing finished work in makes the count
+     * meaningless and the list grow forever.
+     *
+     * But a row that vanishes the moment you act on it, with nowhere to look it
+     * up, reads as work lost rather than work done. So: same query, opposite
+     * filter, behind an opt-in toggle. Off by default; nothing about the inbox
+     * changes until somebody asks.
+     *
+     * Capped and newest-first, because "everything I have ever closed" is an
+     * unbounded set and this feeds a list, not a report.
+     */
+    public List<ActionItemResponse> getMyClosedItems(Long userId, List<String> userRoles,
+                                                     Long tenantId, Long userVendorId, int limit) {
+        Specification<ActionItem> spec =
+                ActionItemSpecification.forTenant(tenantId)
+                        .and(ActionItemSpecification.assignedToUserOrRole(userId, userRoles, userVendorId))
+                        .and(ActionItemSpecification.withStatus(ActionItem.Status.RESOLVED));
+
+        return actionItemRepository.findAll(spec).stream()
+                .sorted((a, b) -> {
+                    var ra = a.getResolvedAt() != null ? a.getResolvedAt() : a.getUpdatedAt();
+                    var rb = b.getResolvedAt() != null ? b.getResolvedAt() : b.getUpdatedAt();
+                    if (ra == null && rb == null) return 0;
+                    if (ra == null) return 1;
+                    if (rb == null) return -1;
+                    return rb.compareTo(ra);
+                })
+                .limit(limit > 0 ? limit : 100)
+                .map(a -> toResponse(a, userId, userRoles))
+                .toList();
+    }
+
     public List<ActionItemResponse> getMyOpenItems(Long userId, List<String> userRoles,
                                                    Long tenantId, Long userVendorId) {
         Specification<ActionItem> assigneeSpec =
@@ -250,6 +368,29 @@ public class ActionItemService {
         return combined.values().stream()
                 .map(a -> toResponse(a, userId, userRoles))
                 .toList();
+    }
+
+    /**
+     * How many items getMyOpenItems would return — the same two specifications
+     * (assigned to me / my roles / my vendor, plus awaiting my review), counted
+     * distinct, without building responses. For the inbox badge, so the number
+     * on the sidebar is the number of rows on the page. countOpenForUser below
+     * predates role- and vendor-scoped items and misses both.
+     */
+    @Transactional(readOnly = true)
+    public long countMyOpenItems(Long userId, List<String> userRoles, Long tenantId, Long userVendorId) {
+        Specification<ActionItem> assigneeSpec =
+                ActionItemSpecification.forTenant(tenantId)
+                        .and(ActionItemSpecification.assignedToUserOrRole(userId, userRoles, userVendorId))
+                        .and(ActionItemSpecification.open());
+        Specification<ActionItem> reviewerSpec =
+                ActionItemSpecification.forTenant(tenantId)
+                        .and(ActionItemSpecification.resolvableBy(userId, userRoles))
+                        .and(ActionItemSpecification.withStatus(ActionItem.Status.PENDING_REVIEW));
+        java.util.Set<Long> ids = new java.util.HashSet<>();
+        actionItemRepository.findAll(assigneeSpec).forEach(a -> ids.add(a.getId()));
+        actionItemRepository.findAll(reviewerSpec).forEach(a -> ids.add(a.getId()));
+        return ids.size();
     }
 
     // ── For entity ────────────────────────────────────────────────────────────
@@ -407,6 +548,8 @@ public class ActionItemService {
                 .resolvedByName(resolveName(item.getResolvedBy()))
                 .resolutionNote(item.getResolutionNote())
                 .navContext(item.getNavContext())
+                .navKey(item.getNavKey())
+                .assignerNavKey(item.getAssignerNavKey())
                 // NEW: item UI rendering
                 .itemScreenKey(item.getItemScreenKey())
                 .itemUiJson(item.getItemUiJson())
@@ -424,6 +567,8 @@ public class ActionItemService {
                 .acceptedRiskByName(resolveName(item.getAcceptedRiskBy()))
                 .acceptedRiskNote(item.getAcceptedRiskNote())
                 .acceptedRiskAt(item.getAcceptedRiskAt())
+                // Escalation — null unless this item was raised as an Issue.
+                .linkedIssueId(item.getLinkedIssueId())
                 .build();
     }
 

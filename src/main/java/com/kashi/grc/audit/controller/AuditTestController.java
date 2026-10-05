@@ -58,6 +58,9 @@ public class AuditTestController {
     private final UtilityService                            utilityService;
     private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepository;
     private final com.kashi.grc.audit.repository.AuditControlInstanceRepository controlInstanceRepository;
+    private final com.kashi.grc.audit.service.ControlAccessGuard      controlAccessGuard;
+    private final com.kashi.grc.audit.service.AuditObligationService  obligationService;
+    private final com.kashi.grc.audit.service.AuditFieldworkService   fieldworkService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // LIBRARY — TESTS CRUD
@@ -404,6 +407,12 @@ public class AuditTestController {
             @PathVariable Long engagementId, @PathVariable Long testInstanceId) {
         AuditTestInstance instance = testInstanceRepository.findById(testInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", testInstanceId));
+        // Loaded by id alone — any tenant's test, and the engagement in the path
+        // was never compared.
+        controlAccessGuard.requireReadable(instance.getTenantId(), instance.getEngagementId());
+        if (!java.util.Objects.equals(instance.getEngagementId(), engagementId)) {
+            throw new ResourceNotFoundException("AuditTestInstance", testInstanceId);
+        }
         return ResponseEntity.ok(ApiResponse.success(toTestInstanceMap(instance)));
     }
 
@@ -419,38 +428,26 @@ public class AuditTestController {
         AuditTestInstance instance = testInstanceRepository.findById(testInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", testInstanceId));
 
-        // Evidence must exist on the control(s) this test belongs to before recording
-        // a result — same rule as the direct control-level test-result endpoint
-        // (AuditEngagementService.recordTestResult). A test's result ultimately
-        // derives the control's result via cascadeDeriveControlResults below, so
-        // this is the path that actually needs the gate enforced in real usage.
-        List<Long> linkedControlIds = controlInstanceTestMappingRepository
-                .findControlInstanceIdsByTestInstanceId(testInstanceId);
-        for (Long controlId : linkedControlIds) {
-            AuditControlInstance control = controlInstanceRepository.findById(controlId).orElse(null);
-            boolean hasEvidence = control != null && (
-                    control.isAuditeeEvidenceSubmitted()
-                            || evidenceLinkRepository.countAcceptedForEntity(
-                            "AUDIT_CONTROL_INSTANCE", controlId) > 0
-            );
-            if (!hasEvidence) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "EVIDENCE_NOT_SUBMITTED",
-                        "Evidence has not been submitted for the control this test belongs to. " +
-                                "The auditee must upload evidence before the auditor can record a test result.");
-            }
+        // WAS: no check of any kind — tenant, engagement, or assignment. Any
+        // authenticated user could record any test result in any tenant, and the
+        // cascade below then re-derived every mapped control's result. Same guard
+        // as PUT /v1/audit/test-instances/{id}/result.
+        if (!java.util.Objects.equals(instance.getEngagementId(), engagementId)) {
+            throw new ResourceNotFoundException("AuditTestInstance", testInstanceId);
         }
+        controlAccessGuard.requireCanRecordTestResult(instance, userId);
 
-        instance.setTestResult(AuditTestInstance.TestResult.valueOf(req.getTestResult()));
-        instance.setTesterNotes(req.getTesterNotes());
-        instance.setFailureDetail(req.getFailureDetail());
-        instance.setRunAt(LocalDateTime.now());
-        instance.setRunByUserId(userId);
-        instance.setRunBySystem(false);
-        testInstanceRepository.save(instance);
-
-        // Cascade: re-derive testResult for all linked control instances
-        snapshotService.cascadeDeriveControlResults(testInstanceId,
+        // One implementation for every screen that records a test result
+        // (AuditFieldworkService). This copy had drifted: it wiped tester notes
+        // and failure detail whenever the caller sent only a result — which the
+        // admin Tests tab always does — never refreshed the affected-control
+        // count, and used a stricter evidence gate than the other paths. Only
+        // the fields actually sent are written.
+        java.util.Map<String, String> fields = new java.util.HashMap<>();
+        fields.put("testResult", req.getTestResult());
+        if (req.getTesterNotes()   != null) fields.put("testerNotes",   req.getTesterNotes());
+        if (req.getFailureDetail() != null) fields.put("failureDetail", req.getFailureDetail());
+        fieldworkService.recordTestResult(instance, fields, userId,
                 utilityService.getLoggedInDataContext().getTenantId());
 
         log.info("[AUDIT-TEST] Result recorded | instanceId={} result={}", testInstanceId, req.getTestResult());
@@ -470,6 +467,9 @@ public class AuditTestController {
 
         List<Map<String, Object>> result = testInstanceRepository.findAllById(testInstanceIds)
                 .stream()
+                // Mapping rows carry no tenant; the test instance does. Without
+                // this any tenant's tests were readable through a control id.
+                .filter(ti -> controlAccessGuard.isReadable(ti.getTenantId(), ti.getEngagementId()))
                 .map(ti -> {
                     Map<String, Object> row = toTestInstanceMap(ti);
                     // Add mapping metadata

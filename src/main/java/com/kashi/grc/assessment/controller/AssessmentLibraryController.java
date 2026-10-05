@@ -158,6 +158,9 @@ public class AssessmentLibraryController {
                 .responseType(req.getResponseType())
                 // questionTag is the KashiGuard category label — null = untagged, guard skips it
                 .questionTag(req.getQuestionTag())
+                // Null on create means "not supplied", and the honest default
+                // for a question nobody marked is that it needs no document.
+                .requiresEvidence(Boolean.TRUE.equals(req.getRequiresEvidence()))
                 .build();
         questionRepository.save(q);
         log.info("[LIBRARY] Question saved | id={}", q.getId());
@@ -187,6 +190,17 @@ public class AssessmentLibraryController {
         // those have their own questionTagSnapshot which is frozen at instantiation time.
         if (req.getQuestionTag() != null || q.getQuestionTag() != null) {
             q.setQuestionTag(req.getQuestionTag());  // null clears the tag intentionally
+        }
+        // Only when supplied. Unlike the tag above there is no "clear it"
+        // gesture to preserve — false IS the cleared state, and it arrives as
+        // an explicit false from any screen that renders the toggle. A caller
+        // that omits the field keeps whatever the question had.
+        //
+        // Same freeze rule as the tag: changing this does NOT reach an
+        // already-instantiated assessment, which carries its own
+        // requiresEvidence snapshot from instantiation time.
+        if (req.getRequiresEvidence() != null) {
+            q.setRequiresEvidence(req.getRequiresEvidence());
         }
         questionRepository.save(q);
 
@@ -507,6 +521,7 @@ public class AssessmentLibraryController {
                 .questionId(q.getId()).questionText(q.getQuestionText())
                 .responseType(q.getResponseType())
                 .questionTag(q.getQuestionTag())   // null = untagged, guard system skips
+                .requiresEvidence(q.isRequiresEvidence())
                 .optionsLinked(linked).build();
     }
 }

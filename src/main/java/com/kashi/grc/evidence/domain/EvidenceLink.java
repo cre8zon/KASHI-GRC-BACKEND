@@ -11,7 +11,7 @@ import java.time.LocalDateTime;
  * Status lifecycle:
  *
  *   MANUAL upload  → autoLinked=false → ACCEPTED immediately (human chose to link it)
- *   Tag auto-link  → autoLinked=true  → PENDING_REVIEW (human must accept/reject)
+ *   Tag auto-link  → autoLinked=true  → ACCEPTED (UCF reuse: same requirement, no second review)
  *
  *   Automation PASS → autoLinked=true, AUTOMATION_VERIFIED (no human gate)
  *   Automation FAIL → autoLinked=true, PENDING_REVIEW (auditor documents exception)

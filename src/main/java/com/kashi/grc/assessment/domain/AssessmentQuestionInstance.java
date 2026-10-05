@@ -98,4 +98,20 @@ public class AssessmentQuestionInstance extends BaseEntity {
      */
     @Column(name = "question_tag_snapshot", length = 80)
     private String questionTagSnapshot;
+
+    /**
+     * Snapshot of AssessmentQuestion.requiresEvidence at instantiation.
+     *
+     * Same isolation rule as questionTagSnapshot: a library question whose
+     * evidence requirement is turned on next quarter must not retroactively
+     * make a vendor's submitted answer incomplete. The running assessment keeps
+     * the rule it started under.
+     *
+     * Not named *Snapshot only because the column is read on every question
+     * render and the suffix would be noise on the DTO; the isolation is the
+     * same either way.
+     */
+    @Column(name = "requires_evidence", nullable = false)
+    @lombok.Builder.Default
+    private boolean requiresEvidence = false;
 }

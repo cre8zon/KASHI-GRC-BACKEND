@@ -8,6 +8,7 @@ import com.kashi.grc.audit.repository.AuditControlInstanceRepository;
 import com.kashi.grc.audit.repository.AuditEngagementRepository;
 import com.kashi.grc.audit.repository.AuditPolicyInstanceRepository;
 import com.kashi.grc.audit.repository.AuditTestInstanceRepository;
+import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.evidence.domain.EvidenceLink;
 import com.kashi.grc.evidence.domain.EvidenceRecord;
@@ -47,9 +48,10 @@ import java.util.Set;
  * appeared in scope with no documented decision behind it.
  *
  * So it is invoked deliberately by the lead auditor, it records who ran it and
- * when, and every link it creates lands as PENDING_REVIEW — never ACCEPTED. The
- * auditor still has to look at each one and decide whether prior-period evidence
- * is good enough for this period. That decision is the audit trail.
+ * when. Links it creates are accepted like any reuse (EvidenceReuseEngine
+ * .reuseStatus): the controls they land on count as submitted, and the auditor
+ * judges prior-period evidence when testing the control — sending it back if it
+ * is not good enough for this period. That decision is the audit trail.
  *
  * ── SCOPING ──────────────────────────────────────────────────────────────────
  * Candidate evidence must:
@@ -72,6 +74,7 @@ public class AuditEvidenceBackfillService {
     private final AuditPolicyInstanceRepository  policyInstanceRepository;
     private final EvidenceRecordRepository       evidenceRecordRepository;
     private final EvidenceReuseEngine            reuseEngine;
+    private final ControlAccessGuard             controlAccessGuard;
 
     /**
      * Preview what a backfill would link, without writing anything.
@@ -80,13 +83,33 @@ public class AuditEvidenceBackfillService {
      */
     @Transactional(readOnly = true)
     public Map<String, Object> preview(Long engagementId, Long tenantId) {
+        requirePullPermission();
         return run(engagementId, tenantId, null, true);
     }
 
-    /** Execute the backfill. Every link created is PENDING_REVIEW. */
+    /** Execute the backfill. Links are created as reuse (accepted — see EvidenceReuseEngine.reuseStatus). */
     @Transactional
     public Map<String, Object> backfill(Long engagementId, Long tenantId, Long requestedBy) {
+        requirePullPermission();
         return run(engagementId, tenantId, requestedBy, false);
+    }
+
+    /**
+     * Pulling links evidence into EVERY control of the engagement, so it is an
+     * engagement-wide action and needs its own permission. It used to need
+     * none on the server (the button showed for anyone who could record a
+     * result or submit evidence). Preview is gated too: it lists the tenant's
+     * evidence records.
+     */
+    public static final String PULL_PERMISSION = "audit:evidence:pull";
+
+    private void requirePullPermission() {
+        if (!controlAccessGuard.callerHolds(PULL_PERMISSION)) {
+            throw new BusinessException("PULL_EVIDENCE_DENIED",
+                    "You do not have permission to pull evidence into this engagement ("
+                            + PULL_PERMISSION + ")",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -10,13 +10,24 @@ import lombok.*;
  * Add a KPI card or chart = insert one row.
  */
 @Entity
-@Table(name = "dashboard_widgets")
+@Table(name = "dashboard_widgets",
+        uniqueConstraints = @UniqueConstraint(
+                name = "uq_widget_key_tenant", columnNames = {"widget_key", "tenant_id"}))
 @Getter @Setter
 @lombok.experimental.SuperBuilder
 @NoArgsConstructor @AllArgsConstructor
 public class DashboardWidget extends BaseEntity {
 
-    @Column(name = "widget_key", unique = true, nullable = false, length = 100)
+    /**
+     * Unique per TENANT, not globally — see migration 34.
+     *
+     * The column-level unique = true meant one row in the whole platform could
+     * be called 'risk_by_status', so a tenant could never hold their own copy
+     * of a platform widget. The table-level constraint below matches what the
+     * dashboards table has always done, and is what makes "our version of that
+     * widget" expressible.
+     */
+    @Column(name = "widget_key", nullable = false, length = 100)
     private String widgetKey;
 
     @Column(name = "widget_type", nullable = false, length = 50)
@@ -77,6 +88,45 @@ public class DashboardWidget extends BaseEntity {
     /** Route to navigate to when widget is clicked. NULL = no link. */
     @Column(name = "click_through_route", length = 255)
     private String clickThroughRoute;
+
+    // ── ADDED WITH THE dashboards TABLE ───────────────────────────────────
+
+    /** Which dashboard this belongs to. Every existing row was adopted onto
+     *  the 'global' dashboard by migration 30, so this is effectively NOT NULL
+     *  in practice; left nullable so the migration could run before the code. */
+    @Column(name = "dashboard_id")
+    private Long dashboardId;
+
+    /** Query params appended to dataEndpoint, so two widgets can share one
+     *  endpoint at different scopes: {"severity": "CRITICAL"}. */
+    @Column(name = "filters_json", columnDefinition = "TEXT")
+    private String filtersJson;
+
+    /** NUMBER | PERCENT | CURRENCY | DURATION_HOURS | DATE.
+     *  Formatting is a property of the metric, not of the component. */
+    @Column(name = "value_format", length = 20)
+    private String valueFormat;
+
+    /**
+     * Colour by VALUE, not by decree:
+     *   [{"gte": 1, "colorTag": "red"}, {"gte": 0, "colorTag": "green"}]
+     * evaluated top down, first match wins.
+     *
+     * Without this, "3 people left without revocation evidence" renders the
+     * same colour as "0 people did", which defeats the purpose of putting the
+     * number on a dashboard at all.
+     */
+    @Column(name = "thresholds_json", columnDefinition = "TEXT")
+    private String thresholdsJson;
+
+    /** Filters carried into clickThroughRoute, e.g. {"severity": "{clicked}"},
+     *  so clicking a slice lands on the list already filtered. A dashboard you
+     *  cannot click into is a poster. */
+    @Column(name = "drill_through_json", columnDefinition = "TEXT")
+    private String drillThroughJson;
+
+    @Column(name = "empty_message", length = 255)
+    private String emptyMessage;
 
     @Column(name = "tenant_id")
     private Long tenantId;

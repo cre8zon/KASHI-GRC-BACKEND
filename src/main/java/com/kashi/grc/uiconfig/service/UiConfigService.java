@@ -25,4 +25,15 @@ public interface UiConfigService {
 
     /** Tenant branding (logo, colors) */
     TenantBrandingResponse getBranding();
+
+    // ── Dashboards ────────────────────────────────────────────────────────────
+    // Reads live in the impl alongside extractSides/extractPermissions, which
+    // already handle role-derived permissions AND the permission_grants table
+    // with its explicit revokes.
+
+    java.util.List<java.util.Map<String, Object>> listDashboards(String entityType, String scope);
+
+    java.util.Map<String, Object> getDashboard(String key);
+
+    java.util.Map<String, Object> defaultDashboard(String entityType);
 }

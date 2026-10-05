@@ -98,7 +98,27 @@ public class DatabaseConfig {
                 + "&prepStmtCacheSqlLimit=2048"
                 + "&useServerPrepStmts=true"
                 + "&rewriteBatchedStatements=true"
-                + "&serverTimezone=UTC";
+                + "&serverTimezone=UTC"
+                // ── Round-trip savers (Aiven RTT ~150 ms from dev) ──────────────
+                // Track autocommit / isolation / read-only locally and skip the
+                // SET statements when the connection is already in that state.
+                // Every transaction toggles autocommit; without this each toggle
+                // the pool or Spring repeats is a full network round trip.
+                + "&useLocalSessionState=true"
+                // Skip commit()/rollback() when the server reports no open
+                // transaction (status flags on the last reply) — free round trip
+                // saved on every read-only transaction that touched nothing.
+                + "&useLocalTransactionState=true"
+                // @Transactional(readOnly = true) otherwise sends
+                // SET SESSION TRANSACTION READ ONLY at start and READ WRITE at end:
+                // two extra round trips per read request. Read-only stays enforced
+                // in Hibernate (no flush), it just isn't mirrored to the server.
+                + "&readOnlyPropagatesToServer=false"
+                // Don't re-read server variables / result-set metadata the driver
+                // already holds — new pooled connections and repeated statements.
+                + "&cacheServerConfiguration=true"
+                + "&cacheResultSetMetadata=true"
+                + "&maintainTimeStats=false";
     }
 
     // ── 2. Performance indexes ────────────────────────────────────────────────

@@ -77,16 +77,40 @@ public class ActionItemController {
     private final ActionItemService actionItemService;
     private final UtilityService    utilityService;
     private final UiConfigService   uiConfigService;
+    /**
+     * Modules that own an entity type may narrow who sees its items
+     * (ActionItemEntityVisibility). Unclaimed types keep the tenant-wide
+     * oversight view exactly as before.
+     */
+    private final org.springframework.beans.factory.ObjectProvider<
+            com.kashi.grc.actionitem.spi.ActionItemEntityVisibility> visibilityPolicies;
 
     // ══════════════════════════════════════════════════════════════
     // MY ITEMS (unchanged)
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * @param status  omitted or "open" — what is waiting, the default and the
+     *                shape every existing caller already gets.
+     *                "closed" — what this person has finished, newest first,
+     *                capped. The inbox's opt-in "Done" view.
+     *
+     * Deliberately not a free-form status list. Two answers are what an inbox
+     * needs, and an enum of five would invite callers to ask for combinations
+     * nobody has designed the ordering or the cap for.
+     */
     @GetMapping("/v1/action-items/my")
-    @Operation(summary = "Get my open action items — all entityTypes across all modules")
-    public ResponseEntity<ApiResponse<List<ActionItemResponse>>> getMyItems() {
+    @Operation(summary = "Get my action items — open by default, or closed with ?status=closed")
+    public ResponseEntity<ApiResponse<List<ActionItemResponse>>> getMyItems(
+            @RequestParam(required = false) String status,
+            @RequestParam(required = false, defaultValue = "100") Integer limit) {
         User user = utilityService.getLoggedInDataContext();
-        List<ActionItemResponse> items = actionItemService.getMyOpenItems(
+
+        List<ActionItemResponse> items = "closed".equalsIgnoreCase(status)
+                ? actionItemService.getMyClosedItems(
+                user.getId(), resolveRoleNames(user), user.getTenantId(),
+                user.getVendorId(), limit != null ? limit : 100)
+                : actionItemService.getMyOpenItems(
                 user.getId(), resolveRoleNames(user), user.getTenantId(), user.getVendorId());
         return ResponseEntity.ok(ApiResponse.success(items));
     }
@@ -111,7 +135,7 @@ public class ActionItemController {
         User user = utilityService.getLoggedInDataContext();
         List<ActionItemResponse> items = actionItemService.getForEntity(
                 entityType, entityId, user.getId(), resolveRoleNames(user), user.getTenantId());
-        return ResponseEntity.ok(ApiResponse.success(items));
+        return ResponseEntity.ok(ApiResponse.success(visibleOnEntity(entityType, entityId, items, user.getId())));
     }
 
     /**
@@ -130,7 +154,21 @@ public class ActionItemController {
         User user = utilityService.getLoggedInDataContext();
         List<ActionItemResponse> items = actionItemService.getForEntities(
                 entityType, entityIds, user.getId(), resolveRoleNames(user), user.getTenantId());
-        return ResponseEntity.ok(ApiResponse.success(items));
+        var policy = policyFor(entityType);
+        if (policy == null) return ResponseEntity.ok(ApiResponse.success(items));
+        // Per entity: unreadable entities drop out entirely (no 403 for the whole
+        // batch), readable ones are narrowed to what the caller may see.
+        Map<Long, List<ActionItemResponse>> byEntity = new java.util.LinkedHashMap<>();
+        items.forEach(i -> byEntity.computeIfAbsent(i.getEntityId(), k -> new java.util.ArrayList<>()).add(i));
+        List<ActionItemResponse> out = new java.util.ArrayList<>();
+        byEntity.forEach((eid, list) -> {
+            try {
+                out.addAll(visibleOnEntity(entityType, eid, list, user.getId()));
+            } catch (RuntimeException denied) {
+                // not readable — omitted
+            }
+        });
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -143,6 +181,7 @@ public class ActionItemController {
         User user = utilityService.getLoggedInDataContext();
         ActionItemResponse response = actionItemService.getById(
                 id, user.getId(), resolveRoleNames(user), user.getTenantId());
+        requireVisible(response, user.getId());
         return ResponseEntity.ok(ApiResponse.success(response));
     }
 
@@ -178,6 +217,7 @@ public class ActionItemController {
         // FIX: getById returns ActionItemResponse (not ActionItem domain object)
         ActionItemResponse item = actionItemService.getById(
                 id, user.getId(), resolveRoleNames(user), tenantId);
+        requireVisible(item, user.getId());
 
         Map<String, Object> result = new java.util.LinkedHashMap<>();
         result.put("actionItemId", item.getId());
@@ -232,6 +272,25 @@ public class ActionItemController {
     public ResponseEntity<ApiResponse<ActionItemResponse>> create(
             @Valid @RequestBody ActionItemRequest req) {
         User user = utilityService.getLoggedInDataContext();
+
+        // ── AUDIT INSTANCE ITEMS ARE NOT RAISED HERE ─────────────────────────
+        // A live action item on an audit control / test / policy instance is an
+        // ACCESS GRANT: ControlAccessGuard lets its assignee act on that
+        // instance. This endpoint checks nothing about who may delegate what, so
+        // accepting one here would let anyone holding a login write an item to
+        // themselves and walk straight past the assignment gate. They are raised
+        // only through POST /v1/audit/{control|test|policy}-instances/{id}/delegate,
+        // which runs the guard on the delegator first.
+        if (req.getEntityType() != null
+                && ActionItemService.AUDIT_INSTANCE_TYPES.contains(req.getEntityType())) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "AUDIT_DELEGATION_ENDPOINT_REQUIRED",
+                    "Action items on audit controls, tests and policies are raised from the "
+                            + "record's Action items tab (POST /v1/audit/…-instances/{id}/delegate), "
+                            + "not through the generic endpoint.",
+                    HttpStatus.BAD_REQUEST);
+        }
+
         ActionItemResponse response = actionItemService.create(req, user.getId(), user.getTenantId());
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(response));
     }
@@ -279,6 +338,38 @@ public class ActionItemController {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private com.kashi.grc.actionitem.spi.ActionItemEntityVisibility policyFor(ActionItem.EntityType type) {
+        if (type == null) return null;
+        return visibilityPolicies.orderedStream().filter(p -> p.supports(type)).findFirst().orElse(null);
+    }
+
+    /** Assignee, creator or reserved resolver — always sees their own item. */
+    private static boolean isParty(ActionItemResponse i, Long userId) {
+        return userId != null && (userId.equals(i.getAssignedTo())
+                || userId.equals(i.getCreatedBy())
+                || userId.equals(i.getResolutionReservedFor()));
+    }
+
+    /** Items on ONE entity narrowed to what the caller may see (see ActionItemEntityVisibility). */
+    private List<ActionItemResponse> visibleOnEntity(ActionItem.EntityType type, Long entityId,
+                                                     List<ActionItemResponse> items, Long userId) {
+        var policy = policyFor(type);
+        if (policy == null) return items;
+        policy.requireReadable(type, entityId);
+        if (policy.seesAll(type, entityId, userId)) return items;
+        return items.stream().filter(i -> isParty(i, userId)).toList();
+    }
+
+    /** Single-item reads: party to it, or oversees the entity it sits on. */
+    private void requireVisible(ActionItemResponse item, Long userId) {
+        var policy = policyFor(item.getEntityType());
+        if (policy == null || item.getEntityId() == null) return;
+        policy.requireReadable(item.getEntityType(), item.getEntityId());
+        if (isParty(item, userId) || policy.seesAll(item.getEntityType(), item.getEntityId(), userId)) return;
+        // Same 404 as an item in another tenant — existence is not disclosed.
+        throw new com.kashi.grc.common.exception.ResourceNotFoundException("ActionItem", item.getId());
+    }
 
     private List<String> resolveRoleNames(User user) {
         if (user.getRoles() == null) return List.of();
