@@ -10,4 +10,7 @@ public interface AuditControlInstanceTestMappingRepositoryCustom {
 
     /** Control instance IDs affected by a test — bulk re-evaluation. */
     List<Long> findControlInstanceIdsByTestInstanceId(Long testId);
+
+    /** Batch: control instance id → number of tests mapped to it, for one engagement. */
+    java.util.Map<Long, Long> countTestsByControlForEngagement(Long engagementId);
 }

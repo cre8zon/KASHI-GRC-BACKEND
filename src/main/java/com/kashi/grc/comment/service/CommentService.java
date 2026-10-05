@@ -273,14 +273,24 @@ public class CommentService {
                 // This is set HERE by CommentService because it knows the module context
                 // (TPRM vendor assessment fill/review pages). Future modules set their
                 // own routes when creating action items — ActionItemsPage never hardcodes.
+                // ── THE THIRD PLACE ROUTES WERE WRITTEN INTO JAVA ───────────
+                // ui_navigation moved workflow tasks to the module page (sql/84)
+                // and AssessmentController/ReviewController moved the assignment
+                // items (sql/86), and this one was missed — so a contributor
+                // with a revision request still landed on the hardcoded fill
+                // page while every other item opened the module.
+                //
+                // nav_key below is the durable fix; these strings stay because
+                // they carry what a nav row cannot — which question to open and
+                // the openWork bypass.
                 String assigneeRoute = taskId != null
-                        ? String.format("/vendor/assessments/%d/fill?taskId=%d&openWork=1", assessmentId, taskId)
-                        : String.format("/vendor/assessments/%d/fill?openWork=1", assessmentId);
-                // Reviewer route: responder-review page.
-                // We don't look up the responder's taskId here — the page resolves it
-                // itself from the inbox, so a plain route is sufficient.
+                        ? String.format("/module/vendor_assessment/%d?tab=fill&taskId=%d&openWork=1",
+                        assessmentId, taskId)
+                        : String.format("/module/vendor_assessment/%d?tab=fill&openWork=1", assessmentId);
+                // The responder reviews from the Sections tab, where the
+                // delegation they are reviewing actually lives.
                 String reviewerRoute = String.format(
-                        "/vendor/assessments/%d/responder-review", assessmentId);
+                        "/module/vendor_assessment/%d?tab=sections", assessmentId);
                 String navCtx = String.format(
                         "{\"assigneeRoute\":\"%s\",\"reviewerRoute\":\"%s\"" +
                                 ",\"questionInstanceId\":%d" +
@@ -294,7 +304,10 @@ public class CommentService {
                 Long vendorId = vendorAssessmentRepository.findById(assessmentId)
                         .map(a -> a.getVendorId()).orElse(null);
                 actionItemService.createFromComment(
-                        comment, contributorId, "VENDOR_RESPONDER", navCtx, tenantId, vendorId
+                        comment, contributorId, "VENDOR_RESPONDER", navCtx, tenantId, vendorId,
+                        // Same two ui_navigation rows every other assessment item
+                        // uses, so one table decides where all of them open.
+                        "vendor_assessment_fill", "vendor_assessment_assign"
                 );
             });
         } catch (Exception e) {

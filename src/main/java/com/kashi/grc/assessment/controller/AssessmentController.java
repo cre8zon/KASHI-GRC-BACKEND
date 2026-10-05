@@ -28,6 +28,9 @@ import com.kashi.grc.workflow.dto.response.TaskInstanceResponse;
 import com.kashi.grc.workflow.dto.response.WorkflowInstanceResponse;
 import com.kashi.grc.workflow.enums.ActionType;
 import com.kashi.grc.workflow.enums.StepStatus;
+import com.kashi.grc.assessment.service.AssessmentAssignmentService;
+import com.kashi.grc.assessment.service.AssessmentObligationService;
+import com.kashi.grc.workflow.enums.StepAction;
 import com.kashi.grc.workflow.enums.TaskStatus;
 import com.kashi.grc.workflow.enums.WorkflowStatus;
 import com.kashi.grc.workflow.service.TaskSectionCompletionService;
@@ -117,12 +120,19 @@ public class AssessmentController {
     private final StepInstanceRepository               stepInstanceRepository;
     private final TaskInstanceRepository               taskInstanceRepository;
     private final WorkflowEngineService                workflowEngineService;
+    // Issue 3 — resolves and enforces what a workflow step declares about its
+    // assignee (WorkflowStep.assignableSide / assignableRoleId).
+    private final AssessmentAssignmentService          assignmentService;
     private final TaskSectionCompletionService         sectionCompletionService;   // Gap 3
     private final ApplicationEventPublisher            eventPublisher;             // Gap 3
     private final DbRepository                         dbRepository;
     private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
-    private final com.kashi.grc.workflow.repository.TaskSectionItemRepository taskSectionItemRepository;
+    private final TaskSectionItemRepository taskSectionItemRepository;
     private final ContributorSectionSubmissionRepository contributorSectionSubmissionRepository;
+    // Closes a person's open per-question assignment obligations for one
+    // section. Shared with ReviewController's assistant path, which had the
+    // same loop and the same early-return bug above it.
+    private final AssessmentObligationService          obligationService;
     private final UtilityService                       utilityService;
     private final GuardEvaluator                        guardEvaluator;
     private final ActionItemRepository                   actionItemRepository;
@@ -241,6 +251,8 @@ public class AssessmentController {
                         // tag changes on the library question. GuardEvaluator reads this
                         // snapshot, never joins back to assessment_questions.
                         .questionTagSnapshot(q.getQuestionTag())
+                        // Same snapshot rule as the tag above.
+                        .requiresEvidence(q.isRequiresEvidence())
                         .build();
                 questionInstanceRepository.save(qi);
 
@@ -338,7 +350,7 @@ public class AssessmentController {
                 .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
                 .map(AssessmentQuestionInstance::getId)
                 .toList();
-        Map<Long, Long> fileAttachCounts = new java.util.HashMap<>();
+        Map<Long, Long> fileAttachCounts = new HashMap<>();
         if (!fileUploadQiIds.isEmpty()) {
             documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileUploadQiIds)
                     .forEach(row -> fileAttachCounts.put((Long) row[0], (Long) row[1]));
@@ -355,6 +367,8 @@ public class AssessmentController {
         VendorAssessmentCycle cycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
 
         return ResponseEntity.ok(ApiResponse.success(VendorAssessmentResponse.builder()
+                // id mirrors assessmentId — the generic detail page reads entity.id.
+                .id(assessment.getId())
                 .assessmentId(assessment.getId())
                 .vendorId(vendor.getId())
                 .vendorName(vendor.getName())
@@ -402,6 +416,8 @@ public class AssessmentController {
                     long total    = questionInstanceRepository.countByAssessmentId(a.getId());
                     int  pct      = total > 0 ? (int)(answered * 100 / total) : 0;
                     return VendorAssessmentResponse.builder()
+                            // id mirrors assessmentId — the generic detail page reads entity.id.
+                            .id(a.getId())
                             .assessmentId(a.getId())
                             .vendorId(a.getVendorId())
                             .templateName(tName)
@@ -513,7 +529,7 @@ public class AssessmentController {
             // individual IDs, which eliminates the read-modify-write race that
             // caused "always 2 selected" when rapid clicks produced concurrent
             // requests each reading stale state and overwriting each other.
-            java.util.Set<Long> existing = new java.util.LinkedHashSet<>(
+            Set<Long> existing = new LinkedHashSet<>(
                     req.getSelectedOptionInstanceIds());
             try {
                 response.setResponseText(new com.fasterxml.jackson.databind.ObjectMapper()
@@ -600,11 +616,11 @@ public class AssessmentController {
                     assessment.getId(), assessment.getId(), qi.getId());
             // Resolve selected option text for SINGLE/MULTI_CHOICE so OPTION_SELECTED rules
             // match against "No"/"Never" etc — not raw option IDs.
-            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+            List<String> selectedOptionValues = new ArrayList<>();
             if ("SINGLE_CHOICE".equals(qi.getResponseType())
                     && response.getSelectedOptionInstanceId() != null) {
                 optionInstanceRepository.findById(response.getSelectedOptionInstanceId())
-                        .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                        .map(AssessmentOptionInstance::getOptionValue)
                         .ifPresent(selectedOptionValues::add);
             } else if ("MULTI_CHOICE".equals(qi.getResponseType())
                     && response.getResponseText() != null
@@ -614,7 +630,7 @@ public class AssessmentController {
                             .readValue(response.getResponseText(), Long[].class);
                     for (Long optId : ids) {
                         optionInstanceRepository.findById(optId)
-                                .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                .map(AssessmentOptionInstance::getOptionValue)
                                 .ifPresent(selectedOptionValues::add);
                     }
                 } catch (Exception ignored) {}
@@ -647,16 +663,32 @@ public class AssessmentController {
                 if (ai.getStatus() != ActionItem.Status.OPEN
                         && ai.getStatus() != ActionItem.Status.IN_PROGRESS) return;
 
-                // CONTRIBUTOR_ASSIGNMENT: answering the question = work done.
-                // Resolve immediately — no pending review needed.
-                // REVISION_REQUEST and REMEDIATION_REQUEST still go to PENDING_REVIEW below.
+                // ── CONTRIBUTOR_ASSIGNMENT: STARTED, NOT FINISHED ───────────
+                //
+                // This used to resolve the item outright, on the reasoning that
+                // "answering the question = work done". It is not: between
+                // answering and locking the section the contributor can still
+                // change their mind, and resolving on the first keystroke meant
+                //
+                //   * their inbox emptied before they had finished,
+                //   * the responder saw "done" on an answer still being edited,
+                //   * and the entry they would come back through was gone.
+                //
+                // The obligation now closes where the person says they are
+                // finished — contributorSubmitSection, the control the UI calls
+                // "Lock my answers". Answering moves it to IN_PROGRESS, which is
+                // the honest state: started, still mine.
+                //
+                // REVIEWER_ASSIGNMENT is deliberately NOT changed to match. A
+                // verdict is a judgement rather than a draft, and the assistant
+                // has no equivalent lock gesture, so resolving on evaluate stays
+                // correct there.
                 if ("CONTRIBUTOR_ASSIGNMENT".equals(ai.getRemediationType())) {
-                    ai.setStatus(ActionItem.Status.RESOLVED);
-                    ai.setResolutionNote("Question answered by contributor");
-                    ai.setResolvedAt(LocalDateTime.now());
-                    ai.setResolvedBy(userId);
-                    actionItemRepository.save(ai);
-                    return; // skip the PENDING_REVIEW transition for this item
+                    if (ai.getStatus() == ActionItem.Status.OPEN) {
+                        ai.setStatus(ActionItem.Status.IN_PROGRESS);
+                        actionItemRepository.save(ai);
+                    }
+                    return; // not a pending-review item either
                 }
 
                 boolean isRemediation = "REMEDIATION_REQUEST".equals(ai.getRemediationType());
@@ -849,6 +881,8 @@ public class AssessmentController {
         VendorAssessmentCycle reviewCycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
 
         return ResponseEntity.ok(ApiResponse.success(VendorAssessmentResponse.builder()
+                // id mirrors assessmentId — the generic detail page reads entity.id.
+                .id(assessment.getId())
                 .assessmentId(assessment.getId())
                 .vendorId(vendor.getId())
                 .vendorName(vendor.getName())
@@ -917,7 +951,7 @@ public class AssessmentController {
 
                     Map<Long, Vendor> vendorById = vendorRepository.findAllById(
                                     page.stream().map(VendorAssessment::getVendorId)
-                                            .filter(java.util.Objects::nonNull)
+                                            .filter(Objects::nonNull)
                                             .collect(java.util.stream.Collectors.toSet()))
                             .stream().collect(java.util.stream.Collectors.toMap(Vendor::getId, v -> v));
 
@@ -931,29 +965,44 @@ public class AssessmentController {
 
                     // Fallback to the template itself only for assessments with no
                     // snapshot — usually none, so usually zero extra queries.
-                    Map<Long, String> templateNameById = new java.util.HashMap<>();
-                    java.util.Set<Long> missingTemplateIds = page.stream()
+                    Map<Long, String> templateNameById = new HashMap<>();
+                    Set<Long> missingTemplateIds = page.stream()
                             .filter(a -> !templateNameByAssessment.containsKey(a.getId()))
                             .map(VendorAssessment::getTemplateId)
-                            .filter(java.util.Objects::nonNull)
+                            .filter(Objects::nonNull)
                             .collect(java.util.stream.Collectors.toSet());
                     if (!missingTemplateIds.isEmpty()) {
                         templateRepository.findAllById(missingTemplateIds)
                                 .forEach(tpl -> templateNameById.put(tpl.getId(), tpl.getName()));
                     }
 
-                    Map<Long, Long> answeredByAssessment = new java.util.HashMap<>();
+                    // Cycle numbers. The list column "Cycle" was blank because the
+                    // list builder never set cycleNo — the detail builder resolves
+                    // it (line ~360) but the list does not, and the column showed a
+                    // dash for every row. Distinct cycle ids only, so a page of ten
+                    // assessments from three cycles costs one query for three rows.
+                    Map<Long, Integer> cycleNoById = new HashMap<>();
+                    Set<Long> cycleIds = page.stream()
+                            .map(VendorAssessment::getCycleId)
+                            .filter(Objects::nonNull)
+                            .collect(java.util.stream.Collectors.toSet());
+                    if (!cycleIds.isEmpty()) {
+                        cycleRepository.findAllById(cycleIds)
+                                .forEach(c -> cycleNoById.put(c.getId(), c.getCycleNo()));
+                    }
+
+                    Map<Long, Long> answeredByAssessment = new HashMap<>();
                     responseRepository.countAnsweredByAssessmentIdIn(aIds)
                             .forEach(r -> answeredByAssessment.put((Long) r[0], ((Number) r[1]).longValue()));
 
-                    Map<Long, Long> totalByAssessment = new java.util.HashMap<>();
+                    Map<Long, Long> totalByAssessment = new HashMap<>();
                     questionInstanceRepository.countByAssessmentIdIn(aIds)
                             .forEach(r -> totalByAssessment.put((Long) r[0], ((Number) r[1]).longValue()));
 
                     // Only needed for assessments with no persisted score — grouped
                     // so the worst case is still two queries, not two per row.
-                    Map<Long, Double> weightByAssessment = new java.util.HashMap<>();
-                    Map<Long, Double> earnedByAssessment = new java.util.HashMap<>();
+                    Map<Long, Double> weightByAssessment = new HashMap<>();
+                    Map<Long, Double> earnedByAssessment = new HashMap<>();
                     List<Long> needLiveScore = page.stream()
                             .filter(a -> a.getTotalPossibleScore() == null || a.getTotalEarnedScore() == null)
                             .map(VendorAssessment::getId).toList();
@@ -992,7 +1041,19 @@ public class AssessmentController {
                                 : 0;
 
                         return VendorAssessmentResponse.builder()
+                                // id mirrors assessmentId — the generic list
+                                // screen navigates on row.id.
+                                .id(a.getId())
                                 .assessmentId(a.getId())
+                                // Flat, and null when unmeasured. compliancePct
+                                // above is an int that falls back to 0, which as a
+                                // progress bar would read as "0% compliant" for an
+                                // assessment nobody has opened.
+                                .compliancePercent(totalPossible > 0 ? compliancePct : null)
+                                // Resolved from the bulk map above. Null (not 0)
+                                // when the assessment has no cycle, so the column
+                                // shows a dash rather than a wrong "0".
+                                .cycleNo(a.getCycleId() != null ? cycleNoById.get(a.getCycleId()) : null)
                                 .vendorId(a.getVendorId())
                                 .vendorName(vendor != null ? vendor.getName() : null)
                                 .templateName(tName)
@@ -1131,7 +1192,7 @@ public class AssessmentController {
                 .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
         if (!tenantId.equals(instance.getTenantId()))
             throw new BusinessException("ACCESS_DENIED", "Access denied",
-                    org.springframework.http.HttpStatus.FORBIDDEN);
+                    HttpStatus.FORBIDDEN);
 
         // Gap 6: currentStep resolved from StepInstance snapshot below — no live blueprint read
         // use step count only from blueprint (cheap), snapshot fields for per-step data
@@ -1142,7 +1203,7 @@ public class AssessmentController {
 
         // Snapshot reads only — no live blueprint read per step row
         List<Map<String, Object>> stepHistory = history.stream().map(s -> {
-            java.util.Map<String, Object> entry = new java.util.LinkedHashMap<>();
+            Map<String, Object> entry = new LinkedHashMap<>();
             entry.put("stepInstanceId", s.getId());
             entry.put("stepName",       s.getSnapName() != null ? s.getSnapName() : "");
             entry.put("stepOrder",      s.getSnapStepOrder() != null ? s.getSnapStepOrder() : 0);
@@ -1354,7 +1415,7 @@ public class AssessmentController {
         Map<Long, List<AssessmentQuestionInstance>> questionsBySection = allQuestions.stream()
                 .collect(java.util.stream.Collectors.groupingBy(
                         AssessmentQuestionInstance::getSectionInstanceId,
-                        java.util.LinkedHashMap::new, java.util.stream.Collectors.toList()));
+                        LinkedHashMap::new, java.util.stream.Collectors.toList()));
 
         List<Long> questionIds = allQuestions.stream()
                 .map(AssessmentQuestionInstance::getId).toList();
@@ -1366,7 +1427,7 @@ public class AssessmentController {
                   .stream()
                   .collect(java.util.stream.Collectors.groupingBy(
                           AssessmentOptionInstance::getQuestionInstanceId,
-                          java.util.LinkedHashMap::new,
+                          LinkedHashMap::new,
                           java.util.stream.Collectors.mapping(
                                   o -> OptionInstanceResponse.builder()
                                        .optionInstanceId(o.getId())
@@ -1378,7 +1439,7 @@ public class AssessmentController {
         // ── Q4: every response for the assessment ────────────────────────────
         // Keep the highest id per question — same row findFirst...OrderByIdDesc
         // returned, without one query per question.
-        Map<Long, AssessmentResponse> latestResponseByQuestion = new java.util.HashMap<>();
+        Map<Long, AssessmentResponse> latestResponseByQuestion = new HashMap<>();
         for (AssessmentResponse r : responseRepository.findByAssessmentId(assessmentId)) {
             latestResponseByQuestion.merge(r.getQuestionInstanceId(), r,
                     (a, b) -> a.getId() >= b.getId() ? a : b);
@@ -1390,12 +1451,12 @@ public class AssessmentController {
         Map<Long, List<CommentResponse>> commentsByResponse = responseIds.isEmpty()
                 ? Map.of()
                 : commentRepository.findByResponseIdIn(responseIds).stream()
-                  .sorted(java.util.Comparator.comparing(
+                  .sorted(Comparator.comparing(
                           c -> c.getCreatedAt(),
-                          java.util.Comparator.nullsLast(java.util.Comparator.naturalOrder())))
+                          Comparator.nullsLast(Comparator.naturalOrder())))
                   .collect(java.util.stream.Collectors.groupingBy(
                           c -> c.getResponseId(),
-                          java.util.LinkedHashMap::new,
+                          LinkedHashMap::new,
                           java.util.stream.Collectors.mapping(
                                   c -> CommentResponse.builder()
                                        .commentId(c.getId())
@@ -1408,19 +1469,24 @@ public class AssessmentController {
         // ── Q6: attachment counts for unanswered FILE_UPLOAD questions ───────
         // FILE_UPLOAD writes no response row — the document IS the answer — so a
         // sentinel response is synthesised to make the question count as answered.
+        // Widened beyond FILE_UPLOAD. The counts feed two readers now: whether a
+        // FILE_UPLOAD question is answered (its documents ARE the answer), and
+        // whether a requires_evidence question of ANY type has had its
+        // requirement met. Counting only FILE_UPLOAD left the second reader
+        // permanently at zero, so a TEXT question marked requires_evidence
+        // stayed amber however many files were attached to it.
         List<Long> fileQiIds = allQuestions.stream()
-                .filter(q -> "FILE_UPLOAD".equals(q.getResponseType()))
+                .filter(q -> "FILE_UPLOAD".equals(q.getResponseType()) || q.isRequiresEvidence())
                 .map(AssessmentQuestionInstance::getId)
-                .filter(qid -> !latestResponseByQuestion.containsKey(qid))
                 .toList();
-        Map<Long, Long> fileAttachCounts = new java.util.HashMap<>();
+        Map<Long, Long> fileAttachCounts = new HashMap<>();
         if (!fileQiIds.isEmpty()) {
             documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileQiIds)
                     .forEach(row -> fileAttachCounts.put((Long) row[0], (Long) row[1]));
         }
 
         // ── Q7: display names for every user referenced by a section ─────────
-        java.util.Set<Long> sectionUserIds = new java.util.HashSet<>();
+        Set<Long> sectionUserIds = new HashSet<>();
         sectionInstances.forEach(s -> {
             if (s.getAssignedUserId()         != null) sectionUserIds.add(s.getAssignedUserId());
             if (s.getReviewerAssignedUserId() != null) sectionUserIds.add(s.getReviewerAssignedUserId());
@@ -1429,7 +1495,7 @@ public class AssessmentController {
         // Collectors.toMap yields a HashMap — get(null) is safe, unlike Map.of().
         Map<Long, String> sectionNameMap = userRepository.findAllById(sectionUserIds).stream()
                 .collect(java.util.stream.Collectors.toMap(
-                        com.kashi.grc.usermanagement.domain.User::getId,
+                        User::getId,
                         u -> {
                             String fn = u.getFirstName() != null ? u.getFirstName() : "";
                             String ln = u.getLastName()  != null ? u.getLastName()  : "";
@@ -1450,12 +1516,12 @@ public class AssessmentController {
                                     // responseText, e.g. "[4257,4259]" — expand it so
                                     // org-side views show every selected option, not
                                     // just the last-toggled one.
-                                    List<Long> multiIds = new java.util.ArrayList<>();
+                                    List<Long> multiIds = new ArrayList<>();
                                     String rt = r.getResponseText();
                                     if (rt != null && rt.startsWith("[")) {
                                         try {
                                             Long[] arr = SECTION_JSON.readValue(rt, Long[].class);
-                                            java.util.Collections.addAll(multiIds, arr);
+                                            Collections.addAll(multiIds, arr);
                                         } catch (Exception ignored) {}
                                     }
                                     answer = AnswerResponse.builder()
@@ -1484,6 +1550,10 @@ public class AssessmentController {
                                         .weight(qi.getWeight())
                                         .mandatory(qi.isMandatory())
                                         .orderNo(qi.getOrderNo())
+                                        // KashiGuard tag, straight off the snapshot column.
+                                        .questionTag(qi.getQuestionTagSnapshot())
+                                        .requiresEvidence(qi.isRequiresEvidence())
+                                        .evidenceCount(fileAttachCounts.getOrDefault(qi.getId(), 0L).intValue())
                                         .options(optionsByQuestion.getOrDefault(qi.getId(), List.of()))
                                         .currentResponse(answer)
                                         .build();
@@ -1501,6 +1571,8 @@ public class AssessmentController {
                     .submittedBy(si.getSubmittedBy())
                     .submittedByName(sectionNameMap.get(si.getSubmittedBy()))
                     .reopenedAt(si.getReopenedAt())
+                    .reviewerSubmittedAt(si.getReviewerSubmittedAt())
+                    .reviewerReopenedAt(si.getReviewerReopenedAt())
                     .questions(questions)
                     .build();
         }).toList();
@@ -1562,11 +1634,44 @@ public class AssessmentController {
             @RequestParam(required = false) Long taskId) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
+        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+
+        // ── THIS ENDPOINT HAD NO GUARD OF ANY KIND ──────────────────────────
+        //
+        // The class javadoc lists assertUserHasActiveTask as being called at the
+        // top of getAssessment, submitAnswer and reviewAssessment. It was never
+        // added here, so any authenticated user who knew an assessmentId and a
+        // sectionInstanceId could lock a section — including one belonging to
+        // another vendor's responder.
+        //
+        // Same guard, same wording as the other three, so this endpoint is no
+        // longer the odd one out.
+        assertUserHasActiveTask(assessment, userId, "submit section");
 
         AssessmentSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sectionInstanceId));
+
+        // ── AND WHOSE SECTION IT IS ─────────────────────────────────────────
+        //
+        // Holding a task on the assessment says you are one of its responders.
+        // It does not say which sections are yours, and submitting a section
+        // LOCKS it for its real owner — who is then told nothing and has no way
+        // to reopen it themselves.
+        //
+        // An unassigned section is left open deliberately: that is the state
+        // before the CISO has allocated anything, and refusing it would mean
+        // nobody can submit a section nobody owns.
+        //
+        // There is no submit-on-behalf path here. If a CISO needs to close
+        // somebody else's section they reassign it first, which is an act that
+        // leaves a record — a silent submit under another person's name is not.
+        if (section.getAssignedUserId() != null && !section.getAssignedUserId().equals(userId)) {
+            throw new BusinessException("SECTION_NOT_YOURS",
+                    "This section is assigned to someone else. Only its owner can submit it — "
+                            + "reassign it first if it needs to move.",
+                    HttpStatus.FORBIDDEN);
+        }
 
         if (section.getSubmittedAt() != null) {
             // Already locked — but STILL evaluate the compound gate before returning.
@@ -1581,12 +1686,65 @@ public class AssessmentController {
             // is the same one the normal path uses — this only fires when every
             // section owned by this responder really is submitted.
             boolean gateFired = fireSectionGateIfAllSubmitted(assessmentId, section, userId, taskId);
-            java.util.Map<String, Object> already = new java.util.LinkedHashMap<>();
+            Map<String, Object> already = new LinkedHashMap<>();
             already.put("sectionInstanceId", sectionInstanceId);
             already.put("status", "ALREADY_SUBMITTED");
             already.put("submittedAt", section.getSubmittedAt().toString());
             already.put("gateFired", gateFired);
             return ResponseEntity.ok(ApiResponse.success(already));
+        }
+
+        // ── EVIDENCE GATE ────────────────────────────────────────────────
+        //
+        // A question carrying requires_evidence must have at least one document
+        // linked to it before the section can be locked. Checked HERE, before
+        // the lock, because a submitted section is read-only — finding out
+        // afterwards would mean a CISO reopen for a missing PDF.
+        //
+        // Costs one query regardless of section size: every question instance
+        // in the section is already being loaded below, so the ids are free,
+        // and document_links answers for all of them at once.
+        //
+        // No existing question is affected. requires_evidence defaults to false
+        // on every row, so this gate is inert until somebody deliberately marks
+        // a question in the library.
+        List<AssessmentQuestionInstance> sectionQuestions =
+                questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sectionInstanceId);
+
+        List<Long> needEvidence = sectionQuestions.stream()
+                .filter(AssessmentQuestionInstance::isRequiresEvidence)
+                .map(AssessmentQuestionInstance::getId)
+                .toList();
+
+        if (!needEvidence.isEmpty()) {
+            java.util.Set<Long> haveEvidence = documentLinkRepository
+                    .findByEntityTypeAndEntityIdIn("QUESTION_RESPONSE", needEvidence)
+                    .stream()
+                    .map(com.kashi.grc.document.domain.DocumentLink::getEntityId)
+                    .collect(java.util.stream.Collectors.toSet());
+
+            List<AssessmentQuestionInstance> missing = sectionQuestions.stream()
+                    .filter(AssessmentQuestionInstance::isRequiresEvidence)
+                    .filter(q -> !haveEvidence.contains(q.getId()))
+                    .toList();
+
+            if (!missing.isEmpty()) {
+                // Name them. "Evidence missing" on a forty-question section is
+                // a scavenger hunt; the question numbers are what the person
+                // needs to go and fix it.
+                String which = missing.stream()
+                        .map(q -> "Q" + (q.getOrderNo() != null ? q.getOrderNo() : q.getId()))
+                        .collect(java.util.stream.Collectors.joining(", "));
+                log.info("[SECTION-SUBMIT] Blocked on evidence | sectionInstanceId={} | missing={}",
+                        sectionInstanceId, which);
+                throw new BusinessException("EVIDENCE_REQUIRED",
+                        missing.size() == 1
+                                ? "This section cannot be submitted yet: " + which
+                                  + " requires an attached document."
+                                : "This section cannot be submitted yet: " + which
+                                  + " require an attached document.",
+                        HttpStatus.BAD_REQUEST);
+            }
         }
 
         // Lock the section
@@ -1598,8 +1756,10 @@ public class AssessmentController {
         // It is preserved for audit (who was assigned to each question).
         // Access control is handled by section.submittedAt being non-null.
         // On reopen, the responder must explicitly re-assign contributors.
-        List<AssessmentQuestionInstance> questions =
-                questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sectionInstanceId);
+        // Was a second findBySectionInstanceId here; the gate above already
+        // loaded the same rows. Kept under the original name so nothing below
+        // has to change.
+        List<AssessmentQuestionInstance> questions = sectionQuestions;
 
         log.info("[SECTION-SUBMIT] Section locked | sectionInstanceId={} | assessmentId={} | userId={}",
                 sectionInstanceId, assessmentId, userId);
@@ -1635,17 +1795,44 @@ public class AssessmentController {
         Long userId = utilityService.getLoggedInDataContext().getId();
         User currentUser = utilityService.getLoggedInDataContext();
 
-        // Only VENDOR_CISO and VENDOR_VRM can reopen a submitted section.
-        // Org-side users should raise a Revision Request instead — that keeps the
-        // audit trail clean and avoids giving the org unilateral access to the vendor's submission.
-        boolean canReopen = currentUser.getRoles().stream().anyMatch(r -> {
+        // ── PERMISSION FIRST, ROLE NAMES ONLY AS A FALLBACK ──────────────
+        //
+        // This read `"VENDOR_CISO".equals(name) || "VENDOR_VRM".equals(name)`
+        // and nothing else, which is a role name compiled into a controller:
+        // rename the role, add a third vendor role that legitimately needs to
+        // reopen, or stand up a tenant that calls its CISO something else, and
+        // the capability disappears with no error to follow.
+        //
+        // assessment.section.reopen is the permission that means this, it is
+        // already seeded (sql/65), and the vendor tab already gates its Reopen
+        // button on it. The server was the half that had not caught up — so the
+        // button was permission-driven and the endpoint behind it was not.
+        //
+        // The role check is KEPT as a fallback rather than deleted. If the
+        // permission has not reached a tenant's roles yet, removing the names
+        // outright would take the capability away from the two roles that have
+        // always had it, mid-assessment. The fallback costs nothing and can be
+        // dropped once every tenant's roles carry the grant.
+        //
+        // Org-side users are still excluded either way: they should raise a
+        // Revision Request rather than take unilateral access to the vendor's
+        // submission, and the permission is not granted to org roles.
+        boolean hasReopenPermission = currentUser.getRoles().stream()
+                .filter(r -> r.getPermissions() != null)
+                .flatMap(r -> r.getPermissions().stream())
+                .anyMatch(p -> "assessment.section.reopen".equals(p.getCode()));
+
+        boolean hasLegacyRole = currentUser.getRoles().stream().anyMatch(r -> {
             String name = r.getName() != null ? r.getName() : "";
             return "VENDOR_CISO".equals(name) || "VENDOR_VRM".equals(name);
         });
 
+        boolean canReopen = hasReopenPermission || hasLegacyRole;
+
         if (!canReopen) {
             throw new BusinessException("ACCESS_DENIED",
-                    "Only VENDOR_CISO or VENDOR_VRM can reopen a submitted section.",
+                    "Reopening a submitted section needs the "
+                            + "assessment.section.reopen permission.",
                     HttpStatus.FORBIDDEN);
         }
 
@@ -1684,16 +1871,16 @@ public class AssessmentController {
                             stepInstanceRepository.findByWorkflowInstanceIdOrderByCreatedAtAsc(
                                             cycle.getWorkflowInstanceId())
                                     .stream()
-                                    .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL)
+                                    .filter(si -> si.getSnapStepAction() == StepAction.FILL)
                                     .findFirst()
                                     .ifPresent(fillStep -> {
                                         taskInstanceRepository.findByStepInstanceId(fillStep.getId())
                                                 .stream()
                                                 .filter(t -> section.getAssignedUserId().equals(t.getAssignedUserId())
                                                         && t.getTaskRole() == com.kashi.grc.workflow.enums.TaskRole.ACTOR
-                                                        && t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.APPROVED)
+                                                        && t.getStatus() == TaskStatus.APPROVED)
                                                 .forEach(t -> {
-                                                    t.setStatus(com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS);
+                                                    t.setStatus(TaskStatus.IN_PROGRESS);
                                                     t.setActedAt(null);
                                                     t.setRemarks("Section reopened — responder needs to resubmit");
                                                     taskInstanceRepository.save(t);
@@ -1778,17 +1965,23 @@ public class AssessmentController {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
 
-        // Idempotent — already submitted
-        if (contributorSectionSubmissionRepository
-                .existsBySectionInstanceIdAndContributorUserId(sectionInstanceId, userId)) {
-            return ResponseEntity.ok(ApiResponse.success(Map.of(
-                    "status", "ALREADY_SUBMITTED",
-                    "sectionInstanceId", sectionInstanceId)));
-        }
-
-        // Verify the task belongs to this user (only when taskId is present)
-        // Revision flow: contributor has no active task (APPROVED) — skip task check,
-        // access was already granted by the open obligation bypass.
+        // ── THE TASK IS YOURS — CHECKED BEFORE EITHER PATH ──────────────────
+        //
+        // Hoisted above the ALREADY_SUBMITTED branch below, which it used to
+        // sit under. The branch calls approveContributorTaskIfAllSubmitted,
+        // which runs countByTaskInstanceId(taskId) — a count that is NOT scoped
+        // to the caller — and returns it in the response body. The approve
+        // itself was never at risk, because WorkflowEngineService.performAction
+        // opens with requireTaskOwnership and throws TASK_NOT_YOURS, but a
+        // caller holding any submission row of their own could read a row count
+        // for a task belonging to someone else.
+        //
+        // One check in front of both paths rather than one per path: the same
+        // reason the obligation loop became a service.
+        //
+        // Revision flow: the contributor's task is already APPROVED so taskId
+        // is null, and there is nothing to check — access came from the open
+        // obligation bypass, not from a task.
         if (taskId != null) {
             TaskInstance task = taskInstanceRepository.findById(taskId)
                     .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskId));
@@ -1797,6 +1990,62 @@ public class AssessmentController {
                         HttpStatus.FORBIDDEN);
             }
         }
+
+        // ── ALREADY SUBMITTED, BUT STILL DO THE WORK BELOW ──────────────────
+        //
+        // This used to be a bare `return ALREADY_SUBMITTED`, and that was a
+        // dead end for one person in one real sequence:
+        //
+        //   1. contributor is assigned ONE question in section S, answers it,
+        //      locks S — which writes the contributor_section_submissions row
+        //   2. the responder later assigns them a SECOND question in S
+        //   3. they can answer it (QuestionItemCard's canEdit is
+        //      `owedHere || (editable && !settled)` — an open obligation beats
+        //      the section lock, mirroring the server's own bypass)
+        //   4. they press Lock again — and the row from step 1 is still there,
+        //      so this returned here, forty lines above the loop that closes
+        //      their CONTRIBUTOR_ASSIGNMENT items
+        //
+        // The item stayed OPEN forever. Their inbox never cleared, and the
+        // sub-task gate was never re-evaluated either.
+        //
+        // The row is NOT cleared on re-assignment to fix this, deliberately:
+        // that would make their earlier answers in S editable again, silently,
+        // because a responder added one unrelated question. The lock is a true
+        // statement about the work they held when they took it. What was
+        // missing is the way out of the NEW obligation, and owedHere already
+        // grants exactly the one question they owe.
+        //
+        // This is the third place the same pattern bit — an early return
+        // skipping work that must still happen. submitSection carries a
+        // comment about its own version; assistantSubmitSection in
+        // ReviewController is the mirror of this one.
+        if (contributorSectionSubmissionRepository
+                .existsBySectionInstanceIdAndContributorUserId(sectionInstanceId, userId)) {
+
+            int reclosed = obligationService.closeAssignmentObligations(
+                    sectionInstanceId, userId,
+                    utilityService.getLoggedInDataContext().getTenantId(),
+                    AssessmentObligationService.CONTRIBUTOR_ASSIGNMENT,
+                    "Answers locked by contributor");
+
+            ContributorGate reGate = approveContributorTaskIfAllSubmitted(assessmentId, userId, taskId);
+
+            log.info("[CONTRIBUTOR-SUBMIT] Re-submit on locked section | si={} | userId={} | " +
+                            "obligationsClosed={} | taskApproved={}",
+                    sectionInstanceId, userId, reclosed, reGate.approved());
+
+            Map<String, Object> already = new LinkedHashMap<>();
+            already.put("status", "ALREADY_SUBMITTED");
+            already.put("sectionInstanceId", sectionInstanceId);
+            already.put("obligationsClosed", reclosed);
+            already.put("submittedSections", reGate.submitted());
+            already.put("totalSections", reGate.total());
+            already.put("taskApproved", reGate.approved());
+            return ResponseEntity.ok(ApiResponse.success(already));
+        }
+
+        // Task ownership is checked above, in front of both paths.
 
         // Record submission
         contributorSectionSubmissionRepository.save(ContributorSectionSubmission.builder()
@@ -1809,6 +2058,28 @@ public class AssessmentController {
 
         log.info("[CONTRIBUTOR-SUBMIT] Section submitted | sectionInstanceId={} | userId={} | taskId={}",
                 sectionInstanceId, userId, taskId);
+
+        // ── CLOSE THIS CONTRIBUTOR'S OBLIGATIONS FOR THIS SECTION ───────────
+        //
+        // The item is the per-question record of "was this person asked, and
+        // are they done"; locking the section is when the second half becomes
+        // true.
+        //
+        // The loop that used to live here is now
+        // AssessmentObligationService.closeAssignmentObligations — because the
+        // ALREADY_SUBMITTED path above has to run it too, and the reviewer side
+        // had a byte-for-byte copy of it with one string different. Its javadoc
+        // carries the three scopes and why each one matters; the short version
+        // is that a revision request, a clarification or a KashiGuard finding
+        // on a question in this section MUST survive the lock, because the open
+        // obligation is what lets the contributor back in to answer it.
+        //
+        // It is also one query now rather than one per question.
+        obligationService.closeAssignmentObligations(
+                sectionInstanceId, userId,
+                utilityService.getLoggedInDataContext().getTenantId(),
+                AssessmentObligationService.CONTRIBUTOR_ASSIGNMENT,
+                "Answers locked by contributor");
 
         // Check if ALL sections with this contributor's questions are now submitted.
         // Revision flow (taskId=null): skip task-approval gate — there's no active task
@@ -1824,6 +2095,41 @@ public class AssessmentController {
                     "taskApproved",      false)));
         }
 
+        ContributorGate gate = approveContributorTaskIfAllSubmitted(assessmentId, userId, taskId);
+
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "status",          gate.approved() ? "TASK_APPROVED" : "SECTION_SUBMITTED",
+                "sectionInstanceId", sectionInstanceId,
+                "submittedSections", gate.submitted(),
+                "totalSections",     gate.total(),
+                "taskApproved",      gate.approved())));
+    }
+
+    /** Result of the contributor sub-task gate — see the method below. */
+    private record ContributorGate(long total, long submitted, boolean approved) {}
+
+    /**
+     * Approves the contributor's sub-task when every section carrying their
+     * questions has been submitted, and reports the counts it used.
+     *
+     * Extracted because the ALREADY_SUBMITTED path above has to evaluate the
+     * same gate: a contributor who was assigned another question after locking
+     * a section, answered it and pressed Lock again needs their sub-task
+     * reconsidered, not skipped.
+     *
+     * It returns the counts rather than just the verdict so the response body
+     * can report them without running the two COUNTs a second time.
+     *
+     * Null taskId is the revision flow — the contributor's task is already
+     * APPROVED and there is nothing to gate, so this reports zeros and false
+     * without touching anything.
+     *
+     * TASK_TERMINAL is swallowed, as it was inline: an already-approved task is
+     * the expected outcome of a second call, not a failure.
+     */
+    private ContributorGate approveContributorTaskIfAllSubmitted(Long assessmentId, Long userId, Long taskId) {
+        if (taskId == null) return new ContributorGate(0, 0, false);
+
         long totalSections = contributorSectionSubmissionRepository
                 .countDistinctSectionsWithAssignments(assessmentId, userId);
         long submittedSections = contributorSectionSubmissionRepository
@@ -1835,10 +2141,9 @@ public class AssessmentController {
 
         if (allDone) {
             try {
-                com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                        new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+                TaskActionRequest req = new TaskActionRequest();
                 req.setTaskInstanceId(taskId);
-                req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+                req.setActionType(ActionType.APPROVE);
                 req.setRemarks("Contributor submitted all assigned section answers");
                 workflowEngineService.performAction(req, userId);
                 log.info("[CONTRIBUTOR-SUBMIT] Sub-task approved | taskId={}", taskId);
@@ -1846,13 +2151,7 @@ public class AssessmentController {
                 if (!"TASK_TERMINAL".equals(e.getErrorCode())) throw e;
             }
         }
-
-        return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "status",          allDone ? "TASK_APPROVED" : "SECTION_SUBMITTED",
-                "sectionInstanceId", sectionInstanceId,
-                "submittedSections", submittedSections,
-                "totalSections",     totalSections,
-                "taskApproved",      allDone)));
+        return new ContributorGate(totalSections, submittedSections, allDone);
     }
 
     /**
@@ -1904,7 +2203,7 @@ public class AssessmentController {
                   .map(List::of).orElse(List.of())
                 : contributorSectionSubmissionRepository.findBySectionInstanceId(sectionInstanceId);
 
-        java.util.Set<Long> reopenedFor = new java.util.LinkedHashSet<>();
+        Set<Long> reopenedFor = new LinkedHashSet<>();
         for (ContributorSectionSubmission sub : submissions) {
             reopenedFor.add(sub.getContributorUserId());
             contributorSectionSubmissionRepository.delete(sub);
@@ -1920,7 +2219,7 @@ public class AssessmentController {
                 questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sectionInstanceId)
                         .stream()
                         .map(AssessmentQuestionInstance::getAssignedUserId)
-                        .filter(java.util.Objects::nonNull)
+                        .filter(Objects::nonNull)
                         .forEach(reopenedFor::add);
             }
         }
@@ -1964,7 +2263,7 @@ public class AssessmentController {
         log.info("[CONTRIBUTOR-REOPEN] si={} | cleared={} | notified={} | by={}",
                 sectionInstanceId, submissions.size(), reopenedFor.size(), responderId);
 
-        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("sectionInstanceId", sectionInstanceId);
         resp.put("submissionsCleared", submissions.size());
         resp.put("contributorsNotified", reopenedFor.size());
@@ -1996,7 +2295,7 @@ public class AssessmentController {
                         .findByAssessmentIdAndContributorUserId(assessmentId, userId)
                         .stream()
                         .map(s -> {
-                            java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+                            Map<String, Object> m = new LinkedHashMap<>();
                             m.put("sectionInstanceId", s.getSectionInstanceId());
                             m.put("submittedAt", s.getSubmittedAt().toString());
                             return m;
@@ -2041,7 +2340,7 @@ public class AssessmentController {
         List<AssessmentSectionInstance> sections =
                 sectionInstanceRepository.findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
 
-        java.util.Set<Long> userIds = new java.util.HashSet<>();
+        Set<Long> userIds = new HashSet<>();
         sections.forEach(s -> {
             if (s.getAssignedUserId() != null) userIds.add(s.getAssignedUserId());
             if (s.getSubmittedBy()    != null) userIds.add(s.getSubmittedBy());
@@ -2049,7 +2348,7 @@ public class AssessmentController {
         });
         Map<Long, String> nameMap = userRepository.findAllById(userIds).stream()
                 .collect(java.util.stream.Collectors.toMap(
-                        com.kashi.grc.usermanagement.domain.User::getId,
+                        User::getId,
                         u -> {
                             String fn = u.getFirstName() != null ? u.getFirstName() : "";
                             String ln = u.getLastName()  != null ? u.getLastName()  : "";
@@ -2071,6 +2370,8 @@ public class AssessmentController {
                     .submittedBy(s.getSubmittedBy())
                     .submittedByName(nameMap.get(s.getSubmittedBy()))
                     .reopenedAt(s.getReopenedAt())
+                    .reviewerSubmittedAt(s.getReviewerSubmittedAt())
+                    .reviewerReopenedAt(s.getReviewerReopenedAt())
                     .questions(null) // status view only — no questions loaded
                     .build();
         }).toList();
@@ -2153,17 +2454,17 @@ public class AssessmentController {
 
         // ── 1. Build QuestionContext list for generic guard sweep ─────────────
         // Map questionInstanceId → latest response (null if never answered)
-        java.util.Map<Long, com.kashi.grc.assessment.domain.AssessmentResponse> responseMap =
+        Map<Long, AssessmentResponse> responseMap =
                 responseRepository.findByAssessmentId(assessmentId).stream()
                         .collect(java.util.stream.Collectors.toMap(
-                                com.kashi.grc.assessment.domain.AssessmentResponse::getQuestionInstanceId,
+                                AssessmentResponse::getQuestionInstanceId,
                                 r -> r, (a, b) -> b));
 
-        java.util.List<ModuleSubmitEvent.QuestionContext> contexts =
+        List<ModuleSubmitEvent.QuestionContext> contexts =
                 questionInstanceRepository.findByAssessmentIdOrderByOrderNo(assessmentId)
                         .stream()
                         .map(qi -> {
-                            com.kashi.grc.assessment.domain.AssessmentResponse r =
+                            AssessmentResponse r =
                                     responseMap.get(qi.getId());
 
                             // ── FILE_UPLOAD: check DocumentLink not responseText ──────────
@@ -2175,13 +2476,13 @@ public class AssessmentController {
                             // responseText stores option IDs (null or "[4257,4259]") — not text.
                             // GuardEvaluator needs the actual option value strings to match
                             // conditionValue like "No", "Never", "Partially" etc.
-                            java.util.List<String> selectedOptionValues = new java.util.ArrayList<>();
+                            List<String> selectedOptionValues = new ArrayList<>();
                             if (r != null) {
                                 if ("SINGLE_CHOICE".equals(qi.getResponseType())
                                         && r.getSelectedOptionInstanceId() != null) {
                                     // Single choice — one option ID
                                     optionInstanceRepository.findById(r.getSelectedOptionInstanceId())
-                                            .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                            .map(AssessmentOptionInstance::getOptionValue)
                                             .ifPresent(selectedOptionValues::add);
                                 } else if ("MULTI_CHOICE".equals(qi.getResponseType())
                                         && r.getResponseText() != null
@@ -2192,7 +2493,7 @@ public class AssessmentController {
                                                 .readValue(r.getResponseText(), Long[].class);
                                         for (Long optId : ids) {
                                             optionInstanceRepository.findById(optId)
-                                                    .map(com.kashi.grc.assessment.domain.AssessmentOptionInstance::getOptionValue)
+                                                    .map(AssessmentOptionInstance::getOptionValue)
                                                     .ifPresent(selectedOptionValues::add);
                                         }
                                     } catch (Exception ignored) {}
@@ -2208,7 +2509,7 @@ public class AssessmentController {
                                 // Fall back to section-level responder assignment
                                 assignedUserId = sectionInstanceRepository
                                         .findById(qi.getSectionInstanceId())
-                                        .map(com.kashi.grc.assessment.domain.AssessmentSectionInstance::getAssignedUserId)
+                                        .map(AssessmentSectionInstance::getAssignedUserId)
                                         .orElse(null);
                             }
 
@@ -2271,10 +2572,10 @@ public class AssessmentController {
         // Directly approve the task — advances step 7 and triggers step 8 task creation.
         // Step 8 uses PUSH_TO_ROLES with ORG_CISO actor role, so it automatically fans
         // out to all ORG_CISO users without any hardcoded reassignment here.
-        com.kashi.grc.workflow.dto.request.TaskActionRequest approveReq =
-                new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+        TaskActionRequest approveReq =
+                new TaskActionRequest();
         approveReq.setTaskInstanceId(taskId);
-        approveReq.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+        approveReq.setActionType(ActionType.APPROVE);
         approveReq.setRemarks("Org CISO assignment confirmed" +
                 (cisoUserId != null ? " — cisoUserId=" + cisoUserId : ""));
         workflowEngineService.performAction(approveReq, userId);
@@ -2333,6 +2634,11 @@ public class AssessmentController {
         Long reviewAssistantId = body.get("userId");
         if (reviewAssistantId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
+        // Issue 3 — the assignee must satisfy what the workflow step declares.
+        // Until this, the ONLY validation of an assignee was that userId is
+        // non-null: no side, no role, not even a tenant check. The dropdown was
+        // the whole control, and a dropdown is not a control.
+        assignmentService.assertAssignable(reviewAssistantId, assessmentId, StepAction.REVIEW);
 
         AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("QuestionInstance", questionInstanceId));
@@ -2381,12 +2687,26 @@ public class AssessmentController {
                 .status(ActionItem.Status.OPEN)
                 .priority(ActionItem.Priority.MEDIUM)
                 .remediationType("REVIEWER_ASSIGNMENT")
+                // The SAME ui_navigation rows the workflow tasks use, so one
+                // resolver answers for a task and for an action item and a
+                // route change is one row, not a code change plus a backfill.
+                // nav_context stays for the per-item extras a nav row cannot
+                // carry — which question to open, the openWork bypass.
+                .navKey("org_assessment_review")
+                .assignerNavKey("org_assessment_review")
                 .build();
         actionItemRepository.save(item);
 
+        // ── ROUTES POINT AT THE MODULE PAGE, NOT THE HARDCODED JSX ──────────
+        // nav_context is written once, at creation, and the action items page
+        // navigates by it. So these strings — not ui_navigation — are what sent
+        // an assigned contributor to /vendor/assessments/{id}/fill. The module
+        // route carries tab, the question to open and the action item, and
+        // UniversalModulePage opens the question drawer straight onto it.
+        // Rows written before this keep their old route; sql/86 backfills them.
         String navCtx = String.format(
-                "{\"assigneeRoute\":\"/assessments/%d/review?questionInstanceId=%d\"" +
-                        ",\"reviewerRoute\":\"/assessments/%d/review\"" +
+                "{\"assigneeRoute\":\"/module/vendor_assessment/%d?tab=review&questionInstanceId=%d\"" +
+                        ",\"reviewerRoute\":\"/module/vendor_assessment/%d?tab=review\"" +
                         ",\"questionInstanceId\":%d,\"assessmentId\":%d}",
                 assessmentId, questionInstanceId,
                 assessmentId, questionInstanceId, assessmentId);
@@ -2459,7 +2779,7 @@ public class AssessmentController {
 
         log.info("[REVIEWER-UNASSIGN] qi={} | assessmentId={}", questionInstanceId, assessmentId);
 
-        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("assessmentId",       assessmentId);
         resp.put("questionInstanceId", questionInstanceId);
         resp.put("reviewerAssignedUserId", null);
@@ -2485,7 +2805,7 @@ public class AssessmentController {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
         String verdict = body.get("verdict");
-        if (verdict == null || !java.util.Set.of("PASS","PARTIAL","FAIL").contains(verdict.toUpperCase())) {
+        if (verdict == null || !Set.of("PASS","PARTIAL","FAIL").contains(verdict.toUpperCase())) {
             throw new com.kashi.grc.common.exception.ValidationException(
                     "verdict must be PASS, PARTIAL, or FAIL");
         }
@@ -2506,9 +2826,27 @@ public class AssessmentController {
         response.setReviewerStatus(verdict.toUpperCase());
         responseRepository.save(response);
 
-        // Auto-resolve open REVIEWER_ASSIGNMENT action items for this question
-        // when the review assistant saves their evaluation verdict.
-        // Same pattern as CONTRIBUTOR_ASSIGNMENT resolution in submitAnswer.
+        // ── EVALUATED IS STARTED, NOT FINISHED ──────────────────────────────
+        //
+        // This resolved the item outright, mirroring what submitAnswer used to
+        // do on the vendor side. I left it alone when I changed that one, on the
+        // reasoning that a verdict is a judgement rather than a draft and the
+        // assistant has no lock gesture to move it to.
+        //
+        // The second half was simply wrong — I had not checked.
+        // ReviewController has assistantSubmitSection, whose own @Operation says
+        // it "mirrors contributorSubmitSection exactly", plus
+        // assistant-section-status to read the lock back and reviewer-reopen for
+        // the org CISO to clear it. The whole chain is there; only this was out
+        // of step.
+        //
+        // And the first half does not hold either: a verdict can be revised
+        // until it is locked, exactly like an answer. Resolving on save meant
+        // the assistant's inbox emptied while they were still working and the
+        // reviewer saw "done" on an evaluation still being changed.
+        //
+        // So: evaluating moves it to IN_PROGRESS. assistantSubmitSection closes
+        // it, the same way contributorSubmitSection does on the vendor side.
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         actionItemRepository.findAll(
                         ActionItemSpecification.forTenant(tenantId)
@@ -2518,11 +2856,9 @@ public class AssessmentController {
                                 .and(ActionItemSpecification.open())
                 ).stream()
                 .filter(ai -> "REVIEWER_ASSIGNMENT".equals(ai.getRemediationType()))
+                .filter(ai -> ai.getStatus() == ActionItem.Status.OPEN)
                 .forEach(ai -> {
-                    ai.setStatus(ActionItem.Status.RESOLVED);
-                    ai.setResolutionNote("Question evaluated by review assistant");
-                    ai.setResolvedAt(LocalDateTime.now());
-                    ai.setResolvedBy(userId);
+                    ai.setStatus(ActionItem.Status.IN_PROGRESS);
                     actionItemRepository.save(ai);
                 });
 
@@ -2598,7 +2934,7 @@ public class AssessmentController {
             if (sec.getReviewerSubmittedAt() != null) {
                 sec.setReviewerSubmittedAt(null);
                 sec.setReviewerSubmittedBy(null);
-                sec.setReviewerReopenedAt(java.time.LocalDateTime.now());
+                sec.setReviewerReopenedAt(LocalDateTime.now());
                 sec.setReviewerReopenedBy(utilityService.getLoggedInDataContext().getId());
                 cleared++;
             }
@@ -2635,10 +2971,10 @@ public class AssessmentController {
         // This is the same pattern as submitAssessment's hasSections fallback.
         if (!sectionCompletionService.hasSections(taskId)) {
             log.warn("[REVIEWER-EVAL] No sections configured for task {} — falling back to direct APPROVE", taskId);
-            com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                    new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+            TaskActionRequest req =
+                    new TaskActionRequest();
             req.setTaskInstanceId(taskId);
-            req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+            req.setActionType(ActionType.APPROVE);
             req.setRemarks("Reviewer evaluation complete — task approved");
             try {
                 workflowEngineService.performAction(req, userId);
@@ -2685,7 +3021,7 @@ public class AssessmentController {
     public ResponseEntity<ApiResponse<Void>> documentFindings(
             @PathVariable Long assessmentId,
             @RequestParam Long taskId,
-            @RequestBody(required = false) java.util.Map<String, String> body) {
+            @RequestBody(required = false) Map<String, String> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         VendorAssessment assessment = assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
@@ -2746,11 +3082,33 @@ public class AssessmentController {
     public ResponseEntity<ApiResponse<Void>> assignRiskRating(
             @PathVariable Long assessmentId,
             @RequestParam Long taskId,
-            @RequestParam String riskRating) {
+            @RequestParam(required = false) String riskRating,
+            @RequestBody(required = false) Map<String, String> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         VendorAssessment assessment = assessmentRepository.findById(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
-        java.util.Set<String> validRatings = java.util.Set.of("LOW", "MEDIUM", "HIGH", "CRITICAL");
+
+        // ── THE RATING MAY ARRIVE AS A QUERY PARAM OR IN A BODY ─────────────
+        //
+        // The query param is how VendorAssessmentFillPage has always called
+        // this and is untouched — it still wins when present, so that page
+        // behaves exactly as it does today.
+        //
+        // The body is for the module screen. A seeded ui_action with a
+        // __formKey opens a DynamicForm whose values are POSTed as JSON, and a
+        // @RequestParam cannot see those. Accepting both is one line here
+        // against either a second endpoint doing the same work or a form
+        // mechanism that writes query strings, and the validation below is
+        // shared by both paths rather than duplicated.
+        if ((riskRating == null || riskRating.isBlank()) && body != null) {
+            riskRating = body.get("riskRating");
+        }
+        if (riskRating == null || riskRating.isBlank()) {
+            throw new BusinessException("RISK_RATING_REQUIRED",
+                    "riskRating is required — pass it as a query parameter or in the body.");
+        }
+
+        Set<String> validRatings = Set.of("LOW", "MEDIUM", "HIGH", "CRITICAL");
         if (!validRatings.contains(riskRating.toUpperCase())) {
             throw new BusinessException("INVALID_RISK_RATING",
                     "riskRating must be one of: LOW, MEDIUM, HIGH, CRITICAL");
@@ -2782,6 +3140,10 @@ public class AssessmentController {
         Long userId = body.get("userId");
         if (userId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
+        // Issue 3 — see the note on assignQuestion. Note that `userId` here is
+        // the ASSIGNEE, not the caller: this method shadows the name used for
+        // the logged-in user everywhere else in this controller.
+        assignmentService.assertAssignable(userId, assessmentId, StepAction.FILL);
 
         AssessmentSectionInstance si = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sectionInstanceId));
@@ -2827,16 +3189,21 @@ public class AssessmentController {
             @RequestBody Map<String, Object> body) {
 
         Long assistantId = body.get("userId") instanceof Number n ? n.longValue() : null;
+        // Issue 3 — the assignee must satisfy what the workflow step declares.
+        // Until this, the ONLY validation of an assignee was that userId is
+        // non-null: no side, no role, not even a tenant check. The dropdown was
+        // the whole control, and a dropdown is not a control.
+        assignmentService.assertAssignable(assistantId, assessmentId, StepAction.REVIEW);
         if (assistantId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
 
         @SuppressWarnings("unchecked")
-        java.util.List<Number> rawIds = (java.util.List<Number>) body.get("questionInstanceIds");
+        List<Number> rawIds = (List<Number>) body.get("questionInstanceIds");
         if (rawIds == null || rawIds.isEmpty())
             throw new com.kashi.grc.common.exception.ValidationException("questionInstanceIds is required");
 
-        java.util.List<Long> questionIds = rawIds.stream()
-                .filter(java.util.Objects::nonNull)
+        List<Long> questionIds = rawIds.stream()
+                .filter(Objects::nonNull)
                 .map(Number::longValue)
                 .distinct()
                 .toList();
@@ -2850,7 +3217,7 @@ public class AssessmentController {
                         "QuestionInstance " + qId + " does not belong to assessment " + assessmentId);
         }
 
-        java.util.Map<String, Long> single = new java.util.HashMap<>();
+        Map<String, Long> single = new HashMap<>();
         single.put("userId", assistantId);
         for (Long qId : questionIds) {
             reviewerAssignQuestion(assessmentId, qId, single);
@@ -2859,7 +3226,7 @@ public class AssessmentController {
         log.info("[REVIEWER-ASSIGN-QUESTIONS-BATCH] {} question(s) -> assistantId={} | assessmentId={}",
                 questionIds.size(), assistantId, assessmentId);
 
-        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("assessmentId",             assessmentId);
         resp.put("reviewerAssignedUserId",   assistantId);
         resp.put("questionInstanceIds",      questionIds);
@@ -2890,11 +3257,16 @@ public class AssessmentController {
             @RequestBody Map<String, Object> body) {
 
         Long responderId = body.get("userId") instanceof Number n ? n.longValue() : null;
+        // Issue 3 — the assignee must satisfy what the workflow step declares.
+        // Until this, the ONLY validation of an assignee was that userId is
+        // non-null: no side, no role, not even a tenant check. The dropdown was
+        // the whole control, and a dropdown is not a control.
+        assignmentService.assertAssignable(responderId, assessmentId, StepAction.FILL);
         if (responderId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
 
         @SuppressWarnings("unchecked")
-        java.util.List<Number> rawIds = (java.util.List<Number>) body.get("sectionInstanceIds");
+        List<Number> rawIds = (List<Number>) body.get("sectionInstanceIds");
         if (rawIds == null || rawIds.isEmpty())
             throw new com.kashi.grc.common.exception.ValidationException("sectionInstanceIds is required");
 
@@ -2902,13 +3274,13 @@ public class AssessmentController {
                 .findByAssessmentId(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance for assessment", assessmentId));
 
-        java.util.List<Long> sectionIds = rawIds.stream()
-                .filter(java.util.Objects::nonNull)
+        List<Long> sectionIds = rawIds.stream()
+                .filter(Objects::nonNull)
                 .map(Number::longValue)
                 .distinct()
                 .toList();
 
-        java.util.List<AssessmentSectionInstance> targets = new java.util.ArrayList<>();
+        List<AssessmentSectionInstance> targets = new ArrayList<>();
         for (Long sid : sectionIds) {
             AssessmentSectionInstance si = sectionInstanceRepository.findById(sid)
                     .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sid));
@@ -2924,7 +3296,7 @@ public class AssessmentController {
         log.info("[ASSIGN-SECTIONS-BATCH] {} section(s) -> userId={} | assessmentId={}",
                 targets.size(), responderId, assessmentId);
 
-        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("assessmentId",       assessmentId);
         resp.put("assignedUserId",     responderId);
         resp.put("sectionInstanceIds", sectionIds);
@@ -2983,7 +3355,7 @@ public class AssessmentController {
         log.info("[UNASSIGN] Question unassigned | questionInstanceId={} | assessmentId={}",
                 questionInstanceId, assessmentId);
 
-        java.util.Map<String, Object> resp = new java.util.LinkedHashMap<>();
+        Map<String, Object> resp = new LinkedHashMap<>();
         resp.put("assessmentId",       assessmentId);
         resp.put("questionInstanceId", questionInstanceId);
         resp.put("assignedUserId",     null);
@@ -3002,6 +3374,11 @@ public class AssessmentController {
         Long contributorId = body.get("userId");
         if (contributorId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
+        // Issue 3 — the assignee must satisfy what the workflow step declares.
+        // Until this, the ONLY validation of an assignee was that userId is
+        // non-null: no side, no role, not even a tenant check. The dropdown was
+        // the whole control, and a dropdown is not a control.
+        assignmentService.assertAssignable(contributorId, assessmentId, StepAction.FILL);
 
         AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("QuestionInstance", questionInstanceId));
@@ -3033,16 +3410,21 @@ public class AssessmentController {
             @RequestBody Map<String, Object> body) {
 
         Long contributorId = body.get("userId") instanceof Number n ? n.longValue() : null;
+        // Issue 3 — the assignee must satisfy what the workflow step declares.
+        // Until this, the ONLY validation of an assignee was that userId is
+        // non-null: no side, no role, not even a tenant check. The dropdown was
+        // the whole control, and a dropdown is not a control.
+        assignmentService.assertAssignable(contributorId, assessmentId, StepAction.FILL);
         if (contributorId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
 
         @SuppressWarnings("unchecked")
-        java.util.List<Integer> rawIds = (java.util.List<Integer>) body.get("questionInstanceIds");
+        List<Integer> rawIds = (List<Integer>) body.get("questionInstanceIds");
         if (rawIds == null || rawIds.isEmpty())
             throw new com.kashi.grc.common.exception.ValidationException("questionInstanceIds is required");
 
         Long assignerId = utilityService.getLoggedInDataContext().getId();
-        java.util.List<Long> questionIds = rawIds.stream().map(Integer::longValue).toList();
+        List<Long> questionIds = rawIds.stream().map(Integer::longValue).toList();
 
         for (Long qId : questionIds) {
             AssessmentQuestionInstance qi = questionInstanceRepository.findById(qId)
@@ -3132,13 +3514,27 @@ public class AssessmentController {
                 .status(ActionItem.Status.OPEN)
                 .priority(ActionItem.Priority.MEDIUM)
                 .remediationType("CONTRIBUTOR_ASSIGNMENT")
+                // The SAME ui_navigation rows the workflow tasks use, so one
+                // resolver answers for a task and for an action item and a
+                // route change is one row, not a code change plus a backfill.
+                // nav_context stays for the per-item extras a nav row cannot
+                // carry — which question to open, the openWork bypass.
+                .navKey("vendor_assessment_fill")
+                .assignerNavKey("vendor_assessment_assign")
                 .build();
         actionItemRepository.save(item); // generates item.getId()
 
+        // ── ROUTES POINT AT THE MODULE PAGE, NOT THE HARDCODED JSX ──────────
+        // nav_context is written once, at creation, and the action items page
+        // navigates by it. So these strings — not ui_navigation — are what sent
+        // an assigned contributor to /vendor/assessments/{id}/fill. The module
+        // route carries tab, the question to open and the action item, and
+        // UniversalModulePage opens the question drawer straight onto it.
+        // Rows written before this keep their old route; sql/86 backfills them.
         String navCtx = String.format(
-                "{\"assigneeRoute\":\"/vendor/assessments/%d/fill" +
-                        "?actionItemId=%d&questionInstanceId=%d\"" +
-                        ",\"reviewerRoute\":\"/vendor/assessments/%d/fill\"" +
+                "{\"assigneeRoute\":\"/module/vendor_assessment/%d?tab=fill" +
+                        "&actionItemId=%d&questionInstanceId=%d\"" +
+                        ",\"reviewerRoute\":\"/module/vendor_assessment/%d?tab=fill\"" +
                         ",\"questionInstanceId\":%d,\"assessmentId\":%d}",
                 assessmentId, item.getId(), qi.getId(),
                 assessmentId, qi.getId(), assessmentId);
@@ -3187,7 +3583,7 @@ public class AssessmentController {
                         AssessmentResponse::getQuestionInstanceId, r -> r, (a, b) -> b));
 
         // Collect all user IDs we'll need for name resolution
-        Set<Long> allUserIds = new java.util.HashSet<>();
+        Set<Long> allUserIds = new HashSet<>();
         rawSections.forEach(s -> {
             if (s.getAssignedUserId() != null) allUserIds.add(s.getAssignedUserId());
             if (s.getSubmittedBy()    != null) allUserIds.add(s.getSubmittedBy());
@@ -3204,7 +3600,7 @@ public class AssessmentController {
         Map<Long, String> nameMap = allUserIds.isEmpty() ? Map.of()
                 : userRepository.findAllById(allUserIds).stream()
                   .collect(java.util.stream.Collectors.toMap(
-                          com.kashi.grc.usermanagement.domain.User::getId,
+                          User::getId,
                           u -> {
                               String fn = u.getFirstName() != null ? u.getFirstName() : "";
                               String ln = u.getLastName()  != null ? u.getLastName()  : "";
@@ -3212,11 +3608,17 @@ public class AssessmentController {
                               return full.isEmpty() ? u.getEmail() : full;
                           }));
 
-        // Bulk-load FILE_UPLOAD attachment counts (1 query)
+        // Bulk-load attachment counts (1 query)
+        // Widened beyond FILE_UPLOAD. The counts feed two readers now: whether a
+        // FILE_UPLOAD question is answered (its documents ARE the answer), and
+        // whether a requires_evidence question of ANY type has had its
+        // requirement met. Counting only FILE_UPLOAD left the second reader
+        // permanently at zero, so a TEXT question marked requires_evidence
+        // stayed amber however many files were attached to it.
         List<Long> fileQiIds = allQuestions.stream()
-                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()) || qi.isRequiresEvidence())
                 .map(AssessmentQuestionInstance::getId).toList();
-        Map<Long, Long> attachCounts = new java.util.HashMap<>();
+        Map<Long, Long> attachCounts = new HashMap<>();
         if (!fileQiIds.isEmpty()) {
             documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", fileQiIds)
                     .forEach(row -> attachCounts.put((Long) row[0], (Long) row[1]));
@@ -3246,12 +3648,12 @@ public class AssessmentController {
 
                                         AnswerResponse answer = null;
                                         if (r != null) {
-                                            java.util.List<Long> multiIds = null;
+                                            List<Long> multiIds = null;
                                             if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
                                                 try {
                                                     Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
                                                             .readValue(r.getResponseText(), Long[].class);
-                                                    multiIds = java.util.Arrays.asList(arr);
+                                                    multiIds = Arrays.asList(arr);
                                                 } catch (Exception ignored) {}
                                             }
                                             answer = AnswerResponse.builder()
@@ -3284,6 +3686,10 @@ public class AssessmentController {
                                                 .weight(qi.getWeight())
                                                 .mandatory(qi.isMandatory())
                                                 .orderNo(qi.getOrderNo())
+                                                // KashiGuard tag, straight off the snapshot column.
+                                                .questionTag(qi.getQuestionTagSnapshot())
+                                                .requiresEvidence(qi.isRequiresEvidence())
+                                                .evidenceCount(attachCounts.getOrDefault(qi.getId(), 0L).intValue())
                                                 .options(options)
                                                 .currentResponse(answer)
                                                 .assignedUserId(qi.getAssignedUserId())
@@ -3303,6 +3709,8 @@ public class AssessmentController {
                             .submittedBy(si.getSubmittedBy())
                             .submittedByName(nameMap.get(si.getSubmittedBy())) // bulk name map
                             .reopenedAt(si.getReopenedAt())
+                            .reviewerSubmittedAt(si.getReviewerSubmittedAt())
+                            .reviewerReopenedAt(si.getReviewerReopenedAt())
                             .questions(questions)
                             .build();
                 })
@@ -3344,14 +3752,14 @@ public class AssessmentController {
                   .collect(java.util.stream.Collectors.toMap(AssessmentSectionInstance::getId, s -> s));
 
         // Collect all user IDs for name resolution
-        Set<Long> myUserIds = new java.util.HashSet<>();
+        Set<Long> myUserIds = new HashSet<>();
         myResponseByQiId.values().forEach(r -> { if (r.getSubmittedBy() != null) myUserIds.add(r.getSubmittedBy()); });
 
         // Bulk-load user names (1 query)
         Map<Long, String> myNameMap = myUserIds.isEmpty() ? Map.of()
                 : userRepository.findAllById(myUserIds).stream()
                   .collect(java.util.stream.Collectors.toMap(
-                          com.kashi.grc.usermanagement.domain.User::getId,
+                          User::getId,
                           u -> {
                               String fn = u.getFirstName() != null ? u.getFirstName() : "";
                               String ln = u.getLastName()  != null ? u.getLastName()  : "";
@@ -3359,11 +3767,11 @@ public class AssessmentController {
                               return full.isEmpty() ? u.getEmail() : full;
                           }));
 
-        // Bulk FILE_UPLOAD attachment counts (1 query)
+        // Bulk attachment counts (1 query) — same widening as above.
         List<Long> myFileQiIds = allMyQuestions.stream()
-                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()))
+                .filter(qi -> "FILE_UPLOAD".equals(qi.getResponseType()) || qi.isRequiresEvidence())
                 .map(AssessmentQuestionInstance::getId).toList();
-        Map<Long, Long> myAttachCounts = new java.util.HashMap<>();
+        Map<Long, Long> myAttachCounts = new HashMap<>();
         if (!myFileQiIds.isEmpty()) {
             documentLinkRepository.countActiveAttachmentsBulk("QUESTION_RESPONSE", myFileQiIds)
                     .forEach(row -> myAttachCounts.put((Long) row[0], (Long) row[1]));
@@ -3375,12 +3783,12 @@ public class AssessmentController {
                             AssessmentResponse r = myResponseByQiId.get(qi.getId());
                             AnswerResponse answer = null;
                             if (r != null) {
-                                java.util.List<Long> multiIds = null;
+                                List<Long> multiIds = null;
                                 if (r.getResponseText() != null && r.getResponseText().startsWith("[")) {
                                     try {
                                         Long[] arr = new com.fasterxml.jackson.databind.ObjectMapper()
                                                 .readValue(r.getResponseText(), Long[].class);
-                                        multiIds = java.util.Arrays.asList(arr);
+                                        multiIds = Arrays.asList(arr);
                                     } catch (Exception ignored) {}
                                 }
                                 answer = AnswerResponse.builder()
@@ -3410,7 +3818,7 @@ public class AssessmentController {
                                     ? mySectionMap.get(qi.getSectionInstanceId()) // bulk section map
                                     : null;
                             String sectionName = sectionInst != null ? sectionInst.getSectionNameSnapshot() : null;
-                            java.time.LocalDateTime sectionSubmittedAt = sectionInst != null ? sectionInst.getSubmittedAt() : null;
+                            LocalDateTime sectionSubmittedAt = sectionInst != null ? sectionInst.getSubmittedAt() : null;
 
                             return QuestionInstanceResponse.builder()
                                     .questionInstanceId(qi.getId())
@@ -3419,6 +3827,10 @@ public class AssessmentController {
                                     .weight(qi.getWeight())
                                     .mandatory(qi.isMandatory())
                                     .orderNo(qi.getOrderNo())
+                                    // KashiGuard tag, straight off the snapshot column.
+                                    .questionTag(qi.getQuestionTagSnapshot())
+                                    .requiresEvidence(qi.isRequiresEvidence())
+                                    .evidenceCount(myAttachCounts.getOrDefault(qi.getId(), 0L).intValue())
                                     .assignedUserId(qi.getAssignedUserId())
                                     .sectionInstanceId(qi.getSectionInstanceId())
                                     .sectionName(sectionName)
@@ -3459,8 +3871,8 @@ public class AssessmentController {
         stepInstanceRepository
                 .findByWorkflowInstanceIdOrderByCreatedAtAsc(cycle.getWorkflowInstanceId())
                 .stream()
-                .filter(si -> si.getSnapStepAction() == com.kashi.grc.workflow.enums.StepAction.FILL
-                        && si.getStatus() == com.kashi.grc.workflow.enums.StepStatus.IN_PROGRESS)
+                .filter(si -> si.getSnapStepAction() == StepAction.FILL
+                        && si.getStatus() == StepStatus.IN_PROGRESS)
                 .findFirst()
                 .ifPresent(fillStep ->
                         taskInstanceRepository.findByStepInstanceId(fillStep.getId())
@@ -3470,7 +3882,7 @@ public class AssessmentController {
                                         || t.getStatus() == TaskStatus.IN_PROGRESS))
                                 .forEach(t -> {
                                     t.setStatus(TaskStatus.REJECTED);
-                                    t.setActedAt(java.time.LocalDateTime.now());
+                                    t.setActedAt(LocalDateTime.now());
                                     t.setRemarks(reason);
                                     taskInstanceRepository.save(t);
                                     log.info("[CONTRIBUTOR-TASK] Closed | contributorId={} | taskId={} | reason={}",
@@ -3646,7 +4058,7 @@ public class AssessmentController {
 
         List<Map<String, Object>> candidates = candidateIds.stream().map(tid -> {
             var tpl = templateRepository.findById(tid).orElse(null);
-            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            Map<String, Object> m = new LinkedHashMap<>();
             m.put("templateId", tid);
             m.put("name",       tpl != null ? tpl.getName()    : "Unknown");
             m.put("version",    tpl != null ? tpl.getVersion() : 1);
@@ -3654,7 +4066,7 @@ public class AssessmentController {
             return m;
         }).toList();
 
-        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        Map<String, Object> body = new LinkedHashMap<>();
         body.put("workflowInstanceId",  workflowInstanceId);
         body.put("riskTierLabel",       selection.getRiskTierLabel());
         body.put("alreadySelected",     selection.getSelectedTemplateId() != null);
@@ -3722,7 +4134,7 @@ public class AssessmentController {
         // ── Persist selection ─────────────────────────────────────────────────
         selection.setSelectedTemplateId(selectedTemplateId);
         selection.setSelectedByUserId(userId);
-        selection.setSelectedAt(java.time.LocalDateTime.now());
+        selection.setSelectedAt(LocalDateTime.now());
         templateSelectionRepository.save(selection);
 
         // ── Complete the QUEUE_ASSESSMENT_CANDIDATES SYSTEM step and advance ──
@@ -3738,7 +4150,7 @@ public class AssessmentController {
         log.info("[TEMPLATE-SELECTION] Selected templateId={} | workflowInstanceId={} | by userId={}",
                 selectedTemplateId, workflowInstanceId, userId);
 
-        Map<String, Object> responseBody = new java.util.LinkedHashMap<>();
+        Map<String, Object> responseBody = new LinkedHashMap<>();
         responseBody.put("selectedTemplateId", selectedTemplateId);
         responseBody.put("workflowInstanceId", workflowInstanceId);
         responseBody.put("message", "Template selected — workflow advancing to assessment execution");

@@ -23,6 +23,20 @@ public final class CacheNames {
     public static final String UI_ACTIONS   = "uiActions";
     public static final String UI_DASHBOARD = "uiDashboardWidgets";
 
+    /**
+     * Tenant-level /stats payloads behind the dashboards.
+     *
+     * These are the expensive ones: the audit stats endpoint scans every
+     * finding and control instance in the tenant, and eleven widgets read it.
+     * The frontend now shares one request per endpoint, so this is the second
+     * line of defence — across users, tabs and page reloads.
+     *
+     * Short TTL on purpose. A dashboard number two minutes stale is fine; one
+     * ten minutes stale gets mistrusted, and a mistrusted dashboard is not
+     * looked at.
+     */
+    public static final String DASHBOARD_STATS = "dashboardStats";
+
     // ── Reference/lookup data — user-facing display names resolved on every
     // history/assignment screen. See UserDisplayNameService.
     public static final String USER_DISPLAY_NAME = "userDisplayName";
@@ -63,4 +77,28 @@ public final class CacheNames {
      */
     public static final String AUDIT_POLICY_LIST = "auditPolicyList";
     public static final String AUDIT_TEST_LIST   = "auditTestList";
+
+    /**
+     * In-flight progress for an assessment snapshot. See
+     * AssessmentProgressTracker.
+     *
+     * The odd one out in this file: every other region here caches a READ to
+     * save a database round trip, and losing an entry costs a slow request.
+     * This one is a side channel for a WRITE that has not committed yet.
+     * executeAssessment builds the whole instance tree in one transaction, so
+     * nothing it writes is visible until it finishes — Redis is the only place
+     * a progress figure can go where a polling client can actually see it.
+     *
+     * Losing an entry here costs a progress bar, never data: the snapshot is
+     * transactional and completes regardless.
+     *
+     * Values are Map<String,Object>, for exactly the reason given for the two
+     * list caches above — the serializer writes no @class for a final type, so
+     * a record would come back as a LinkedHashMap and fail on cast.
+     *
+     * Written directly via cache.put rather than @Cacheable, so
+     * TenantAwareKeyGenerator does not apply; the key carries its own tenant
+     * prefix. See AssessmentProgressTracker.keyFor.
+     */
+    public static final String ASSESSMENT_PROGRESS = "assessmentProgress";
 }

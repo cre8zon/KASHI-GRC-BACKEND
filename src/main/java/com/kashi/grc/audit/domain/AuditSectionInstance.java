@@ -137,4 +137,16 @@ public class AuditSectionInstance extends BaseEntity {
 
     @Column(name = "auditee_reopened_by")
     private Long auditeeReopenedBy;
+
+    // ── Testing submitted (auditor) ───────────────────────────────────────────
+    // The tester has submitted their testing for this section — every control
+    // in it has a result or a recorded reason for being left untested
+    // (AuditSectionSubmissionService). Separate from submittedAt, which the
+    // evidence side and the section counts already use.
+
+    @Column(name = "testing_submitted_at")
+    private LocalDateTime testingSubmittedAt;
+
+    @Column(name = "testing_submitted_by")
+    private Long testingSubmittedBy;
 }

@@ -22,6 +22,7 @@ public class AuditEngagementResponse {
     private AuditEngagement.Status  status;
     private String frameworkRef;
     private Long   leadAuditorId;
+    private Long   leadAuditeeId;
     private Long   ownerId;
     private Integer totalControls;
     /**

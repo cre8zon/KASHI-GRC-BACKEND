@@ -46,6 +46,7 @@ import java.util.Map;
  * PUT    /v1/users/password                 Change own password
  * GET    /v1/users/{userId}/access-summary  Full access profile
  * GET    /v1/users/{userId}/activity-log    Access-history
+ * GET    /v1/users/lookup?ids=1,2,3         Names for many ids in one call
  * All endpoints require: Authorization: Bearer <token>
  *                        X-Tenant-ID: <tenantId>
  */
@@ -59,6 +60,7 @@ public class UserController {
     private final UserService userService;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final UtilityService utilityService;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -87,6 +89,48 @@ public class UserController {
             @PathVariable Long userId) {
         UserResponse user = userService.getUserById(userId);
         return ResponseEntity.ok(ApiResponse.success(user));
+    }
+
+    // ── LOOKUP (names for many ids, one call) ─────────────────────
+    /**
+     * Display names for a set of user ids — what list columns and detail fields
+     * need to turn a raw id into "Sneha Kapoor".
+     *
+     * WHY: the frontend resolved each id with its own GET /v1/users/{id}, which
+     * builds the FULL user (roles, attributes — 6–10 queries) to show one name.
+     * A list of 10 rows with three user columns made ~30 such calls; one page
+     * was measured at 29. This returns only the name fields for up to 200 ids in
+     * two queries.
+     *
+     * Visibility is exactly getUserById's: a user of this tenant, or anyone with
+     * a usable membership here (an external auditor working in it). Ids the
+     * caller may not see are simply absent from the result.
+     */
+    @GetMapping("/lookup")
+    @Operation(summary = "Display names for many user ids in one call (?ids=1,2,3)")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> lookupUsers(
+            @RequestParam(name = "ids") List<Long> ids) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        List<Long> wanted = ids == null ? List.of() : ids.stream()
+                                                      .filter(java.util.Objects::nonNull).distinct().limit(200).toList();
+        if (wanted.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
+
+        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        for (var u : userRepository.findAllById(wanted)) {
+            if (u.isDeleted()) continue;
+            boolean visible = java.util.Objects.equals(u.getTenantId(), tenantId)
+                    || membershipRepository.findByUserIdAndTenantId(u.getId(), tenantId)
+                    .map(m -> m.isUsable()).orElse(false);
+            if (!visible) continue;
+            Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id",        u.getId());
+            m.put("firstName", u.getFirstName());
+            m.put("lastName",  u.getLastName());
+            m.put("fullName",  u.getFullName());
+            m.put("email",     u.getEmail());
+            out.add(m);
+        }
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     // ── LIST (paginated + filtered) ───────────────────────────────
@@ -131,6 +175,12 @@ public class UserController {
         }
         // HOME | GUEST — lets the engagement form ask for internal staff or for
         // external auditors invited from a firm, using one endpoint.
+        // Only users who HOLD this permission in the tenant — e.g.
+        // permission=audit:section:assign-auditee for the engagement owner
+        // picker. Chooses people by what they may do, not by role or side.
+        String permission = allParams.get("permission");
+        if (permission != null && permission.isBlank()) permission = null;
+
         String membershipType = allParams.get("membershipType");
         if (membershipType != null && membershipType.isBlank()) membershipType = null;
 
@@ -146,7 +196,7 @@ public class UserController {
 
         return ResponseEntity.ok(ApiResponse.success(
                 userService.listUsers(utilityService.getpageDetails(allParams), side, noRoles,
-                        vendorId, roleId, tenantId, membershipType, firmTenantId)));
+                        vendorId, roleId, tenantId, membershipType, firmTenantId, permission)));
     }
 
     /**

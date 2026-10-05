@@ -22,6 +22,14 @@ public interface UserService {
      *   null    — both, identical to the six-arg form
      */
     PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam, String membershipType, Long firmTenantId);
+
+    /**
+     * Same list, additionally limited to users who HOLD a permission in the
+     * tenant being listed (PermissionHolderService) — for people pickers that
+     * choose by what someone may do rather than by role name or side.
+     * null — no permission filter, identical to the eight-arg form.
+     */
+    PaginatedResponse<UserResponse> listUsers(PageDetails pageDetails, String side, boolean noRoles, Long vendorId, Long roleId, Long tenantIdParam, String membershipType, Long firmTenantId, String permission);
     UserResponse updateUser(Long userId, UserUpdateRequest request);
     void deleteUser(Long userId);
     UserResponse suspendUser(Long userId);

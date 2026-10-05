@@ -76,6 +76,8 @@ public class WorkflowAccessService {
     private final com.kashi.grc.workflow.repository.TaskSectionCompletionRepository taskSectionCompletionRepository;
     // For AUDIT_ENGAGEMENT → resolve via parent AUDIT_PROJECT workflow instance
     private final AuditEngagementRepository auditEngagementRepository;
+    private final com.kashi.grc.assessment.repository.VendorAssessmentRepository vendorAssessmentRepository;
+    private final com.kashi.grc.assessment.repository.VendorAssessmentCycleRepository vendorAssessmentCycleRepository;
     private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
 
     // ── Default workflow actions available per task role ──────────────────────
@@ -181,6 +183,41 @@ public class WorkflowAccessService {
                         .flatMap(e -> instanceRepository
                                 .findActiveByEntityTypeAndEntityId("AUDIT_PROJECT", e.getProjectInstanceId()));
                 log.debug("[ACCESS] AUDIT_ENGAGEMENT {} has no own WF instance — delegating to projectInstance", entityId);
+            }
+
+            // ── VENDOR_ASSESSMENT — SAME SHAPE, ONE MORE HOP ─────────────────
+            //
+            // TPRM's workflow is filed under entityType = 'VENDOR' with the
+            // VENDOR's id, not the assessment's. The assessment is a derived
+            // artifact two hops down: instance → cycle → assessment.
+            //
+            // So a lookup on ('VENDOR_ASSESSMENT', assessmentId) finds nothing,
+            // canAct stays false, stepAction stays null, and EVERY control on
+            // every tab of the assessment renders read-only. Opening the same
+            // assessment from the task inbox works, because that URL carries
+            // ?taskId= and takes the stepInstanceId branch above instead.
+            //
+            // That difference is invisible: the page loads, the data is there,
+            // and nothing can be done with it. It reads as a permissions bug.
+            //
+            // Resolved through the CYCLE rather than through the vendor,
+            // deliberately. cycle.workflowInstanceId is THIS assessment's own
+            // instance; looking up the vendor's active instance instead would
+            // hand someone viewing last quarter's assessment the step state of
+            // this quarter's running cycle — and let them act on it.
+            //
+            // An instance whose steps are all finished yields no IN_PROGRESS
+            // step below, so a completed assessment still resolves read-only.
+            // That is correct, and it is the reason this uses findById rather
+            // than findActive*.
+            if (activeInstance.isEmpty() && "VENDOR_ASSESSMENT".equals(entityType)) {
+                activeInstance = vendorAssessmentRepository.findById(entityId)
+                        .map(com.kashi.grc.assessment.domain.VendorAssessment::getCycleId)
+                        .flatMap(vendorAssessmentCycleRepository::findById)
+                        .map(com.kashi.grc.assessment.domain.VendorAssessmentCycle::getWorkflowInstanceId)
+                        .flatMap(instanceRepository::findById);
+                log.debug("[ACCESS] VENDOR_ASSESSMENT {} has no own WF instance — resolved via cycle to {}",
+                        entityId, activeInstance.map(WorkflowInstance::getId).orElse(null));
             }
             if (activeInstance.isPresent()) {
                 sodViolations = evaluateSod(user, activeInstance.get().getId(),
@@ -379,7 +416,18 @@ public class WorkflowAccessService {
         List<String> cached = REQUEST_PERMISSION_CACHE.get();
         if (cached != null) return cached;
 
+        // ...and across requests, for a short TTL, keyed by user + tenant + the
+        // roles in force. Cleared whenever roles, grants or overrides are written
+        // (UserContextCache) — this was 2 of the ~4 queries every request paid.
+        List<String> shared = com.kashi.grc.common.cache.UserContextCache.getPermissions(user);
+        if (shared != null) {
+            REQUEST_PERMISSION_CACHE.set(shared);
+            return shared;
+        }
+        long generationAtLoad = com.kashi.grc.common.cache.UserContextCache.generation();
+
         List<String> resolved = computePermissions(user);
+        com.kashi.grc.common.cache.UserContextCache.putPermissions(user, resolved, generationAtLoad);
         REQUEST_PERMISSION_CACHE.set(resolved);
         return resolved;
     }
@@ -664,8 +712,21 @@ public class WorkflowAccessService {
         // Hide COMPLETE_STEP only when there are REQUIRED sections not yet completed.
         // Optional sections (snapRequired=false) like FINDINGS_REMEDIATED on Step 8
         // track progress informationally but must not block manual completion.
-        boolean hasSections = taskInstanceId != null
-                && !taskSectionCompletionRepository.findIncompleteRequired(taskInstanceId).isEmpty();
+        //
+        // Resolved ONCE into the list of keys still owed. hasSections is that
+        // list's emptiness, so this is the same single query it always was, and
+        // the keys ride along for actions that need to know WHICH gate is open
+        // rather than merely that one is — see AccessContext.openSectionKeys.
+        List<String> openSectionKeys = taskInstanceId == null
+                ? List.of()
+                : taskSectionCompletionRepository.findIncompleteRequired(taskInstanceId)
+                  .stream()
+                  .map(com.kashi.grc.workflow.domain.TaskSectionCompletion::getSnapSectionKey)
+                  .filter(java.util.Objects::nonNull)
+                  .distinct()
+                  .toList();
+
+        boolean hasSections = !openSectionKeys.isEmpty();
 
         return AccessContext.builder()
                 // ── Existing fields (from mode resolution) ────────────────────
@@ -701,6 +762,7 @@ public class WorkflowAccessService {
                                 && "ACTOR".equals(base.getTaskRole())
                                 && Boolean.TRUE.equals(snapAutoCompleteActorOnSubmit))
                 .hasSections(hasSections)
+                .openSectionKeys(nullIfEmpty(openSectionKeys))
                 .build();
     }
 

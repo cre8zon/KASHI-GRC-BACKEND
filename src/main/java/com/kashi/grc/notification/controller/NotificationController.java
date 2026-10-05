@@ -61,6 +61,7 @@ public class NotificationController {
                 n -> NotificationResponse.builder()
                         .notificationId(n.getId()).type(n.getType()).message(n.getMessage())
                         .entityType(n.getEntityType()).entityId(n.getEntityId())
+                        .actionUrl(n.getActionUrl())
                         .sentAt(n.getSentAt()).readAt(n.getReadAt())
                         .build()
         )));
@@ -82,6 +83,7 @@ public class NotificationController {
                 NotificationResponse.builder()
                         .notificationId(n.getId()).type(n.getType()).message(n.getMessage())
                         .entityType(n.getEntityType()).entityId(n.getEntityId())
+                        .actionUrl(n.getActionUrl())
                         .sentAt(n.getSentAt()).readAt(n.getReadAt())
                         .build()));
     }

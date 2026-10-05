@@ -35,4 +35,19 @@ public class AuditControlInstanceTestMappingRepositoryImpl
                 .where(cb.equal(m.get("testInstanceId"), testId));
         return em.createQuery(cq).getResultList();
     }
+
+    @Override
+    public java.util.Map<Long, Long> countTestsByControlForEngagement(Long engagementId) {
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<jakarta.persistence.Tuple> cq = cb.createTupleQuery();
+        Root<AuditControlInstanceTestMapping> m = cq.from(AuditControlInstanceTestMapping.class);
+        cq.multiselect(m.get("controlInstanceId"), cb.countDistinct(m.get("testInstanceId")))
+                .where(cb.equal(m.get("engagementId"), engagementId))
+                .groupBy(m.get("controlInstanceId"));
+        java.util.Map<Long, Long> counts = new java.util.HashMap<>();
+        for (jakarta.persistence.Tuple t : em.createQuery(cq).getResultList()) {
+            counts.put(t.get(0, Long.class), t.get(1, Long.class));
+        }
+        return counts;
+    }
 }

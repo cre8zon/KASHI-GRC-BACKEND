@@ -27,9 +27,16 @@ import java.util.Set;
  *
  * THE RULE
  *   A guest sees an engagement only if they are connected to it: named as its
- *   lead auditor, assigned to one of its sections, or assigned to one of its
- *   controls. HOME members are unaffected — the client's own staff keep
- *   tenant-wide visibility, which is what tenancy already meant.
+ *   lead auditor, assigned to one of its sections, assigned to one of its
+ *   controls, or holding a live delegation on one of its control / test /
+ *   policy instances (AuditObligationService). HOME members are unaffected —
+ *   the client's own staff keep tenant-wide visibility, which is what tenancy
+ *   already meant.
+ *
+ *   The delegation leg is what lets an external auditor who was handed ONE
+ *   control open it; without it the delegate could act on the control (the
+ *   guard allows it) but could not read the engagement it sits in. It lapses
+ *   with the delegation — a resolved or dismissed item no longer counts.
  *
  * WHY DERIVED, NOT STORED
  *   A membership→engagement link table would need maintaining on every
@@ -79,6 +86,24 @@ public class AuditScopeService {
                         UNION
                         SELECT c.engagement_id FROM audit_control_instances c
                          WHERE c.tenant_id = :tenantId AND c.assigned_auditor_id = :userId
+                        UNION
+                        SELECT c2.engagement_id FROM action_items ai
+                          JOIN audit_control_instances c2 ON c2.id = ai.entity_id
+                         WHERE ai.tenant_id = :tenantId AND ai.assigned_to = :userId
+                           AND ai.entity_type = 'AUDIT_CONTROL_INSTANCE'
+                           AND ai.status IN ('OPEN','IN_PROGRESS','PENDING_REVIEW','PENDING_VALIDATION')
+                        UNION
+                        SELECT t.engagement_id FROM action_items ai2
+                          JOIN audit_test_instances t ON t.id = ai2.entity_id
+                         WHERE ai2.tenant_id = :tenantId AND ai2.assigned_to = :userId
+                           AND ai2.entity_type = 'AUDIT_TEST_INSTANCE'
+                           AND ai2.status IN ('OPEN','IN_PROGRESS','PENDING_REVIEW','PENDING_VALIDATION')
+                        UNION
+                        SELECT p.engagement_id FROM action_items ai3
+                          JOIN audit_policy_instances p ON p.id = ai3.entity_id
+                         WHERE ai3.tenant_id = :tenantId AND ai3.assigned_to = :userId
+                           AND ai3.entity_type = 'AUDIT_POLICY_INSTANCE'
+                           AND ai3.status IN ('OPEN','IN_PROGRESS','PENDING_REVIEW','PENDING_VALIDATION')
                         """)
                 .setParameter("tenantId", tenantId)
                 .setParameter("userId", userId)

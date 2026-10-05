@@ -171,6 +171,25 @@ public class UtilityService {
                     "AUTH_PRINCIPAL_TYPE", "Unexpected principal type",
                     org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR);
         }
+        // ── Cross-request cache (UserContextCache) ────────────────────────
+        // The user + roles + permissions + membership + access scope used to be
+        // rebuilt from the database on EVERY request — several remote round
+        // trips before any controller code ran. Cached per (user, active tenant)
+        // for a short TTL and cleared whenever any of those tables is written.
+        Long activeTenantId = TenantContext.getCurrentTenant();
+        com.kashi.grc.common.cache.UserContextCache.Entry hit =
+                com.kashi.grc.common.cache.UserContextCache.get(userId, activeTenantId);
+        if (hit != null) {
+            if (hit.scope() != null) {
+                com.kashi.grc.common.config.multitenancy.AccessScope.set(hit.scope());
+            } else {
+                publishAccessScope(hit.user());   // guests: always fresh
+            }
+            REQUEST_USER_CACHE.set(hit.user());
+            return hit.user();
+        }
+        long generationAtLoad = com.kashi.grc.common.cache.UserContextCache.generation();
+
         // ── Criteria query with eager fetch for roles + permissions ───
         jakarta.persistence.EntityManager em = getEntityManager();
         jakarta.persistence.criteria.CriteriaBuilder cb = em.getCriteriaBuilder();
@@ -184,9 +203,22 @@ public class UtilityService {
         User user = em.createQuery(cq).getResultStream().findFirst()
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
 
+        // The cached copy is DETACHED and shared, so load its only other lazy
+        // association now — before applyActiveMembership may detach it.
+        org.hibernate.Hibernate.initialize(user.getAttributes());
+
         user = applyActiveMembership(em, user);
 
         publishAccessScope(user);
+
+        // Share a detached copy: a managed instance belongs to this request's
+        // persistence context and must not be handed to other threads.
+        if (em.contains(user)) em.detach(user);
+        var scope = com.kashi.grc.common.config.multitenancy.AccessScope.get();
+        com.kashi.grc.common.cache.UserContextCache.put(userId, activeTenantId,
+                new com.kashi.grc.common.cache.UserContextCache.Entry(
+                        user, scope != null && !scope.guest() ? scope : null),
+                generationAtLoad);
 
         // Cache for the remainder of this request
         REQUEST_USER_CACHE.set(user);

@@ -68,6 +68,29 @@ public class ActionItemRequest {
     private String resolutionRole;
 
     // ── State ─────────────────────────────────────────────────────────────────
+    /**
+     * What KIND of item this is: REMEDIATION_REQUEST, CLARIFICATION,
+     * CONTRIBUTOR_ASSIGNMENT, REVIEWER_ASSIGNMENT, CONTRIBUTOR_REOPEN.
+     *
+     * The column has existed on ActionItem all along; this request object had no
+     * field for it, so every item created THROUGH THE SERVICE — which is every
+     * item KashiGuard raises — landed with a null type. Downstream that meant:
+     * AssessmentIssueEscalationService refused to escalate them ("Only a
+     * remediation request can be escalated"), and the findings screens could not
+     * tell a finding from assignment bookkeeping. The controllers that build
+     * ActionItem directly set it and were fine, which is why the gap only showed
+     * on the automated path.
+     */
+    private String remediationType;
+
+    /**
+     * CRITICAL | HIGH | MEDIUM | LOW. Distinct from priority: priority is how
+     * soon someone should get to it, severity is how bad the finding is, and the
+     * escalation maps severity — not priority — onto the Issue. Also absent
+     * here until now, so an escalated guard finding had nothing to map.
+     */
+    private String severity;
+
     private ActionItem.Priority priority;
     private String              dueAt;  // ISO datetime string — parsed by service
 
@@ -80,6 +103,14 @@ public class ActionItemRequest {
      *         "itemId": 88, "itemRefType": "CONTROL", "itemRefId": 42 }
      */
     private String navContext;
+
+    /**
+     * ui_navigation keys — the route half of nav_context, as data. See
+     * ActionItem.navKey. Optional: an item with neither still resolves through
+     * nav_context, which is how every row written before this behaves.
+     */
+    private String navKey;
+    private String assignerNavKey;
 
     /**
      * Vendor scope for role-based assignment.

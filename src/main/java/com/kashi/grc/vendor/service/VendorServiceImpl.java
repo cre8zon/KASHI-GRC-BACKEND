@@ -1,5 +1,6 @@
 package com.kashi.grc.vendor.service;
 
+import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.usermanagement.repository.RoleRepository;
 import com.kashi.grc.usermanagement.service.user.UserService;
@@ -7,8 +8,10 @@ import com.kashi.grc.vendor.domain.Vendor;
 import com.kashi.grc.vendor.dto.request.VendorOnboardRequest;
 import com.kashi.grc.vendor.dto.response.VendorOnboardResponse;
 import com.kashi.grc.vendor.repository.VendorRepository;
+import com.kashi.grc.workflow.domain.Workflow;
 import com.kashi.grc.workflow.dto.request.StartWorkflowRequest;
 import com.kashi.grc.workflow.dto.response.WorkflowInstanceResponse;
+import com.kashi.grc.workflow.repository.WorkflowRepository;
 import com.kashi.grc.workflow.repository.WorkflowStepRepository;
 import com.kashi.grc.workflow.service.WorkflowEngineService;
 import lombok.RequiredArgsConstructor;
@@ -46,6 +49,7 @@ public class VendorServiceImpl implements VendorService {
     private final VendorRiskService      riskService;
     private final WorkflowEngineService  workflowEngineService;
     private final WorkflowStepRepository stepRepository;
+    private final WorkflowRepository     workflowRepository;
     private final UtilityService         utilityService;
     private final UserService            userService;
     private final RoleRepository         roleRepository;
@@ -142,7 +146,7 @@ public class VendorServiceImpl implements VendorService {
         entityManager.flush();
 
         StartWorkflowRequest wfReq = new StartWorkflowRequest();
-        wfReq.setWorkflowId(req.getWorkflowId());
+        wfReq.setWorkflowId(resolveWorkflowId(req.getWorkflowId(), tenantId));
         wfReq.setEntityId(vendor.getId());
         wfReq.setEntityType("VENDOR");
         wfReq.setPriority("MEDIUM");
@@ -164,5 +168,67 @@ public class VendorServiceImpl implements VendorService {
                 .calculatedRiskScore(riskScore)
                 .currentStep(currentStepMap)
                 .build();
+    }
+
+    /**
+     * Which TPRM workflow to start when the caller did not name one.
+     *
+     * ── ISSUE 7 ───────────────────────────────────────────────────────────
+     * The onboarding form asked for a workflow, and the flow asked again for
+     * the assessment template once the vendor existed. The workflowId is now
+     * optional on the request (see VendorOnboardRequest) and the picker comes
+     * off the form; the template choice, which happens after the risk score is
+     * calculated and with the candidate list in hand, is the ask that can
+     * actually be answered.
+     *
+     * ── RESOLUTION ORDER ──────────────────────────────────────────────────
+     *   1. What the caller sent, if anything. An explicit choice always wins —
+     *      the API keeps working for anyone who still makes one.
+     *   2. The tenant's own active VENDOR workflow. A tenant that has authored
+     *      its own blueprint means it, and the global one is not a substitute.
+     *   3. The global active VENDOR workflow.
+     *
+     * Within 2 and 3, highest version wins. Not "the only one" — that would
+     * throw the moment a second version is published, which is a normal
+     * administrative act and should not break onboarding. Highest version is
+     * also what findTopBy…OrderByVersionDesc already means elsewhere in this
+     * repository, so it is the convention rather than a new rule.
+     *
+     * ── AND IT REFUSES RATHER THAN GUESSES ────────────────────────────────
+     * If nothing resolves, this throws with a message naming what is missing.
+     * The alternative — onboarding "succeeding" with no workflow — produces a
+     * vendor with no assessment, no tasks and nothing in anybody's inbox, and
+     * the failure surfaces days later as "why did nothing happen", far from
+     * the cause.
+     */
+    private Long resolveWorkflowId(Long requested, Long tenantId) {
+        if (requested != null) return requested;
+
+        Long tenantOwned = highestVersion(
+                workflowRepository.findByTenantIdAndEntityTypeAndIsActiveTrue(tenantId, "VENDOR"));
+        if (tenantOwned != null) {
+            log.info("[VENDOR] No workflowId supplied — using tenant's own VENDOR workflow | id={} | tenant={}",
+                    tenantOwned, tenantId);
+            return tenantOwned;
+        }
+
+        Long global = highestVersion(
+                workflowRepository.findByTenantIdIsNullAndEntityTypeAndIsActiveTrue("VENDOR"));
+        if (global != null) {
+            log.info("[VENDOR] No workflowId supplied — using global VENDOR workflow | id={}", global);
+            return global;
+        }
+
+        throw new BusinessException("NO_VENDOR_WORKFLOW",
+                "No active VENDOR workflow is published, so onboarding cannot start one. "
+                        + "Publish a TPRM workflow blueprint, or pass workflowId explicitly.");
+    }
+
+    private Long highestVersion(java.util.List<Workflow> candidates) {
+        return candidates.stream()
+                .max(java.util.Comparator.comparing(Workflow::getVersion,
+                        java.util.Comparator.nullsFirst(java.util.Comparator.naturalOrder())))
+                .map(Workflow::getId)
+                .orElse(null);
     }
 }

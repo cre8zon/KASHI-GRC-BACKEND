@@ -18,4 +18,13 @@ public class DashboardWidgetResponse {
     private Integer gridCols;
     private Integer sortOrder;
     private String  clickThroughRoute;
+
+    // Added with the dashboards table. All optional — a widget that sets none
+    // of them behaves exactly as widgets did before.
+    private Long    dashboardId;
+    private String  filtersJson;
+    private String  valueFormat;
+    private String  thresholdsJson;
+    private String  drillThroughJson;
+    private String  emptyMessage;
 }

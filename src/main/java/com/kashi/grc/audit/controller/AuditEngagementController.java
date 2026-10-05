@@ -89,7 +89,9 @@ public class AuditEngagementController {
     private final AuditEngagementService                service;
     private final AuditProjectRepository                projectRepository;
     private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepository;
-    private final com.kashi.grc.audit.repository.AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
+    private final AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
+    private final AuditControlInstanceTestMappingRepository controlInstanceTestMappingRepository;
+    private final com.kashi.grc.audit.service.AuditAssignableUsersService assignableUsersService;
     private final com.fasterxml.jackson.databind.ObjectMapper controlFlagsMapper; // Spring-configured (JSR-310 enabled) — injected via @RequiredArgsConstructor
     private final AuditProjectTemplateRepository        projectTemplateRepository;
     private final AuditProjectInstanceRepository        projectInstanceRepository;
@@ -98,6 +100,9 @@ public class AuditEngagementController {
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final AuditSectionInstanceRepository        sectionInstanceRepository;
     private final AuditControlInstanceRepository        controlInstanceRepository;
+    private final com.kashi.grc.actionitem.repository.ActionItemRepository actionItemRepository;
+    private final com.kashi.grc.document.repository.DocumentLinkRepository documentLinkRepository;
+    private final com.kashi.grc.usermanagement.repository.UserRepository   delegationUserRepository;
     private final com.kashi.grc.audit.service.ControlAccessGuard controlAccessGuard;
     private final AuditFindingRepository                findingRepository;
     private final AuditTemplateRepository               templateRepository;
@@ -128,7 +133,7 @@ public class AuditEngagementController {
         Long tenantId = utilityService.isSystemUser() ? null : ctx.getTenantId();
 
         // Use MAX on ref to get a globally unique sequence — avoids collisions from count-based approach
-        int year = java.time.LocalDateTime.now().getYear();
+        int year = LocalDateTime.now().getYear();
         String prefix = "PROJ-" + year + "-";
         long seq = projectRepository.findAll().stream()
                 .map(p -> p.getProjectRef())
@@ -265,7 +270,7 @@ public class AuditEngagementController {
         // Multiple instances per project are valid (annual runs etc.) — show the most recent one.
         projectInstanceRepository.findByOriginalProjectId(projectId).stream()
                 .filter(i -> ctx.getTenantId().equals(i.getTenantId()))
-                .max(java.util.Comparator.comparing(AuditProjectInstance::getCreatedAt))
+                .max(Comparator.comparing(AuditProjectInstance::getCreatedAt))
                 .ifPresent(inst -> {
                     Map<String, Object> snapshot = new LinkedHashMap<>();
                     snapshot.put("id",                  inst.getId());
@@ -387,7 +392,7 @@ public class AuditEngagementController {
     /** Engagement must belong to the caller's tenant, and be within a guest's scope. */
     private void requireOwnedEngagement(AuditEngagement e) {
         var ctx = utilityService.getLoggedInDataContext();
-        if (!java.util.Objects.equals(e.getTenantId(), ctx.getTenantId())) {
+        if (!Objects.equals(e.getTenantId(), ctx.getTenantId())) {
             log.warn("[AUDIT-ENGAGEMENT] Refused cross-tenant write | engagementId={} owner={} caller={}",
                     e.getId(), e.getTenantId(), ctx.getTenantId());
 
@@ -397,10 +402,10 @@ public class AuditEngagementController {
             // the frontend has to guess: search the inbox, or ask them to pick from
             // their client list. Gated on membership so it discloses nothing to
             // someone who could not have switched there anyway.
-            java.util.Map<String, Object> hint = membershipRepository
+            Map<String, Object> hint = membershipRepository
                     .findByUserIdAndTenantId(ctx.getId(), e.getTenantId())
                     .filter(m -> m.isUsable())
-                    .<java.util.Map<String, Object>>map(m -> java.util.Map.of(
+                    .<Map<String, Object>>map(m -> Map.of(
                             "tenantId", e.getTenantId(),
                             "switchable", true))
                     .orElse(null);
@@ -419,7 +424,7 @@ public class AuditEngagementController {
     private void requireOwnedProject(AuditProject p) {
         if (utilityService.isSystemUser()) return;
         Long caller = utilityService.getLoggedInDataContext().getTenantId();
-        if (java.util.Objects.equals(p.getTenantId(), caller)) return;
+        if (Objects.equals(p.getTenantId(), caller)) return;
 
         log.warn("[AUDIT-PROJECT] Refused write | projectId={} owner={} caller={}",
                 p.getId(), p.getTenantId(), caller);
@@ -433,7 +438,7 @@ public class AuditEngagementController {
     /** Null-tolerant response map — Map.of throws on null VALUES. See
      *  AuditPolicyController.responseMap for the failure this prevents. */
     private static Map<String, Object> responseMap(Object... kv) {
-        Map<String, Object> m = new java.util.LinkedHashMap<>();
+        Map<String, Object> m = new LinkedHashMap<>();
         for (int i = 0; i + 1 < kv.length; i += 2) m.put(String.valueOf(kv[i]), kv[i + 1]);
         return m;
     }
@@ -525,7 +530,7 @@ public class AuditEngagementController {
         // Bulk-load workflow statuses to avoid N+1 per instance
         Set<Long> wfIds = instances.stream()
                 .map(AuditProjectInstance::getWorkflowInstanceId)
-                .filter(java.util.Objects::nonNull)
+                .filter(Objects::nonNull)
                 .collect(java.util.stream.Collectors.toSet());
         Map<Long, com.kashi.grc.workflow.domain.WorkflowInstance> wfMap = instanceRepository.findAllById(wfIds)
                 .stream().collect(java.util.stream.Collectors.toMap(
@@ -724,7 +729,7 @@ public class AuditEngagementController {
         report.put("lowFindings",          programLowFind);
         report.put("openFindings",         programOpenFind);
         report.put("engagements",          engBreakdown);
-        report.put("generatedAt",          java.time.LocalDateTime.now().toString());
+        report.put("generatedAt",          LocalDateTime.now().toString());
 
         return ResponseEntity.ok(ApiResponse.success(report));
     }
@@ -910,7 +915,7 @@ public class AuditEngagementController {
 
     private Map<String, Object> toProjectInstanceMap(AuditProjectInstance inst) {
         // Single-fetch fallback for getProjectInstance (single entity endpoint)
-        Map<Long, com.kashi.grc.workflow.domain.WorkflowInstance> wfMap = new java.util.HashMap<>();
+        Map<Long, com.kashi.grc.workflow.domain.WorkflowInstance> wfMap = new HashMap<>();
         if (inst.getWorkflowInstanceId() != null) {
             instanceRepository.findById(inst.getWorkflowInstanceId())
                     .ifPresent(wi -> wfMap.put(wi.getId(), wi));
@@ -1157,6 +1162,10 @@ public class AuditEngagementController {
                 .body(ApiResponse.success(service.create(req, ctx.getId(), ctx.getTenantId())));
     }
 
+    // One read-only transaction for the whole request. open-in-view is off, so
+    // without it every repository call below opened and committed its own
+    // transaction — ~4 database round trips per query (~150 ms each to Aiven).
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/engagements")
     @Operation(summary = "List engagements — filterable by projectId, status, auditType")
     public ResponseEntity<?> listEngagements(
@@ -1183,7 +1192,7 @@ public class AuditEngagementController {
             pd.setTake(engs.size() > 0 ? engs.size() : 100);
             pd.setSkip(0L);
             return ResponseEntity.ok(ApiResponse.success(
-                    new com.kashi.grc.common.dto.PaginatedResponse<>(engs, engs.size(), pd)));
+                    new PaginatedResponse<>(engs, engs.size(), pd)));
         }
 
         return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
@@ -1255,6 +1264,8 @@ public class AuditEngagementController {
                     m.put("plannedStart",       e.getPlannedStart());
                     m.put("plannedEnd",         e.getPlannedEnd());
                     m.put("leadAuditorId",      e.getLeadAuditorId());
+                    m.put("leadAuditeeId",      e.getLeadAuditeeId());
+                    m.put("ownerId",            e.getOwnerId());
                     m.put("totalControls",      e.getTotalControls());
                     m.put("testedControls",     e.getTestedControls());
                     m.put("openFindingCount",   e.getOpenFindingCount());
@@ -1286,6 +1297,18 @@ public class AuditEngagementController {
         if (fields.containsKey("ownerId"))
             e.setOwnerId(fields.get("ownerId") != null
                     ? Long.parseLong(fields.get("ownerId").toString()) : null);
+        // Same owner rule as create — checked against the values AFTER this
+        // patch, so changing the lead auditor onto the owner is caught too.
+        if (fields.containsKey("ownerId") || fields.containsKey("leadAuditorId"))
+            service.requireEligibleOwner(e.getOwnerId(), e.getLeadAuditorId(), e.getTenantId());
+        // Lead auditee was missing from this whitelist, so editing it inline on
+        // the overview was silently ignored — and engagements created before the
+        // create() fix (lead_auditee_id NULL) had no way to get one.
+        Long previousLeadAuditee = e.getLeadAuditeeId();
+        if (fields.containsKey("leadAuditeeId"))
+            e.setLeadAuditeeId(fields.get("leadAuditeeId") != null
+                    && !fields.get("leadAuditeeId").toString().isBlank()
+                    ? Long.parseLong(fields.get("leadAuditeeId").toString()) : null);
         if (fields.containsKey("plannedStart"))
             e.setPlannedStart(fields.get("plannedStart") != null
                     ? java.time.LocalDate.parse(fields.get("plannedStart").toString()).atStartOfDay() : null);
@@ -1295,6 +1318,11 @@ public class AuditEngagementController {
 
         engagementRepository.save(e);
         log.info("[AUDIT-ENG] Patched | id={} | fields={}", id, fields.keySet());
+
+        // Same message create() sends, so a lead auditee named later is told too.
+        if (e.getLeadAuditeeId() != null && !e.getLeadAuditeeId().equals(previousLeadAuditee)) {
+            service.notifyLeadAuditeeAssigned(e);
+        }
 
         // When leadAuditorId is set (Step 2 — Assign Lead Auditors), fire the
         // ENGAGEMENTS_LEAD_ASSIGNED section item completion so the per-engagement
@@ -1318,6 +1346,7 @@ public class AuditEngagementController {
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/engagements/{id}")
     @Operation(summary = "Get engagement detail — flat response for UniversalModulePage compatibility")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getEngagement(@PathVariable Long id) {
@@ -1344,6 +1373,7 @@ public class AuditEngagementController {
         result.put("templateId",         e.getTemplateId());
         result.put("projectId",          e.getProjectId());
         result.put("leadAuditorId",      e.getLeadAuditorId());
+        result.put("leadAuditeeId",      e.getLeadAuditeeId());
         result.put("ownerId",            e.getOwnerId());
         result.put("plannedStart",       e.getPlannedStart());
         result.put("plannedEnd",         e.getPlannedEnd());
@@ -1436,6 +1466,7 @@ public class AuditEngagementController {
     // SECTIONS (instance layer)
     // ══════════════════════════════════════════════════════════════════════════
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/engagements/{id}/sections")
     @Operation(summary = "List section instances for an engagement, ordered by tree path")
     public ResponseEntity<ApiResponse<List<AuditSectionInstance>>> listSections(
@@ -1446,23 +1477,40 @@ public class AuditEngagementController {
 
     /**
      * GET /v1/audit/engagements/{id}/assignable-auditees
-     * Returns AUDITEE_CONTRIBUTOR users for the tenant — accessible to section auditee owners
-     * who need to sub-assign individual controls to peers (no USER_VIEW permission required).
+     * People who may be made evidence owners on this engagement: the client's
+     * own staff who hold audit:control:submit-evidence. No USER_VIEW needed —
+     * section owners sub-assigning controls use it.
+     *
+     * WAS: every user with an AUDITEE-side role, whatever that role allowed —
+     * chosen by role side, so someone the submit endpoint would refuse could be
+     * offered, and someone who could do the job was hidden if their role sat on
+     * another side. See AuditAssignableUsersService.
      */
     @GetMapping("/engagements/{id}/assignable-auditees")
     @Operation(summary = "List users assignable as control auditees for this engagement")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getAssignableAuditees(
             @PathVariable Long id) {
-        var ctx = utilityService.getLoggedInDataContext();
-        // Return all AUDITEE-side users for the tenant — no USER_VIEW permission needed.
-        // Uses the same role-side lookup as eligible-users but scoped to AUDITEE side.
-        List<Long> roleIds = roleRepository
-                .findAllForTenantBySide(ctx.getTenantId(),
-                        com.kashi.grc.usermanagement.domain.RoleSide.AUDITEE)
-                .stream().map(r -> r.getId()).toList();
-        if (roleIds.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
-        List<Map<String, Object>> users = workflowEngineService.getUsersByRoles(roleIds, ctx.getTenantId());
-        return ResponseEntity.ok(ApiResponse.success(users));
+        AuditEngagement e = engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id));
+        requireOwnedEngagement(e);
+        return ResponseEntity.ok(ApiResponse.success(assignableUsersService.assignableAuditees(e)));
+    }
+
+    /**
+     * GET /v1/audit/engagements/{id}/assignable-auditors
+     * People who may be made auditors of controls or sections on this
+     * engagement: holders of audit:control:record-test-result — the client's
+     * own staff on an internal audit, the lead auditor's firm on an external
+     * one. Same shape as assignable-auditees.
+     */
+    @GetMapping("/engagements/{id}/assignable-auditors")
+    @Operation(summary = "List users assignable as control/section auditors for this engagement")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getAssignableAuditors(
+            @PathVariable Long id) {
+        AuditEngagement e = engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id));
+        requireOwnedEngagement(e);
+        return ResponseEntity.ok(ApiResponse.success(assignableUsersService.assignableAuditors(e)));
     }
 
     @PutMapping("/engagements/{id}/sections/{sid}/assign")
@@ -1500,7 +1548,7 @@ public class AuditEngagementController {
                     "the same as single-section assignment (defaults to true).")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkAssignSections(
             @PathVariable Long id,
-            @RequestBody com.kashi.grc.audit.dto.request.BulkSectionAssignRequest req) {
+            @RequestBody BulkSectionAssignRequest req) {
         var ctx = utilityService.getLoggedInDataContext();
         int updated = service.bulkAssignSections(id, req, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("updated", updated)));
@@ -1537,21 +1585,117 @@ public class AuditEngagementController {
     // CONTROLS (instance layer)
     // ══════════════════════════════════════════════════════════════════════════
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/engagements/{id}/controls")
     @Operation(summary = "List control instances for an engagement (+ hasPolicy / hasEvidence flags)")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listControls(
             @PathVariable Long id) {
+        // The id was used as-is: any tenant's controls were one guessed id away.
+        requireOwnedEngagement(engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id)));
         List<AuditControlInstance> controls = controlInstanceRepository.findByEngagementId(id);
+
+        // Per-row "may I act" flags from the SAME guard the write endpoints call,
+        // with the engagement-wide lookups done once for the whole list. The
+        // controls tab reads these instead of re-deriving a rule of its own —
+        // its old rule ("unassigned is open to any role holder") was the hole.
+        var ev = controlAccessGuard
+                .evaluator(id, utilityService.getLoggedInDataContext().getId())
+                .prefetchControls(controls);
 
         // Two batch queries for the WHOLE list (not per-control):
         //   hasPolicy   — control has >=1 policy instance mapped
         //   hasEvidence — control has >=1 evidence link of ANY status
         //                 (PENDING_REVIEW or ACCEPTED — includes reused evidence)
-        java.util.Set<Long> withPolicy = policyInstanceControlMappingRepository
+        Set<Long> withPolicy = policyInstanceControlMappingRepository
                 .controlIdsWithPolicyForEngagement(id);
         List<Long> controlIds = controls.stream().map(AuditControlInstance::getId).toList();
-        java.util.Set<Long> withEvidence = evidenceLinkRepository
-                .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", controlIds);
+        // LIVE links only — a control whose only evidence was rejected (or has
+        // expired) no longer shows as having evidence.
+        Set<Long> withEvidence = evidenceLinkRepository
+                .entityIdsWithLiveLink("AUDIT_CONTROL_INSTANCE", controlIds);
+        // Counts for the card badges ("3 tests", "2 policies") — one grouped
+        // query each for the whole engagement, like the flags above.
+        Map<Long, Long> testCounts = controlInstanceTestMappingRepository
+                .countTestsByControlForEngagement(id);
+        Map<Long, Long> policyCounts = policyInstanceControlMappingRepository
+                .countPoliciesByControlForEngagement(id);
+
+        // Evidence breakdown per control, for the card badges: linked evidence by
+        // review status (pending / accepted / verified by an integration) and
+        // documents REUSED from elsewhere (document_links.link_type = REFERENCE).
+        // An accepted or integration-verified link is evidence the auditor (or the
+        // integration) has already approved, so the card treats it as submitted.
+        Long listTenantId = utilityService.getLoggedInDataContext().getTenantId();
+        Map<Long, Map<String, Long>> linkStatusCounts = new HashMap<>();
+        if (!controlIds.isEmpty()) {
+            for (Object[] r : evidenceLinkRepository.countByTargetAndStatusGrouped(
+                    "AUDIT_CONTROL_INSTANCE", controlIds, listTenantId)) {
+                linkStatusCounts.computeIfAbsent((Long) r[0], k -> new HashMap<>())
+                        .put(String.valueOf(r[1]), ((Number) r[2]).longValue());
+            }
+        }
+        // Where the live evidence came from — integration checks vs KashiLink
+        // reuse — so the card can keep showing the source after submission.
+        Map<Long, long[]> sourceCounts = new HashMap<>();
+        if (!controlIds.isEmpty()) {
+            for (Object[] r : evidenceLinkRepository.countBySourceGrouped(
+                    "AUDIT_CONTROL_INSTANCE", controlIds, listTenantId,
+                    com.kashi.grc.evidence.domain.EvidenceRecord.CollectionType.MANUAL,
+                    com.kashi.grc.evidence.domain.EvidenceLink.Status.AUTOMATION_VERIFIED,
+                    com.kashi.grc.evidence.domain.EvidenceLink.Status.PENDING_REVIEW,
+                    List.of(com.kashi.grc.evidence.domain.EvidenceLink.Status.PENDING_REVIEW,
+                            com.kashi.grc.evidence.domain.EvidenceLink.Status.ACCEPTED,
+                            com.kashi.grc.evidence.domain.EvidenceLink.Status.AUTOMATION_VERIFIED))) {
+                sourceCounts.put((Long) r[0], new long[]{
+                        r[1] == null ? 0 : ((Number) r[1]).longValue(),
+                        r[2] == null ? 0 : ((Number) r[2]).longValue(),
+                        r[3] == null ? 0 : ((Number) r[3]).longValue()});
+            }
+        }
+        Map<Long, Long> reusedDocCounts = new HashMap<>();
+        if (!controlIds.isEmpty()) {
+            documentLinkRepository.findByEntityTypeAndEntityIdIn("AUDIT_CONTROL_INSTANCE", controlIds).stream()
+                    .filter(l -> "REFERENCE".equalsIgnoreCase(l.getLinkType()))
+                    .forEach(l -> reusedDocCounts.merge(l.getEntityId(), 1L, Long::sum));
+        }
+
+        // Delegations / send-backs on these controls, for the card badges and the
+        // "delegated" filter: who holds it, who handed it out, which side, and
+        // whether it is still live. Finished ones are included (live=false) so a
+        // delegator can find the controls delegated to someone after the work was
+        // submitted — that is when they review it and may ask for a resubmit.
+        // Reassigned-away (DISMISSED) ones are not. Newest first.
+        // One query for the list, one for the names.
+        Map<Long, List<Map<String, Object>>> delegationsByControl = new HashMap<>();
+        {
+            var live = actionItemRepository.findNonDismissedForEntities("AUDIT_CONTROL_INSTANCE", controlIds,
+                    utilityService.getLoggedInDataContext().getTenantId());
+            Set<Long> people = new HashSet<>();
+            live.forEach(ai -> { if (ai.getAssignedTo() != null) people.add(ai.getAssignedTo());
+                                 if (ai.getResolutionReservedFor() != null) people.add(ai.getResolutionReservedFor()); });
+            Map<Long, String> names = new HashMap<>();
+            if (!people.isEmpty()) delegationUserRepository.findAllById(people).forEach(u -> names.put(u.getId(),
+                    u.getFullName() != null && !u.getFullName().isBlank() ? u.getFullName().trim() : u.getEmail()));
+            for (var ai : live) {
+                Map<String, Object> d = new LinkedHashMap<>();
+                d.put("id",              ai.getId());
+                d.put("type",            ai.getRemediationType());
+                d.put("side",            com.kashi.grc.audit.service.AuditObligationTypes.CONTROL_AUDITEE_TYPES
+                                                 .contains(ai.getRemediationType()) ? "EVIDENCE" : "TESTING");
+                d.put("status",          ai.getStatus() != null ? ai.getStatus().name() : null);
+                d.put("live",            ai.getStatus() == com.kashi.grc.actionitem.domain.ActionItem.Status.OPEN
+                                         || ai.getStatus() == com.kashi.grc.actionitem.domain.ActionItem.Status.IN_PROGRESS
+                                         || ai.getStatus() == com.kashi.grc.actionitem.domain.ActionItem.Status.PENDING_REVIEW
+                                         || ai.getStatus() == com.kashi.grc.actionitem.domain.ActionItem.Status.PENDING_VALIDATION);
+                d.put("resolvedAt",      ai.getResolvedAt());
+                d.put("assignedTo",      ai.getAssignedTo());
+                d.put("assignedToName",  names.get(ai.getAssignedTo()));
+                d.put("delegatedBy",     ai.getResolutionReservedFor());
+                d.put("delegatedByName", names.get(ai.getResolutionReservedFor()));
+                delegationsByControl.computeIfAbsent(ai.getEntityId(), k -> new ArrayList<>()).add(d);
+            }
+        }
 
         List<Map<String, Object>> rows = controls.stream().map(c -> {
             // convertValue preserves EVERY entity field the frontend already reads,
@@ -1559,9 +1703,33 @@ public class AuditEngagementController {
             @SuppressWarnings("unchecked")
             Map<String, Object> m = controlFlagsMapper.convertValue(c, Map.class);
             m.put("hasPolicy",   withPolicy.contains(c.getId()));
+            m.put("testCount",   testCounts.getOrDefault(c.getId(), 0L));
+            m.put("policyCount", policyCounts.getOrDefault(c.getId(), 0L));
             // hasEvidence combines the legacy submit flag with any evidence link,
             // so reused/linked evidence (pending or accepted) also counts.
             m.put("hasEvidence", c.isAuditeeEvidenceSubmitted() || withEvidence.contains(c.getId()));
+            boolean canSubmit = ev.canAct(c, true);
+            boolean canRecord = ev.canAct(c, false);
+            m.put("canSubmitEvidence", canSubmit);
+            m.put("canRecordResult",   canRecord);
+            m.put("hasMyObligation",   ev.hasControlObligation(c.getId(), true)
+                    || ev.hasControlObligation(c.getId(), false));
+            m.put("delegations",       delegationsByControl.getOrDefault(c.getId(), List.of()));
+            Map<String, Long> lc = linkStatusCounts.getOrDefault(c.getId(), Map.of());
+            long accepted = lc.getOrDefault("ACCEPTED", 0L);
+            long verified = lc.getOrDefault("AUTOMATION_VERIFIED", 0L);
+            m.put("evidencePendingCount",  lc.getOrDefault("PENDING_REVIEW", 0L));
+            m.put("evidenceAcceptedCount", accepted);
+            m.put("evidenceVerifiedCount", verified);
+            long[] src = sourceCounts.getOrDefault(c.getId(), new long[]{0, 0, 0});
+            m.put("integrationEvidenceCount", src[0]);
+            // Integration checks that failed and still wait for the auditor —
+            // NOT every pending link (a reused link pending from before is not a
+            // failed check). A later run of the same check supersedes it.
+            m.put("failedCheckCount",      src[2]);
+            // Reused = KashiLink pulls from another control + documents reused by reference.
+            m.put("reusedEvidenceCount",   src[1] + reusedDocCounts.getOrDefault(c.getId(), 0L));
+            m.put("evidenceAccepted",      accepted + verified > 0);
             return m;
         }).toList();
 
@@ -1572,9 +1740,23 @@ public class AuditEngagementController {
     @Operation(summary = "Get a single control instance")
     public ResponseEntity<ApiResponse<AuditControlInstance>> getControl(
             @PathVariable Long id, @PathVariable Long cid) {
-        var control = controlInstanceRepository.findById(cid)
-                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", cid));
-        return ResponseEntity.ok(ApiResponse.success(control));
+        return ResponseEntity.ok(ApiResponse.success(requireControlInEngagement(id, cid)));
+    }
+
+    /**
+     * The engagement is the caller's (tenant + guest scope) and the control is
+     * in it. Every control endpoint below took both ids from the path and used
+     * the control id alone, so the engagement in the URL was decorative.
+     */
+    private AuditControlInstance requireControlInEngagement(Long engagementId, Long controlId) {
+        requireOwnedEngagement(engagementRepository.findById(engagementId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", engagementId)));
+        AuditControlInstance control = controlInstanceRepository.findById(controlId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", controlId));
+        if (!Objects.equals(control.getEngagementId(), engagementId)) {
+            throw new BusinessException("CONTROL_MISMATCH", "Control does not belong to this engagement");
+        }
+        return control;
     }
 
     @PostMapping("/engagements/{id}/controls/{cid}/send-back-evidence")
@@ -1586,14 +1768,39 @@ public class AuditEngagementController {
         // Same guard as recording a result: sending evidence back is an auditor
         // action on that control. The service only checked engagement membership,
         // so anyone holding the permission could bounce any control in the tenant.
-        controlAccessGuard.requireCanRecordResult(
-                controlInstanceRepository.findById(cid)
-                        .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", cid)),
-                ctx.getId());
+        controlAccessGuard.requireCanRecordResult(requireControlInEngagement(id, cid), ctx.getId());
         String reason = body != null && body.get("reason") != null
                 ? body.get("reason").toString() : null;
         service.sendBackControlEvidence(id, cid, reason, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success());
+    }
+
+    /**
+     * Submit, in one go, controls whose evidence is LINKED (pulled, reused,
+     * auto-tagged) but not yet submitted. Body: { "controlIds": [..] } —
+     * optional; omitted or empty = every eligible control in the engagement.
+     * Needs audit:evidence:bulk-submit; per-control scope (lead auditee, section
+     * owner, or someone allowed to submit that control) and the effects are in
+     * AuditEngagementService.bulkSubmitLinkedEvidence. Controls outside scope
+     * are skipped and listed in the response.
+     */
+    @PostMapping("/engagements/{id}/controls/submit-linked-evidence")
+    @Operation(summary = "Bulk-submit controls whose linked evidence is not yet submitted")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> submitLinkedEvidence(
+            @PathVariable Long id,
+            @RequestBody(required = false) Map<String, Object> body) {
+        var ctx = utilityService.getLoggedInDataContext();
+        requireOwnedEngagement(engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id)));
+        List<Long> controlIds = new ArrayList<>();
+        Object raw = body != null ? body.get("controlIds") : null;
+        if (raw instanceof Collection<?> list) {
+            for (Object o : list) {
+                if (o != null && !o.toString().isBlank()) controlIds.add(Long.parseLong(o.toString()));
+            }
+        }
+        return ResponseEntity.ok(ApiResponse.success(
+                service.bulkSubmitLinkedEvidence(id, controlIds, ctx.getId(), ctx.getTenantId())));
     }
 
     @PostMapping("/engagements/{id}/controls/{cid}/submit-evidence")
@@ -1601,16 +1808,32 @@ public class AuditEngagementController {
     public ResponseEntity<ApiResponse<Void>> submitControlEvidence(
             @PathVariable Long id, @PathVariable Long cid) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireControlInEngagement(id, cid);
+        // The assignment check itself is in the service (ControlAccessGuard), so
+        // every caller of submitControlEvidence gets it, not only this endpoint.
         service.submitControlEvidence(id, cid, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    /**
+     * NOTE — two endpoints record a control-level result:
+     *   PUT /v1/audit/engagements/{id}/controls/{cid}/test-result   (this one; EngagementControlsTab)
+     *   PUT /v1/audit/control-instances/{id}/test-result            (ControlFieldworkTab)
+     * Both run the same guard and the same implementation,
+     * AuditEngagementService.recordControlResult — counters, section gate,
+     * evidence gate (with override reason) and obligation closing are identical
+     * whichever screen records the result.
+     */
     @PutMapping("/engagements/{id}/controls/{cid}/test-result")
     @Operation(summary = "Record test result for a control")
     public ResponseEntity<ApiResponse<AuditControlInstance>> recordTestResult(
             @PathVariable Long id, @PathVariable Long cid,
             @RequestBody AuditControlTestRequest req) {
         var ctx = utilityService.getLoggedInDataContext();
+        // WAS: no guard at all — engagement membership and evidence presence were
+        // the whole check, so any auditor in the engagement could conclude any
+        // control. Now the same guard as its sibling on /control-instances.
+        controlAccessGuard.requireCanRecordResult(requireControlInEngagement(id, cid), ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(
                 service.recordTestResult(id, cid, req, ctx.getId(), ctx.getTenantId())));
     }
@@ -1621,6 +1844,7 @@ public class AuditEngagementController {
             @PathVariable Long id, @PathVariable Long cid,
             @RequestBody Map<String, Object> body) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireControlInEngagement(id, cid);
         assertCanActOnControlSection(id, cid, ctx.getId(), "audit:control:assign-auditee");
         java.time.LocalDate dueDate = body.get("evidenceDueDate") != null
                 ? java.time.LocalDate.parse(body.get("evidenceDueDate").toString())
@@ -1635,6 +1859,7 @@ public class AuditEngagementController {
             @PathVariable Long id, @PathVariable Long cid,
             @RequestBody Map<String, Object> body) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireControlInEngagement(id, cid);
         assertCanActOnControlSection(id, cid, ctx.getId(), "audit:control:assign-auditor");
         Object raw = body.get("auditorUserId");
         Long auditorId = raw != null ? Long.valueOf(raw.toString()) : null;
@@ -1649,21 +1874,59 @@ public class AuditEngagementController {
                     "auditeeUserId. Eliminates N individual PUT calls for 50-100 control engagements.")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkAssignControls(
             @PathVariable Long id,
-            @RequestBody com.kashi.grc.audit.dto.request.BulkControlAssignRequest req) {
+            @RequestBody BulkControlAssignRequest req) {
         var ctx = utilityService.getLoggedInDataContext();
-        Long repControlId = null;
+        requireOwnedEngagement(engagementRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", id)));
+
+        // ── EVERY CONTROL IS AUTHORISED, NOT THE FIRST ───────────────────────
+        // This used to check one representative control and apply the verdict to
+        // the whole list, so a list starting with one of your own controls was
+        // authorised for every control after it. Now each target is checked, for
+        // each side being assigned, and the request is refused WHOLE if any
+        // fails — naming the controls — because a partial bulk assign is
+        // invisible to the caller: the response says "updated N" and nobody
+        // notices which ones were silently left out.
+        List<AuditControlInstance> targets;
         if (req.getControlIds() != null && !req.getControlIds().isEmpty()) {
-            repControlId = req.getControlIds().get(0);
+            targets = controlInstanceRepository.findAllById(req.getControlIds());
+            Set<Long> found = targets.stream().map(AuditControlInstance::getId)
+                    .collect(java.util.stream.Collectors.toSet());
+            List<Long> missing = req.getControlIds().stream()
+                    .filter(cid -> cid != null && !found.contains(cid)).distinct().toList();
+            if (!missing.isEmpty()) {
+                throw new BusinessException("CONTROLS_NOT_FOUND",
+                        "Some controls do not exist: " + missing, HttpStatus.BAD_REQUEST,
+                        Map.<String, Object>of("controlIds", missing));
+            }
         } else if (req.getSectionInstanceId() != null) {
-            var repControls = controlInstanceRepository
+            targets = controlInstanceRepository
                     .findBySectionInstanceIdOrderByOrderNoAsc(req.getSectionInstanceId());
-            if (!repControls.isEmpty()) repControlId = repControls.get(0).getId();
+        } else {
+            targets = List.of();   // the service raises MISSING_TARGET
         }
-        if (repControlId != null) {
-            String permission = req.getAuditorUserId() != null
-                    ? "audit:control:assign-auditor" : "audit:control:assign-auditee";
-            assertCanActOnControlSection(id, repControlId, ctx.getId(), permission);
+
+        LinkedHashSet<Long> denied = new LinkedHashSet<>();
+        targets.stream().filter(c -> !Objects.equals(c.getEngagementId(), id))
+                .forEach(c -> denied.add(c.getId()));
+        // Unassigning is assigning to nobody — the same authority per side.
+        if (req.getAuditorUserId() != null || Boolean.TRUE.equals(req.getUnassignAuditor())) {
+            denied.addAll(deniedForAssignment(id, targets, ctx.getId(), "audit:control:assign-auditor"));
         }
+        if (req.getAuditeeUserId() != null || Boolean.TRUE.equals(req.getUnassignAuditee())) {
+            denied.addAll(deniedForAssignment(id, targets, ctx.getId(), "audit:control:assign-auditee"));
+        }
+        if (!denied.isEmpty()) {
+            log.warn("[AUDIT-ENG] Bulk assign refused | engagementId={} by={} denied={}",
+                    id, ctx.getId(), denied);
+            throw new BusinessException("BULK_ASSIGN_DENIED",
+                    "Nothing was assigned. You cannot assign " + denied.size() + " of the selected "
+                            + "control(s) — they are outside the sections you are the designated "
+                            + "owner for, or outside this engagement. Remove them and try again.",
+                    HttpStatus.FORBIDDEN,
+                    Map.<String, Object>of("deniedControlIds", new ArrayList<>(denied)));
+        }
+
         int updated = service.bulkAssignControls(id, req, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success(Map.of("updated", updated)));
     }
@@ -1690,39 +1953,28 @@ public class AuditEngagementController {
         var control = controlInstanceRepository.findById(controlInstanceId).orElse(null);
         if (control == null) return; // 404 will be raised downstream by the service
 
-        var user = utilityService.getLoggedInUserWithRolesAndPermissions();
-        var access = workflowAccessService.resolveForModule(user, "AUDIT_ENGAGEMENT", engagementId);
-        List<String> perms = access != null ? access.getPermissions() : List.of();
-
-        // Lead-auditor/org-side actors hold the SECTION-level assign permissions
-        // (audit:section:assign-auditor / audit:section:assign-auditee) per the
-        // workflow's own actor-role configuration (workflow_step_actor_roles).
-        // Holding either is the workflow-driven signal for "this caller can assign
-        // across the whole engagement" — not a hardcoded side/role check.
-        boolean isSectionLevelAssigner = perms.contains("audit:section:assign-auditor")
-                || perms.contains("audit:section:assign-auditee");
-        if (isSectionLevelAssigner) return;
-
-        // Walk up the section tree to find ownership — checks direct parent first,
-        // then ancestors. Handles cases where cascade didn't reach intermediate nodes
-        // (e.g. P1.1 assigned via P root section cascade).
-        Long sectionId = control.getSectionInstanceId();
-        boolean ownsSection = false;
-        Long currentSectionId = sectionId;
-        while (currentSectionId != null && !ownsSection) {
-            var sec = sectionInstanceRepository.findById(currentSectionId).orElse(null);
-            if (sec == null) break;
-            ownsSection = requiredPermission.equals("audit:control:assign-auditor")
-                    ? callerId.equals(sec.getAssignedAuditorId())
-                    : callerId.equals(sec.getAuditeeAssignedUserId());
-            currentSectionId = sec.getParentInstanceId(); // walk up to parent
-        }
-
-        if (!ownsSection) {
-            throw new com.kashi.grc.common.exception.BusinessException(
+        if (!deniedForAssignment(engagementId, List.of(control), callerId, requiredPermission).isEmpty()) {
+            throw new BusinessException(
                     "ACCESS_DENIED",
                     "You can only assign within sections you are the designated auditor for.");
         }
+    }
+
+    /**
+     * The rule assertCanActOnControlSection always applied, for a whole list:
+     * the ids of the controls the caller may NOT assign on the given side.
+     *
+     * The workflow permission set is resolved ONCE rather than per control —
+     * resolveForModule runs several queries, and a 100-control bulk assign would
+     * otherwise run it 100 times. Section rows are cached across the walk.
+     */
+    private List<Long> deniedForAssignment(Long engagementId, List<AuditControlInstance> controls,
+                                           Long callerId, String requiredPermission) {
+        // The rule now lives in ControlAccessGuard so the control-instance assign
+        // endpoint applies the SAME one (it used to check the auditor-result rule
+        // for an auditee assignment). Behaviour here is unchanged.
+        return controlAccessGuard.deniedForAssignment(engagementId, controls, callerId,
+                !"audit:control:assign-auditor".equals(requiredPermission));
     }
 
 
@@ -1745,7 +1997,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.PLANNING) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in PLANNING status to activate. Current: " + e.getStatus(),
-                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.FIELDWORK);
@@ -1803,7 +2055,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.FIELDWORK) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in FIELDWORK to start evidence review. Current: " + e.getStatus(),
-                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.EVIDENCE_REVIEW);
@@ -1826,7 +2078,7 @@ public class AuditEngagementController {
         if (e.getStatus() != AuditEngagement.Status.EVIDENCE_REVIEW) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement must be in EVIDENCE_REVIEW to draft report. Current: " + e.getStatus(),
-                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.DRAFT_REPORT);
@@ -1852,7 +2104,7 @@ public class AuditEngagementController {
                 || e.getStatus() == AuditEngagement.Status.CANCELLED) {
             throw new BusinessException("INVALID_TRANSITION",
                     "Engagement is already " + e.getStatus(),
-                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         e.setStatus(AuditEngagement.Status.CLOSED);

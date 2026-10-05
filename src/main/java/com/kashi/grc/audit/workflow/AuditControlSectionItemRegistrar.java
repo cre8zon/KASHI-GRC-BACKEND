@@ -1,8 +1,10 @@
 package com.kashi.grc.audit.workflow;
 
 import com.kashi.grc.audit.domain.AuditControlInstance;
+import com.kashi.grc.audit.domain.AuditSectionInstance;
 import com.kashi.grc.audit.repository.AuditControlInstanceRepository;
 import com.kashi.grc.audit.repository.AuditEngagementRepository;
+import com.kashi.grc.audit.repository.AuditSectionInstanceRepository;
 import com.kashi.grc.workflow.domain.WorkflowInstance;
 import com.kashi.grc.workflow.event.SectionItemsNeededEvent;
 import com.kashi.grc.workflow.repository.WorkflowInstanceRepository;
@@ -52,6 +54,7 @@ public class AuditControlSectionItemRegistrar {
 
     private final AuditEngagementRepository      engagementRepository;
     private final AuditControlInstanceRepository controlInstanceRepository;
+    private final AuditSectionInstanceRepository sectionInstanceRepository;
     private final TaskSectionCompletionService   sectionService;
     private final WorkflowInstanceRepository     workflowInstanceRepository;
 
@@ -92,28 +95,26 @@ public class AuditControlSectionItemRegistrar {
         Long assignedUserId = event.assignedUserId();
         String sectionKey   = event.sectionKey();
 
+        // Every control whose EFFECTIVE owner on this side is the task's user:
+        // its own assignee when set, otherwise the nearest section above it that
+        // has one. Section assignment no longer copies the assignee onto each
+        // control (the UI shows them as "inherited"), so matching the control's
+        // own column alone registered NO items for a section-level owner — an
+        // empty checklist that could never be completed. The auditor side had a
+        // section-path fallback, but only when the person had no direct control
+        // at all, and only for controls sitting directly in the section.
+        boolean auditorSide = "CONTROLS_EVALUATED".equalsIgnoreCase(sectionKey);
+        List<AuditControlInstance> all = controlInstanceRepository.findByEngagementId(engagement.getId());
         List<AuditControlInstance> controls;
-        if ("CONTROLS_EVALUATED".equalsIgnoreCase(sectionKey)) {
-            // Auditor side — find controls assigned to this auditor
-            // If assignedAuditorId is not set (cascade removed), fall back to
-            // controls under this auditor's assigned sections
-            controls = (assignedUserId != null)
-                    ? controlInstanceRepository.findByEngagementIdAndAssignedAuditorId(
-                    engagement.getId(), assignedUserId)
-                    : controlInstanceRepository.findByEngagementId(engagement.getId());
-            if (controls.isEmpty() && assignedUserId != null) {
-                // Fallback: auditor assigned to sections — get all controls under those sections
-                log.info("[AUDIT-CTRL-REGISTRAR] No direct control assignments for auditorId={} — falling back to section-path lookup",
-                        assignedUserId);
-                controls = controlInstanceRepository
-                        .findByEngagementIdAndSectionAuditorId(engagement.getId(), assignedUserId);
-            }
+        if (assignedUserId == null) {
+            controls = all;
         } else {
-            // EVIDENCE_UPLOADED or any other auditee-side section key
-            controls = (assignedUserId != null)
-                    ? controlInstanceRepository.findByEngagementIdAndAuditeeAssignedUserId(
-                    engagement.getId(), assignedUserId)
-                    : controlInstanceRepository.findByEngagementId(engagement.getId());
+            java.util.Map<Long, AuditSectionInstance> sections = new java.util.HashMap<>();
+            sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagement.getId())
+                    .forEach(x -> sections.put(x.getId(), x));
+            controls = all.stream()
+                    .filter(c -> assignedUserId.equals(effectiveOwner(c, sections, auditorSide)))
+                    .toList();
         }
 
         if (controls.isEmpty()) {
@@ -148,6 +149,21 @@ public class AuditControlSectionItemRegistrar {
                         "engagementId={} | sectionKey={} | taskInstanceId={}",
                 registrations.size(), engagement.getId(),
                 event.sectionKey(), event.taskInstanceId());
+    }
+
+    /** The control's own assignee on that side, else the nearest section above it with one. */
+    public static Long effectiveOwner(AuditControlInstance c, java.util.Map<Long, AuditSectionInstance> sections, boolean auditorSide) {
+        Long own = auditorSide ? c.getAssignedAuditorId() : c.getAuditeeAssignedUserId();
+        if (own != null) return own;
+        Long cur = c.getSectionInstanceId();
+        for (int hops = 0; cur != null && hops < 64; hops++) {
+            AuditSectionInstance s = sections.get(cur);
+            if (s == null) return null;
+            Long owner = auditorSide ? s.getAssignedAuditorId() : s.getAuditeeAssignedUserId();
+            if (owner != null) return owner;
+            cur = s.getParentInstanceId();
+        }
+        return null;
     }
 
     private static String truncate(String text, int maxLen) {

@@ -447,6 +447,8 @@ public class AuditFindingController {
             req.setWorkflowId(findingWorkflowId(tenantId));
         }
 
+        // Only the finding workflow starts at the owner — a caller-chosen workflow keeps OPEN.
+        req.setStartTriaged(!(body != null && body.get("workflowId") instanceof Number));
         IssueResponse issueResponse = issueService.create(req, userId, tenantId);
 
         finding.setLinkedIssueId(issueResponse.getId());

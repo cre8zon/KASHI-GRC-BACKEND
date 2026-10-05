@@ -278,9 +278,31 @@ public class GuardEvaluator {
         req.setResolutionRole(blueprint.getResolutionRole());
         req.setTitle(blueprint.getTitleTemplate());
         req.setDescription(blueprint.getDescriptionTemplate());
-        req.setPriority(rule.getPriorityOverride() != null
+        ActionItem.Priority priority = rule.getPriorityOverride() != null
                 ? ActionItem.Priority.valueOf(rule.getPriorityOverride())
-                : blueprint.getDefaultPriority());
+                : blueprint.getDefaultPriority();
+        req.setPriority(priority);
+
+        // ── A GUARD MATCH IS A FINDING, AND NOW SAYS SO ──────────────────────
+        //
+        // These two lines are the whole reason an automated finding could not be
+        // escalated. A rule firing means a stated condition was met on a real
+        // answer — a missing policy file, a "No formal process" option, a score
+        // under threshold. That is a finding by any definition, and it is the
+        // same thing a reviewer produces by hand from the Review tab.
+        //
+        // Without remediationType the item arrived as null, which every consumer
+        // reads as "assignment bookkeeping": the escalation refused it outright,
+        // and the findings screens filtered it toward the wrong bucket. So the
+        // automated half of the finding pipeline existed and could not be used.
+        //
+        // Severity mirrors priority because priority is the only severity signal
+        // a rule carries — priority_override on the rule, default_priority on the
+        // blueprint. That is an honest 1:1 of what the author configured, rather
+        // than the hardcoded MEDIUM the audit module's two automatic paths use,
+        // which makes their automated findings indistinguishable from each other.
+        req.setRemediationType("REMEDIATION_REQUEST");
+        req.setSeverity(priority != null ? priority.name() : null);
         req.setNavContext(ctx.navContext());
 
         ActionItemResponse created = actionItemService.create(req, SYSTEM_USER_ID, tenantId);

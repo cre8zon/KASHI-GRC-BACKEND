@@ -95,4 +95,92 @@ public class ActionItemRepositoryImpl implements ActionItemRepositoryCustom {
         );
         return count(cq) > 0;
     }
+
+    @Override
+    public java.util.Set<Long> findEntityIdsWithLiveItemForAssignee(String entityTypeStr,
+                                                                   java.util.Collection<Long> entityIds,
+                                                                   Long userId,
+                                                                   Long tenantId,
+                                                                   java.util.Collection<String> remediationTypes) {
+        if (entityTypeStr == null || userId == null || tenantId == null
+                || entityIds == null || entityIds.isEmpty()
+                || remediationTypes == null || remediationTypes.isEmpty()) {
+            return java.util.Set.of();
+        }
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<ActionItem> a = cq.from(ActionItem.class);
+        cq.select(a.get("entityId")).distinct(true).where(
+                cb.equal(a.get("entityType").as(String.class), entityTypeStr),
+                a.get("entityId").in(entityIds),
+                cb.equal(a.get("assignedTo"), userId),
+                cb.equal(a.get("tenantId"), tenantId),
+                a.get("status").in(LIVE_STATUSES),
+                a.get("remediationType").in(remediationTypes)
+        );
+        return new java.util.HashSet<>(em.createQuery(cq).getResultList());
+    }
+
+    @Override
+    public java.util.Set<Long> findEntityIdsWithLiveItemDelegatedBy(String entityTypeStr,
+                                                                   java.util.Collection<Long> entityIds,
+                                                                   Long userId,
+                                                                   Long tenantId,
+                                                                   java.util.Collection<String> remediationTypes) {
+        if (entityTypeStr == null || userId == null || tenantId == null
+                || entityIds == null || entityIds.isEmpty()
+                || remediationTypes == null || remediationTypes.isEmpty()) {
+            return java.util.Set.of();
+        }
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Long> cq = cb.createQuery(Long.class);
+        Root<ActionItem> a = cq.from(ActionItem.class);
+        cq.select(a.get("entityId")).distinct(true).where(
+                cb.equal(a.get("entityType").as(String.class), entityTypeStr),
+                a.get("entityId").in(entityIds),
+                cb.equal(a.get("resolutionReservedFor"), userId),
+                cb.equal(a.get("tenantId"), tenantId),
+                a.get("status").in(LIVE_STATUSES),
+                a.get("remediationType").in(remediationTypes)
+        );
+        return new java.util.HashSet<>(em.createQuery(cq).getResultList());
+    }
+
+    @Override
+    public List<ActionItem> findLiveForEntities(String entityTypeStr,
+                                                          java.util.Collection<Long> entityIds,
+                                                          Long tenantId) {
+        if (entityTypeStr == null || tenantId == null || entityIds == null || entityIds.isEmpty()) {
+            return List.of();
+        }
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<ActionItem> cq = cb.createQuery(ActionItem.class);
+        Root<ActionItem> a = cq.from(ActionItem.class);
+        cq.select(a).where(
+                cb.equal(a.get("entityType").as(String.class), entityTypeStr),
+                a.get("entityId").in(entityIds),
+                cb.equal(a.get("tenantId"), tenantId),
+                a.get("status").in(LIVE_STATUSES)
+        );
+        return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public List<ActionItem> findNonDismissedForEntities(String entityTypeStr,
+                                                                  java.util.Collection<Long> entityIds,
+                                                                  Long tenantId) {
+        if (entityTypeStr == null || tenantId == null || entityIds == null || entityIds.isEmpty()) {
+            return List.of();
+        }
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<ActionItem> cq = cb.createQuery(ActionItem.class);
+        Root<ActionItem> a = cq.from(ActionItem.class);
+        cq.select(a).where(
+                cb.equal(a.get("entityType").as(String.class), entityTypeStr),
+                a.get("entityId").in(entityIds),
+                cb.equal(a.get("tenantId"), tenantId),
+                cb.notEqual(a.get("status"), ActionItem.Status.DISMISSED)
+        ).orderBy(cb.desc(a.get("id")));
+        return em.createQuery(cq).getResultList();
+    }
 }

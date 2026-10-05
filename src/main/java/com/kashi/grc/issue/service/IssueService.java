@@ -124,7 +124,7 @@ public class IssueService {
                 .description(req.getDescription())
                 .issueType(req.getIssueType())
                 .severity(req.getSeverity())
-                .status(Issue.Status.OPEN)
+                .status(Boolean.TRUE.equals(req.getStartTriaged()) ? Issue.Status.TRIAGED : Issue.Status.OPEN)
                 .category(req.getCategory())
                 .sourceModule(req.getSourceModule())
                 .sourceEntityType(req.getSourceEntityType())
@@ -136,6 +136,9 @@ public class IssueService {
                 .dueAt(req.getDueAt() != null ? req.getDueAt()
                         : computeDueAt(req.getSeverity()))
                 .frameworkRef(req.getFrameworkRef())
+                // Null for everything except a TPRM escalation. Scoping, not
+                // decoration — see the note on Issue.vendorId.
+                .vendorId(req.getVendorId())
                 .linkedControlIds(listToJson(req.getLinkedControlIds()))
                 .linkedRiskIds(listToJson(req.getLinkedRiskIds()))
                 .rcaJson(req.getRcaJson())
@@ -392,6 +395,40 @@ public class IssueService {
             log.warn("[ISSUE-WF] Failed to read advanceOnFieldSet for issueId={}: {}", issue.getId(), e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * Who may move an issue's status while its workflow is running: the person
+     * holding an open task on the CURRENT step, or an override holder.
+     *
+     * Every status move approves the current step's task (advanceWorkflowTask).
+     * The page already offers the buttons only to that task's holder
+     * (status_flow_json transitions are task-gated), but the endpoints took
+     * anyone in the tenant — and for anyone else the status changed while the
+     * workflow silently did not, so the two drifted apart.
+     *
+     * No running workflow (none started, or finished — e.g. Reopen from CLOSED):
+     * unchanged, the existing button permissions decide.
+     */
+    @Transactional(readOnly = true)
+    public void requireCanMoveStatus(Long issueId, Long userId, boolean overrideHolder) {
+        Issue issue = issueRepository.findById(issueId)
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", issueId));
+        if (issue.getWorkflowInstanceId() == null || overrideHolder) return;
+        com.kashi.grc.workflow.domain.WorkflowInstance wf =
+                instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+        if (wf == null || wf.getCurrentStepId() == null) return;
+        boolean holdsTask = taskInstanceRepository.findByStepInstanceId(wf.getCurrentStepId()).stream()
+                .anyMatch(t -> userId.equals(t.getAssignedUserId())
+                        && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
+                        || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS));
+        if (holdsTask) return;
+        String step = stepInstanceRepository.findById(wf.getCurrentStepId())
+                .map(si -> si.getSnapName()).orElse("the current step");
+        throw new com.kashi.grc.common.exception.BusinessException("ISSUE_NOT_YOUR_STEP",
+                "This issue is at \"" + step + "\", which is assigned to someone else. "
+                        + "Only the person holding that step (or someone with override) can move it on.",
+                org.springframework.http.HttpStatus.FORBIDDEN);
     }
 
     @Transactional

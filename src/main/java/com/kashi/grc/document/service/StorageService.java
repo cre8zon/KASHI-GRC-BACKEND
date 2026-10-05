@@ -127,6 +127,31 @@ public class StorageService {
             "application/x-zip-compressed"
     );
 
+    /**
+     * Document types whose uploads are video, and the MIME types they may use.
+     *
+     * Kept SEPARATE from ALLOWED_MIME_TYPES rather than merged into it. This
+     * service backs evidence, policy documents and vendor documents as well as
+     * training; widening the shared list would quietly make every one of those
+     * a valid place to upload a 500MB video, which is a storage bill and an
+     * evidence-review problem nobody asked for.
+     */
+    private static final Set<String> VIDEO_DOCUMENT_TYPES = Set.of("TRAINING_VIDEO");
+
+    private static final Set<String> VIDEO_MIME_TYPES = Set.of(
+            "video/mp4", "video/webm", "video/quicktime"
+    );
+
+    /**
+     * Per-document-type size ceiling, defaulting to MAX_FILE_SIZE_BYTES.
+     *
+     * A training video runs 60-150MB at watchable quality for eight minutes, so
+     * the 50MB default rejects every real one. Raising the default instead would
+     * change what can be attached to an audit engagement, which is not a
+     * decision this feature gets to make.
+     */
+    private static final long MAX_VIDEO_FILE_SIZE_BYTES = 500L * 1024 * 1024; // 500MB
+
     private static final Set<String> IMAGE_MIME_TYPES = Set.of(
             "image/jpeg", "image/png", "image/gif",
             "image/tiff", "image/heic", "image/heif"
@@ -178,8 +203,8 @@ public class StorageService {
             Long fileSizeBytes, String documentType, String entityType, Long entityId) {
 
         // ── Validate ──────────────────────────────────────────────────────
-        validateMimeType(mimeType);
-        validateFileSize(fileSizeBytes);
+        validateMimeType(mimeType, documentType);
+        validateFileSize(fileSizeBytes, documentType);
 
         // Determine if image needs conversion
         boolean willConvertToWebP = IMAGE_MIME_TYPES.contains(mimeType);
@@ -259,8 +284,8 @@ public class StorageService {
             Long tenantId, Long userId, MultipartFile file,
             String documentType, String entityType, Long entityId) throws Exception {
 
-        validateMimeType(file.getContentType());
-        validateFileSize(file.getSize());
+        validateMimeType(file.getContentType(), documentType);
+        validateFileSize(file.getSize(), documentType);
 
         // Encode, then take the extension and content type from what actually
         // came out rather than from what we hoped would.
@@ -699,7 +724,18 @@ public class StorageService {
                 .replaceAll("[^a-z0-9\\-_]", "-")  // keep alphanumeric, dash, underscore
                 .replaceAll("-{2,}", "-")            // collapse consecutive dashes
                 .replaceAll("^-|-$", "")             // trim leading/trailing dashes
-                .substring(0, Math.min(80, withoutExt.length()));
+                // Bound by the TRANSFORMED length, not withoutExt.length().
+                //
+                // The replaceAll chain above can SHORTEN the string: collapsing
+                // consecutive dashes and trimming the ends both remove characters.
+                // Bounding by the original length then threw on any filename that
+                // collapsed — "3  vid.mp4" has base "3  vid" (6), becomes "3--vid",
+                // collapses to "3-vid" (5), and substring(0, 6) failed with
+                // StringIndexOutOfBoundsException: begin 0, end 6, length 5.
+                //
+                // Latent for years because it needs a name with two adjacent
+                // separators, or one that is all separators.
+                .replaceAll("^(.{0,80}).*$", "$1");
     }
 
     private String extractExtension(String filename) {
@@ -707,7 +743,26 @@ public class StorageService {
         return filename.substring(filename.lastIndexOf('.') + 1).toLowerCase();
     }
 
-    private void validateMimeType(String mimeType) {
+    /**
+     * Video types are allowed ONLY for a video document type, and a video
+     * document type allows ONLY video. Both directions matter: the first keeps
+     * 500MB files out of evidence, the second keeps a PDF from being uploaded
+     * as a training video and then failing silently in the player.
+     */
+    private void validateMimeType(String mimeType, String documentType) {
+        boolean videoUpload = documentType != null
+                && VIDEO_DOCUMENT_TYPES.contains(documentType.toUpperCase());
+
+        if (videoUpload) {
+            if (mimeType == null || !VIDEO_MIME_TYPES.contains(mimeType.toLowerCase())) {
+                throw new com.kashi.grc.common.exception.BusinessException(
+                        "INVALID_MIME_TYPE",
+                        "Video type not allowed: " + mimeType + ". Allowed: MP4, WebM, QuickTime",
+                        org.springframework.http.HttpStatus.BAD_REQUEST);
+            }
+            return;
+        }
+
         if (mimeType == null || !ALLOWED_MIME_TYPES.contains(mimeType.toLowerCase())) {
             throw new com.kashi.grc.common.exception.BusinessException(
                     "INVALID_MIME_TYPE",
@@ -718,11 +773,16 @@ public class StorageService {
         }
     }
 
-    private void validateFileSize(Long size) {
-        if (size != null && size > MAX_FILE_SIZE_BYTES) {
+    private void validateFileSize(Long size, String documentType) {
+        boolean videoUpload = documentType != null
+                && VIDEO_DOCUMENT_TYPES.contains(documentType.toUpperCase());
+        long ceiling = videoUpload ? MAX_VIDEO_FILE_SIZE_BYTES : MAX_FILE_SIZE_BYTES;
+
+        if (size != null && size > ceiling) {
             throw new com.kashi.grc.common.exception.BusinessException(
                     "FILE_TOO_LARGE",
-                    "File size " + (size / 1024 / 1024) + "MB exceeds the 50MB limit.",
+                    "File size " + (size / 1024 / 1024) + "MB exceeds the "
+                            + (ceiling / 1024 / 1024) + "MB limit.",
                     org.springframework.http.HttpStatus.BAD_REQUEST);
         }
     }

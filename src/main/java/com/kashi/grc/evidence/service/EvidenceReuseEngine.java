@@ -27,7 +27,9 @@ import java.util.Set;
  *
  * Two propagation paths:
  *
- *   propagate(recordId)          — MANUAL upload → EvidenceLink.PENDING_REVIEW
+ *   propagate(recordId)          — MANUAL upload → EvidenceLink.ACCEPTED
+ *       (UCF reuse: controls sharing a tag need the same evidence, so the
+ *       copy needs no second review — the target counts it as submitted)
  *   propagateAutomated(recordId, isPass) — AUTOMATED collection:
  *       isPass=true  → EvidenceLink.AUTOMATION_VERIFIED (no human gate)
  *       isPass=false → EvidenceLink.PENDING_REVIEW (auditor must document exception)
@@ -47,6 +49,7 @@ public class EvidenceReuseEngine {
     private final AssessmentQuestionInstanceRepository assessmentQuestionRepo;
     private final List<EvidenceTagMatcher>             tagMatchers;
     private final NotificationService                  notificationService;
+    private final org.springframework.context.ApplicationEventPublisher eventPublisher;
 
     /**
      * Engagements that may still receive new evidence.
@@ -101,10 +104,11 @@ public class EvidenceReuseEngine {
 
         String tag      = record.getControlTag();
         Long   tenantId = record.getTenantId();
-        // AUTOMATION_VERIFIED for automated PASS, PENDING_REVIEW for everything else
-        EvidenceLink.Status linkStatus = automatedPass
+        // AUTOMATION_VERIFIED for automated PASS, PENDING_REVIEW for a failed
+        // automated check (needs a documented exception), ACCEPTED for reuse.
+        EvidenceLink.Status linkStatus = reuseStatus(record, automatedPass
                 ? EvidenceLink.Status.AUTOMATION_VERIFIED
-                : EvidenceLink.Status.PENDING_REVIEW;
+                : EvidenceLink.Status.PENDING_REVIEW);
 
         int newLinks = 0;
 
@@ -129,6 +133,10 @@ public class EvidenceReuseEngine {
                     notificationService.send(auditorId, "EVIDENCE_AUTO_LINKED",
                             "Evidence '" + record.getTitle() + "' was auto-linked. Please review.",
                             "EVIDENCE_RECORD", evidenceRecordId);
+                } else if (auditorId != null && linkStatus == EvidenceLink.Status.ACCEPTED) {
+                    notificationService.send(auditorId, "EVIDENCE_AUTO_LINKED",
+                            "Evidence '" + record.getTitle() + "' was reused on a control linked to the same requirement.",
+                            "AUDIT_CONTROL_INSTANCE", instanceId);
                 }
             }
         }
@@ -139,7 +147,7 @@ public class EvidenceReuseEngine {
             Long responderId = (Long) match.get("assignedUserId");
             if (createLink(record, "ASSESSMENT_QUESTION_INSTANCE", instanceId, tenantId, linkStatus)) {
                 newLinks++;
-                if (responderId != null && linkStatus == EvidenceLink.Status.PENDING_REVIEW) {
+                if (responderId != null && linkStatus != EvidenceLink.Status.AUTOMATION_VERIFIED) {
                     notificationService.send(responderId, "EVIDENCE_AUTO_LINKED",
                             "Evidence '" + record.getTitle() + "' was auto-linked to your assessment question.",
                             "EVIDENCE_RECORD", evidenceRecordId);
@@ -187,6 +195,70 @@ public class EvidenceReuseEngine {
         link.setReviewedAt(LocalDateTime.now());
         link.setReviewerNote(note);
         evidenceLinkRepository.save(link);
+        // Accepted evidence IS evidence: let the target's module record it as such.
+        eventPublisher.publishEvent(new com.kashi.grc.evidence.event.EvidenceLinkAcceptedEvent(
+                link.getTargetEntityType(), link.getTargetEntityId(), reviewedBy, tenantId));
+    }
+
+    /**
+     * One-off catch-up for reused links created before reuse stopped needing a
+     * review: accepts them and publishes the accepted event, so their controls
+     * count as submitted through the normal path (checklist, delegations,
+     * section auto-submit). Idempotent — an accepted link is not found again.
+     */
+    @Transactional
+    public int acceptPendingReuse() {
+        List<EvidenceLink> pending = evidenceLinkRepository.findPendingReuse(
+                EvidenceLink.Status.PENDING_REVIEW, EvidenceRecord.CollectionType.AUTOMATED);
+        for (EvidenceLink link : pending) {
+            link.setStatus(EvidenceLink.Status.ACCEPTED);
+            link.setReviewedAt(LocalDateTime.now());
+            link.setReviewerNote("Reused evidence — accepted without review");
+            evidenceLinkRepository.save(link);
+            eventPublisher.publishEvent(new com.kashi.grc.evidence.event.EvidenceLinkAcceptedEvent(
+                    link.getTargetEntityType(), link.getTargetEntityId(), null, link.getTenantId()));
+        }
+        if (!pending.isEmpty()) log.info("[EVIDENCE-REUSE] Accepted {} reused link(s) left pending review", pending.size());
+        return pending.size();
+    }
+
+    /**
+     * A new run of an integration check supersedes that check's earlier
+     * UNREVIEWED failures on the same target: if it now passes, the old fail is
+     * no longer true; if it fails again, only the latest failure needs review.
+     * Superseded links become EXPIRED with a note (the status column is an enum
+     * the schema already knows). Earlier passes are kept — they evidence the
+     * control operating over the period.
+     */
+    private void supersedeOlderRuns(EvidenceRecord record, String targetType, Long targetId) {
+        if (record.getIntegrationKey() == null) return;
+        for (EvidenceLink old : evidenceLinkRepository.findOlderPendingRuns(
+                targetType, targetId, record.getIntegrationKey(), record.getId(), EvidenceLink.Status.PENDING_REVIEW)) {
+            supersede(old, record.getCollectedAt());
+        }
+    }
+
+    private void supersede(EvidenceLink old, LocalDateTime byRunAt) {
+        old.setStatus(EvidenceLink.Status.EXPIRED);
+        old.setReviewedAt(LocalDateTime.now());
+        old.setReviewerNote(SUPERSEDED_NOTE + (byRunAt != null ? " on " + byRunAt.toLocalDate() : ""));
+        evidenceLinkRepository.save(old);
+        evidenceRecordRepository.findById(old.getEvidenceRecordId()).ifPresent(r -> {
+            r.setLinkCount(Math.max(0, r.getLinkCount() - 1));
+            evidenceRecordRepository.save(r);
+        });
+    }
+
+    /** Prefix the UI reads to label an EXPIRED link "Superseded". */
+    public static final String SUPERSEDED_NOTE = "Superseded by a later run";
+
+    /** Catch-up of supersedeOlderRuns for failures recorded before it existed. Idempotent. */
+    @Transactional
+    public int supersedeStaleFailures() {
+        List<EvidenceLink> stale = evidenceLinkRepository.findSupersededPendingRuns(EvidenceLink.Status.PENDING_REVIEW);
+        stale.forEach(l -> supersede(l, null));
+        if (!stale.isEmpty()) log.info("[EVIDENCE-REUSE] Superseded {} integration failure(s) a later run replaced", stale.size());
+        return stale.size();
     }
 
     @Transactional
@@ -291,8 +363,24 @@ public class EvidenceReuseEngine {
         return true;
     }
 
+    /**
+     * Reuse needs no review. Controls share a tag because the UCF maps them to
+     * the same requirement, so evidence accepted for one is evidence for the
+     * other; asking a reviewer to approve every copy added a step nobody could
+     * take. Only a FAILED automated check stays PENDING_REVIEW — that needs an
+     * exception documented. Applies to propagation and to the backfill alike.
+     */
+    private static EvidenceLink.Status reuseStatus(EvidenceRecord record, EvidenceLink.Status requested) {
+        if (requested == EvidenceLink.Status.PENDING_REVIEW
+                && record.getCollectionType() != EvidenceRecord.CollectionType.AUTOMATED) {
+            return EvidenceLink.Status.ACCEPTED;
+        }
+        return requested;
+    }
+
     private boolean createLink(EvidenceRecord record, String targetType, Long targetId,
                                Long tenantId, EvidenceLink.Status status) {
+        status = reuseStatus(record, status);
         if (evidenceLinkRepository.existsByEvidenceRecordIdAndTargetEntityTypeAndTargetEntityId(
                 record.getId(), targetType, targetId)) {
             return false;
@@ -308,6 +396,11 @@ public class EvidenceReuseEngine {
                     .matchedTagSnapshot(record.getControlTag())
                     .linkedAt(LocalDateTime.now())
                     .build());
+            supersedeOlderRuns(record, targetType, targetId);
+            if (status == EvidenceLink.Status.AUTOMATION_VERIFIED || status == EvidenceLink.Status.ACCEPTED) {
+                eventPublisher.publishEvent(new com.kashi.grc.evidence.event.EvidenceLinkAcceptedEvent(
+                        targetType, targetId, null, tenantId));
+            }
             return true;
         } catch (Exception e) {
             log.debug("[EVIDENCE-REUSE] Duplicate link skipped for {}:{}", targetType, targetId);

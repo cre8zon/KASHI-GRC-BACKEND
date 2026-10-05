@@ -62,6 +62,7 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
     private final VendorAssessmentRepository           assessmentRepository;
     private final AssessmentQuestionInstanceRepository questionInstanceRepository;
     private final AssessmentResponseRepository         responseRepository;
+    private final AssessmentReportRepository           assessmentReportRepository;
     private final ActionItemRepository                 actionItemRepository;
     private final DocumentRepository                   documentRepository;
     private final DocumentLinkRepository               documentLinkRepository;
@@ -108,9 +109,11 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
         Long actorId      = wi.getInitiatedBy() != null ? wi.getInitiatedBy() : 0L;
 
         // ── 2. Idempotency check — don't generate twice ────────────────────
-        boolean alreadyGenerated = !documentLinkRepository
-                .findActiveByEntity("ASSESSMENT", assessmentId, "REPORT")
-                .isEmpty();
+        // Checks assessment_reports, not document_links. The link check could
+        // only ever find a report that had a PDF, and no PDF generator exists
+        // — so this guard never fired and, worse, nothing was recorded for it
+        // to fire on next time.
+        boolean alreadyGenerated = assessmentReportRepository.countByAssessmentId(assessmentId) > 0;
         if (alreadyGenerated) {
             log.warn("[GENERATE_ASSESSMENT_REPORT] Already generated — skipping | assessmentId={}", assessmentId);
             return true;
@@ -160,6 +163,39 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
         // that we cannot populate without an actual upload.
         // Wire in a PDF generator here when ready:
         //   byte[] pdfBytes = pdfGenerator.generate(assessment, generatedData);
+        // ── RECORD THE VERSION FIRST, FILE OR NO FILE ────────────────────
+        //
+        // This block used to be wrapped entirely in `if (pdfBytes.length > 0)`,
+        // so with the stub generator it did nothing at all and simply logged
+        // that it was skipping. The workflow then completed and the assessment
+        // was marked COMPLETED — so from the outside a report HAD been
+        // generated, while the Reports tab stayed empty and no row existed
+        // anywhere to say otherwise.
+        //
+        // The report data is real: compliance, scores, risk rating and the two
+        // open counts are all computed above. Only the PDF is missing. So the
+        // version goes into assessment_reports unconditionally, and the
+        // Document + DocumentLink pair — which needs a non-null s3_key, that
+        // column being NOT NULL — is created only when there is a file.
+        AssessmentReport report = AssessmentReport.builder()
+                .tenantId(tenantId)
+                .assessmentId(assessmentId)
+                .reportVersion(1)
+                .generatedAt(LocalDateTime.now())
+                .generatedBy(actorId)
+                .totalEarnedScore(totalEarned)
+                .totalPossibleScore(totalPossible)
+                .compliancePct(compliancePct)
+                .riskRating(assessment.getRiskRating())
+                .openRemediationCount(openRemediation)
+                .openClarificationCount(openClarification)
+                .triggerEvent("INITIAL")
+                .remarks("Initial report generated at workflow completion")
+                .build();
+        assessmentReportRepository.save(report);
+        log.info("[GENERATE_ASSESSMENT_REPORT] v1 recorded | assessmentId={} | reportRowId={} | {}%",
+                assessmentId, report.getId(), compliancePct);
+
         if (pdfBytes.length > 0) {
             try {
                 StorageService.ServerUploadResult uploadResult = storageService.uploadSystemDocument(
@@ -198,17 +234,21 @@ public class GenerateAssessmentReportAction implements AutomatedActionHandler {
                         .notes("Auto-generated at workflow completion")
                         .build());
 
+                report.setReportUrl(s3Key);
+                assessmentReportRepository.save(report);
+
                 log.info("[GENERATE_ASSESSMENT_REPORT] Report uploaded | assessmentId={} | docId={} | s3Key={}",
                         assessmentId, reportDoc.getId(), s3Key);
 
             } catch (Exception e) {
-                // S3 upload failed — log but don't abort. Assessment still completes.
-                // The report can be re-generated via POST /v1/assessments/:id/generate-report
+                // S3 upload failed — log but do not abort. The version is
+                // already recorded, so the assessment still completes with a
+                // readable report; only the file is missing.
                 log.error("[GENERATE_ASSESSMENT_REPORT] S3 upload failed: {}", e.getMessage(), e);
             }
         } else {
-            log.info("[GENERATE_ASSESSMENT_REPORT] PDF stub — skipping document creation. " +
-                    "Wire in a PDF generator to produce a real report | assessmentId={}", assessmentId);
+            log.info("[GENERATE_ASSESSMENT_REPORT] No PDF generator wired — version recorded without a file "
+                    + "| assessmentId={}", assessmentId);
         }
 
         // ── 8. Mark assessment + cycle COMPLETED ──────────────────────────

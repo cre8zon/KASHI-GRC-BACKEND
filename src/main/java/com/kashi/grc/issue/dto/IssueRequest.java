@@ -72,6 +72,13 @@ public class IssueRequest {
     private List<Long> linkedRiskIds;
     private String     frameworkRef;
 
+    /**
+     * Set by the vendor-assessment escalation path; null for org-internal and
+     * audit issues. Carried onto Issue.vendorId, which is what scopes the issue
+     * to one vendor — see the note on that field.
+     */
+    private Long       vendorId;
+
     // ── Workflow ──────────────────────────────────────────────────────────────
 
     /**
@@ -81,6 +88,17 @@ public class IssueRequest {
      * via the workflow admin UI.
      */
     private Long workflowId;
+
+    /**
+     * Start at TRIAGED instead of OPEN. Set by audit-finding escalations: the
+     * audit already triaged the finding, and the "Audit Finding Remediation"
+     * workflow opens at the owner — so the owner's Start remediation completes
+     * their "Acknowledges & Plans" step, Submit for review completes "Execute",
+     * the auditor's Validate completes "Validates", and Close the last step.
+     * Starting at OPEN put an extra Triage in front and shifted every status
+     * one step off the workflow. Null/false = OPEN, as before.
+     */
+    private Boolean startTriaged;
 
     // ── RCA (optional at creation, filled via workflow FILL step) ─────────────
 

@@ -26,6 +26,14 @@ public interface EvidenceLinkRepositoryCustom {
      */
     java.util.Set<Long> entityIdsWithAnyLink(String entityType, java.util.List<Long> entityIds);
 
+    /**
+     * Batch: of the given entity IDs, the subset with AT LEAST ONE LIVE link —
+     * PENDING_REVIEW, ACCEPTED or AUTOMATION_VERIFIED. Unlike
+     * {@link #entityIdsWithAnyLink}, rejected and expired links do not count:
+     * "has evidence" must not stay true after the only evidence was rejected.
+     */
+    java.util.Set<Long> entityIdsWithLiveLink(String entityType, java.util.List<Long> entityIds);
+
     /** Control-instance links whose evidence is also linked to the given test instance. */
     List<EvidenceLink> findControlEvidenceUsedByTest(Long testInstanceId, Long tenantId);
 

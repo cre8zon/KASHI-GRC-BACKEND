@@ -48,6 +48,7 @@ public class AuditEngagementService {
     private final WorkflowEngineService                     workflowEngineService;
     private final WorkflowRepository                        workflowRepository;
     private final NotificationService                       notificationService;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
 
     // Self-injected via the Spring proxy — NOT the same as `this`. Needed
     // because completeEngagementProvisioning() calls snapshotTemplate() and
@@ -88,6 +89,57 @@ public class AuditEngagementService {
     // as a bean when kashi.kafka.enabled=true. getIfAvailable() returning null
     // is the signal to fall back to synchronous snapshotting (see create()).
     private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaEventPublisherProvider;
+    // Who may act on a control (one rule for every endpoint) and the per-control
+    // obligations that rule honours. Neither depends back on this service.
+    private final ControlAccessGuard                        controlAccessGuard;
+    private final AuditObligationService                    obligationService;
+    private final AuditControlInstanceTestMappingRepository controlTestMappingRepository;
+    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+    private final com.kashi.grc.usermanagement.service.role.PermissionHolderService permissionHolderService;
+
+    // ── OWNER ELIGIBILITY ─────────────────────────────────────────────────────
+
+    /**
+     * The engagement owner is the CLIENT's accountable person: workflow steps on
+     * the ORGANIZATION side resolve to them (AuditEngagementEntityResolver), and
+     * on engagements without a lead auditee they are the one who assigns evidence
+     * owners (ControlAccessGuard.unassignedFallback). An auditor in that seat
+     * would approve their own audit on the client's behalf and pick who supplies
+     * the evidence they test. So the owner must:
+     *
+     *   • be one of the client's own people — a usable HOME membership in this
+     *     tenant. An invited external auditor's membership here is GUEST.
+     *   • not be the engagement's lead auditor.
+     *
+     *   • hold audit:section:assign-auditee in this tenant — the owner assigns
+     *     evidence owners when there is no lead auditee, so they must be someone
+     *     allowed to. This is also what keeps the client's own internal-audit
+     *     staff out of the seat, without naming a role or a side.
+     *
+     * Decided by membership, permission and the engagement's own assignments —
+     * no role names or role sides. A null owner (or tenant) is left to the caller.
+     */
+    public static final String OWNER_PERMISSION = "audit:section:assign-auditee";
+
+    public void requireEligibleOwner(Long ownerId, Long leadAuditorId, Long tenantId) {
+        if (ownerId == null || tenantId == null) return;
+        if (ownerId.equals(leadAuditorId)) {
+            throw new BusinessException("OWNER_IS_LEAD_AUDITOR",
+                    "The engagement owner cannot also be its lead auditor");
+        }
+        boolean clientStaff = membershipRepository.findByUserIdAndTenantId(ownerId, tenantId)
+                .filter(m -> m.isUsable() && "HOME".equalsIgnoreCase(m.getMembershipType()))
+                .isPresent();
+        if (!clientStaff) {
+            throw new BusinessException("OWNER_NOT_CLIENT_STAFF",
+                    "The engagement owner must be a member of your organisation, not an invited external auditor");
+        }
+        if (!permissionHolderService.holds(ownerId, tenantId, OWNER_PERMISSION)) {
+            throw new BusinessException("OWNER_LACKS_PERMISSION",
+                    "The engagement owner must be someone allowed to assign evidence owners ("
+                            + OWNER_PERMISSION + ")");
+        }
+    }
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
@@ -127,6 +179,13 @@ public class AuditEngagementService {
                     "This engagement was just created — please wait a moment before trying again");
         }
 
+        // An owner named on the form must be one of the client's own people and
+        // not the lead auditor. The default (the creator) is not checked —
+        // whoever may create the engagement may own it.
+        if (req.getOwnerId() != null) {
+            requireEligibleOwner(req.getOwnerId(), req.getLeadAuditorId(), tenantId);
+        }
+
         AuditEngagement engagement = AuditEngagement.builder()
                 .engagementRef(ref)
                 .projectId(req.getProjectId())
@@ -145,6 +204,11 @@ public class AuditEngagementService {
                         ? AuditEngagement.Status.FIELDWORK
                         : AuditEngagement.Status.PLANNING)
                 .leadAuditorId(req.getLeadAuditorId())
+                // Was accepted on the request and used for the notification below,
+                // but never written — so the column stayed NULL and every reader of
+                // it (list/overview, the AUDITEE-ASSIGN step resolver, both finding
+                // escalation paths) silently fell back to someone else.
+                .leadAuditeeId(req.getLeadAuditeeId())
                 .ownerId(req.getOwnerId() != null ? req.getOwnerId() : createdBy)
                 .createdBy(createdBy)
                 // FIX: request has LocalDate, domain has LocalDateTime — convert with atStartOfDay()
@@ -213,7 +277,7 @@ public class AuditEngagementService {
                         com.kashi.grc.common.kafka.KafkaTopics.AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED,
                         "AUDIT_ENGAGEMENT_SNAPSHOT_REQUESTED",
                         String.valueOf(engagement.getId()),
-                        java.util.Map.of(
+                        Map.of(
                                 "engagementId", engagement.getId(),
                                 "templateId", req.getTemplateId(),
                                 "createdBy", createdBy,
@@ -263,6 +327,24 @@ public class AuditEngagementService {
         }
 
         return toResponse(engagement);
+    }
+
+    /**
+     * Tells a lead auditee named AFTER creation (overview inline edit) what
+     * create() tells one named up front. Best-effort: a failed notification
+     * must not undo the assignment.
+     */
+    public void notifyLeadAuditeeAssigned(AuditEngagement engagement) {
+        if (engagement == null || engagement.getLeadAuditeeId() == null) return;
+        try {
+            notificationService.send(engagement.getLeadAuditeeId(), "AUDIT_ENGAGEMENT_LEAD_AUDITEE_ASSIGNED",
+                    "You are the evidence lead for audit engagement " + engagement.getEngagementRef()
+                            + ". Assign control owners in your organization to begin evidence collection.",
+                    "AUDIT_ENGAGEMENT", engagement.getId());
+        } catch (Exception ex) {
+            log.warn("[AUDIT] Lead auditee notification failed | engagementId={} — {}",
+                    engagement.getId(), ex.getMessage());
+        }
     }
 
     /**
@@ -353,7 +435,7 @@ public class AuditEngagementService {
                 .stream().collect(java.util.stream.Collectors.toMap(AuditSection::getId, s -> s));
         List<AuditSection> rootSections = rootMappings.stream()
                 .map(m -> rootSectionMap.get(m.getSectionId()))
-                .filter(java.util.Objects::nonNull)
+                .filter(Objects::nonNull)
                 .toList();
 
         // See AuditSectionService.snapshotSectionTree javadoc for what changed
@@ -422,6 +504,8 @@ public class AuditEngagementService {
         if (!section.getEngagementId().equals(engagementId))
             throw new BusinessException("SECTION_MISMATCH", "Section does not belong to this engagement");
 
+        Long previousSectionAuditor = section.getAssignedAuditorId();
+        List<Long> affectedSectionIds = new ArrayList<>(List.of(sectionInstanceId));
         section.setAssignedAuditorId(auditorId);
         sectionInstanceRepository.save(section);
 
@@ -444,7 +528,16 @@ public class AuditEngagementService {
             for (AuditSectionInstance child : descendants) {
                 child.setAssignedAuditorId(auditorId);
                 sectionInstanceRepository.save(child);
+                affectedSectionIds.add(child.getId());
             }
+        }
+
+        // Controls with no auditor of their own inherit this section's owner, so
+        // testing delegations on them lapse with the old owner — same rule as a
+        // control reassignment (AuditObligationService.closeOnSectionReassignment).
+        if (!Objects.equals(previousSectionAuditor, auditorId)) {
+            obligationService.closeOnSectionReassignment(engagementId, affectedSectionIds, false,
+                    auditorId, performedBy, tenantId);
         }
 
         if (auditorId != null) {
@@ -586,6 +679,8 @@ public class AuditEngagementService {
         if (!section.getEngagementId().equals(engagementId))
             throw new BusinessException("SECTION_MISMATCH", "Section does not belong to this engagement");
 
+        Long previousSectionAuditee = section.getAuditeeAssignedUserId();
+        List<Long> affectedSectionIds = new ArrayList<>(List.of(sectionInstanceId));
         section.setAuditeeAssignedUserId(auditeeUserId);
         sectionInstanceRepository.save(section);
 
@@ -605,12 +700,20 @@ public class AuditEngagementService {
             for (AuditSectionInstance child : descendants) {
                 child.setAuditeeAssignedUserId(auditeeUserId);
                 sectionInstanceRepository.save(child);
+                affectedSectionIds.add(child.getId());
             }
             // NOTE: control cascade deliberately removed — see assignSection() for
             // the matching auditor-side rationale. Controls inherit the section's
             // auditee implicitly via AuditWorkflowActorResolver /
             // AuditProjectWorkflowActorResolver until explicitly overridden by
             // assignAuditeeToControl().
+        }
+
+        // Evidence delegations on controls that inherit this section's owner
+        // lapse with the old owner — see assignSectionInternal.
+        if (!Objects.equals(previousSectionAuditee, auditeeUserId)) {
+            obligationService.closeOnSectionReassignment(engagementId, affectedSectionIds, true,
+                    auditeeUserId, performedBy, tenantId);
         }
 
         if (auditeeUserId != null) {
@@ -695,9 +798,16 @@ public class AuditEngagementService {
         if (!control.getEngagementId().equals(engagementId))
             throw new BusinessException("CONTROL_MISMATCH", "Control does not belong to this engagement");
 
+        Long previousAuditee = control.getAuditeeAssignedUserId();
         control.setAuditeeAssignedUserId(auditeeUserId);
         if (evidenceDueDate != null) control.setEvidenceDueDate(evidenceDueDate);
         controlInstanceRepository.save(control);
+
+        // A live delegation is an access grant; when the control changes hands
+        // on this side, the new owner did not choose those delegates.
+        if (!Objects.equals(previousAuditee, auditeeUserId)) {
+            obligationService.closeOnReassignment(controlInstanceId, true, auditeeUserId, null, tenantId);
+        }
 
         if (auditeeUserId != null) {
             String dueDateStr = evidenceDueDate != null ? " (due " + evidenceDueDate + ")" : "";
@@ -723,10 +833,22 @@ public class AuditEngagementService {
             throw new BusinessException("CONTROL_MISMATCH",
                     "Control does not belong to this engagement");
 
+        Long previousAuditor = control.getAssignedAuditorId();
         control.setAssignedAuditorId(auditorId);
         controlInstanceRepository.save(control);
 
-        fireControlSectionEvent("CONTROLS_ASSIGNED", controlInstanceId, engagementId, auditorId);
+        if (!Objects.equals(previousAuditor, auditorId)) {
+            obligationService.closeOnReassignment(controlInstanceId, false, auditorId, null, tenantId);
+        }
+
+        if (auditorId != null) {
+            fireControlSectionEvent("CONTROLS_ASSIGNED", controlInstanceId, engagementId, auditorId);
+        } else if (previousAuditor != null) {
+            // Unassign: WAS fireControlSectionEvent(..., null), which NPE'd inside
+            // its own try/catch — a warning in the log and the control's
+            // CONTROLS_ASSIGNED item left complete on a control nobody owns.
+            uncompleteControlItem("CONTROLS_ASSIGNED", controlInstanceId, engagementId);
+        }
 
         log.info("[AUDIT-ENG-SERVICE] Auditor assigned | controlInstanceId={} | auditorId={}",
                 controlInstanceId, auditorId);
@@ -747,7 +869,7 @@ public class AuditEngagementService {
      */
     @Transactional
     public int bulkAssignControls(Long engagementId,
-                                  com.kashi.grc.audit.dto.request.BulkControlAssignRequest req,
+                                  BulkControlAssignRequest req,
                                   Long actorId, Long tenantId) {
         // Resolve the target controls
         List<AuditControlInstance> controls;
@@ -770,6 +892,14 @@ public class AuditEngagementService {
                     controls.size() - owned.size());
         }
 
+        boolean clearAuditor = Boolean.TRUE.equals(req.getUnassignAuditor());
+        boolean clearAuditee = Boolean.TRUE.equals(req.getUnassignAuditee());
+        if ((clearAuditor && req.getAuditorUserId() != null)
+                || (clearAuditee && req.getAuditeeUserId() != null)) {
+            throw new BusinessException("CONFLICTING_ASSIGNMENT",
+                    "Choose either a user to assign or unassign for each side, not both.");
+        }
+
         int updated = 0;
         // Resolved ONCE — see resolveActorTaskInstanceId javadoc for why this,
         // not the control.save() calls, was the actual N+1 here. engagementId
@@ -781,6 +911,8 @@ public class AuditEngagementService {
 
         for (AuditControlInstance ctrl : owned) {
             boolean changed = false;
+            Long previousAuditor = ctrl.getAssignedAuditorId();
+            Long previousAuditee = ctrl.getAuditeeAssignedUserId();
             if (req.getAuditorUserId() != null) {
                 ctrl.setAssignedAuditorId(req.getAuditorUserId());
                 changed = true;
@@ -791,11 +923,40 @@ public class AuditEngagementService {
                     ctrl.setEvidenceDueDate(req.getEvidenceDueDate());
                 changed = true;
             }
+            if (clearAuditor && previousAuditor != null) {
+                ctrl.setAssignedAuditorId(null);
+                changed = true;
+            }
+            if (clearAuditee && previousAuditee != null) {
+                ctrl.setAuditeeAssignedUserId(null);
+                changed = true;
+            }
             if (changed) {
                 controlInstanceRepository.save(ctrl);
+                // Same cleanup as the single-control paths: delegations on a side
+                // whose owner just changed stop granting access.
+                if (req.getAuditorUserId() != null
+                        && !Objects.equals(previousAuditor, req.getAuditorUserId())) {
+                    obligationService.closeOnReassignment(ctrl.getId(), false,
+                            req.getAuditorUserId(), actorId, tenantId);
+                }
+                if (req.getAuditeeUserId() != null
+                        && !Objects.equals(previousAuditee, req.getAuditeeUserId())) {
+                    obligationService.closeOnReassignment(ctrl.getId(), true,
+                            req.getAuditeeUserId(), actorId, tenantId);
+                }
                 if (req.getAuditorUserId() != null) {
                     fireControlSectionEventWithResolvedTask("CONTROLS_ASSIGNED", ctrl.getId(),
                             resolvedTaskInstanceId, actorId);
+                }
+                // Unassign: delegations on that side lapse (nobody chose them for
+                // the next owner) and the control's assignment item re-opens.
+                if (clearAuditor && previousAuditor != null) {
+                    obligationService.closeOnReassignment(ctrl.getId(), false, null, actorId, tenantId);
+                    uncompleteControlItem("CONTROLS_ASSIGNED", ctrl.getId(), engagementId);
+                }
+                if (clearAuditee && previousAuditee != null) {
+                    obligationService.closeOnReassignment(ctrl.getId(), true, null, actorId, tenantId);
                 }
                 updated++;
             }
@@ -816,7 +977,7 @@ public class AuditEngagementService {
      */
     @Transactional
     public int bulkAssignSections(Long engagementId,
-                                  com.kashi.grc.audit.dto.request.BulkSectionAssignRequest req,
+                                  BulkSectionAssignRequest req,
                                   Long actorId, Long tenantId) {
         if (req.getSectionIds() == null || req.getSectionIds().isEmpty()) {
             throw new BusinessException("MISSING_TARGET", "sectionIds must be provided");
@@ -892,7 +1053,17 @@ public class AuditEngagementService {
         // Reset submission flag so auditee can re-upload
         control.setAuditeeEvidenceSubmitted(false);
         control.setAuditeeEvidenceSubmittedAt(null);
+        // A control submitted without evidence can be sent back too — it is open again.
+        control.setEvidenceGapReason(null);
+        control.setEvidenceGapAt(null);
+        control.setEvidenceGapBy(null);
         controlInstanceRepository.save(control);
+
+        // The section (and the clauses above it) are no longer complete, and the
+        // control's EVIDENCE_UPLOADED checklist item is open again — otherwise
+        // the evidence step could close on a control that is waiting for evidence.
+        reopenEvidenceSectionChain(control.getSectionInstanceId(), sentBackBy);
+        uncompleteControlItem("EVIDENCE_UPLOADED", controlInstanceId, engagementId);
 
         // Notify the assigned auditee
         Long auditeeId = control.getAuditeeAssignedUserId();
@@ -909,6 +1080,11 @@ public class AuditEngagementService {
             notificationService.send(auditeeId, "AUDIT_EVIDENCE_SENT_BACK", msg,
                     "AUDIT_CONTROL_INSTANCE", controlInstanceId);
         }
+
+        // A notification is read once and gone. The send-back is work, so it also
+        // becomes a CONTROL_REOPEN item in the same person's inbox (mirrors the
+        // vendor side's CONTRIBUTOR_REOPEN) and closes when evidence is resubmitted.
+        obligationService.raiseControlReopen(control, reason, sentBackBy, tenantId);
 
         log.info("[AUDIT-ENG-SERVICE] Control sent back for evidence | controlInstanceId={} | by={} | reason={}",
                 controlInstanceId, sentBackBy, reason);
@@ -927,36 +1103,33 @@ public class AuditEngagementService {
         // Section ownership check — submitter must be the assigned auditee of this control's
         // parent section (or explicitly assigned to this control). Prevents Vikram from
         // submitting evidence for controls in Anita's sections.
-        if (submittedBy != null) {
-            AuditSectionInstance parentSection = control.getSectionInstanceId() != null
-                    ? sectionInstanceRepository.findById(control.getSectionInstanceId()).orElse(null)
-                    : null;
-            boolean isControlOwner   = submittedBy.equals(control.getAuditeeAssignedUserId());
-            boolean isSectionOwner   = parentSection != null
-                    && submittedBy.equals(parentSection.getAuditeeAssignedUserId());
-            boolean isEngagementOwner = engagementRepository.findById(engagementId)
-                    .map(e -> submittedBy.equals(e.getLeadAuditorId())
-                            || submittedBy.equals(e.getOwnerId()))
-                    .orElse(false);
-            if (!isControlOwner && !isSectionOwner && !isEngagementOwner) {
-                throw new BusinessException("NOT_EVIDENCE_OWNER",
-                        "You are not assigned as evidence owner for this control or its section");
-            }
-        }
+        //
+        // Was an inline three-tier check of its own, NOT the same as the guard the
+        // instance endpoint uses: it let the LEAD AUDITOR submit the auditee's
+        // evidence, ignored delegations, and looked at the direct section only.
+        // One rule now — ControlAccessGuard — so the two submit paths cannot
+        // disagree. NOT_EVIDENCE_OWNER is retired: no client reads it (checked),
+        // and the guard's CONTROL_NOT_ASSIGNED is the code every other control
+        // endpoint already returns.
+        controlAccessGuard.requireCanSubmitEvidence(control, submittedBy);
 
-        // Require at least one uploaded document OR automated evidence before allowing submit
-        boolean hasManualDocs = !documentLinkRepository
-                .findAllActiveByEntity("AUDIT_CONTROL_INSTANCE", controlInstanceId).isEmpty();
-        boolean hasAutomatedEvidence = evidenceLinkRepository
-                .countAcceptedForEntity("AUDIT_CONTROL_INSTANCE", controlInstanceId) > 0;
-        if (!hasManualDocs && !hasAutomatedEvidence) {
+        // Require at least one uploaded document OR live linked evidence — see hasSubmittableEvidence.
+        if (!hasSubmittableEvidence(control)) {
             throw new BusinessException("NO_EVIDENCE",
                     "Please upload at least one evidence file before submitting.");
         }
 
         control.setAuditeeEvidenceSubmitted(true);
-        control.setAuditeeEvidenceSubmittedAt(java.time.LocalDateTime.now());
+        control.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
+        // Evidence arrived after all — the earlier "submitted without evidence" no longer applies.
+        control.setEvidenceGapReason(null);
+        control.setEvidenceGapAt(null);
+        control.setEvidenceGapBy(null);
         controlInstanceRepository.save(control);
+
+        // Doing the work closes the submitter's own evidence delegation and any
+        // send-back reopen on this control — nothing else attached to it.
+        obligationService.onEvidenceSubmitted(controlInstanceId, submittedBy, tenantId);
 
         // Auto-submit parent section when all its controls have evidence submitted.
         // Auditees don't manually submit sections — it happens automatically when
@@ -965,6 +1138,8 @@ public class AuditEngagementService {
 
         // Fire section event for engagement-level workflow (WF14 SOC2 Type II)
         fireControlSectionEvent("EVIDENCE_UPLOADED", controlInstanceId, engagementId, submittedBy);
+
+        notifyEvidenceSubmitted(control, submittedBy, null);
 
         // Note: Step 5 (Evidence Submission) advances via manual APPROVE by lead auditor,
         // not by auto-gate. This allows partial evidence submission — auditors can
@@ -975,44 +1150,413 @@ public class AuditEngagementService {
     }
 
     /**
+     * What submitControlEvidence accepts as evidence: an uploaded document, or a
+     * live linked one. Shared with AuditSectionSubmissionService so "ready to
+     * submit" in the section dialog means exactly what the submit will accept.
+     */
+    public boolean hasSubmittableEvidence(AuditControlInstance control) {
+        Long controlInstanceId = control.getId();
+        boolean hasManualDocs = !documentLinkRepository
+                .findAllActiveByEntity("AUDIT_CONTROL_INSTANCE", controlInstanceId).isEmpty();
+        // Linked evidence counts too — pulled from integrations (KashiLink),
+        // reused from another engagement or auto-tagged — as long as the link is
+        // live: awaiting review, accepted or automation-verified. It used to need
+        // ACCEPTED, but pulled links arrive PENDING_REVIEW and the auditor reviews
+        // AFTER the auditee submits, so a control whose only evidence was pulled
+        // could never be submitted (and so its section never auto-submitted).
+        // REJECTED and EXPIRED links still do not count.
+        boolean hasAutomatedEvidence = evidenceLinkRepository
+                .findByTargetEntityTypeAndTargetEntityIdAndTenantId(
+                        "AUDIT_CONTROL_INSTANCE", controlInstanceId, control.getTenantId())
+                .stream()
+                .anyMatch(l -> l.getStatus() == com.kashi.grc.evidence.domain.EvidenceLink.Status.PENDING_REVIEW
+                        || l.getStatus() == com.kashi.grc.evidence.domain.EvidenceLink.Status.ACCEPTED
+                        || l.getStatus() == com.kashi.grc.evidence.domain.EvidenceLink.Status.AUTOMATION_VERIFIED);
+        return hasManualDocs || hasAutomatedEvidence;
+    }
+
+    // ── BULK SUBMIT OF LINKED EVIDENCE ────────────────────────────────────────
+
+    /**
+     * Permission for submitting, in one go, controls whose evidence is LINKED
+     * (pulled from an integration, reused, auto-tagged) but not yet submitted.
+     */
+    public static final String BULK_SUBMIT_PERMISSION = "audit:evidence:bulk-submit";
+
+    /**
+     * Submits every control (of {@code controlIds}, or of the whole engagement
+     * when none are given) that has LIVE linked evidence and is not submitted
+     * yet — for the case where the auditee side is confident the linked
+     * evidence will do, and clicking Submit on each control would be busywork.
+     * Freshly uploaded evidence is submitted by its owner one control at a
+     * time, as before; this only touches controls that HAVE linked evidence.
+     *
+     * Who:
+     *   • must hold audit:evidence:bulk-submit, and per control be
+     *   • the engagement's lead auditee            → any control, or
+     *   • the auditee owner of the control's section or a section above it
+     *                                              → controls under that section, or
+     *   • someone ControlAccessGuard already lets submit that control
+     *     (its assignee, a delegate, an override holder).
+     * Controls outside that scope are skipped and reported, not refused as a
+     * whole — so a section owner can press one button on a mixed list.
+     *
+     * Each submission has the same effects as the single Submit: the flag and
+     * timestamp, the evidence delegation / send-back closed (for the person
+     * pressing the button AND the control's evidence owner, since the owner's
+     * work is now done), section auto-submit with roll-up, and the
+     * EVIDENCE_UPLOADED item ticked on the submitter's task and on the owner's.
+     *
+     * Linked evidence still has to pass the auditor's review: submitting only
+     * hands it over, exactly as a single Submit does.
+     *
+     * @return { submitted: n, submittedControlIds: [...], skipped: [{controlId, reason}] }
+     */
+    @Transactional
+    public Map<String, Object> bulkSubmitLinkedEvidence(Long engagementId, List<Long> controlIds,
+                                                        Long submittedBy, Long tenantId) {
+        if (!controlAccessGuard.callerHolds(BULK_SUBMIT_PERMISSION)) {
+            throw new BusinessException("BULK_SUBMIT_DENIED",
+                    "You do not have permission to submit linked evidence in bulk ("
+                            + BULK_SUBMIT_PERMISSION + ")",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        AuditEngagement engagement = engagementRepository.findById(engagementId)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditEngagement", engagementId));
+
+        List<AuditControlInstance> controls = controlInstanceRepository.findByEngagementId(engagementId);
+        boolean explicit = controlIds != null && !controlIds.isEmpty();
+        if (explicit) {
+            Set<Long> wanted = new HashSet<>(controlIds);
+            controls = controls.stream().filter(c -> wanted.contains(c.getId())).toList();
+        }
+
+        List<Map<String, Object>> skipped = new ArrayList<>();
+        List<AuditControlInstance> done = new ArrayList<>();
+        if (!controls.isEmpty()) {
+            Set<Long> live = evidenceLinkRepository.entityIdsWithLiveLink(
+                    "AUDIT_CONTROL_INSTANCE", controls.stream().map(AuditControlInstance::getId).toList());
+            Map<Long, AuditSectionInstance> sections = new HashMap<>();
+            sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId)
+                    .forEach(s -> sections.put(s.getId(), s));
+            boolean leadAuditee = submittedBy.equals(engagement.getLeadAuditeeId());
+            var ev = controlAccessGuard.evaluator(engagementId, submittedBy).prefetchControls(controls);
+            LocalDateTime now = LocalDateTime.now();
+
+            for (AuditControlInstance c : controls) {
+                if (c.isAuditeeEvidenceSubmitted()) {
+                    if (explicit) skipped.add(skip(c, "ALREADY_SUBMITTED"));
+                    continue;
+                }
+                if (!live.contains(c.getId())) {
+                    if (explicit) skipped.add(skip(c, "NO_LINKED_EVIDENCE"));
+                    continue;
+                }
+                boolean inScope = leadAuditee
+                        || ownsSectionChain(c.getSectionInstanceId(), submittedBy, sections)
+                        || ev.canAct(c, true);
+                if (!inScope) {
+                    skipped.add(skip(c, "NOT_YOURS"));
+                    continue;
+                }
+                c.setAuditeeEvidenceSubmitted(true);
+                c.setAuditeeEvidenceSubmittedAt(now);
+                c.setEvidenceGapReason(null);
+                c.setEvidenceGapAt(null);
+                c.setEvidenceGapBy(null);
+                controlInstanceRepository.save(c);
+                done.add(c);
+            }
+
+            Map<Long, Long> taskByUser = new HashMap<>();
+            Set<Long> sectionIds = new LinkedHashSet<>();
+            for (AuditControlInstance c : done) {
+                Long owner = effectiveEvidenceOwner(c, sections);
+                obligationService.onEvidenceSubmitted(c.getId(), submittedBy, tenantId);
+                if (owner != null && !owner.equals(submittedBy)) {
+                    obligationService.onEvidenceSubmitted(c.getId(), owner, tenantId);
+                }
+                for (Long uid : owner != null && !owner.equals(submittedBy)
+                        ? List.of(submittedBy, owner) : List.of(submittedBy)) {
+                    Long taskId = taskByUser.computeIfAbsent(uid,
+                            u -> Optional.ofNullable(
+                                    resolveActorTaskInstanceId(engagementId, u, "EVIDENCE_UPLOADED")).orElse(-1L));
+                    if (taskId > 0) {
+                        fireControlSectionEventWithResolvedTask("EVIDENCE_UPLOADED", c.getId(), taskId, uid);
+                    }
+                }
+                if (c.getSectionInstanceId() != null) sectionIds.add(c.getSectionInstanceId());
+            }
+            for (Long sid : sectionIds) autoSubmitSectionIfComplete(sid, engagementId, submittedBy);
+        }
+
+        log.info("[AUDIT-ENG-SERVICE] Bulk linked-evidence submit | engagementId={} | by={} | submitted={} | skipped={}",
+                engagementId, submittedBy, done.size(), skipped.size());
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("submitted",           done.size());
+        result.put("submittedControlIds", done.stream().map(AuditControlInstance::getId).toList());
+        result.put("skipped",             skipped);
+        return result;
+    }
+
+    private static Map<String, Object> skip(AuditControlInstance c, String reason) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("controlId", c.getId());
+        m.put("controlCode", c.getControlCodeSnapshot());
+        m.put("reason", reason);
+        return m;
+    }
+
+    /** The caller is the auditee owner of this section or of any section above it. */
+    private static boolean ownsSectionChain(Long sectionId, Long userId,
+                                            Map<Long, AuditSectionInstance> sections) {
+        Long cur = sectionId;
+        for (int hops = 0; cur != null && hops < 64; hops++) {
+            AuditSectionInstance s = sections.get(cur);
+            if (s == null) return false;
+            if (userId.equals(s.getAuditeeAssignedUserId())) return true;
+            cur = s.getParentInstanceId();
+        }
+        return false;
+    }
+
+    /** The control's evidence owner: its own auditee, else its section's. */
+    private static Long effectiveEvidenceOwner(AuditControlInstance c, Map<Long, AuditSectionInstance> sections) {
+        if (c.getAuditeeAssignedUserId() != null) return c.getAuditeeAssignedUserId();
+        AuditSectionInstance s = c.getSectionInstanceId() != null ? sections.get(c.getSectionInstanceId()) : null;
+        return s != null ? s.getAuditeeAssignedUserId() : null;
+    }
+
+    /**
      * Fires a project-level section completion event when ALL controls in a
      * project-governed engagement have evidence submitted.
      * Advances the Evidence Submission step (WF16 Step 5) section gate so the
      * step auto-approves once all engagements in the programme are fully evidenced.
      */
     /**
-     * Auto-submits a section when ALL controls within it have evidence submitted.
-     * Called after each control evidence submission — no-op until the last control is done.
-     * This removes the need for auditees to manually click "Submit section".
+     * Auto-submits a section when ALL controls within it have evidence submitted,
+     * then ROLLS UP: each ancestor auto-submits once every child section is
+     * submitted and its own controls (if it has any) all have evidence.
+     * Called after each control evidence submission — a no-op until the last
+     * control in the section is done.
+     *
+     * WAS: the control's own section only. Controls hang on leaf sections, so a
+     * parent clause (A.5, CC6 …) has no controls of its own and returned at
+     * "sectionControls.isEmpty()" — parents never auto-submitted, the Sections
+     * tab showed every clause open with all of its children done, and
+     * submittedSections never reached totalSections.
      */
     private void autoSubmitSectionIfComplete(Long sectionInstanceId, Long engagementId, Long submittedBy) {
         if (sectionInstanceId == null) return;
         try {
             AuditSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId).orElse(null);
-            if (section == null || section.getSubmittedAt() != null) return; // already submitted
+            if (section == null) return;
 
-            // Check all controls in this section have evidence
-            List<AuditControlInstance> sectionControls =
-                    controlInstanceRepository.findBySectionInstanceIdOrderByOrderNoAsc(sectionInstanceId);
-            if (sectionControls.isEmpty()) return;
+            if (section.getSubmittedAt() == null) {
+                List<AuditControlInstance> sectionControls =
+                        controlInstanceRepository.findBySectionInstanceIdOrderByOrderNoAsc(sectionInstanceId);
+                if (sectionControls.isEmpty()) return;
+                if (!sectionControls.stream().allMatch(AuditEngagementService::evidenceDone)) return;
+                markAutoSubmitted(section, submittedBy);
+            }
 
-            boolean allDone = sectionControls.stream()
-                    .allMatch(AuditControlInstance::isAuditeeEvidenceSubmitted);
-            if (!allDone) return;
-
-            // All controls done — auto-submit the section
-            LocalDateTime now = LocalDateTime.now();
-            section.setSubmittedAt(now);
-            section.setSubmittedBy(submittedBy);
-            if (section.getAuditeeSubmittedAt() == null) section.setAuditeeSubmittedAt(now);
-            sectionInstanceRepository.save(section);
-
-            log.info("[AUDIT-ENG-SERVICE] Section auto-submitted | sectionInstanceId={} | engagementId={} | by={}",
-                    sectionInstanceId, engagementId, submittedBy);
+            // Roll up through the ancestors.
+            Long parentId = section.getParentInstanceId();
+            int hops = 0;
+            while (parentId != null && hops++ < 64) {
+                AuditSectionInstance parent = sectionInstanceRepository.findById(parentId).orElse(null);
+                if (parent == null || parent.getSubmittedAt() != null) break;
+                List<AuditSectionInstance> children =
+                        sectionInstanceRepository.findByParentInstanceIdOrderByOrderNoAsc(parentId);
+                boolean childrenDone = children.stream().allMatch(c -> c.getSubmittedAt() != null);
+                boolean ownDone = controlInstanceRepository.findBySectionInstanceIdOrderByOrderNoAsc(parentId)
+                        .stream().allMatch(AuditEngagementService::evidenceDone);
+                if (!childrenDone || !ownDone) break;
+                markAutoSubmitted(parent, submittedBy);
+                parentId = parent.getParentInstanceId();
+            }
         } catch (Exception ex) {
             log.warn("[AUDIT-ENG-SERVICE] Section auto-submit failed (non-fatal) | sectionInstanceId={} | {}",
                     sectionInstanceId, ex.getMessage());
         }
+    }
+
+    /** Evidence submitted, or submitted without evidence for a recorded reason. */
+    static boolean evidenceDone(AuditControlInstance c) {
+        return c.isAuditeeEvidenceSubmitted() || (c.getEvidenceGapReason() != null && !c.getEvidenceGapReason().isBlank());
+    }
+
+    /**
+     * Submit one control WITHOUT evidence, for a reason — the evidence owner's
+     * answer when they submit a section with this control still empty. Same
+     * side effects as submitControlEvidence (delegation closed, section roll-up,
+     * checklist item ticked) except that it is not evidence: the submitted flag
+     * stays false, so concluding the control effective still needs evidence or
+     * the auditor's own override. Callers run the access guard first.
+     */
+    @Transactional
+    public void submitControlWithoutEvidence(AuditControlInstance control, String reason, Long userId, Long tenantId) {
+        control.setEvidenceGapReason(reason.trim());
+        control.setEvidenceGapAt(LocalDateTime.now());
+        control.setEvidenceGapBy(userId);
+        controlInstanceRepository.save(control);
+        obligationService.onEvidenceSubmitted(control.getId(), userId, tenantId);
+        autoSubmitSectionIfComplete(control.getSectionInstanceId(), control.getEngagementId(), userId);
+        fireControlSectionEvent("EVIDENCE_UPLOADED", control.getId(), control.getEngagementId(), userId);
+        notifyEvidenceSubmitted(control, userId, reason);
+        log.info("[AUDIT-ENG-SERVICE] Control submitted without evidence | controlInstanceId={} | by={} | reason={}",
+                control.getId(), userId, reason);
+    }
+
+    /**
+     * Leave one control untested, for a reason — the tester's answer when they
+     * submit their testing with it still NOT_TESTED. The result stays
+     * NOT_TESTED (not a conclusion; counts and scores are unchanged) and the
+     * report shows the reason as a scope limitation. Closes the tester's
+     * delegation and ticks the checklist item. Callers run the access guard first.
+     */
+    @Transactional
+    public void markControlNotTested(AuditControlInstance control, String reason, Long userId, Long tenantId) {
+        control.setNotTestedReason(reason.trim());
+        control.setNotTestedAt(LocalDateTime.now());
+        control.setNotTestedBy(userId);
+        controlInstanceRepository.save(control);
+        obligationService.onControlResultRecorded(control.getId(), userId, tenantId);
+        fireControlSectionEvent("TEST_RECORDED", control.getId(), control.getEngagementId(), userId);
+        log.info("[AUDIT-ENG-SERVICE] Control left untested | controlInstanceId={} | by={} | reason={}",
+                control.getId(), userId, reason);
+    }
+
+    /**
+     * Auditee-side reopen: the evidence owner's side (section owner, the
+     * delegator, lead auditee, engagement owner, override) is not satisfied
+     * with what was submitted and wants it redone BEFORE the auditor concludes.
+     * The control goes back to open exactly as an auditor send-back does — flag
+     * cleared, section un-submitted, checklist item reopened — and the work goes
+     * back to whoever did it: their delegation is reopened, or, with no
+     * delegation, the control's owner gets a reopen item. Callers check access.
+     */
+    @Transactional
+    public void reopenEvidenceByAuditeeSide(AuditControlInstance control, String reason, Long reopenedBy, Long tenantId) {
+        control.setAuditeeEvidenceSubmitted(false);
+        control.setAuditeeEvidenceSubmittedAt(null);
+        control.setEvidenceGapReason(null);
+        control.setEvidenceGapAt(null);
+        control.setEvidenceGapBy(null);
+        controlInstanceRepository.save(control);
+        reopenEvidenceSectionChain(control.getSectionInstanceId(), reopenedBy);
+        uncompleteControlItem("EVIDENCE_UPLOADED", control.getId(), control.getEngagementId());
+        if (!obligationService.reopenLastEvidenceDelegation(control, reopenedBy, reason, tenantId)) {
+            // No delegation to give back — the control's owner gets a reopen item.
+            // raiseControlReopen itself only raises the item (the auditor's
+            // send-back notifies separately), so say so here.
+            Long to = obligationService.raiseControlReopen(control, reason, reopenedBy, tenantId);
+            if (to != null) {
+                String who = userRepository.findById(reopenedBy)
+                        .map(u -> u.getFullName() != null && !u.getFullName().isBlank() ? u.getFullName().trim() : u.getEmail())
+                        .orElse("Someone");
+                String label = (control.getControlCodeSnapshot() != null ? control.getControlCodeSnapshot() + " — " : "")
+                        + (control.getControlNameSnapshot() != null ? control.getControlNameSnapshot() : "control #" + control.getId());
+                try {
+                    notificationService.send(to, "AUDIT_EVIDENCE_REOPENED",
+                            who + " asked you to resubmit the evidence for " + label
+                                    + (reason == null || reason.isBlank() ? "" : ": " + reason.trim()),
+                            "AUDIT_CONTROL_INSTANCE", control.getId());
+                } catch (RuntimeException e) {
+                    log.warn("[AUDIT-ENG-SERVICE] Reopen notification failed (non-fatal) | {}", e.getMessage());
+                }
+            }
+        }
+        log.info("[AUDIT-ENG-SERVICE] Evidence reopened by auditee side | controlInstanceId={} | by={} | reason={}",
+                control.getId(), reopenedBy, reason);
+    }
+
+    /** A document was reused onto this control: submit its evidence as the person who reused it (no-op if already submitted). */
+    @Transactional
+    public void submitReusedEvidence(Long controlInstanceId, Long reusedBy, Long tenantId) {
+        AuditControlInstance control = controlInstanceRepository.findById(controlInstanceId).orElse(null);
+        if (control == null || control.isAuditeeEvidenceSubmitted() || control.isTestConcluded()) return;
+        submitControlEvidence(control.getEngagementId(), controlInstanceId, reusedBy, tenantId);
+    }
+
+    /**
+     * Linked evidence on this control was ACCEPTED by a reviewer, or arrived
+     * AUTOMATION_VERIFIED from an integration. Approved evidence is not pending,
+     * so the control counts as submitted everywhere — not only on the card:
+     * the submitted flag, the evidence delegations closed, the section roll-up,
+     * and the owner's checklist item ticked. No-op when already submitted.
+     */
+    @Transactional
+    public void recordAcceptedEvidence(Long controlInstanceId, Long acceptedBy) {
+        AuditControlInstance control = controlInstanceRepository.findById(controlInstanceId).orElse(null);
+        if (control == null || control.isAuditeeEvidenceSubmitted()) return;
+        control.setAuditeeEvidenceSubmitted(true);
+        control.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
+        control.setEvidenceGapReason(null);
+        control.setEvidenceGapAt(null);
+        control.setEvidenceGapBy(null);
+        controlInstanceRepository.save(control);
+        obligationService.onEvidenceSubmitted(controlInstanceId, acceptedBy, control.getTenantId());
+        autoSubmitSectionIfComplete(control.getSectionInstanceId(), control.getEngagementId(), acceptedBy);
+        fireControlSectionEvent("EVIDENCE_UPLOADED", controlInstanceId, control.getEngagementId(), acceptedBy);
+        log.info("[AUDIT-ENG-SERVICE] Accepted linked evidence counts as submitted | controlInstanceId={} | by={}",
+                controlInstanceId, acceptedBy);
+    }
+
+    /** Ticks an already-done control on the caller's checklist (idempotent) — see AuditSectionSubmissionService. */
+    public void tickControl(String completionEvent, Long controlInstanceId, Long engagementId, Long userId) {
+        fireControlSectionEvent(completionEvent, controlInstanceId, engagementId, userId);
+    }
+
+    private void markAutoSubmitted(AuditSectionInstance section, Long submittedBy) {
+        LocalDateTime now = LocalDateTime.now();
+        section.setSubmittedAt(now);
+        section.setSubmittedBy(submittedBy);
+        if (section.getAuditeeSubmittedAt() == null) {
+            section.setAuditeeSubmittedAt(now);
+            section.setAuditeeSubmittedBy(submittedBy);
+        }
+        sectionInstanceRepository.save(section);
+        log.info("[AUDIT-ENG-SERVICE] Section auto-submitted | sectionInstanceId={} | engagementId={} | by={}",
+                section.getId(), section.getEngagementId(), submittedBy);
+    }
+
+    /**
+     * The inverse of auto-submission: a control in this section needs evidence
+     * again (sent back, or its task was reset), so the section — and every
+     * ancestor that rolled up on top of it — is no longer complete.
+     *
+     * WAS: send-back cleared the control's flag and left the section SUBMITTED,
+     * so the Sections tab and the stats reported it done while a control in it
+     * was waiting for the auditee, and auto-submission could not re-fire
+     * later (it skips submitted sections).
+     *
+     * @return how many sections were reopened
+     */
+    public int reopenEvidenceSectionChain(Long sectionInstanceId, Long reopenedBy) {
+        int reopened = 0;
+        Long current = sectionInstanceId;
+        int hops = 0;
+        LocalDateTime now = LocalDateTime.now();
+        while (current != null && hops++ < 64) {
+            AuditSectionInstance s = sectionInstanceRepository.findById(current).orElse(null);
+            if (s == null) break;
+            if (s.getSubmittedAt() != null || s.getAuditeeSubmittedAt() != null) {
+                s.setSubmittedAt(null);
+                s.setSubmittedBy(null);
+                s.setAuditeeSubmittedAt(null);
+                s.setAuditeeSubmittedBy(null);
+                s.setReopenedAt(now);
+                s.setReopenedBy(reopenedBy);
+                s.setAuditeeReopenedAt(now);
+                s.setAuditeeReopenedBy(reopenedBy);
+                sectionInstanceRepository.save(s);
+                reopened++;
+            }
+            current = s.getParentInstanceId();
+        }
+        return reopened;
     }
 
     /**
@@ -1026,10 +1570,10 @@ public class AuditEngagementService {
         List<AuditControlInstance> controls =
                 controlInstanceRepository.findByEngagementId(engagementId);
         if (controls.isEmpty()) return 0;
-        java.util.List<Long> ids = controls.stream()
+        List<Long> ids = controls.stream()
                 .map(AuditControlInstance::getId).toList();
-        java.util.Set<Long> withReused = evidenceLinkRepository
-                .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", ids);
+        Set<Long> withReused = evidenceLinkRepository
+                .entityIdsWithLiveLink("AUDIT_CONTROL_INSTANCE", ids);
         return (int) controls.stream()
                 .filter(c -> c.isAuditeeEvidenceSubmitted() || withReused.contains(c.getId()))
                 .count();
@@ -1049,10 +1593,10 @@ public class AuditEngagementService {
             // adequacy is judged later in the auditor's review/testing step (PASS/FAIL
             // + findings), NOT gated here. So presence (direct OR reused) advances the
             // evidence-submission step.
-            java.util.List<Long> controlIds = allControls.stream()
+            List<Long> controlIds = allControls.stream()
                     .map(AuditControlInstance::getId).toList();
-            java.util.Set<Long> controlsWithReusedEvidence = evidenceLinkRepository
-                    .entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", controlIds);
+            Set<Long> controlsWithReusedEvidence = evidenceLinkRepository
+                    .entityIdsWithLiveLink("AUDIT_CONTROL_INSTANCE", controlIds);
 
             long submittedCount = allControls.stream()
                     .filter(c -> c.isAuditeeEvidenceSubmitted()
@@ -1107,23 +1651,69 @@ public class AuditEngagementService {
         if (!control.getEngagementId().equals(engagementId))
             throw new BusinessException("CONTROL_MISMATCH", "Control does not belong to this engagement");
 
-        // Evidence must exist before recording a test result.
-        // Checks both the legacy boolean flag AND the evidence_links table
-        // (which covers both MANUAL uploaded files and AUTOMATED integration evidence).
-        boolean hasEvidence = control.isAuditeeEvidenceSubmitted()
-                || evidenceLinkRepository.countAcceptedForEntity(
-                "AUDIT_CONTROL_INSTANCE", controlInstanceId) > 0;
-        if (!hasEvidence) {
-            throw new BusinessException("EVIDENCE_NOT_SUBMITTED",
-                    "Evidence has not been submitted for this control. " +
-                            "The auditee must upload and submit evidence before the auditor can record a test result.");
+        return recordControlResult(control, req, testedBy, tenantId);
+    }
+
+    /**
+     * THE one way a control-level result is recorded. Both endpoints call it:
+     *   PUT /v1/audit/engagements/{id}/controls/{cid}/test-result  (EngagementControlsTab)
+     *   PUT /v1/audit/control-instances/{id}/test-result           (ControlFieldworkTab)
+     *
+     * They used to be two implementations with different side effects. The
+     * control-instance one saved the result but never updated engagement
+     * counters, never fired TEST_RECORDED (so the section gate could stall with
+     * every control tested), and gated evidence differently. Callers must have
+     * run ControlAccessGuard.requireCanRecordResult already.
+     *
+     * EVIDENCE GATE — only a POSITIVE conclusion (EFFECTIVE, PARTIALLY_EFFECTIVE)
+     * must rest on evidence. INEFFECTIVE carries its own record (the finding), and
+     * "no evidence was provided" is itself a legitimate reason to conclude
+     * ineffective — gating it deadlocked the auditor whenever the auditee never
+     * uploaded. NOT_APPLICABLE / NOT_TESTED are not conclusions.
+     * Evidence counts if ANY of what either endpoint used to accept is present:
+     * the submitted flag, an accepted link on the control, or any link on the
+     * control or its required tests — so nothing that passed before is refused.
+     * Without evidence, an explicit override WITH a reason is accepted and logged.
+     */
+    @Transactional
+    public AuditControlInstance recordControlResult(AuditControlInstance control,
+                                                    AuditControlTestRequest req,
+                                                    Long testedBy, Long tenantId) {
+        if (req == null || req.getTestResult() == null) {
+            throw new BusinessException("TEST_RESULT_REQUIRED", "testResult is required");
+        }
+        Long controlInstanceId = control.getId();
+        Long engagementId      = control.getEngagementId();
+
+        boolean positiveConclusion =
+                req.getTestResult() == AuditControlInstance.TestResult.EFFECTIVE
+                        || req.getTestResult() == AuditControlInstance.TestResult.PARTIALLY_EFFECTIVE;
+        boolean override = Boolean.TRUE.equals(req.getEvidenceOverride());
+        if (override && (req.getEvidenceOverrideReason() == null || req.getEvidenceOverrideReason().isBlank())) {
+            throw new BusinessException("OVERRIDE_REASON_REQUIRED", "An override needs a reason");
+        }
+        if (positiveConclusion && !override && !hasEvidenceForConclusion(control)) {
+            throw new BusinessException("EVIDENCE_REQUIRED",
+                    "Attach evidence before concluding this control effective, or record an override reason");
+        }
+        if (override) {
+            log.warn("[AUDIT] Evidence gate overridden | controlInstanceId={} by={} reason={}",
+                    controlInstanceId, testedBy, req.getEvidenceOverrideReason());
         }
 
         control.setTestResult(req.getTestResult());
-        control.setTestNotes(req.getTestNotes());
-        control.setTestProcedure(req.getTestProcedure());
+        // Only overwrite what the caller sent — the fieldwork tab sends notes but
+        // no procedure, and must not wipe a procedure recorded from the list.
+        if (req.getTestNotes()     != null) control.setTestNotes(req.getTestNotes());
+        if (req.getTestProcedure() != null) control.setTestProcedure(req.getTestProcedure());
         control.setTestedAt(LocalDateTime.now());
         control.setTestedBy(testedBy);
+        // A conclusion replaces an earlier "left untested" (unless it IS not-tested).
+        if (req.getTestResult() != AuditControlInstance.TestResult.NOT_TESTED) {
+            control.setNotTestedReason(null);
+            control.setNotTestedAt(null);
+            control.setNotTestedBy(null);
+        }
 
         if (req.getFindingIssueId() != null) {
             control.setFindingLinked(true);
@@ -1133,13 +1723,26 @@ public class AuditEngagementService {
         controlInstanceRepository.save(control);
         updateEngagementCounts(engagementId);
 
+        // The tester's own control-test delegation is done.
+        obligationService.onControlResultRecorded(controlInstanceId, testedBy, tenantId);
+
         // Fire section completion event so compound section gate advances the workflow
         // step when all of the auditor's controls have been tested.
         fireControlSectionEvent("TEST_RECORDED", controlInstanceId, engagementId, testedBy);
 
-        log.info("[AUDIT] Control tested | controlInstanceId={} | result={}",
-                controlInstanceId, req.getTestResult());
+        log.info("[AUDIT] Control tested | controlInstanceId={} | result={}{}",
+                controlInstanceId, req.getTestResult(), override ? " | evidence override" : "");
         return control;
+    }
+
+    /** See recordControlResult — the union of what both endpoints used to accept. */
+    private boolean hasEvidenceForConclusion(AuditControlInstance control) {
+        Long id = control.getId();
+        if (control.isAuditeeEvidenceSubmitted()) return true;
+        if (evidenceLinkRepository.countAcceptedForEntity("AUDIT_CONTROL_INSTANCE", id) > 0) return true;
+        if (!evidenceLinkRepository.entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", List.of(id)).isEmpty()) return true;
+        List<Long> requiredTests = controlTestMappingRepository.findRequiredTestInstanceIdsByControlInstanceId(id);
+        return !evidenceLinkRepository.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", requiredTests).isEmpty();
     }
 
     // ── SUBMISSION ────────────────────────────────────────────────────────────
@@ -1653,16 +2256,51 @@ public class AuditEngagementService {
         }
     }
 
+    /**
+     * Companion to fireControlSectionEvent for an assignment that was CLEARED:
+     * resets that control's tracked item to PENDING on every live task of the
+     * active step that tracks this completion event, so the gate re-opens.
+     * The actor who originally completed it is not recorded, so every task is
+     * checked; uncompleteItemByRef is a no-op where the item is absent or
+     * already pending. Never breaks the domain action.
+     */
+    private void uncompleteControlItem(String completionEvent, Long controlInstanceId, Long engagementId) {
+        try {
+            AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
+            if (engagement == null || engagement.getWorkflowInstanceId() == null) return;
+            for (var step : stepInstanceRepository.findByWorkflowInstanceIdAndStatus(
+                    engagement.getWorkflowInstanceId(), StepStatus.IN_PROGRESS)) {
+                List<com.kashi.grc.workflow.domain.TaskInstance> tasks = new ArrayList<>(
+                        taskInstanceRepository.findByStepInstanceIdAndStatus(step.getId(), TaskStatus.IN_PROGRESS));
+                tasks.addAll(taskInstanceRepository.findByStepInstanceIdAndStatus(step.getId(), TaskStatus.PENDING));
+                for (var task : tasks) {
+                    taskSectionCompletionRepository
+                            .findByTaskInstanceIdAndSnapCompletionEvent(task.getId(), completionEvent)
+                            .ifPresent(sec -> taskSectionCompletionService.uncompleteItemByRef(
+                                    task.getId(), sec.getSnapSectionKey(), controlInstanceId));
+                }
+            }
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] uncompleteControlItem failed (non-fatal) | event={} | controlInstanceId={} | {}",
+                    completionEvent, controlInstanceId, ex.getMessage());
+        }
+    }
+
     private void fireControlSectionEvent(String completionEvent,
                                          Long controlInstanceId,
                                          Long engagementId,
                                          Long userId) {
         try {
+            // The control's OWNER on that side too, when someone else did the work —
+            // a delegate usually holds no evidence/testing task of their own, so
+            // ticking only theirs left the owner's checklist item open and the
+            // owner's gate could never close. (The bulk path already did both.)
+            tickOwnerIfDelegated(completionEvent, controlInstanceId, engagementId, userId);
+
             Long taskInstanceId = resolveActorTaskInstanceId(engagementId, userId, completionEvent);
             if (taskInstanceId == null) return; // resolveActorTaskInstanceId already logged why
 
-            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    completionEvent, taskInstanceId, userId, "AUDIT_CONTROL_INSTANCE", controlInstanceId));
+            completeControlOnTask(completionEvent, taskInstanceId, controlInstanceId, userId);
 
             log.info("[AUDIT-ENG-SERVICE] Section event fired | event='{}' | " +
                             "controlInstanceId={} | taskInstanceId={} | userId={}",
@@ -1673,6 +2311,88 @@ public class AuditEngagementService {
             log.warn("[AUDIT-ENG-SERVICE] Section event '{}' failed (non-fatal) | " +
                     "controlInstanceId={} | {}", completionEvent, controlInstanceId, ex.getMessage());
         }
+    }
+
+    /**
+     * Ticks ONE control off the task's checklist.
+     *
+     * WAS: a blanket TaskSectionEvent carrying the control as the artifact. The
+     * listener behind it (TaskSectionCompletionService.onSectionEvent) marks the
+     * whole SECTION complete and never looks at items — so on an item-tracked
+     * gate (EVIDENCE_UPLOADED, CONTROLS_EVALUATED: one item per control) the
+     * first control submitted closed the gate and auto-approved the person's
+     * task, with every other control still open.
+     *
+     * Item-tracked sections now complete the item (completeItemByRef); the gate
+     * closes when the last item does (WorkflowEventListener.onItemCompleted). A
+     * section that tracks no items keeps the old one-shot event, which is right
+     * for it.
+     */
+    /**
+     * Evidence handed over: tell the control's auditor it is ready for review,
+     * and the control's evidence owner when somebody else (a delegate, or the
+     * delegator) did the submitting. Never fails the submission.
+     */
+    private void notifyEvidenceSubmitted(AuditControlInstance c, Long submittedBy, String gapReason) {
+        try {
+            Map<Long, AuditSectionInstance> sections = new HashMap<>();
+            sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(c.getEngagementId())
+                    .forEach(x -> sections.put(x.getId(), x));
+            Long auditor = com.kashi.grc.audit.workflow.AuditControlSectionItemRegistrar.effectiveOwner(c, sections, true);
+            Long owner   = com.kashi.grc.audit.workflow.AuditControlSectionItemRegistrar.effectiveOwner(c, sections, false);
+            String who = userRepository.findById(submittedBy)
+                    .map(u -> u.getFullName() != null && !u.getFullName().isBlank() ? u.getFullName().trim() : u.getEmail())
+                    .orElse("Someone");
+            String ctrl = (c.getControlCodeSnapshot() != null ? c.getControlCodeSnapshot() + " — " : "") + c.getControlNameSnapshot();
+            String what = gapReason == null
+                    ? who + " submitted evidence for " + ctrl
+                    : who + " submitted " + ctrl + " without evidence: " + gapReason;
+            Set<Long> sent = new HashSet<>();
+            if (auditor != null && !auditor.equals(submittedBy) && sent.add(auditor)) {
+                notificationService.send(auditor, "AUDIT_EVIDENCE_SUBMITTED", what + " — ready for your review",
+                        "AUDIT_CONTROL_INSTANCE", c.getId());
+            }
+            if (owner != null && !owner.equals(submittedBy) && sent.add(owner)) {
+                notificationService.send(owner, "AUDIT_EVIDENCE_SUBMITTED", what,
+                        "AUDIT_CONTROL_INSTANCE", c.getId());
+            }
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Evidence notification failed (non-fatal) | controlInstanceId={} | {}",
+                    c.getId(), ex.getMessage());
+        }
+    }
+
+    private void tickOwnerIfDelegated(String completionEvent, Long controlInstanceId, Long engagementId, Long userId) {
+        boolean evidence = "EVIDENCE_UPLOADED".equals(completionEvent);
+        if (!evidence && !"TEST_RECORDED".equals(completionEvent)) return;
+        try {
+            AuditControlInstance c = controlInstanceRepository.findById(controlInstanceId).orElse(null);
+            if (c == null) return;
+            Map<Long, AuditSectionInstance> sections = new HashMap<>();
+            sectionInstanceRepository.findByEngagementIdOrderByPathAscOrderNoAsc(engagementId)
+                    .forEach(x -> sections.put(x.getId(), x));
+            Long owner = com.kashi.grc.audit.workflow.AuditControlSectionItemRegistrar
+                    .effectiveOwner(c, sections, !evidence);
+            if (owner == null || owner.equals(userId)) return;
+            Long ownerTask = resolveActorTaskInstanceId(engagementId, owner, completionEvent);
+            if (ownerTask != null) completeControlOnTask(completionEvent, ownerTask, controlInstanceId, userId);
+        } catch (Exception ex) {
+            log.warn("[AUDIT-ENG-SERVICE] Owner tick failed (non-fatal) | event={} | controlInstanceId={} | {}",
+                    completionEvent, controlInstanceId, ex.getMessage());
+        }
+    }
+
+    void completeControlOnTask(String completionEvent, Long taskInstanceId, Long controlInstanceId, Long userId) {
+        var section = taskSectionCompletionRepository
+                .findByTaskInstanceIdAndSnapCompletionEvent(taskInstanceId, completionEvent)
+                .orElse(null);
+        if (section != null && section.isSnapTracksItems()) {
+            taskSectionCompletionService.completeItemByRef(
+                    taskInstanceId, section.getSnapSectionKey(), controlInstanceId, userId);
+            return;
+        }
+        eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
+                completionEvent, taskInstanceId, userId, "AUDIT_CONTROL_INSTANCE", controlInstanceId));
     }
 
     /**
@@ -1692,6 +2412,7 @@ public class AuditEngagementService {
      * changed between iterations.
      */
     private Long resolveActorTaskInstanceId(Long engagementId, Long userId, String completionEvent) {
+        if (userId == null) return null;   // system actions (integration-verified evidence) hold no task
         AuditEngagement engagement = engagementRepository.findById(engagementId).orElse(null);
         if (engagement == null || engagement.getWorkflowInstanceId() == null) {
             log.debug("[AUDIT-ENG-SERVICE] No workflow instance for engagementId={} — " +
@@ -1741,8 +2462,7 @@ public class AuditEngagementService {
                                                          Long taskInstanceId, Long userId) {
         if (taskInstanceId == null) return;
         try {
-            eventPublisher.publishEvent(TaskSectionEvent.sectionDone(
-                    completionEvent, taskInstanceId, userId, "AUDIT_CONTROL_INSTANCE", controlInstanceId));
+            completeControlOnTask(completionEvent, taskInstanceId, controlInstanceId, userId);
             log.info("[AUDIT-ENG-SERVICE] Section event fired | event='{}' | " +
                             "controlInstanceId={} | taskInstanceId={} | userId={}",
                     completionEvent, controlInstanceId, taskInstanceId, userId);
@@ -1811,7 +2531,7 @@ public class AuditEngagementService {
                 .id(e.getId()).engagementRef(e.getEngagementRef())
                 .projectId(e.getProjectId()).name(e.getName()).description(e.getDescription())
                 .auditType(e.getAuditType()).status(e.getStatus()).frameworkRef(e.getFrameworkRef())
-                .leadAuditorId(e.getLeadAuditorId()).ownerId(e.getOwnerId())
+                .leadAuditorId(e.getLeadAuditorId()).leadAuditeeId(e.getLeadAuditeeId()).ownerId(e.getOwnerId())
                 .totalControls(e.getTotalControls()).snapshotStatus(e.getSnapshotStatus())
                 .testedControls(e.getTestedControls())
                 // Count controls that have evidence PROVIDED — direct submit OR reused

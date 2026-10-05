@@ -45,6 +45,7 @@ public class IssueController {
     private final IssueRepository                                            issueRepository;
     private final com.kashi.grc.audit.service.AuditScopeService              auditScope;
     private final AuditFindingRepository                                     findingRepository;
+    private final com.kashi.grc.workflow.service.WorkflowAccessService      workflowAccessService;
 
     @Value("${app.ingest.token:}")
     private String ingestToken;
@@ -159,9 +160,17 @@ public class IssueController {
             @PathVariable Long id,
             @RequestBody Map<String, String> body) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         Issue.Status newStatus = Issue.Status.valueOf(body.get("status").toUpperCase());
         return ResponseEntity.ok(ApiResponse.success(
                 issueService.updateStatus(id, newStatus, ctx.getId(), ctx.getTenantId())));
+    }
+
+    /** See IssueService.requireCanMoveStatus — the step holder, or an override holder. */
+    private void requireCanMoveStatus(Long id, com.kashi.grc.usermanagement.domain.User ctx) {
+        java.util.List<String> perms = workflowAccessService.resolvePermissions(ctx);
+        boolean override = perms.contains("workflow:step:override") || perms.contains("WORKFLOW_STEP_OVERRIDE");
+        issueService.requireCanMoveStatus(id, ctx.getId(), override);
     }
 
     // ── Dashboard stats ───────────────────────────────────────────────────────
@@ -235,6 +244,7 @@ public class IssueController {
     @Operation(summary = "Triage issue — OPEN → TRIAGED, sets acknowledgedAt")
     public ResponseEntity<ApiResponse<IssueResponse>> triage(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         IssueResponse resp = issueService.updateStatus(
                 id, Issue.Status.TRIAGED, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Triaged | id={} | by={}", id, ctx.getId());
@@ -245,6 +255,7 @@ public class IssueController {
     @Operation(summary = "Start work — TRIAGED → IN_PROGRESS")
     public ResponseEntity<ApiResponse<IssueResponse>> start(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         IssueResponse resp = issueService.updateStatus(
                 id, Issue.Status.IN_PROGRESS, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Started | id={} | by={}", id, ctx.getId());
@@ -255,6 +266,7 @@ public class IssueController {
     @Operation(summary = "Submit for review — IN_PROGRESS → PENDING_REVIEW")
     public ResponseEntity<ApiResponse<IssueResponse>> submitForReview(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         IssueResponse resp = issueService.updateStatus(
                 id, Issue.Status.PENDING_REVIEW, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Submitted for review | id={} | by={}", id, ctx.getId());
@@ -265,6 +277,7 @@ public class IssueController {
     @Operation(summary = "Resolve issue — PENDING_REVIEW → RESOLVED, sets remediatedAt")
     public ResponseEntity<ApiResponse<IssueResponse>> resolve(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         IssueResponse resp = issueService.updateStatus(
                 id, Issue.Status.RESOLVED, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Resolved | id={} | by={}", id, ctx.getId());
@@ -275,6 +288,7 @@ public class IssueController {
     @Operation(summary = "Close issue — RESOLVED → CLOSED, sets closedAt + closedBy")
     public ResponseEntity<ApiResponse<IssueResponse>> close(@PathVariable Long id) {
         var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
         IssueResponse resp = issueService.updateStatus(
                 id, Issue.Status.CLOSED, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Closed | id={} | by={}", id, ctx.getId());

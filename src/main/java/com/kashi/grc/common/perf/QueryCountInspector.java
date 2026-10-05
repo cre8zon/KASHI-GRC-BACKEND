@@ -36,6 +36,11 @@ public final class QueryCountInspector implements StatementInspector {
     public String inspect(String sql) {
         COUNT.get()[0]++;
         LAST.set(sql);
+        // Every statement Hibernate runs passes here — entity saves, collection
+        // join rows, bulk JPQL and native SQL alike — which makes it the one
+        // place that sees every write to the tables behind the login context.
+        // Reads are rejected on the first character; see UserContextCache.
+        com.kashi.grc.common.cache.UserContextCache.onSql(sql);
         return sql;   // never rewrite the statement
     }
 

@@ -713,11 +713,52 @@ public class WorkflowEngineService {
         // Auto-approve all remaining PENDING tasks on this step so the workflow
         // advances immediately — no separate inbox action needed.
         // Covers: issue creation/triage, policy draft submission, evidence upload, etc.
+        //
+        // ── WHY isStepApprovalSatisfied IS NOW PART OF THE CONDITION ──────────
+        //
+        // The three lines above describe a step with ONE actor, which is every
+        // case the flag was written for. On a step with several, it did
+        // something nobody asked for: the FIRST actor to submit expired all the
+        // others and ended the step. The comment below still says "Force step
+        // completion regardless of approval_type", and that is exactly what it
+        // did — approval_type was never consulted.
+        //
+        // Observed on TPRM step 171, "Responders Fill Questionnaires", with two
+        // responders: responder 2 locked their sections, responder 1's task went
+        // straight to EXPIRED with no action from them and no warning to anyone,
+        // and the workflow moved to step 7 with half the questionnaire unanswered.
+        // On an assessment this is not a workflow inconvenience, it is a vendor
+        // assessed on work nobody did.
+        //
+        // isStepApprovalSatisfied already knows the answer and is already called
+        // on the ordinary path thirty lines below. It reads ACTOR tasks only,
+        // excludes REJECTED, and switches on the step's own approval_type:
+        // ANY_ONE, ALL, MAJORITY, THRESHOLD. updateTask above has already moved
+        // THIS task to APPROVED, so it is counted when we ask.
+        //
+        // NOTHING CHANGES FOR ANY EXISTING SINGLE-ACTOR STEP. One actor means
+        // total = 1 and approved = 1, which satisfies every approval_type, so
+        // issue triage, policy submission and evidence upload take the same
+        // branch they always took. ANY_ONE steps with several actors are also
+        // unchanged — one approval satisfies ANY_ONE by definition. The only
+        // behaviour that moves is ALL / MAJORITY / THRESHOLD with more than one
+        // actor, which is the bug.
+        //
+        // When it is not satisfied this block is skipped and execution reaches
+        // the ordinary path below, which calls isStepApprovalSatisfied again,
+        // gets the same false, and leaves the step IN_PROGRESS with the other
+        // actors' tasks PENDING. That path was always correct; it was simply
+        // unreachable whenever this flag was set.
         if (Boolean.TRUE.equals(stepInstance.getSnapAutoCompleteActorOnSubmit())
-                && task.getTaskRole() != TaskRole.ASSIGNER) {
-            log.info("[WORKFLOW-AUTO] autoCompleteActorOnSubmit — expiring all pending tasks | stepInstanceId={}",
-                    stepInstance.getId());
-            // Expire all other PENDING tasks on this step (they are redundant now)
+                && task.getTaskRole() != TaskRole.ASSIGNER
+                && isStepApprovalSatisfied(stepInstance)) {
+            log.info("[WORKFLOW-AUTO] autoCompleteActorOnSubmit — approval satisfied ({}), completing step | " +
+                            "stepInstanceId={} | byTaskId={}",
+                    stepInstance.getSnapApprovalType(), stepInstance.getId(), task.getId());
+            // Expire any PENDING task left on this step. Reachable only once the
+            // step's approval_type is already satisfied, so these are genuinely
+            // redundant — under ALL there are none left to expire, and under
+            // ANY_ONE expiring them is the point of ANY_ONE.
             taskInstanceRepository.findByStepInstanceId(stepInstance.getId()).stream()
                     .filter(t -> t.getStatus() == TaskStatus.PENDING && !t.getId().equals(task.getId()))
                     .forEach(t -> {
@@ -725,7 +766,8 @@ public class WorkflowEngineService {
                         t.setActedAt(java.time.LocalDateTime.now());
                         taskInstanceRepository.save(t);
                     });
-            // Force step completion regardless of approval_type
+            // Complete the step. No longer "regardless of approval_type" — the
+            // condition above is approval_type, asked properly.
             completeStep(stepInstance, StepStatus.APPROVED, "Auto-completed on form submit");
             expirePendingTasks(stepInstance, task.getId());
             recordHistory(instance, stepInstance, task, "STEP_AUTO_COMPLETED_ON_SUBMIT",
@@ -1697,11 +1739,73 @@ public class WorkflowEngineService {
                         || side.equalsIgnoreCase(s.getAssignableSide()))
                 .toList();
 
+        // ── ONE NARROW PRECEDENCE RULE, THE UNION OTHERWISE UNCHANGED ────────
+        //
+        // THE BUG: this method unioned assignable_role_id with the actor roles
+        // of EVERY step on the requested side. TPRM has five VENDOR steps, so
+        // the "assign a responder" picker offered the VRM, the vendor CISO and
+        // both responders — every vendor-side role in the workflow. Audit has
+        // the same shape and the same symptom.
+        //
+        // THE RULE: when the step the picker is being used FROM says, in its
+        // own two columns, "this step assigns to side X, role Y" — that is the
+        // answer. Nothing widens it.
+        //
+        // Deliberately narrow, on two axes:
+        //
+        //   * Only the CURRENT step's columns count, not every matched step's.
+        //     Workflow 14 step 195 carries assignable_role_id=35 (an AUDITEE
+        //     evidence owner) while its own side is AUDITOR. Reading role 35
+        //     out of it for an AUDITOR picker would be worse than the union,
+        //     not better — assignable_role_id only means anything together
+        //     with the assignable_side it sits beside.
+        //
+        //   * Only when assignable_role_id is actually set. A step with an
+        //     assignable_side and no role (workflow 14 step 194, "Assign
+        //     Sections to Auditors") keeps today's behaviour exactly.
+        //
+        // This is not a new rule — it is the rule mode 1 of the /eligible-users
+        // controller already applies to the SAME two columns off the step
+        // instance snapshot. Mode 0 was simply disagreeing with mode 1 about
+        // what they mean. Reading them off the live step rather than the
+        // snapshot also means seeding assignable_role_id takes effect on
+        // workflows that are already running, which a snapshot cannot do.
+        //
+        // WHAT THIS CHANGES IN AUDIT — stated rather than buried, because it
+        // does touch the audit pickers. It fires only on a step that already
+        // names both columns, and on every such step the narrowing is to the
+        // role that step's own name describes:
+        //   wf 14 step 195  AUDITEE  → role 35   "Assign Evidence Owners"
+        //   wf 16 step 222  AUDITEE  → role 35   "Assign Evidence Owners…"
+        //   wf 16 step 254  AUDITOR  → role 33   "Assign Lead Auditors"
+        //   wf 16 step 259  AUDITOR  → role 34   "Evidence Review"
+        //   wf 22 step 262  AUDITEE  → role 35   "Assign Evidence Owners"
+        //   wf 22 step 263  AUDITEE  → role 35   "Evidence Collection"
+        //   wf 22 step 265  AUDITOR  → role 34   "Evidence Review"
+        //   wf 23 steps 269/270 → roles 33 / 30
+        // Every other audit picker — including workflow 14 step 194 and
+        // workflow 22 step 264, the two "assign sections" steps — resolves
+        // exactly as it does today.
         java.util.LinkedHashSet<Long> roleIds = new java.util.LinkedHashSet<>();
-        for (WorkflowStep s : steps) {
-            if (s.getAssignableRoleId() != null) roleIds.add(s.getAssignableRoleId());
-            stepRoleRepository.findByStepId(s.getId())
-                    .forEach(ar -> roleIds.add(ar.getRoleId()));
+
+        WorkflowStep currentStep = si.getStepId() == null ? null
+                : stepRepository.findById(si.getStepId()).orElse(null);
+
+        if (currentStep != null
+                && currentStep.getAssignableRoleId() != null
+                && side.equalsIgnoreCase(currentStep.getAssignableSide())) {
+            roleIds.add(currentStep.getAssignableRoleId());
+            log.debug("[WF-ELIGIBLE] step {} declares assignableSide={} assignableRoleId={} — "
+                            + "using it alone rather than every {}-side actor role",
+                    currentStep.getId(), currentStep.getAssignableSide(),
+                    currentStep.getAssignableRoleId(), side);
+        } else {
+            // Unchanged from before: the union across every matched step.
+            for (WorkflowStep s : steps) {
+                if (s.getAssignableRoleId() != null) roleIds.add(s.getAssignableRoleId());
+                stepRoleRepository.findByStepId(s.getId())
+                        .forEach(ar -> roleIds.add(ar.getRoleId()));
+            }
         }
 
         // Nothing configured — fall back to every role on that side, which is the
@@ -1728,9 +1832,115 @@ public class WorkflowEngineService {
         if (userIds.isEmpty()) return List.of();
 
         // getUsersByRoles keys the id as "id", not "userId".
-        return getUsersByRoles(new java.util.ArrayList<>(roleIds), tenantId).stream()
-                .filter(m -> m.get("id") instanceof Number n && userIds.contains(n.longValue()))
+        return scopeToVendor(
+                getUsersByRoles(new java.util.ArrayList<>(roleIds), tenantId).stream()
+                        .filter(m -> m.get("id") instanceof Number n && userIds.contains(n.longValue()))
+                        .toList(),
+                instance, side);
+    }
+
+    /**
+     * Narrow a VENDOR-side picker to the vendor this workflow is about.
+     *
+     * ── THIS WAS A LEAK, AND A BAD ONE ───────────────────────────────────
+     * getUsersByRoles scopes by tenant and role. Nothing else. So a picker
+     * asking for VENDOR-side users returned EVERY vendor user in the tenant —
+     * a Razorpay CISO assigning a section saw responders, VRMs and CISOs
+     * belonging to other vendors, by full name and role, and could assign a
+     * questionnaire section to one of them.
+     *
+     * That is one vendor learning the staff list of another vendor from the
+     * same buyer, which is exactly the thing a TPRM tool must not do. And it
+     * is worse than disclosure alone: an assignment that lands on the wrong
+     * vendor's user gives them a task carrying the other vendor's assessment.
+     *
+     * The precedent is directly below in resolveMembershipScope, which already
+     * narrows AUDITOR users to the right firm for an external engagement. The
+     * vendor case simply never got its equivalent.
+     *
+     * ── WHY FILTER RATHER THAN QUERY ─────────────────────────────────────
+     * The user ids have already been resolved through three different paths
+     * (side-scoped, membership-scoped, role-only). Adding a vendor predicate to
+     * each is three places to get it wrong. One filter at the exit covers every
+     * path, including the two the controller calls directly.
+     *
+     * ORG-side pickers are untouched: an org user has vendor_id = null and has
+     * no business being narrowed by vendor.
+     */
+    /**
+     * getUsersByRoles with the vendor scope applied.
+     *
+     * The controller's modes 1 (assignableSide) and 2 (next step's actor roles)
+     * call getUsersByRoles directly, so they bypassed scopeToVendor and leaked
+     * exactly as mode 0 did. This is the entry point they should use: it works
+     * out the side from the step when the caller has not stated one, which is
+     * precisely the case in those two modes.
+     */
+    public List<Map<String, Object>> getUsersByRolesScoped(List<Long> roleIds, Long tenantId,
+                                                           StepInstance si, String side) {
+        List<Map<String, Object>> users = getUsersByRoles(roleIds, tenantId);
+        if (si == null) return users;
+        WorkflowInstance instance = instanceRepository.findById(si.getWorkflowInstanceId()).orElse(null);
+        if (instance == null) return users;
+
+        // Mode 1 and 2 do not pass a side, so take it from the step: the side it
+        // can assign to, else the side it runs on.
+        String effectiveSide = (side != null && !side.isBlank())
+                ? side
+                : (si.getSnapAssignableSide() != null ? si.getSnapAssignableSide() : si.getSnapSide());
+
+        return scopeToVendor(users, instance, effectiveSide);
+    }
+
+    private List<Map<String, Object>> scopeToVendor(List<Map<String, Object>> users,
+                                                    WorkflowInstance instance, String side) {
+        if (users.isEmpty()) return users;
+        if (side == null || !"VENDOR".equalsIgnoreCase(side)) return users;
+
+        Long vendorId = resolveVendorId(instance);
+        if (vendorId == null) {
+            // Cannot tell which vendor this workflow is about. Fail CLOSED —
+            // an empty picker that says nothing is recoverable; a picker
+            // listing another vendor's staff is not.
+            log.warn("[WF-ELIGIBLE] VENDOR-side picker on instance {} ({} {}) — cannot resolve a vendor, "
+                            + "returning no users rather than every vendor's",
+                    instance.getId(), instance.getEntityType(), instance.getEntityId());
+            return List.of();
+        }
+
+        java.util.Set<Long> allowed = userRepository.findByVendorIdAndIsDeletedFalse(vendorId)
+                .stream().map(com.kashi.grc.usermanagement.domain.User::getId)
+                .collect(java.util.stream.Collectors.toSet());
+
+        List<Map<String, Object>> scoped = users.stream()
+                .filter(m -> m.get("id") instanceof Number n && allowed.contains(n.longValue()))
                 .toList();
+
+        if (scoped.size() != users.size()) {
+            log.info("[WF-ELIGIBLE] VENDOR scope on instance {} → vendorId={} | {} of {} users kept",
+                    instance.getId(), vendorId, scoped.size(), users.size());
+        }
+        return scoped;
+    }
+
+    /**
+     * Which vendor a workflow instance is about.
+     *
+     * TPRM files its instance under ('VENDOR', vendorId), so that is the direct
+     * case. VENDOR_ASSESSMENT is handled too because an instance could be filed
+     * that way — assessment → cycle → vendor, the same walk
+     * VendorAssessmentEntityResolver does.
+     */
+    private Long resolveVendorId(WorkflowInstance instance) {
+        if (instance == null || instance.getEntityId() == null) return null;
+        String type = instance.getEntityType();
+        if ("VENDOR".equalsIgnoreCase(type)) return instance.getEntityId();
+        if ("VENDOR_ASSESSMENT".equalsIgnoreCase(type)) {
+            return vendorAssessmentRepository.findById(instance.getEntityId())
+                    .map(com.kashi.grc.assessment.domain.VendorAssessment::getVendorId)
+                    .orElse(null);
+        }
+        return null;
     }
 
     private String resolveMembershipScope(WorkflowInstance instance, String stepSide) {
@@ -1837,11 +2047,40 @@ public class WorkflowEngineService {
         // How much was still outstanding when it was forced through. Counted
         // BEFORE expiring, or it is always zero — and "overridden with 43 tasks
         // still open" is a different fact from "overridden with 1".
-        int stillPending = taskInstanceRepository
-                .findByStepInstanceIdAndStatus(si.getId(), TaskStatus.PENDING).size();
-
-        // Expire all pending tasks on this step
-        expirePendingTasks(si, null);
+        //
+        // IN_PROGRESS counts too, and is closed too. expirePendingTasks leaves
+        // in-progress tasks alone on purpose (normal completion must not close
+        // real work under its owner), but an override ends the step outright —
+        // a half-done task left IN_PROGRESS on a finished step stays in its
+        // owner's inbox forever with nothing it can do. Each is closed with the
+        // override note so the owner can see who closed it and why.
+        List<TaskInstance> stillOpen = new ArrayList<>(taskInstanceRepository
+                .findByStepInstanceIdAndStatus(si.getId(), TaskStatus.PENDING));
+        stillOpen.addAll(taskInstanceRepository
+                .findByStepInstanceIdAndStatus(si.getId(), TaskStatus.IN_PROGRESS));
+        int stillPending = stillOpen.size();
+        if (!stillOpen.isEmpty()) {
+            java.time.LocalDateTime closedAt = java.time.LocalDateTime.now();
+            stillOpen.forEach(t -> {
+                t.setStatus(TaskStatus.EXPIRED);
+                t.setActedAt(closedAt);
+                t.setRemarks("Closed by override — " + overrideNote);
+            });
+            taskInstanceRepository.saveAll(stillOpen);
+            // Tell the people whose work was closed. Never fails the override.
+            String closedMsg = actorName + " completed \"" + si.getSnapName() + "\" by override — your task on it is closed"
+                    + (remarks != null && !remarks.isBlank() ? ": " + remarks : "");
+            stillOpen.stream().map(TaskInstance::getAssignedUserId)
+                    .filter(java.util.Objects::nonNull).filter(u -> !u.equals(performedBy)).distinct()
+                    .forEach(u -> {
+                        try {
+                            notificationService.send(u, "WORKFLOW_STEP_OVERRIDDEN", closedMsg,
+                                    instance.getEntityType(), instance.getEntityId());
+                        } catch (RuntimeException e) {
+                            log.warn("[WORKFLOW-OVERRIDE] Notification failed (non-fatal) | user={} | {}", u, e.getMessage());
+                        }
+                    });
+        }
 
         // Attribution on the step itself. The tasks are gone from every inbox,
         // so without this the override leaves no visible trace on the record.
@@ -4388,8 +4627,13 @@ public class WorkflowEngineService {
         // Also clear task_section_items for the reset task itself — items from the
         // previous run may have status=DONE. The SectionItemsNeededEvent re-fire
         // below will re-register them fresh so they start at NOT_DONE.
+        // THIS task's items only. findByStepInstanceId returned every task's items
+        // on the step, so resetting one person wiped everyone else's checklist —
+        // and only the reset task is re-registered below.
         List<com.kashi.grc.workflow.domain.TaskSectionItem> existingItems =
-                taskSectionItemRepository.findByStepInstanceId(si.getId());
+                taskSectionItemRepository.findByStepInstanceId(si.getId()).stream()
+                        .filter(i -> taskId.equals(i.getTaskInstanceId()))
+                        .toList();
         if (!existingItems.isEmpty()) {
             taskSectionItemRepository.deleteAll(existingItems);
             log.info("[WF-ADMIN] RESET-TASK | cleared {} task_section_item(s) for re-registration | taskId={}",
@@ -4545,6 +4789,41 @@ public class WorkflowEngineService {
         recordHistory(instance, si, task, "TASK_RESET",
                 previousStatus, TaskStatus.IN_PROGRESS.name(), performedBy,
                 "Task reset by admin — assignee can re-work");
+
+        // 6. Tell the owning module its own locks need clearing.
+        //
+        // Everything above is state the ENGINE owns: the task, its section
+        // gates, its items. A module may hold a lock of its own that the engine
+        // cannot see, and the vendor assessment holds three — submitted_at and
+        // reviewer_submitted_at on the section instance, plus the contributor's
+        // and assistant's own submission rows.
+        //
+        // Without this the reset was half a reset: the responder got their task
+        // back and still could not act, because the section read as submitted,
+        // the Submit control stays hidden on a submitted section, and the gate
+        // this method just re-armed had nothing left that could fire it.
+        //
+        // An event rather than a call, because the engine must not know what a
+        // questionnaire section is — the same contract SectionItemsNeededEvent
+        // above already uses in the other direction. A workflow whose module has
+        // no listener is unaffected; nothing consumes this but the assessment
+        // module today.
+        //
+        // Published last, after the rollback block and the history row, so a
+        // listener sees the finished state rather than a half-applied one.
+        eventPublisher.publishEvent(new com.kashi.grc.workflow.event.TaskResetEvent(
+                task.getId(),
+                si.getId(),
+                si.getWorkflowInstanceId(),
+                instance.getTenantId(),
+                instance.getEntityType(),
+                instance.getEntityId(),
+                task.getAssignedUserId(),
+                si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
+                previousStatus,
+                performedBy,
+                rollbackDownstream
+        ));
 
         return Map.of(
                 "reset",          true,

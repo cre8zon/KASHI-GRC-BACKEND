@@ -648,6 +648,7 @@ public class AuditTestPolicySnapshotService {
             req.setSourceEntityId(finding.getId());
             req.setFrameworkRef(finding.getFrameworkRef());
             req.setOwnerId(finding.getOwnerId());
+            req.setStartTriaged(true);   // finding workflow starts at the owner — see IssueRequest.startTriaged
             req.setWorkflowId(findingWorkflowId(tenantId));
             // REQUIRES_NEW, via the writer. Calling issueService.create() directly
             // joined THIS transaction, so its failure marked the whole thing

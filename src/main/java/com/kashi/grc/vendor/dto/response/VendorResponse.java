@@ -10,6 +10,20 @@ import java.time.LocalDateTime;
 @JsonInclude(JsonInclude.Include.NON_NULL)
 public class VendorResponse {
     private Long        vendorId;
+
+    /**
+     * Same value as vendorId, under the name the generic list screen reads.
+     *
+     * UniversalModulePage.handleRowClick does
+     *     navigate(`/module/${base}/${row.id}`)
+     * so a DTO without `id` produces /module/vendor/undefined and the detail
+     * page never resolves. Every module that works exposes `id`; this one
+     * exposed only vendorId, which is why clicking a row went nowhere.
+     *
+     * Added rather than renaming vendorId, because existing callers read that
+     * name and a rename would break them silently.
+     */
+    private Long        id;
     private String      name;
     private String      legalName;
     private String      registrationNumber;

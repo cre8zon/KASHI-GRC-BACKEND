@@ -175,6 +175,38 @@ public class AuditControlInstance extends BaseEntity {
     @Column(name = "auditee_evidence_submitted_at")
     private LocalDateTime auditeeEvidenceSubmittedAt;
 
+    /**
+     * Submitted WITHOUT evidence: the evidence owner's reason ("not applicable",
+     * "not available", "will follow"). Set when a section is submitted with this
+     * control still empty (AuditSectionSubmissionService). It closes the owner's
+     * checklist item for the control but is NOT evidence — auditeeEvidenceSubmitted
+     * stays false, so the auditor's evidence gate still applies. Cleared when real
+     * evidence is submitted or the control is sent back.
+     */
+    @Column(name = "evidence_gap_reason", columnDefinition = "TEXT")
+    private String evidenceGapReason;
+
+    @Column(name = "evidence_gap_at")
+    private LocalDateTime evidenceGapAt;
+
+    @Column(name = "evidence_gap_by")
+    private Long evidenceGapBy;
+
+    /**
+     * Left untested on purpose: the tester's reason, recorded when they submit
+     * their testing with this control still NOT_TESTED. testResult stays
+     * NOT_TESTED (it is not a conclusion), and the report shows it as a scope
+     * limitation. Cleared when a result is recorded.
+     */
+    @Column(name = "not_tested_reason", columnDefinition = "TEXT")
+    private String notTestedReason;
+
+    @Column(name = "not_tested_at")
+    private LocalDateTime notTestedAt;
+
+    @Column(name = "not_tested_by")
+    private Long notTestedBy;
+
     // ── Finding linkage ───────────────────────────────────────────────────────
 
     @Column(name = "finding_linked", nullable = false)
@@ -189,6 +221,16 @@ public class AuditControlInstance extends BaseEntity {
 
     @Column(name = "workflow_instance_id")
     private Long workflowInstanceId;
+
+    /**
+     * A conclusion has been recorded (anything but NOT_TESTED). Derived, not
+     * stored — it serialises as "testConcluded" so a ui_actions row can hide a
+     * button with {"__hideIfField": "testConcluded"} (Mark not tested).
+     */
+    @Transient
+    public boolean isTestConcluded() {
+        return testResult != null && testResult != TestResult.NOT_TESTED;
+    }
 
     public enum TestResult {
         EFFECTIVE,

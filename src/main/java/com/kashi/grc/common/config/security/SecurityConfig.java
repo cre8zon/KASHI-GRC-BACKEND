@@ -111,6 +111,27 @@ public class SecurityConfig {
                         // .anyRequest().authenticated() — closed to anonymous callers,
                         // but open to every authenticated user of every tenant.
                         .requestMatchers("/v1/content/public/**").denyAll()
+                        // ── TRUST CENTER PUBLIC SURFACE ────────────────────────
+                        // Read by a prospect's procurement team, who have no
+                        // account and never will. Same discipline as the content
+                        // block above: each endpoint listed individually, then a
+                        // denyAll catch-all, so anything added under
+                        // /v1/trust/public/ later is CLOSED until somebody opens
+                        // it deliberately.
+                        //
+                        // The download route is anonymous at the filter only
+                        // because the TOKEN is the credential — 32 bytes of
+                        // SecureRandom, validated in TrustCenterService on every
+                        // single call, revocable, and logged. That is
+                        // authorisation; it is simply not session-based, so the
+                        // filter chain has nothing to check here.
+                        //
+                        // Nothing under this prefix may EVER read a tenant from
+                        // the caller. The slug or the token decides it.
+                        .requestMatchers(HttpMethod.GET,  "/v1/trust/public/*").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/trust/public/*/request-access").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/v1/trust/public/download/*/*").permitAll()
+                        .requestMatchers("/v1/trust/public/**").denyAll()
                         .requestMatchers(
                                 "/v1/admin/**",
                                 "/v1/tenants/**"

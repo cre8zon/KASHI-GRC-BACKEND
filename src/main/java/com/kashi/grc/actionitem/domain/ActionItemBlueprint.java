@@ -19,9 +19,9 @@ import lombok.experimental.SuperBuilder;
  */
 @Entity
 @Table(name = "action_item_blueprints", indexes = {
-    @Index(name = "idx_aib_tenant",      columnList = "tenant_id"),
-    @Index(name = "idx_aib_source_type", columnList = "source_type"),
-    @Index(name = "idx_aib_category",    columnList = "category"),
+        @Index(name = "idx_aib_tenant",      columnList = "tenant_id"),
+        @Index(name = "idx_aib_source_type", columnList = "source_type"),
+        @Index(name = "idx_aib_category",    columnList = "category"),
 })
 @Getter @Setter
 @SuperBuilder
@@ -63,6 +63,36 @@ public class ActionItemBlueprint extends GlobalOrTenantEntity {
     private String standardRef;
 
     /** Short code for programmatic lookup e.g. 'ISO27001_CHANGE_MGMT' */
+    /**
+     * Where an item raised from this blueprint opens — the answer to "how do I
+     * set a route for work that has no workflow step behind it".
+     *
+     * A workflow task gets its destination from workflow_steps.nav_key, set in
+     * the Workflow Blueprint Designer. An automated action item has no step, so
+     * until now its route was a string literal in whichever Java class raised
+     * it — which meant nobody could configure it and every change was a deploy.
+     *
+     * The blueprint is the right home because it is already the template for
+     * everything else about such an item: its title, its description, who
+     * resolves it, how urgent it is. The destination is the same kind of fact,
+     * and the blueprint admin screen is where somebody is already standing when
+     * they define one.
+     *
+     * Resolution order at creation, in ActionItemService.create:
+     *   1. the raising code's explicit nav_key  — a caller that knows better
+     *   2. this blueprint's nav_key             — the configured default
+     *   3. neither, and the item falls back to nav_context as before
+     *
+     * Same precedence resolution_role and default_priority already use, for the
+     * same reason: the blueprint is the default, not the override.
+     */
+    @Column(name = "nav_key", length = 100)
+    private String navKey;
+
+    /** The reviewer/validator's screen. See navKey. */
+    @Column(name = "assigner_nav_key", length = 100)
+    private String assignerNavKey;
+
     @Column(name = "blueprint_code", unique = true, length = 80)
     private String blueprintCode;
 

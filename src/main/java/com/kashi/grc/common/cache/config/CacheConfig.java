@@ -121,7 +121,7 @@ public class CacheConfig implements CachingConfigurer {
                         .build();
         redisObjectMapper.activateDefaultTyping(
                 ptv,
-                com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping.NON_FINAL,
+                ObjectMapper.DefaultTyping.NON_FINAL,
                 // WRAPPER_ARRAY, not PROPERTY.
                 //
                 // As.PROPERTY writes the type as a "@class" field INSIDE the JSON
@@ -166,6 +166,11 @@ public class CacheConfig implements CachingConfigurer {
         perCache.put(CacheNames.UI_SCREEN,    defaults.entryTtl(Duration.ofMinutes(5)));
         perCache.put(CacheNames.UI_ACTIONS,   defaults.entryTtl(Duration.ofMinutes(5)));
         perCache.put(CacheNames.UI_DASHBOARD, defaults.entryTtl(Duration.ofMinutes(5)));
+
+        // Two minutes: long enough that eleven widgets and a page refresh cost
+        // one computation, short enough that a number nobody trusts does not
+        // survive a coffee break.
+        perCache.put(CacheNames.DASHBOARD_STATS, defaults.entryTtl(Duration.ofMinutes(2)));
         // User display names change rarely (profile edits) and are read on
         // every history/assignment screen — longer TTL is safe.
         perCache.put(CacheNames.USER_DISPLAY_NAME, defaults.entryTtl(Duration.ofMinutes(15)));
@@ -174,6 +179,13 @@ public class CacheConfig implements CachingConfigurer {
         // Entitlements should feel immediate to an admin who just changed a
         // plan — short TTL + explicit evict on write (see TenantFeatureService).
         perCache.put(CacheNames.TENANT_ENTITLEMENTS, defaults.entryTtl(Duration.ofMinutes(10)));
+        // In-flight assessment snapshot progress (AssessmentProgressTracker).
+        // Not a read cache — a side channel for an uncommitted write, so the
+        // TTL is a lifetime rather than a staleness bound: two minutes is
+        // longer than any snapshot takes and short enough that a finished
+        // entry does not linger. The default five would be harmless but says
+        // the wrong thing about what this region is for.
+        perCache.put(CacheNames.ASSESSMENT_PROGRESS, defaults.entryTtl(Duration.ofMinutes(2)));
         // Compound "template structure" snapshot (see AssessmentTemplateStructureCacheService)
         // — read on every instantiation, changes only when an admin edits a
         // template in the library. Longer TTL is safe; explicit evict on write.

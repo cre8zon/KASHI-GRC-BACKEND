@@ -48,24 +48,36 @@ public class AuditInstanceController {
     private final AuditPolicyInstanceControlMappingRepository policyCtrlMappingRepo;
     private final AuditTestPolicySnapshotService             snapshotService;
     private final UtilityService                            utilityService;
-    private final AuditFindingRepository                    findingRepo;
-    private final com.kashi.grc.workflow.repository.WorkflowRepository workflowRepository;
-    private final IssueService                              issueService;
+    // Test results and policy reviews: the one shared implementation.
+    private final com.kashi.grc.audit.service.AuditFieldworkService fieldworkService;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository engagementRepo;
     private final com.kashi.grc.evidence.repository.EvidenceLinkRepository evidenceLinkRepo;
+    private final com.kashi.grc.audit.service.AuditObligationService obligationService;
+    // The one implementation of "record a control-level result" — counters,
+    // section gate, evidence gate and obligation closing live there.
+    private final com.kashi.grc.audit.service.AuditEngagementService engagementService;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROL INSTANCES — /v1/audit/control-instances/{id}
     // ══════════════════════════════════════════════════════════════════════════
 
+    // One read-only transaction for the whole request. open-in-view is off, so
+    // without it every repository call below opened and committed its own
+    // transaction — ~4 database round trips per query (~150 ms each to Aiven).
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/control-instances/{id}")
     @Operation(summary = "Get control instance by ID — flat response for UMP overview tab")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getControlInstance(@PathVariable Long id) {
         var ctx  = utilityService.getLoggedInDataContext();
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
+        // Loaded by id alone, so any authenticated user in any tenant could read
+        // any control — and a guest any engagement's. Same rule as the engagement
+        // detail page: tenant, then the guest's staffed engagements.
+        controlAccessGuard.requireReadable(ctrl.getTenantId(), ctrl.getEngagementId());
 
-        Map<String, Object> result = buildControlMap(ctrl);
+        Map<String, Object> result = buildControlMap(ctrl,
+                controlAccessGuard.evaluator(ctrl.getEngagementId(), ctx.getId()));
 
         // PRECEDENCE: the control's own guidance wins; the mapped tests are only a
         // fallback. Evidence guidance used to live solely on AuditTestInstance and
@@ -98,10 +110,15 @@ public class AuditInstanceController {
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/control-instances/{id}/tests")
     @Operation(summary = "List all test instances mapped to this control")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getControlTests(
             @PathVariable Long id) {
+
+        var parentCtrl = controlRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
+        controlAccessGuard.requireReadable(parentCtrl.getTenantId(), parentCtrl.getEngagementId());
 
         List<AuditControlInstanceTestMapping> mappings =
                 ctrlTestMappingRepo.findByControlInstanceIdOrderByOrderNoAsc(id);
@@ -128,14 +145,17 @@ public class AuditInstanceController {
         // Recording a result needs ASSIGNMENT, not just the permission - the same
         // rule setTestResult enforces. Telling the client here is what lets the
         // fieldwork tab render read-only instead of offering a Save that 400s.
+        //
+        // Per TEST now, through the same guard setTestResult calls. It used to be
+        // one control-level value plus a bypass for anyone holding
+        // audit:control:assign-auditor — a permission check standing in for an
+        // assignment check, which is exactly the hole being closed. Cover for an
+        // absent colleague is the override permission, inside the guard.
         var evCtx = utilityService.getLoggedInDataContext();
-        boolean evHasAssignPermission = evCtx.getRoles().stream()
-                .flatMap(r -> r.getPermissions().stream())
-                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
-        boolean evCanRecord = evHasAssignPermission
-                || controlRepo.findById(id)
-                .map(c -> controlAccessGuard.canAct(c, evCtx.getId(), false))
-                .orElse(false);
+        var ev = controlAccessGuard.evaluator(parentCtrl.getEngagementId(), evCtx.getId())
+                .prefetchControls(List.of(parentCtrl))
+                .prefetchTests(testInstanceIds);
+        boolean ctrlObligation = ev.hasControlObligation(id, false);
 
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
@@ -144,8 +164,11 @@ public class AuditInstanceController {
             row.put("isRequired",         m.isRequired());
             row.put("orderNo",            m.getOrderNo());
             row.put("mappingNoteSnapshot",m.getMappingNoteSnapshot());
-            row.put("canRecordResult",    evCanRecord);
             AuditTestInstance t = testsById.get(m.getTestInstanceId());
+            row.put("canRecordResult",    t != null && ev.canActOnTest(t));
+            // A live delegation on this test, or on the control it sits under —
+            // lets the UI offer the editor to a delegate who holds no workflow task.
+            row.put("hasMyObligation",    ctrlObligation || ev.hasTestObligation(m.getTestInstanceId()));
             if (t != null) {
                 row.put("testNameSnapshot",        t.getTestNameSnapshot());
                 row.put("testRefSnapshot",         t.getTestRefSnapshot());
@@ -179,10 +202,15 @@ public class AuditInstanceController {
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/control-instances/{id}/policies")
     @Operation(summary = "List all policy instances covering this control")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getControlPolicies(
             @PathVariable Long id) {
+
+        var parentCtrl = controlRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
+        controlAccessGuard.requireReadable(parentCtrl.getTenantId(), parentCtrl.getEngagementId());
 
         List<AuditPolicyInstanceControlMapping> mappings =
                 policyCtrlMappingRepo.findByControlInstanceId(id);
@@ -197,6 +225,14 @@ public class AuditInstanceController {
                 : policyRepo.findAllById(policyInstanceIds).stream()
                   .collect(Collectors.toMap(AuditPolicyInstance::getId, p -> p));
 
+        // Same guard reviewPolicy and setContribution enforce, per row, so the
+        // fieldwork and policies tabs render read-only where Save would 403.
+        var polCtx = utilityService.getLoggedInDataContext();
+        var polEv  = controlAccessGuard.evaluator(parentCtrl.getEngagementId(), polCtx.getId())
+                .prefetchControls(List.of(parentCtrl))
+                .prefetchPolicies(policyInstanceIds);
+        boolean canActOnParent = polEv.canAct(parentCtrl, false);
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",            m.getId());
@@ -205,6 +241,10 @@ public class AuditInstanceController {
             row.put("mappingTypeSnapshot",  m.getMappingTypeSnapshot());
             row.put("mappingNoteSnapshot",  m.getMappingNoteSnapshot());
             AuditPolicyInstance p = policiesById.get(m.getPolicyInstanceId());
+            boolean canReviewPolicy = p != null && polEv.canActOnPolicy(p);
+            row.put("canReviewPolicy",      canReviewPolicy);
+            row.put("canSetContribution",   canReviewPolicy || canActOnParent);
+            row.put("hasMyObligation",      polEv.hasPolicyObligation(m.getPolicyInstanceId()));
             if (p != null) {
                 row.put("titleSnapshot",        p.getTitleSnapshot());
                 row.put("policyRefSnapshot",    p.getPolicyRefSnapshot());
@@ -239,39 +279,14 @@ public class AuditInstanceController {
         // anyone with the permission. Assignee, section auditor or lead auditor.
         controlAccessGuard.requireCanRecordResult(ctrl, ctx.getId());
 
-        // A positive conclusion must rest on something. INEFFECTIVE carries its own
-        // record (the finding), and NOT_APPLICABLE / NOT_TESTED are not conclusions,
-        // so only the effective results are gated.
-        boolean positiveConclusion =
-                req.getTestResult() == AuditControlInstance.TestResult.EFFECTIVE
-                        || req.getTestResult() == AuditControlInstance.TestResult.PARTIALLY_EFFECTIVE;
-        if (positiveConclusion && !Boolean.TRUE.equals(req.getEvidenceOverride())) {
-            List<Long> mappedTestIds = ctrlTestMappingRepo.findRequiredTestInstanceIdsByControlInstanceId(id);
-            boolean hasEvidence =
-                    !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", List.of(id)).isEmpty()
-                            || !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", mappedTestIds).isEmpty();
-            if (!hasEvidence) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "EVIDENCE_REQUIRED",
-                        "Attach evidence before concluding this control, or record an override reason");
-            }
-        }
-        if (Boolean.TRUE.equals(req.getEvidenceOverride())) {
-            if (req.getEvidenceOverrideReason() == null || req.getEvidenceOverrideReason().isBlank()) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "OVERRIDE_REASON_REQUIRED", "An override needs a reason");
-            }
-            log.warn("[CTRL-INST] Evidence gate overridden | id={} by={} reason={}",
-                    id, ctx.getId(), req.getEvidenceOverrideReason());
-        }
-
-        ctrl.setTestResult(req.getTestResult());
-        if (req.getTestNotes() != null) ctrl.setTestNotes(req.getTestNotes());
-        ctrl.setTestedAt(LocalDateTime.now());
-        ctrl.setTestedBy(ctx.getId());
-        controlRepo.save(ctrl);
+        // WAS a second implementation here: it saved the result but never updated
+        // the engagement counters or fired TEST_RECORDED, so the section gate
+        // could stall with every control tested, and its evidence gate differed
+        // from the engagement path's. Both endpoints now share one method.
+        ctrl = engagementService.recordControlResult(ctrl, req, ctx.getId(), ctx.getTenantId());
         log.info("[CTRL-INST] Test result set | id={} result={} by={}", id, req.getTestResult(), ctx.getId());
-        return ResponseEntity.ok(ApiResponse.success(buildControlMap(ctrl)));
+        return ResponseEntity.ok(ApiResponse.success(buildControlMap(ctrl,
+                controlAccessGuard.evaluator(ctrl.getEngagementId(), ctx.getId()))));
     }
 
     @PutMapping("/v1/audit/control-instances/{id}/assign-auditee")
@@ -284,15 +299,18 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
-        // Its siblings (submitControlEvidence, recordControlTestResult) both call
-        // ControlAccessGuard; this one loaded by raw id and wrote, so any caller
-        // could reassign any control instance in any tenant. Recording a result is
-        // the closest existing authority — whoever may conclude on the control may
-        // decide who provides its evidence.
-        controlAccessGuard.requireCanRecordResult(ctrl, ctx.getId());
+        // Same tenant/scope rule as every instance endpoint, then the SAME
+        // assignment rule as PUT /engagements/{id}/controls/{cid}/assign-auditee
+        // (section-level assigner, or owner of the control's section on the
+        // auditee side). It used to check the AUDITOR result rule here, so an
+        // auditee section owner was refused and an auditor was allowed.
+        controlAccessGuard.requireReadable(ctrl.getTenantId(), ctrl.getEngagementId());
+        controlAccessGuard.requireCanAssign(ctrl, ctx.getId(), true);
 
-        ctrl.setAuditeeAssignedUserId(body.get("auditeeUserId"));
-        controlRepo.save(ctrl);
+        // One implementation: notifications, delegation clean-up and the null
+        // (= unassign) case are handled exactly as on the engagement path.
+        engagementService.assignAuditeeToControl(ctrl.getEngagementId(), id,
+                body.get("auditeeUserId"), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -303,28 +321,115 @@ public class AuditInstanceController {
         var ctrl = controlRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditControlInstance", id));
 
-        // WAS: only blocked when the control HAD an assignee, so an unassigned
-        // control -- the normal state until someone bulk-assigns a section -- was
-        // open to anyone holding the permission. Now the assignee, the section
-        // owner or the engagement owner may act, and nobody else.
-        controlAccessGuard.requireCanSubmitEvidence(ctrl, ctx.getId());
-
-        ctrl.setAuditeeEvidenceSubmitted(true);
-        ctrl.setAuditeeEvidenceSubmittedAt(LocalDateTime.now());
-        controlRepo.save(ctrl);
+        // Tenant / guest scope, then ONE implementation. This endpoint used to set
+        // the flag itself — no "is there any evidence" check, no section
+        // auto-submit, no EVIDENCE_UPLOADED checklist event — so evidence
+        // submitted from the control drawer or detail page never completed its
+        // section or ticked the workflow item, while the same click on the
+        // engagement Controls tab did. submitControlEvidence runs the assignment
+        // guard (ControlAccessGuard) and closes obligations itself.
+        controlAccessGuard.requireReadable(ctrl.getTenantId(), ctrl.getEngagementId());
+        engagementService.submitControlEvidence(ctrl.getEngagementId(), id, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success());
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // DELEGATION — per-instance action items (AuditObligationService)
+    // ══════════════════════════════════════════════════════════════════════════
+
+    /**
+     * Delegate one control to a colleague, on one side.
+     *
+     *   body: { assignedTo, side: "AUDITEE"|"AUDITOR", note, dueAt, priority }
+     *
+     * Only someone who may act on that side of the control may delegate it
+     * (ControlAccessGuard), and only to a user who can do that side's work. The
+     * live item then lets the delegate act on this one control — nothing else —
+     * until they finish it or the delegator revokes it.
+     */
+    @PostMapping("/v1/audit/control-instances/{id}/delegate")
+    @Operation(summary = "Delegate a control instance to a colleague (raises a per-control action item)")
+    public ResponseEntity<ApiResponse<com.kashi.grc.actionitem.dto.ActionItemResponse>> delegateControl(
+            @PathVariable Long id,
+            @RequestBody com.kashi.grc.audit.service.AuditObligationService.DelegateRequest req) {
+        return ResponseEntity.status(org.springframework.http.HttpStatus.CREATED)
+                .body(ApiResponse.success(obligationService.delegateControl(id, req)));
+    }
+
+    /** Delegate one test instance (auditor side). Same body; side is ignored or AUDITOR. */
+    @PostMapping("/v1/audit/test-instances/{id}/delegate")
+    @Operation(summary = "Delegate a test instance to a colleague auditor")
+    public ResponseEntity<ApiResponse<com.kashi.grc.actionitem.dto.ActionItemResponse>> delegateTest(
+            @PathVariable Long id,
+            @RequestBody com.kashi.grc.audit.service.AuditObligationService.DelegateRequest req) {
+        return ResponseEntity.status(org.springframework.http.HttpStatus.CREATED)
+                .body(ApiResponse.success(obligationService.delegateTest(id, req)));
+    }
+
+    /** Delegate one policy-instance review (auditor side). */
+    @PostMapping("/v1/audit/policy-instances/{id}/delegate")
+    @Operation(summary = "Delegate a policy instance review to a colleague auditor")
+    public ResponseEntity<ApiResponse<com.kashi.grc.actionitem.dto.ActionItemResponse>> delegatePolicy(
+            @PathVariable Long id,
+            @RequestBody com.kashi.grc.audit.service.AuditObligationService.DelegateRequest req) {
+        return ResponseEntity.status(org.springframework.http.HttpStatus.CREATED)
+                .body(ApiResponse.success(obligationService.delegatePolicy(id, req)));
+    }
+
+    /**
+     * Move a live delegation (action item on a control / test / policy) to
+     * someone else in one step — the new one is raised through the normal
+     * delegate checks first, then the old one is closed.
+     *
+     *   body: { assignedTo, note?, dueAt?, priority? }
+     */
+    @PutMapping("/v1/audit/delegations/{actionItemId}/reassign")
+    @Operation(summary = "Reassign an audit delegation to another user (revoke + delegate in one step)")
+    public ResponseEntity<ApiResponse<com.kashi.grc.actionitem.dto.ActionItemResponse>> reassignDelegation(
+            @PathVariable Long actionItemId,
+            @RequestBody com.kashi.grc.audit.service.AuditObligationService.DelegateRequest req) {
+        return ResponseEntity.ok(ApiResponse.success(obligationService.reassignDelegation(actionItemId, req)));
+    }
+
+    /**
+     * Who the delegate picker may offer for one kind of work — users holding
+     * that work's permission, whatever their role or side. The same list the
+     * delegate endpoints validate against, so the picker cannot offer someone
+     * the server will refuse. Excludes the caller.
+     *
+     *   ?work=EVIDENCE | TESTING | POLICY_REVIEW   (?side=AUDITEE|AUDITOR still accepted)
+     */
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
+    @GetMapping("/v1/audit/delegate-candidates")
+    @Operation(summary = "Users who can take delegated audit work (EVIDENCE | TESTING | POLICY_REVIEW)")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> delegateCandidates(
+            @RequestParam(required = false) String work,
+            @RequestParam(required = false) String side) {
+        if (com.kashi.grc.common.config.multitenancy.AccessScope.isVendor()) {
+            throw new com.kashi.grc.common.exception.BusinessException("AUDIT_INSTANCE_NOT_ACCESSIBLE",
+                    "Vendor accounts do not have access to audit engagements",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        var w = com.kashi.grc.audit.service.AuditObligationService.Work.parse(work != null ? work : side);
+        if (w == null) {
+            throw new com.kashi.grc.common.exception.BusinessException("INVALID_WORK",
+                    "work must be EVIDENCE, TESTING or POLICY_REVIEW");
+        }
+        return ResponseEntity.ok(ApiResponse.success(obligationService.candidates(w)));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     // TEST INSTANCES — /v1/audit/test-instances/{id}
     // ══════════════════════════════════════════════════════════════════════════
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/test-instances/{id}")
     @Operation(summary = "Get test instance by ID — flat response for UMP overview tab")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getTestInstance(@PathVariable Long id) {
         var ctx  = utilityService.getLoggedInDataContext();
         var test = testRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", id));
+        controlAccessGuard.requireReadable(test.getTenantId(), test.getEngagementId());
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id",                      test.getId());
@@ -359,20 +464,32 @@ public class AuditInstanceController {
         result.put("affectedControlCount",    test.getAffectedControlCount());
         result.put("snapshottedAt",           test.getSnapshottedAt());
 
-        List<Long> controlIds = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id);
-        boolean isAssigned = !controlIds.isEmpty() &&
-                controlRepo.findAllById(controlIds).stream()
-                        .anyMatch(c -> ctx.getId().equals(c.getAssignedAuditorId())
-                                || c.getAssignedAuditorId() == null);
-        result.put("isAssignedToCurrentUser", isAssigned);
+        // WAS: `|| c.getAssignedAuditorId() == null` — any unassigned mapped
+        // control made the test "assigned" to everyone. Now the same guard
+        // setTestResult enforces, so the header buttons mirror the server.
+        var testEv = controlAccessGuard.evaluator(test.getEngagementId(), ctx.getId());
+        boolean canRecordTest = testEv.canActOnTest(test);
+        result.put("isAssignedToCurrentUser", canRecordTest);
+        result.put("canRecordResult",         canRecordTest);
+        result.put("hasMyObligation",         testEv.hasTestObligation(id));
+        // Keyed by the permission a ui_action carries, so a requires_assignment
+        // button is gated on THIS side's answer, not on either side's. Read by
+        // UniversalModulePage's shared action filter.
+        result.put("assignmentByPermission", Map.of(
+                "audit:control:record-test-result", canRecordTest));
 
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/test-instances/{id}/controls")
     @Operation(summary = "List all control instances that this test is mapped to")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getTestControls(
             @PathVariable Long id) {
+
+        var parentTest = testRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", id));
+        controlAccessGuard.requireReadable(parentTest.getTenantId(), parentTest.getEngagementId());
 
         List<AuditControlInstanceTestMapping> mappings =
                 ctrlTestMappingRepo.findByTestInstanceId(id);
@@ -419,84 +536,31 @@ public class AuditInstanceController {
         var test = testRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTestInstance", id));
 
-        boolean hasAssignPermission = ctx.getRoles().stream()
-                .flatMap(r -> r.getPermissions().stream())
-                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
-        if (!hasAssignPermission) {
-            List<Long> controlInstanceIds = ctrlTestMappingRepo
-                    .findControlInstanceIdsByTestInstanceId(id);
-            // The old `|| c.getAssignedAuditorId() == null` made every unassigned
-            // control testable by anyone. Delegating to the guard keeps section
-            // owners and the lead auditor able to act without opening it up.
-            boolean isAssigned = !controlInstanceIds.isEmpty() &&
-                    controlRepo.findAllById(controlInstanceIds).stream()
-                            .anyMatch(c -> controlAccessGuard.canAct(c, ctx.getId(), false));
-            if (!isAssigned) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "TEST_NOT_ASSIGNED",
-                        "You are not assigned to any control mapped to this test");
-            }
-        }
+        // WAS: anyone holding audit:control:assign-auditor skipped the check
+        // entirely, in any tenant — a permission standing in for an assignment.
+        // Now one rule, in the guard: a mapped control the caller may act on
+        // (assignee, section owner, delegate), a delegation on this test, or the
+        // auditor-override permission for covering an absent colleague. The guard
+        // also refuses other tenants and a guest's unstaffed engagements.
+        controlAccessGuard.requireCanRecordTestResult(test, ctx.getId());
 
-        AuditTestInstance.TestResult newResult =
-                AuditTestInstance.TestResult.valueOf(body.get("testResult"));
-
-        // Evidence gate. Only PASS is blocked: FAIL and EXCEPTION carry their own
-        // record via failureDetail/exceptionReason, and NOT_RUN is not a result.
-        // Runs BEFORE the write so a blocked call cannot cascade.
-        String overrideReason = body.get("evidenceOverrideReason");
-        boolean overridden = overrideReason != null && !overrideReason.isBlank();
-        if (newResult == AuditTestInstance.TestResult.PASS && !overridden) {
-            List<Long> mappedControlIds = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id);
-            boolean hasEvidence =
-                    !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_TEST_INSTANCE", List.of(id)).isEmpty()
-                            || !evidenceLinkRepo.entityIdsWithAnyLink("AUDIT_CONTROL_INSTANCE", mappedControlIds).isEmpty();
-            if (!hasEvidence) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "EVIDENCE_REQUIRED",
-                        "Attach a work paper or evidence before passing this test, "
-                                + "or record an override reason");
-            }
-        }
-        if (overridden) {
-            log.warn("[TEST-INSTANCE] Evidence gate overridden | id={} by={} reason={}",
-                    id, ctx.getId(), overrideReason);
-        }
-
-        test.setTestResult(newResult);
-        test.setRunAt(LocalDateTime.now());
-        test.setRunByUserId(ctx.getId());
-        test.setRunBySystem(false);
-        if (body.containsKey("testerNotes"))     test.setTesterNotes(body.get("testerNotes"));
-        if (body.containsKey("failureDetail"))   test.setFailureDetail(body.get("failureDetail"));
-        if (body.containsKey("exceptionReason")) test.setExceptionReason(body.get("exceptionReason"));
-        testRepo.save(test);
-
-        snapshotService.cascadeDeriveControlResults(id, ctx.getTenantId());
-
-        int affectedCount = ctrlTestMappingRepo.findControlInstanceIdsByTestInstanceId(id).size();
-        test.setAffectedControlCount(affectedCount);
-        testRepo.save(test);
-
-        log.info("[TEST-INSTANCE] Result set | id={} | result={} | affectedControls={}",
-                id, newResult, affectedCount);
-
-        return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "testInstanceId",    id,
-                "testResult",        newResult,
-                "affectedControls",  affectedCount
-        )));
+        // One implementation for every screen that records a test result —
+        // control Fieldwork, test detail, admin Tests tab (AuditFieldworkService).
+        return ResponseEntity.ok(ApiResponse.success(
+                fieldworkService.recordTestResult(test, body, ctx.getId(), ctx.getTenantId())));
     }
 
     // ══════════════════════════════════════════════════════════════════════════
     // POLICY INSTANCES — /v1/audit/policy-instances/{id}
     // ══════════════════════════════════════════════════════════════════════════
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/policy-instances/{id}")
     @Operation(summary = "Get policy instance by ID — flat response for UMP overview tab")
     public ResponseEntity<ApiResponse<Map<String, Object>>> getPolicyInstance(@PathVariable Long id) {
         var policy = policyRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", id));
+        controlAccessGuard.requireReadable(policy.getTenantId(), policy.getEngagementId());
 
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("id",                      policy.getId());
@@ -530,22 +594,29 @@ public class AuditInstanceController {
         result.put("auditorNotes",            policy.getAuditorNotes());
         result.put("snapshottedAt",           policy.getSnapshottedAt());
 
+        // WAS: `|| c.getAssignedAuditorId() == null` — see getTestInstance. Now
+        // the same guard reviewPolicy enforces.
         var ctx2 = utilityService.getLoggedInDataContext();
-        List<Long> policyControlIds = policyCtrlMappingRepo.findByPolicyInstanceId(id)
-                .stream().map(m -> m.getControlInstanceId()).toList();
-        boolean isPolicyAssigned = !policyControlIds.isEmpty() &&
-                controlRepo.findAllById(policyControlIds).stream()
-                        .anyMatch(c -> ctx2.getId().equals(c.getAssignedAuditorId())
-                                || c.getAssignedAuditorId() == null);
-        result.put("isAssignedToCurrentUser", isPolicyAssigned);
+        var polEv = controlAccessGuard.evaluator(policy.getEngagementId(), ctx2.getId());
+        boolean canReviewPolicy = polEv.canActOnPolicy(policy);
+        result.put("isAssignedToCurrentUser", canReviewPolicy);
+        result.put("canReviewPolicy",         canReviewPolicy);
+        result.put("hasMyObligation",         polEv.hasPolicyObligation(id));
+        result.put("assignmentByPermission", Map.of(
+                "audit:policy:review", canReviewPolicy));
 
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/policy-instances/{id}/controls")
     @Operation(summary = "List all control instances covered by this policy")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getPolicyControls(
             @PathVariable Long id) {
+
+        var parentPolicy = policyRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", id));
+        controlAccessGuard.requireReadable(parentPolicy.getTenantId(), parentPolicy.getEngagementId());
 
         List<AuditPolicyInstanceControlMapping> mappings =
                 policyCtrlMappingRepo.findByPolicyInstanceId(id);
@@ -560,6 +631,14 @@ public class AuditInstanceController {
                 : controlRepo.findAllById(coveredControlIds).stream()
                   .collect(Collectors.toMap(AuditControlInstance::getId, c -> c));
 
+        // Mirrors setContribution's guard per row: the policy's reviewer, or
+        // whoever may act on that control auditor-side.
+        var pcCtx = utilityService.getLoggedInDataContext();
+        var pcEv  = controlAccessGuard.evaluator(parentPolicy.getEngagementId(), pcCtx.getId())
+                .prefetchControls(coveredControlsById.values())
+                .prefetchPolicies(List.of(id));
+        boolean canReviewParent = pcEv.canActOnPolicy(parentPolicy);
+
         List<Map<String, Object>> result = mappings.stream().map(m -> {
             Map<String, Object> row = new LinkedHashMap<>();
             row.put("mappingId",           m.getId());
@@ -568,6 +647,7 @@ public class AuditInstanceController {
             row.put("mappingTypeSnapshot", m.getMappingTypeSnapshot());
             row.put("mappingNoteSnapshot", m.getMappingNoteSnapshot());
             AuditControlInstance c = coveredControlsById.get(m.getControlInstanceId());
+            row.put("canSetContribution",  canReviewParent || (c != null && pcEv.canAct(c, false)));
             if (c != null) {
                 row.put("controlCodeSnapshot", c.getControlCodeSnapshot());
                 row.put("controlNameSnapshot", c.getControlNameSnapshot());
@@ -591,74 +671,14 @@ public class AuditInstanceController {
         var policy = policyRepo.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", id));
 
-        boolean hasAssignPermission = ctx.getRoles().stream()
-                .flatMap(r -> r.getPermissions().stream())
-                .anyMatch(p -> "audit:control:assign-auditor".equals(p.getCode()));
-        if (!hasAssignPermission) {
-            List<Long> controlInstanceIds = policyCtrlMappingRepo.findByPolicyInstanceId(id)
-                    .stream().map(m -> m.getControlInstanceId()).toList();
-            // The old `|| c.getAssignedAuditorId() == null` made every unassigned
-            // control testable by anyone. Delegating to the guard keeps section
-            // owners and the lead auditor able to act without opening it up.
-            boolean isAssigned = !controlInstanceIds.isEmpty() &&
-                    controlRepo.findAllById(controlInstanceIds).stream()
-                            .anyMatch(c -> controlAccessGuard.canAct(c, ctx.getId(), false));
-            if (!isAssigned) {
-                throw new com.kashi.grc.common.exception.BusinessException(
-                        "POLICY_NOT_ASSIGNED",
-                        "You are not assigned to any control mapped to this policy");
-            }
-        }
+        // WAS: anyone holding audit:control:assign-auditor skipped the check, in
+        // any tenant. Now the guard alone — see setTestResult.
+        controlAccessGuard.requireCanReviewPolicy(policy, ctx.getId());
 
-        policy.setReviewResult(
-                AuditPolicyInstance.ReviewResult.valueOf(body.get("reviewResult")));
-        policy.setReviewedById(ctx.getId());
-        policy.setReviewedAt(LocalDateTime.now());
-        if (body.containsKey("auditorNotes")) policy.setAuditorNotes(body.get("auditorNotes"));
-        policyRepo.save(policy);
-
-        // One finding per policy (not per control) when INADEQUATE.
-        // The policy owner is responsible for remediation — not the individual control auditees.
-        if (policy.getReviewResult() == AuditPolicyInstance.ReviewResult.INADEQUATE) {
-            String autoTitle = "Policy gap: " + policy.getTitleSnapshot();
-            boolean alreadyExists = findingRepo
-                    .findByEngagementIdAndTenantId(policy.getEngagementId(), ctx.getTenantId())
-                    .stream()
-                    .anyMatch(f -> autoTitle.equals(f.getTitle())
-                            && f.getStatus() != AuditFinding.Status.CLOSED
-                            && f.getStatus() != AuditFinding.Status.ACCEPTED_RISK
-                            && f.getStatus() != AuditFinding.Status.WITHDRAWN);
-
-            if (!alreadyExists) {
-                AuditFinding autoFinding = AuditFinding.builder()
-                        .tenantId(ctx.getTenantId())
-                        .findingRef(generateFindingRef(ctx.getTenantId()))
-                        .engagementId(policy.getEngagementId())
-                        .controlInstanceId(null)  // policy-level finding, not tied to one control
-                        .title(autoTitle)
-                        .description("Policy '" + policy.getTitleSnapshot() + "' v"
-                                + policy.getVersionSnapshot() + " reviewed as INADEQUATE.")
-                        .severity(AuditFinding.Severity.MEDIUM)
-                        .findingType(AuditFinding.FindingType.CONTROL_DEFICIENCY)
-                        // Raised by the policy-review derivation, not typed by a person.
-                        .source(AuditFinding.Source.AUTOMATED)
-                        .status(AuditFinding.Status.OPEN)
-                        .frameworkRef(policy.getFrameworkRefsSnapshot())
-                        .ownerId(policy.getOwnerIdSnapshot())  // policy owner remediates policy gaps
-                        .raisedBy(ctx.getId())
-                        .raisedAt(LocalDateTime.now())
-                        .build();
-                findingRepo.save(autoFinding);
-                log.info("[POLICY-INSTANCE] Auto-finding raised | policyInstanceId={} findingRef={}",
-                        id, autoFinding.getFindingRef());
-
-                autoEscalateToIssue(autoFinding, ctx.getId(), ctx.getTenantId());
-            }
-
-            snapshotService.syncEngagementScore(policy.getEngagementId(), ctx.getTenantId());
-        }
-
-        log.info("[POLICY-INSTANCE] Reviewed | id={} | result={}", id, policy.getReviewResult());
+        // One implementation for every screen that records a policy review —
+        // control Fieldwork, Policy content tab, admin Policies tab — so the
+        // INADEQUATE policy-gap finding is raised whichever one is used.
+        fieldworkService.reviewPolicy(policy, body, ctx.getId(), ctx.getTenantId());
         return ResponseEntity.ok(ApiResponse.success());
     }
 
@@ -686,6 +706,22 @@ public class AuditInstanceController {
         }
         auditScopeService.requireEngagementVisible(ctrlInst.getEngagementId());
 
+        // Tenant and visibility were the whole check, so any auditor in the
+        // engagement could rewrite any control's contribution. Same answer as
+        // the row's canSetContribution flag: the policy's reviewer, or whoever
+        // may act on this control auditor-side.
+        var contribPolicy = policyRepo.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicyInstance", id));
+        if (!java.util.Objects.equals(contribPolicy.getEngagementId(), ctrlInst.getEngagementId())) {
+            throw new ResourceNotFoundException("PolicyControlMapping", id);
+        }
+        if (!controlAccessGuard.canActOnPolicy(contribPolicy, ctxUser.getId())
+                && !controlAccessGuard.canAct(ctrlInst, ctxUser.getId(), false)) {
+            throw new com.kashi.grc.common.exception.BusinessException("POLICY_NOT_ASSIGNED",
+                    "Only the policy's reviewer or the control's auditor can set its contribution.",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+
         mapping.setReviewContribution(
                 AuditPolicyInstanceControlMapping.ReviewContribution.valueOf(body.get("contribution")));
         policyCtrlMappingRepo.save(mapping);
@@ -697,26 +733,38 @@ public class AuditInstanceController {
     // LIST ENDPOINTS — tenant-scoped, optionally filtered by engagementId
     // ══════════════════════════════════════════════════════════════════════════
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/control-instances")
     @Operation(summary = "List all control instances for this tenant, optionally filtered by engagement")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listControlInstances(
             @RequestParam(required = false) Long engagementId) {
         var ctx = utilityService.getLoggedInDataContext();
         List<AuditControlInstance> items = engagementId != null
-                ? controlRepo.findByEngagementId(engagementId)
+                ? controlRepo.findByEngagementId(requireListableEngagement(engagementId))
                 : controlRepo.findByTenantIdOrderByControlCodeSnapshotAsc(ctx.getTenantId());
+        items = onlyVisible(items, AuditControlInstance::getEngagementId);
+
+        // One evaluator per engagement, prefetched — buildControlMap used to run
+        // the workflow tier twice per row.
+        Map<Long, com.kashi.grc.audit.service.ControlAccessGuard.Evaluator> evaluators = new HashMap<>();
+        items.stream().collect(Collectors.groupingBy(AuditControlInstance::getEngagementId))
+                .forEach((eid, ctrls) -> evaluators.put(eid,
+                        controlAccessGuard.evaluator(eid, ctx.getId()).prefetchControls(ctrls)));
         return ResponseEntity.ok(ApiResponse.success(
-                items.stream().map(this::buildControlMap).collect(Collectors.toList())));
+                items.stream().map(c -> buildControlMap(c, evaluators.get(c.getEngagementId())))
+                        .collect(Collectors.toList())));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/test-instances")
     @Operation(summary = "List all test instances for this tenant, optionally filtered by engagement")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listTestInstances(
             @RequestParam(required = false) Long engagementId) {
         var ctx = utilityService.getLoggedInDataContext();
         List<AuditTestInstance> items = engagementId != null
-                ? testRepo.findByEngagementIdOrderByTestNameSnapshotAsc(engagementId)
+                ? testRepo.findByEngagementIdOrderByTestNameSnapshotAsc(requireListableEngagement(engagementId))
                 : testRepo.findByTenantIdOrderByTestNameSnapshotAsc(ctx.getTenantId());
+        items = onlyVisible(items, AuditTestInstance::getEngagementId);
         return ResponseEntity.ok(ApiResponse.success(
                 items.stream().map(t -> {
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -732,14 +780,16 @@ public class AuditInstanceController {
                 }).collect(Collectors.toList())));
     }
 
+    @org.springframework.transaction.annotation.Transactional(readOnly = true)
     @GetMapping("/v1/audit/policy-instances")
     @Operation(summary = "List all policy instances for this tenant, optionally filtered by engagement")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> listPolicyInstances(
             @RequestParam(required = false) Long engagementId) {
         var ctx = utilityService.getLoggedInDataContext();
         List<AuditPolicyInstance> items = engagementId != null
-                ? policyRepo.findByEngagementIdOrderByTitleSnapshotAsc(engagementId)
+                ? policyRepo.findByEngagementIdOrderByTitleSnapshotAsc(requireListableEngagement(engagementId))
                 : policyRepo.findByTenantIdOrderByTitleSnapshotAsc(ctx.getTenantId());
+        items = onlyVisible(items, AuditPolicyInstance::getEngagementId);
         return ResponseEntity.ok(ApiResponse.success(
                 items.stream().map(p -> {
                     Map<String, Object> m = new LinkedHashMap<>();
@@ -756,7 +806,37 @@ public class AuditInstanceController {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private Map<String, Object> buildControlMap(AuditControlInstance c) {
+    /**
+     * An engagementId filter on a list endpoint: the engagement must exist in
+     * the caller's tenant and be visible to a guest. Previously the id was used
+     * as-is, so ?engagementId= read another tenant's instances.
+     */
+    private Long requireListableEngagement(Long engagementId) {
+        var eng = engagementRepo.findById(engagementId)
+                .orElseThrow(() -> new com.kashi.grc.common.exception.BusinessException(
+                        "AUDIT_INSTANCE_NOT_ACCESSIBLE", "You do not have access to this record.",
+                        org.springframework.http.HttpStatus.FORBIDDEN));
+        controlAccessGuard.requireReadable(eng.getTenantId(), eng.getId());
+        return engagementId;
+    }
+
+    /**
+     * Tenant-wide lists: a vendor sees nothing, and a guest sees only the
+     * engagements they are staffed on. HOME members are unaffected.
+     */
+    private <T> List<T> onlyVisible(List<T> items, java.util.function.Function<T, Long> engagementOf) {
+        if (com.kashi.grc.common.config.multitenancy.AccessScope.isVendor()) {
+            throw new com.kashi.grc.common.exception.BusinessException("AUDIT_INSTANCE_NOT_ACCESSIBLE",
+                    "Vendor accounts do not have access to audit engagements",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        java.util.Set<Long> visible = com.kashi.grc.common.config.multitenancy.AccessScope.engagementIds();
+        if (visible == null) return items;
+        return items.stream().filter(i -> visible.contains(engagementOf.apply(i))).toList();
+    }
+
+    private Map<String, Object> buildControlMap(AuditControlInstance c,
+                                                com.kashi.grc.audit.service.ControlAccessGuard.Evaluator ev) {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("id",                       c.getId());
         // The frontend's requires_assignment gate reads entity.isAssignedToCurrentUser
@@ -768,10 +848,25 @@ public class AuditInstanceController {
         // this flag only needs to answer "assigned to THIS control". Auditor-only
         // would have killed SUBMIT_EVIDENCE for the assigned auditee, whose
         // assignment lives in auditeeAssignedUserId, not assignedAuditorId.
-        Long uid = utilityService.getLoggedInDataContext().getId();
-        boolean auditorSide = controlAccessGuard.canAct(c, uid, false);
-        m.put("isAssignedToCurrentUser", auditorSide || controlAccessGuard.canAct(c, uid, true));
+        //
+        // ...which still let a user holding BOTH permissions see both buttons when
+        // only one side was theirs. canSubmitEvidence / canRecordResult answer each
+        // side separately, and assignmentByPermission keys those answers by the
+        // permission a ui_action carries, so the shared action filter gates a
+        // requires_assignment button on the side it actually belongs to.
+        boolean auditorSide = ev.canAct(c, false);
+        boolean auditeeSide = ev.canAct(c, true);
+        m.put("isAssignedToCurrentUser", auditorSide || auditeeSide);
         m.put("canRecordResult",         auditorSide);
+        m.put("canSubmitEvidence",       auditeeSide);
+        m.put("hasMyObligation",         ev.hasControlObligation(c.getId(), true)
+                || ev.hasControlObligation(c.getId(), false));
+        m.put("assignmentByPermission",  Map.of(
+                "audit:control:submit-evidence",    auditeeSide,
+                "audit:control:record-test-result", auditorSide,
+                // AuditFindingController guards a control-linked finding with
+                // requireCanRecordResult — same answer.
+                "audit:finding:create",             auditorSide));
         m.put("engagementId",             c.getEngagementId());
         // Breadcrumb support
         if (c.getEngagementId() != null) {
@@ -797,6 +892,18 @@ public class AuditInstanceController {
         m.put("auditeeAssignedUserId",    c.getAuditeeAssignedUserId());
         m.put("auditeeEvidenceSubmitted", c.isAuditeeEvidenceSubmitted());
         m.put("evidenceSubmittedAt",      c.getAuditeeEvidenceSubmittedAt());
+        // Submitted without evidence / left untested, with the reason — and the
+        // derived flag a ui_actions row hides "Not tested" on.
+        m.put("evidenceGapReason",        c.getEvidenceGapReason());
+        m.put("evidenceGapAt",            c.getEvidenceGapAt());
+        m.put("notTestedReason",          c.getNotTestedReason());
+        m.put("notTestedAt",              c.getNotTestedAt());
+        m.put("testConcluded",            c.isTestConcluded());
+        // "Ask to resubmit" — the evidence side (who may delegate the evidence)
+        // can reopen what was submitted until the auditor concludes the control.
+        m.put("canReopenEvidence", (c.isAuditeeEvidenceSubmitted()
+                || (c.getEvidenceGapReason() != null && !c.getEvidenceGapReason().isBlank()))
+                && !c.isTestConcluded() && ev.canDelegate(c, true));
         m.put("testedAt",                 c.getTestedAt());
         m.put("testedBy",                 c.getTestedBy());
         m.put("findingLinked",            c.isFindingLinked());
@@ -806,75 +913,4 @@ public class AuditInstanceController {
         return m;
     }
 
-    /**
-     * Auto-escalate a finding to Issue Management using workflow 15.
-     * Step 1 (ENTITY_CREATOR + auto_complete_actor_on_submit=1) completes immediately on creation.
-     * Step 2 (ENTITY_OWNER) lands in the owner's task inbox.
-     * Wrapped in try-catch so a workflow config issue never breaks the parent operation.
-     */
-    private void autoEscalateToIssue(AuditFinding finding, Long createdBy, Long tenantId) {
-        // IssueService now rejects an owner or creator who is not a user of this
-        // tenant. Checking here first keeps the finding intact and the log
-        // readable instead of relying on the catch below.
-        if (finding.getOwnerId() == null || createdBy == null) {
-            log.warn("[AUDIT-FINDING] Not escalating {} — ownerId={} createdBy={}. "
-                            + "Set a policy owner, then escalate manually.",
-                    finding.getFindingRef(), finding.getOwnerId(), createdBy);
-            return;
-        }
-        try {
-            IssueRequest req = new IssueRequest();
-            req.setTitle(finding.getTitle());
-            req.setDescription(finding.getDescription());
-            req.setIssueType(Issue.IssueType.INTERNAL);
-            req.setSeverity(Issue.Severity.MEDIUM);
-            req.setSourceModule("AUDIT");
-            req.setSourceEntityType("AUDIT_FINDING");
-            req.setSourceEntityId(finding.getId());
-            req.setFrameworkRef(finding.getFrameworkRef());
-            req.setOwnerId(finding.getOwnerId());
-            req.setWorkflowId(findingWorkflowId(tenantId));
-            var issueResp = issueService.create(req, createdBy, tenantId);
-            finding.setLinkedIssueId(issueResp.getId());
-            findingRepo.save(finding);
-            log.info("[AUDIT-FINDING] Auto-escalated to issue | findingId={} issueId={} issueRef={}",
-                    finding.getId(), issueResp.getId(), issueResp.getIssueRef());
-        } catch (Exception ex) {
-            log.warn("[AUDIT-FINDING] Auto-escalate failed for finding {} — {}",
-                    finding.getId(), ex.getMessage());
-        }
-    }
-
-    /**
-     * Workflow used for issues escalated from an audit finding.
-     *
-     * Resolved by name, not by a hardcoded id. Workflow 15 "Issue Remediation
-     * Lifecycle" opens with a triage step resolved ENTITY_CREATOR, which is
-     * meaningless for an issue nobody filed — and it was that step that turned a
-     * bad createdBy into a task in a stranger's inbox. The finding workflow
-     * starts at the owner instead and has the auditor validate the fix.
-     *
-     * Falls back to the generic issue workflow if the finding one is absent, so
-     * escalation still happens on an environment where seed 17 has not run.
-     */
-    private Long findingWorkflowId(Long tenantId) {
-        return workflowRepository.findAll().stream()
-                .filter(w -> w.isActive())
-                .filter(w -> "ISSUE".equalsIgnoreCase(w.getEntityType()))
-                .filter(w -> w.getTenantId() == null || w.getTenantId().equals(tenantId))
-                .filter(w -> "Audit Finding Remediation".equalsIgnoreCase(w.getName()))
-                .map(w -> w.getId())
-                .findFirst()
-                .orElse(15L);
-    }
-
-    /** Collision-safe finding ref generator */
-    private String generateFindingRef(Long tenantId) {
-        long count = findingRepo.countByTenantId(tenantId) + 1;
-        String candidate = String.format("FND-%d-%04d", Year.now().getValue(), count);
-        while (findingRepo.existsByFindingRefAndTenantId(candidate, tenantId)) {
-            candidate = String.format("FND-%d-%04d", Year.now().getValue(), ++count);
-        }
-        return candidate;
-    }
 }

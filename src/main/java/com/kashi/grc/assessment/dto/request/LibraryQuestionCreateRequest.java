@@ -33,4 +33,14 @@ public class LibraryQuestionCreateRequest {
      * If null or blank, the guard system will skip this question entirely.
      */
     public String questionTag;
+
+    /**
+     * Optional. Does this question require a document to be attached?
+     *
+     * Boxed, not primitive, on purpose: update is a partial PUT and a primitive
+     * would arrive as false for every caller that simply did not send the
+     * field, silently clearing the requirement on every question edited from a
+     * screen that predates it. Null means "not supplied".
+     */
+    public Boolean requiresEvidence;
 }
