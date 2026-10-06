@@ -33,4 +33,24 @@ public interface ChatMessageRepository extends JpaRepository<ChatMessage, Long> 
 
     @Query("SELECT MAX(m.id) FROM ChatMessage m WHERE m.conversationId = :c")
     Long maxId(@Param("c") Long conversationId);
+
+    /** Pinned messages of a conversation, most recently pinned first. */
+    @Query("SELECT m FROM ChatMessage m WHERE m.conversationId = :c AND m.pinnedAt IS NOT NULL AND m.deleted = false ORDER BY m.pinnedAt DESC")
+    List<ChatMessage> pinned(@Param("c") Long conversationId);
+
+    /** Search one conversation's text, newest first. :q is already lower-cased and wrapped in %…%. */
+    @Query("SELECT m FROM ChatMessage m WHERE m.conversationId = :c AND m.deleted = false AND LOWER(m.body) LIKE :q ESCAPE '!' ORDER BY m.id DESC")
+    List<ChatMessage> search(@Param("c") Long conversationId, @Param("q") String q, Pageable pageable);
+
+    /** Messages with files, newest first — the details panel's Media and Files. */
+    @Query("SELECT m FROM ChatMessage m WHERE m.conversationId = :c AND m.deleted = false AND m.attachmentsJson IS NOT NULL AND m.id < :before ORDER BY m.id DESC")
+    List<ChatMessage> withFiles(@Param("c") Long conversationId, @Param("before") Long before, Pageable pageable);
+
+    /** Messages that may hold a link (web or a KashiGuard page), newest first — the details panel's Links. */
+    @Query("""
+            SELECT m FROM ChatMessage m WHERE m.conversationId = :c AND m.deleted = false AND m.id < :before
+              AND (m.body LIKE '%http://%' OR m.body LIKE '%https://%' OR m.body LIKE '%/module/%' OR m.body LIKE '%/collaboration/meetings/%')
+            ORDER BY m.id DESC
+            """)
+    List<ChatMessage> withLinks(@Param("c") Long conversationId, @Param("before") Long before, Pageable pageable);
 }

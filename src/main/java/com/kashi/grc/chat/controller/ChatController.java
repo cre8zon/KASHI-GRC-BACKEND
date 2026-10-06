@@ -25,6 +25,7 @@ import java.util.Map;
  *   GET    /v1/chat/me                                  { userId, canUse, pushTopic }
  *   GET    /v1/chat/unread                              { total } — sidebar badge
  *   GET    /v1/chat/people                              staff you can message
+ *   GET    /v1/chat/presence                            { online: [userId], lastSeen: { userId: time } } — live: "presence" pushes
  *   GET    /v1/chat/conversations                       mine, newest activity first, with unread counts
  *   GET    /v1/chat/conversations/browse                public channels I am not in
  *   POST   /v1/chat/conversations                       { kind: DIRECT|GROUP|CHANNEL, ... }
@@ -34,10 +35,20 @@ import java.util.Map;
  *   POST   /v1/chat/conversations/{id}/members          { userIds }
  *   DELETE /v1/chat/conversations/{id}/members/{userId} remove, or leave (yourself)
  *   GET    /v1/chat/conversations/{id}/messages?before=&limit=
- *   POST   /v1/chat/conversations/{id}/messages         { body, mentions: [userId] }
+ *   POST   /v1/chat/conversations/{id}/messages         { body, mentions: [userId], replyToId?, attachmentIds?: [documentId] }
+ *   GET    /v1/chat/conversations/{id}/members          everyone in it (details panel)
+ *   GET    /v1/chat/conversations/{id}/shared?type=media|files|links&before=   what was shared (details panel)
+ *   GET    /v1/chat/conversations/{id}/pins             pinned messages
+ *   GET    /v1/chat/conversations/{id}/search?q=        text search, newest first
+ *   POST   /v1/chat/conversations/{id}/typing           "I am typing" (pushed to the others)
  *   POST   /v1/chat/conversations/{id}/read             { messageId? }
  *   PATCH  /v1/chat/messages/{id}                       { body } — your own
  *   DELETE /v1/chat/messages/{id}                       yours, or as channel owner
+ *   POST   /v1/chat/messages/{id}/reactions             { emoji } — toggles mine
+ *   POST   /v1/chat/messages/{id}/pin                   { pinned: true|false }
+ *
+ * Files: upload with the document API to entityType CHAT_CONVERSATION and the
+ * conversation id, then send the document ids as attachmentIds.
  *
  * Rules are in ChatService.
  */
@@ -144,7 +155,58 @@ public class ChatController {
         return ResponseEntity.ok(ApiResponse.success(service.edit(id, body)));
     }
 
-    @DeleteMapping("/messages/{id}")
+    @GetMapping("/presence")
+    @Operation(summary = "Who in my organisation is online, and when the others were last seen")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> presence() {
+        return ResponseEntity.ok(ApiResponse.success(service.presence()));
+    }
+
+    @GetMapping("/conversations/{id}/members")
+    @Operation(summary = "Everyone in a conversation")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> members(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.success(service.members(id)));
+    }
+
+    @GetMapping("/conversations/{id}/shared")
+    @Operation(summary = "Images, files or links shared in a conversation, newest first")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> shared(@PathVariable Long id,
+                                                                   @RequestParam(value = "type", defaultValue = "media") String type,
+                                                                   @RequestParam(value = "before", required = false) Long before) {
+        return ResponseEntity.ok(ApiResponse.success(service.shared(id, type, before)));
+    }
+
+    @GetMapping("/conversations/{id}/pins")
+    @Operation(summary = "Pinned messages")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> pins(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.success(service.pins(id)));
+    }
+
+    @GetMapping("/conversations/{id}/search")
+    @Operation(summary = "Search this conversation's messages")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> search(@PathVariable Long id, @RequestParam("q") String q) {
+        return ResponseEntity.ok(ApiResponse.success(service.search(id, q)));
+    }
+
+    @PostMapping("/conversations/{id}/typing")
+    @Operation(summary = "Tell the others I am typing")
+    public ResponseEntity<ApiResponse<Void>> typing(@PathVariable Long id) {
+        service.typing(id);
+        return ResponseEntity.ok(ApiResponse.success());
+    }
+
+    @PostMapping("/messages/{id}/reactions")
+    @Operation(summary = "Add or remove my reaction")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> react(@PathVariable Long id, @RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(service.react(id, body)));
+    }
+
+    @PostMapping("/messages/{id}/pin")
+    @Operation(summary = "Pin or unpin a message")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> pin(@PathVariable Long id, @RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(service.pin(id, Boolean.parseBoolean(String.valueOf(body.get("pinned"))))));
+    }
+
+        @DeleteMapping("/messages/{id}")
     @Operation(summary = "Delete a message")
     public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {
         service.delete(id);

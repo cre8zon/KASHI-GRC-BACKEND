@@ -39,4 +39,24 @@ public class ChatMessage extends TenantAwareEntity {
     @Column(name = "deleted", nullable = false)
     @lombok.Builder.Default
     private boolean deleted = false;
+
+    /** The message this one answers (same conversation). */
+    @Column(name = "reply_to_id")
+    private Long replyToId;
+
+    /**
+     * Files sent with the message, as JSON [{documentId, fileName, mimeType, size}].
+     * The files are documents linked to the conversation (CHAT_CONVERSATION);
+     * this is the snapshot the bubble shows, so a renamed document does not
+     * rewrite history.
+     */
+    @Column(name = "attachments_json", columnDefinition = "TEXT")
+    private String attachmentsJson;
+
+    /** Pinned to the conversation: when, and by whom. Null = not pinned. */
+    @Column(name = "pinned_at")
+    private LocalDateTime pinnedAt;
+
+    @Column(name = "pinned_by")
+    private Long pinnedBy;
 }

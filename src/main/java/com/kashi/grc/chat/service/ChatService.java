@@ -3,9 +3,16 @@ package com.kashi.grc.chat.service;
 import com.kashi.grc.chat.domain.ChatConversation;
 import com.kashi.grc.chat.domain.ChatMember;
 import com.kashi.grc.chat.domain.ChatMessage;
+import com.kashi.grc.chat.domain.ChatReaction;
 import com.kashi.grc.chat.repository.ChatConversationRepository;
 import com.kashi.grc.chat.repository.ChatMemberRepository;
 import com.kashi.grc.chat.repository.ChatMessageRepository;
+import com.kashi.grc.chat.repository.ChatReactionRepository;
+import com.kashi.grc.document.domain.Document;
+import com.kashi.grc.document.repository.DocumentLinkRepository;
+import com.kashi.grc.document.repository.DocumentRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.kashi.grc.collab.service.CollabAccessService;
 import com.kashi.grc.collab.service.CollabAccessService.Caller;
 import com.kashi.grc.collab.service.CollabMeetingService;
@@ -41,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
@@ -57,6 +65,9 @@ import java.util.stream.Collectors;
  *   owners. In a group anyone in it may add people or rename it. A direct
  *   conversation has no settings.
  *   Edit a message: whoever sent it. Delete: the sender, or a channel owner.
+ *   Reply, react, pin, attach files: members. Files are documents linked to
+ *   the conversation (CHAT_CONVERSATION) — ChatDocumentAccessPolicy lets
+ *   members attach and readers read them, through the shared document API.
  *
  * ── LIVE UPDATES WITHOUT LEAKING CONTENT ──────────────────────────────────────
  * The STOMP broker does not check who subscribes to a topic, so nothing
@@ -65,6 +76,9 @@ import java.util.stream.Collectors;
  * push says only "conversation N changed", and the browser fetches through
  * the authorised API. The secret is per process, so topics change on
  * restart — the client asks /v1/chat/me again when it reconnects.
+ * Two lighter pushes carry no content either: "typing" (who, by user id) and
+ * "read" (who caught up to which message id) — for the typing line and
+ * "Seen by", without refetching the messages.
  */
 @Slf4j
 @Service
@@ -72,7 +86,13 @@ import java.util.stream.Collectors;
 public class ChatService {
 
     public static final String PERM_USE = "chat:use";
+    /** Entity type chat files are linked to in the document module. */
+    public static final String DOC_ENTITY = "CHAT_CONVERSATION";
     private static final int MAX_BODY = 8000;
+    private static final int MAX_FILES = 10;
+    private static final int MAX_REACTIONS_PER_PERSON = 20;
+    /** Last "typing" push per user + conversation — at most one every 2 seconds. */
+    private static final Map<String, Long> TYPING_AT = new ConcurrentHashMap<>();
     private static final byte[] PUSH_SECRET = new byte[32];
     static { new SecureRandom().nextBytes(PUSH_SECRET); }
 
@@ -81,9 +101,14 @@ public class ChatService {
     private final ChatConversationRepository conversationRepository;
     private final ChatMemberRepository       memberRepository;
     private final ChatMessageRepository      messageRepository;
+    private final ChatReactionRepository     reactionRepository;
+    private final DocumentRepository         documentRepository;
+    private final DocumentLinkRepository     documentLinkRepository;
+    private final ObjectMapper               objectMapper;
     private final UserRepository             userRepository;
     private final NotificationService        notificationService;
     private final SimpMessagingTemplate      messaging;
+    private final ChatPresenceService        presence;
 
     // ══════════════════════ ACCESS ═══════════════════════════════════════════
 
@@ -149,6 +174,12 @@ public class ChatService {
         return new ArrayList<>(staff().values());
     }
 
+    /** Who in my organisation is online now, and when the others were last seen (live updates: "presence" pushes). */
+    public Map<String, Object> presence() {
+        Caller c = requireChat();
+        return presence.snapshot(c.tenantId());
+    }
+
     @Transactional(readOnly = true)
     public List<Map<String, Object>> conversations() {
         Caller c = requireChat();
@@ -176,7 +207,7 @@ public class ChatService {
             if (lm != null) {
                 Map<String, Object> l = new LinkedHashMap<>();
                 l.put("senderName", lm.getSenderId().equals(c.userId()) ? "You" : firstName(users.get(lm.getSenderId())));
-                l.put("text", lm.isDeleted() ? "Message deleted" : preview(lm.getBody()));
+                l.put("text", lm.isDeleted() ? "Message deleted" : messagePreview(lm));
                 l.put("at", lm.getCreatedAt());
                 x.put("lastMessage", l);
             }
@@ -192,7 +223,86 @@ public class ChatService {
         ChatConversation conv = requireConversation(c, id);
         ChatMember me = requireReader(c, conv);
         List<ChatMember> members = memberRepository.findByConversationId(conv.getId());
-        return summary(c, conv, me, members, users(members.stream().map(ChatMember::getUserId).collect(Collectors.toSet())));
+        Set<Long> ids = members.stream().map(ChatMember::getUserId).collect(Collectors.toSet());
+        if (conv.getCreatedBy() != null) ids.add(conv.getCreatedBy());
+        Map<Long, User> users = users(ids);
+        Map<String, Object> out = summary(c, conv, me, members, users);
+        // For the details panel.
+        out.put("createdAt", conv.getCreatedAt());
+        out.put("createdByName", conv.getCreatedBy() == null ? null : name(users.get(conv.getCreatedBy())));
+        return out;
+    }
+
+    /** Everyone in a conversation (the summary carries at most 60) — the details panel's People. */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> members(Long id) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, id);
+        requireReader(c, conv);
+        List<ChatMember> members = memberRepository.findByConversationId(conv.getId());
+        Map<Long, User> users = users(members.stream().map(ChatMember::getUserId).collect(Collectors.toSet()));
+        return members.stream().map(m -> {
+            User u = users.get(m.getUserId());
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("userId", m.getUserId());
+            p.put("name", name(u));
+            p.put("email", u == null ? null : u.getEmail());
+            p.put("role", m.getRole());
+            p.put("joinedAt", m.getCreatedAt());
+            p.put("you", m.getUserId().equals(c.userId()));
+            return p;
+        }).sorted(Comparator.comparing((Map<String, Object> p) -> !ChatMember.OWNER.equals(p.get("role")))
+                .thenComparing(p -> String.valueOf(p.get("name")).toLowerCase()))
+                .toList();
+    }
+
+    /**
+     * What was shared in a conversation, newest first — the details panel.
+     *   type=media  images      { documentId, fileName, mimeType, size, messageId, senderName, createdAt }
+     *   type=files  other files (same fields)
+     *   type=links  messages with links { messageId, senderName, createdAt, body } — the page picks the links out
+     * Scans 100 messages per call; pass nextBefore back as before for more.
+     */
+    @Transactional(readOnly = true)
+    public Map<String, Object> shared(Long id, String type, Long before) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, id);
+        requireReader(c, conv);
+        String t = type == null ? "media" : type.trim().toLowerCase();
+        if (!Set.of("media", "files", "links").contains(t)) throw bad("CHAT_BAD_TYPE", "type must be media, files or links");
+        int scan = 100;
+        long from = before == null ? Long.MAX_VALUE : before;
+        List<ChatMessage> page = "links".equals(t)
+                ? messageRepository.withLinks(conv.getId(), from, PageRequest.of(0, scan))
+                : messageRepository.withFiles(conv.getId(), from, PageRequest.of(0, scan));
+        Map<Long, User> users = users(page.stream().map(ChatMessage::getSenderId).collect(Collectors.toSet()));
+        List<Map<String, Object>> items = new ArrayList<>();
+        for (ChatMessage m : page) {
+            String sender = m.getSenderId().equals(c.userId()) ? "You" : name(users.get(m.getSenderId()));
+            if ("links".equals(t)) {
+                Map<String, Object> x = new LinkedHashMap<>();
+                x.put("messageId", m.getId());
+                x.put("senderName", sender);
+                x.put("createdAt", m.getCreatedAt());
+                x.put("body", m.getBody());
+                items.add(x);
+                continue;
+            }
+            for (Map<String, Object> f : readList(m.getAttachmentsJson())) {
+                boolean image = String.valueOf(f.get("mimeType")).toLowerCase().startsWith("image/");
+                if (image != "media".equals(t)) continue;
+                Map<String, Object> x = new LinkedHashMap<>(f);
+                x.put("messageId", m.getId());
+                x.put("senderName", sender);
+                x.put("createdAt", m.getCreatedAt());
+                items.add(x);
+            }
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("items", items);
+        out.put("hasMore", page.size() == scan);
+        out.put("nextBefore", page.isEmpty() ? null : page.get(page.size() - 1).getId());
+        return out;
     }
 
     /** Public channels I am not in yet. */
@@ -226,9 +336,8 @@ public class ChatService {
         boolean more = page.size() > n;
         if (more) page = page.subList(0, n);
         java.util.Collections.reverse(page);
-        Map<Long, User> users = users(page.stream().map(ChatMessage::getSenderId).collect(Collectors.toSet()));
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("messages", page.stream().map(m -> messageMap(c, m, users)).toList());
+        out.put("messages", render(c, page));
         out.put("hasMore", more);
         out.put("lastReadMessageId", me == null ? null : me.getLastReadMessageId());
         return out;
@@ -406,7 +515,16 @@ public class ChatService {
         ChatConversation conv = requireConversation(c, conversationId);
         ChatMember me = requireMember(c, conv);
         if (conv.isArchived()) throw bad("CHAT_ARCHIVED", "This conversation is archived");
-        String text = cleanBody(body.get("body"));
+        List<Map<String, Object>> files = attachmentsFor(c, conv, ids(body.get("attachmentIds")));
+        // A message is text, files, or both — files alone need no text.
+        String text = files.isEmpty() ? cleanBody(body.get("body")) : cleanOptionalBody(body.get("body"));
+        ChatMessage replyTarget = null;
+        Long replyToId = longOrNull(body.get("replyToId"));
+        if (replyToId != null) {
+            replyTarget = messageRepository.findById(replyToId)
+                    .filter(x -> x.getConversationId().equals(conv.getId()))
+                    .orElseThrow(() -> bad("CHAT_BAD_REPLY", "That message is not in this conversation"));
+        }
         List<ChatMember> memberRows = memberRepository.findByConversationId(conv.getId());
         Set<Long> members = memberRows.stream().map(ChatMember::getUserId)
                 .collect(Collectors.toCollection(LinkedHashSet::new));
@@ -419,6 +537,8 @@ public class ChatService {
                 .senderId(c.userId())
                 .body(text)
                 .mentions(mentions.isEmpty() ? null : mentions.stream().map(String::valueOf).collect(Collectors.joining(",")))
+                .replyToId(replyTarget == null ? null : replyTarget.getId())
+                .attachmentsJson(files.isEmpty() ? null : write(files))
                 .build();
         m.setTenantId(c.tenantId());
         messageRepository.save(m);
@@ -428,20 +548,34 @@ public class ChatService {
         memberRepository.save(me);
         ping(conv.getId(), members);
 
+        String where = ChatConversation.CHANNEL.equals(conv.getKind()) ? "#" + conv.getName() : "a conversation";
+        String who = null;
         if (!mentions.isEmpty()) {
-            String who = name(userRepository.findById(c.userId()).orElse(null));
-            String where = ChatConversation.CHANNEL.equals(conv.getKind()) ? "#" + conv.getName() : "a conversation";
+            who = name(userRepository.findById(c.userId()).orElse(null));
             for (Long uid : mentions) {
                 try {
-                    notificationService.send(uid, "CHAT_MENTION", who + " mentioned you in " + where + ": " + preview(text),
+                    notificationService.send(uid, "CHAT_MENTION", who + " mentioned you in " + where + ": " + messagePreview(m),
                             "CHAT_CONVERSATION", conv.getId());
                 } catch (RuntimeException e) {
                     log.warn("[CHAT] Mention notification failed (non-fatal) | {}", e.getMessage());
                 }
             }
         }
-        notifyMessage(c, conv, memberRows, mentions, previousLatest, text);
-        return messageMap(c, m, users(Set.of(c.userId())));
+        // A reply tells the person replied to — once: not again if they were also @mentioned.
+        Set<Long> told = new LinkedHashSet<>(mentions);
+        if (replyTarget != null && !replyTarget.getSenderId().equals(c.userId())
+                && !mentions.contains(replyTarget.getSenderId()) && members.contains(replyTarget.getSenderId())) {
+            if (who == null) who = name(userRepository.findById(c.userId()).orElse(null));
+            try {
+                notificationService.send(replyTarget.getSenderId(), "CHAT_REPLY",
+                        who + " replied to you in " + where + ": " + messagePreview(m), "CHAT_CONVERSATION", conv.getId());
+                told.add(replyTarget.getSenderId());
+            } catch (RuntimeException e) {
+                log.warn("[CHAT] Reply notification failed (non-fatal) | {}", e.getMessage());
+            }
+        }
+        notifyMessage(c, conv, memberRows, told, previousLatest, messagePreview(m));
+        return render(c, List.of(m)).get(0);
     }
 
     @Transactional
@@ -450,11 +584,11 @@ public class ChatService {
         ChatMessage m = requireMessage(c, messageId);
         if (!m.getSenderId().equals(c.userId())) throw denied("You can only edit your own messages");
         if (m.isDeleted()) throw bad("CHAT_DELETED", "This message was deleted");
-        m.setBody(cleanBody(body.get("body")));
+        m.setBody(m.getAttachmentsJson() != null ? cleanOptionalBody(body.get("body")) : cleanBody(body.get("body")));
         m.setEditedAt(LocalDateTime.now());
         messageRepository.save(m);
         ping(m.getConversationId(), memberIds(m.getConversationId()));
-        return messageMap(c, m, users(Set.of(c.userId())));
+        return render(c, List.of(m)).get(0);
     }
 
     @Transactional
@@ -468,6 +602,9 @@ public class ChatService {
         m.setDeleted(true);
         m.setBody(null);
         m.setMentions(null);
+        m.setAttachmentsJson(null);
+        m.setPinnedAt(null);
+        m.setPinnedBy(null);
         messageRepository.save(m);
         ping(conv.getId(), memberIds(conv.getId()));
     }
@@ -483,6 +620,113 @@ public class ChatService {
             me.setLastReadMessageId(upTo);
             memberRepository.save(me);
             ping(conv.getId(), Set.of(c.userId()));    // my other tabs clear the badge too
+            // Everyone else: "Seen by" moves — a light push, no refetch of messages.
+            Set<Long> others = memberIds(conv.getId());
+            others.remove(c.userId());
+            push(others, Map.of("type", "read", "conversationId", conv.getId(), "userId", c.userId(), "messageId", upTo));
+        }
+    }
+
+    // ══════════════════════ REACTIONS · PINS · SEARCH · TYPING ═══════════════
+
+    /** Toggle my reaction with this emoji on a message. Returns the message as it now is. */
+    @Transactional
+    public Map<String, Object> react(Long messageId, Map<String, Object> body) {
+        Caller c = requireChat();
+        ChatMessage m = requireMessage(c, messageId);
+        if (m.isDeleted()) throw bad("CHAT_DELETED", "This message was deleted");
+        String emoji = cleanEmoji(body == null ? null : body.get("emoji"));
+        var existing = reactionRepository.findByMessageIdAndUserIdAndEmoji(m.getId(), c.userId(), emoji);
+        if (existing.isPresent()) {
+            reactionRepository.delete(existing.get());
+        } else {
+            if (reactionRepository.countByMessageIdAndUserId(m.getId(), c.userId()) >= MAX_REACTIONS_PER_PERSON) {
+                throw bad("CHAT_TOO_MANY_REACTIONS", "That is enough reactions on one message");
+            }
+            ChatReaction r = ChatReaction.builder().messageId(m.getId()).conversationId(m.getConversationId())
+                    .userId(c.userId()).emoji(emoji).build();
+            r.setTenantId(c.tenantId());
+            reactionRepository.save(r);
+        }
+        ping(m.getConversationId(), memberIds(m.getConversationId()));
+        return render(c, List.of(m)).get(0);
+    }
+
+    /** Pin or unpin a message (any member). */
+    @Transactional
+    public Map<String, Object> pin(Long messageId, boolean pinned) {
+        Caller c = requireChat();
+        ChatMessage m = requireMessage(c, messageId);
+        if (m.isDeleted()) throw bad("CHAT_DELETED", "This message was deleted");
+        m.setPinnedAt(pinned ? LocalDateTime.now() : null);
+        m.setPinnedBy(pinned ? c.userId() : null);
+        messageRepository.save(m);
+        ping(m.getConversationId(), memberIds(m.getConversationId()));
+        return render(c, List.of(m)).get(0);
+    }
+
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> pins(Long conversationId) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, conversationId);
+        requireReader(c, conv);
+        return render(c, messageRepository.pinned(conv.getId()));
+    }
+
+    /** Text search in one conversation, newest first (30 at most). */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> search(Long conversationId, String q) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, conversationId);
+        requireReader(c, conv);
+        String t = q == null ? "" : q.trim().toLowerCase();
+        if (t.length() < 2) return List.of();
+        if (t.length() > 100) t = t.substring(0, 100);
+        String like = "%" + t.replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%";
+        return render(c, messageRepository.search(conv.getId(), like, PageRequest.of(0, 30)));
+    }
+
+    /** "I am typing" — pushed to the other members, at most every 2 seconds per person. */
+    public void typing(Long conversationId) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, conversationId);
+        requireMember(c, conv);
+        String key = c.userId() + ":" + conv.getId();
+        long now = System.currentTimeMillis();
+        Long last = TYPING_AT.get(key);
+        if (last != null && now - last < 2000) return;
+        TYPING_AT.put(key, now);
+        if (TYPING_AT.size() > 10_000) TYPING_AT.clear();     // never grows without bound
+        Set<Long> others = memberIds(conv.getId());
+        others.remove(c.userId());
+        push(others, Map.of("type", "typing", "conversationId", conv.getId(), "userId", c.userId()));
+    }
+
+    // ── Files: who may read / attach (ChatDocumentAccessPolicy asks these) ──
+
+    /** May the caller see the files of this conversation? (member, or a public channel) */
+    @Transactional(readOnly = true)
+    public boolean canReadFiles(Long conversationId) {
+        try {
+            Caller c = requireChat();
+            requireReader(c, requireConversation(c, conversationId));
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** May the caller attach a file to this conversation? (member of a conversation that is not archived) */
+    @Transactional(readOnly = true)
+    public boolean canAttachFiles(Long conversationId, Long userId) {
+        try {
+            Caller c = requireChat();
+            if (!c.userId().equals(userId)) return false;
+            ChatConversation conv = requireConversation(c, conversationId);
+            requireMember(c, conv);
+            return !conv.isArchived();
+        } catch (RuntimeException e) {
+            return false;
         }
     }
 
@@ -542,6 +786,7 @@ public class ChatService {
             p.put("userId", m.getUserId());
             p.put("name", name(users.containsKey(m.getUserId()) ? users.get(m.getUserId()) : userRepository.findById(m.getUserId()).orElse(null)));
             p.put("role", m.getRole());
+            p.put("lastReadMessageId", m.getLastReadMessageId());   // "Seen by"
             return p;
         }).toList());
         String display = conv.getName();
@@ -566,19 +811,112 @@ public class ChatService {
         return x;
     }
 
-    private Map<String, Object> messageMap(Caller c, ChatMessage m, Map<Long, User> users) {
-        Map<String, Object> x = new LinkedHashMap<>();
-        x.put("id", m.getId());
-        x.put("conversationId", m.getConversationId());
-        x.put("senderId", m.getSenderId());
-        x.put("senderName", name(users.get(m.getSenderId())));
-        x.put("body", m.isDeleted() ? null : m.getBody());
-        x.put("deleted", m.isDeleted());
-        x.put("mentions", m.getMentions() == null ? List.of() : List.of(m.getMentions().split(",")).stream().map(Long::valueOf).toList());
-        x.put("editedAt", m.getEditedAt());
-        x.put("createdAt", m.getCreatedAt());
-        x.put("mine", m.getSenderId().equals(c.userId()));
-        return x;
+    /**
+     * Messages as the page shows them, loaded in a few queries for the whole
+     * list: senders, the messages replied to, reactions and who pinned.
+     */
+    private List<Map<String, Object>> render(Caller c, List<ChatMessage> msgs) {
+        if (msgs.isEmpty()) return List.of();
+        List<Long> ids = msgs.stream().map(ChatMessage::getId).toList();
+        Set<Long> replyIds = msgs.stream().map(ChatMessage::getReplyToId).filter(Objects::nonNull).collect(Collectors.toSet());
+        Map<Long, ChatMessage> replied = new HashMap<>();
+        if (!replyIds.isEmpty()) messageRepository.findAllById(replyIds).forEach(r -> replied.put(r.getId(), r));
+        Map<Long, List<ChatReaction>> reactions = reactionRepository.findByMessageIdIn(ids).stream()
+                .sorted(Comparator.comparing(ChatReaction::getId))
+                .collect(Collectors.groupingBy(ChatReaction::getMessageId, LinkedHashMap::new, Collectors.toList()));
+        Set<Long> userIds = new HashSet<>();
+        msgs.forEach(m -> { userIds.add(m.getSenderId()); if (m.getPinnedBy() != null) userIds.add(m.getPinnedBy()); });
+        replied.values().forEach(r -> userIds.add(r.getSenderId()));
+        reactions.values().forEach(l -> l.forEach(r -> userIds.add(r.getUserId())));
+        Map<Long, User> users = users(userIds);
+
+        List<Map<String, Object>> out = new ArrayList<>(msgs.size());
+        for (ChatMessage m : msgs) {
+            Map<String, Object> x = new LinkedHashMap<>();
+            x.put("id", m.getId());
+            x.put("conversationId", m.getConversationId());
+            x.put("senderId", m.getSenderId());
+            x.put("senderName", name(users.get(m.getSenderId())));
+            x.put("body", m.isDeleted() ? null : m.getBody());
+            x.put("deleted", m.isDeleted());
+            x.put("mentions", m.getMentions() == null ? List.of() : List.of(m.getMentions().split(",")).stream().map(Long::valueOf).toList());
+            x.put("editedAt", m.getEditedAt());
+            x.put("createdAt", m.getCreatedAt());
+            x.put("mine", m.getSenderId().equals(c.userId()));
+            x.put("attachments", m.isDeleted() ? List.of() : readList(m.getAttachmentsJson()));
+            ChatMessage r = m.getReplyToId() == null ? null : replied.get(m.getReplyToId());
+            if (r != null) {
+                Map<String, Object> rt = new LinkedHashMap<>();
+                rt.put("id", r.getId());
+                rt.put("senderId", r.getSenderId());
+                rt.put("senderName", name(users.get(r.getSenderId())));
+                rt.put("deleted", r.isDeleted());
+                rt.put("preview", r.isDeleted() ? "Message deleted" : messagePreview(r));
+                x.put("replyTo", rt);
+            }
+            List<Map<String, Object>> rs = new ArrayList<>();
+            Map<String, List<ChatReaction>> byEmoji = reactions.getOrDefault(m.getId(), List.of()).stream()
+                    .collect(Collectors.groupingBy(ChatReaction::getEmoji, LinkedHashMap::new, Collectors.toList()));
+            byEmoji.forEach((emoji, list) -> {
+                Map<String, Object> e = new LinkedHashMap<>();
+                e.put("emoji", emoji);
+                e.put("count", list.size());
+                e.put("mine", list.stream().anyMatch(z -> z.getUserId().equals(c.userId())));
+                e.put("names", list.stream().map(z -> z.getUserId().equals(c.userId()) ? "You" : name(users.get(z.getUserId()))).toList());
+                rs.add(e);
+            });
+            x.put("reactions", rs);
+            x.put("pinnedAt", m.getPinnedAt());
+            x.put("pinnedByName", m.getPinnedBy() == null ? null : name(users.get(m.getPinnedBy())));
+            out.add(x);
+        }
+        return out;
+    }
+
+    /**
+     * Checks each file the client says it uploaded for this message: a document
+     * of this tenant, ACTIVE, and linked to THIS conversation (the upload linked
+     * it, through ChatDocumentAccessPolicy). Returns the snapshot to store.
+     */
+    private List<Map<String, Object>> attachmentsFor(Caller c, ChatConversation conv, List<Long> documentIds) {
+        if (documentIds.isEmpty()) return List.of();
+        if (documentIds.size() > MAX_FILES) throw bad("CHAT_TOO_MANY_FILES", "At most " + MAX_FILES + " files in one message");
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (Long id : documentIds) {
+            Document d = documentRepository.findByIdAndTenantId(id, c.tenantId())
+                    .filter(x -> "ACTIVE".equals(x.getStatus()))
+                    .orElseThrow(() -> bad("CHAT_BAD_FILE", "A file did not finish uploading — try again"));
+            boolean linked = documentLinkRepository
+                    .findByDocumentIdAndEntityTypeAndEntityIdAndLinkType(id, DOC_ENTITY, conv.getId(), "ATTACHMENT").isPresent();
+            if (!linked) throw bad("CHAT_BAD_FILE", "That file was not uploaded to this conversation");
+            Map<String, Object> f = new LinkedHashMap<>();
+            f.put("documentId", d.getId());
+            f.put("fileName", d.getFileName());
+            f.put("mimeType", d.getMimeType());
+            f.put("size", d.getContentLength() != null ? d.getContentLength() : d.getFileSize());
+            out.add(f);
+        }
+        return out;
+    }
+
+    /** One line for previews and notifications: the text, or what was sent instead. */
+    private String messagePreview(ChatMessage m) {
+        String text = preview(m.getBody());
+        if (!text.isEmpty()) return text;
+        List<Map<String, Object>> files = readList(m.getAttachmentsJson());
+        if (files.isEmpty()) return "";
+        return files.size() == 1 ? "📎 " + files.get(0).get("fileName") : "📎 " + files.size() + " files";
+    }
+
+    private String write(Object o) {
+        try { return objectMapper.writeValueAsString(o); }
+        catch (Exception e) { throw new IllegalStateException(e); }
+    }
+
+    private List<Map<String, Object>> readList(String json) {
+        if (json == null || json.isBlank()) return List.of();
+        try { return objectMapper.readValue(json, new TypeReference<List<Map<String, Object>>>() {}); }
+        catch (Exception e) { return List.of(); }
     }
 
     /**
@@ -628,9 +966,15 @@ public class ChatService {
 
     /** After the transaction commits, tell these people's browsers that the conversation changed. */
     private void ping(Long conversationId, Collection<Long> userIds) {
+        push(userIds, Map.of("type", "chat", "conversationId", conversationId));
+    }
+
+    /** Push one small event (ids only, never content) to these people, after commit. */
+    private void push(Collection<Long> userIds, Map<String, Object> event) {
         Set<Long> to = new LinkedHashSet<>(userIds);
+        if (to.isEmpty()) return;
         Runnable send = () -> to.forEach(uid -> {
-            try { messaging.convertAndSend(topic(uid), Map.of("type", "chat", "conversationId", conversationId)); }
+            try { messaging.convertAndSend(topic(uid), event); }
             catch (RuntimeException e) { log.debug("[CHAT] Push failed (clients poll as fallback) | {}", e.getMessage()); }
         });
         if (TransactionSynchronizationManager.isSynchronizationActive()) {
@@ -642,7 +986,8 @@ public class ChatService {
         }
     }
 
-    static String topic(Long userId) {
+    /** The private push topic of one person (also checked on SUBSCRIBE by StompAuthChannelInterceptor). */
+    public static String topic(Long userId) {
         try {
             Mac mac = Mac.getInstance("HmacSHA256");
             mac.init(new SecretKeySpec(PUSH_SECRET, "HmacSHA256"));
@@ -664,6 +1009,24 @@ public class ChatService {
         if (s.isEmpty()) throw bad("CHAT_EMPTY", "Write something first");
         if (s.length() > MAX_BODY) throw bad("CHAT_TOO_LONG", "A message is at most " + MAX_BODY + " characters");
         return s;
+    }
+
+    /** Text that may be empty (a message that carries files). */
+    private static String cleanOptionalBody(Object raw) {
+        String s = raw == null ? "" : raw.toString().replace("\r\n", "\n").strip();
+        if (s.length() > MAX_BODY) throw bad("CHAT_TOO_LONG", "A message is at most " + MAX_BODY + " characters");
+        return s.isEmpty() ? null : s;
+    }
+
+    /** One emoji (or emoji sequence) — not text. */
+    private static String cleanEmoji(Object raw) {
+        String e = raw == null ? "" : raw.toString().strip();
+        if (e.isEmpty() || e.length() > 16 || e.codePoints().anyMatch(Character::isWhitespace)
+                || e.codePoints().noneMatch(cp -> cp > 0x2000)
+                || e.codePoints().anyMatch(cp -> cp < 0x2000 && Character.isLetter(cp))) {
+            throw bad("CHAT_BAD_EMOJI", "Pick an emoji");
+        }
+        return e;
     }
 
     private static String preview(String s) {

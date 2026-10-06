@@ -23,7 +23,7 @@ turn:
   relay_range_start: 30000
   relay_range_end: 40000
 keys:
-  kashikey: REPLACE_WITH_THE_BACKEND_LIVEKIT_API_SECRET
+  kashikey: 0123456789abcdef0123456789abcdef01
 room:
   empty_timeout: 300         # close a room 5 min after the last person leaves
   max_participants: 50
