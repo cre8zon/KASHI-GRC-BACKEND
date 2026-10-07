@@ -1,6 +1,9 @@
 package com.kashi.grc.common.config;
 
+import com.kashi.grc.common.config.security.StompAuthChannelInterceptor;
+import lombok.RequiredArgsConstructor;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.simp.config.ChannelRegistration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
 import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
 import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
@@ -19,6 +22,10 @@ import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerCo
  *
  * Publish prefix: /app (not used currently — server pushes only)
  *
+ * Who is connected: StompAuthChannelInterceptor reads the access token sent
+ * on CONNECT, and only lets a signed-in user subscribe to their own
+ * /topic/user/{userId} and /topic/chat/{…} topics.
+ *
  * NOTE: Add spring-boot-starter-websocket to pom.xml:
  *   <dependency>
  *     <groupId>org.springframework.boot</groupId>
@@ -27,7 +34,15 @@ import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerCo
  */
 @Configuration
 @EnableWebSocketMessageBroker
+@RequiredArgsConstructor
 public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    private final StompAuthChannelInterceptor stompAuth;
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(stompAuth);
+    }
 
     @Override
     public void configureMessageBroker(MessageBrokerRegistry registry) {
