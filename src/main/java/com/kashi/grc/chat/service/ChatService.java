@@ -977,6 +977,19 @@ public class ChatService {
                 e.put("count", list.size());
                 e.put("mine", list.stream().anyMatch(z -> z.getUserId().equals(c.userId())));
                 e.put("names", list.stream().map(z -> z.getUserId().equals(c.userId()) ? "You" : name(users.get(z.getUserId()))).toList());
+                // names is a flat list of strings and stays — it is what the
+                // chip's tooltip reads. people carries the identity the "who
+                // reacted" panel needs: an id to key and avatar by, the real
+                // name rather than "You", and whether this one is the caller so
+                // the panel can offer to remove it. Ordered by reaction id, so
+                // the list reads oldest-first like it does everywhere else.
+                e.put("people", list.stream().map(z -> {
+                    Map<String, Object> p = new LinkedHashMap<>();
+                    p.put("userId", z.getUserId());
+                    p.put("name", name(users.get(z.getUserId())));
+                    p.put("you", z.getUserId().equals(c.userId()));
+                    return p;
+                }).toList());
                 rs.add(e);
             });
             x.put("reactions", rs);
