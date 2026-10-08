@@ -291,6 +291,25 @@ public class CollabCallService {
             a.setAttended(true);
             attendeeRepository.save(a);
         }
+
+        // Somebody joined, so the meeting is happening. Nothing recorded that
+        // before: a meeting the whole team attended stayed SCHEDULED for ever,
+        // drifting into "Past" purely by client-side clock comparison, and
+        // "Mark held" was a button a human had to remember to press.
+        //
+        // This is also what keeps an attended occurrence out of cancelSeries,
+        // which only touches rows still marked SCHEDULED — so a stand-up that
+        // ran can no longer be swept into CANCELLED by ending the recurrence.
+        //
+        // Guarded on the start time so that joining EARLY does not declare the
+        // meeting held before it begins. An ad-hoc call starts now, so it is
+        // held the moment the first person is in, which is true.
+        if (CollabMeeting.SCHEDULED.equals(m.getStatus())
+                && m.getStartsAt() != null
+                && !m.getStartsAt().isAfter(LocalDateTime.now())) {
+            m.setStatus(CollabMeeting.HELD);
+            meetingRepository.save(m);
+        }
     }
 
     /** The room page: the room, what is scheduled in it, and its past sessions. */

@@ -31,6 +31,8 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -339,9 +341,21 @@ public class CollabMeetingService {
         Caller c = access.caller();
         CollabMeeting m = requireRun(c, meetingId);
         if (m.getSeriesRef() == null) throw bad("COLLAB_NOT_SERIES", "This meeting does not repeat");
+        // "This occurrence and every later one" quietly included an occurrence
+        // that had ALREADY HAPPENED. The daily stand-up runs, everybody attends,
+        // it overruns, the organiser then opens today's page and clicks "Stop
+        // repeating" to end the recurrence — and today's attended meeting is
+        // flipped to CANCELLED along with the future ones. Struck through in the
+        // list, attendance locked, minutes locked, and the record now says a
+        // meeting that demonstrably took place never did.
+        //
+        // Stopping a recurrence is a statement about the FUTURE. An occurrence
+        // that has already started is history and is left exactly as it is.
+        LocalDateTime now = LocalDateTime.now();
         int n = 0;
         for (CollabMeeting x : meetingRepository.findByTenantIdAndSeriesRefAndIsDeletedFalse(c.tenantId(), m.getSeriesRef())) {
             if (x.getStartsAt().isBefore(m.getStartsAt()) || !CollabMeeting.SCHEDULED.equals(x.getStatus())) continue;
+            if (!x.getStartsAt().isAfter(now)) continue;   // already began — not ours to rewrite
             x.setStatus(CollabMeeting.CANCELLED);
             x.setUpdatedBy(c.userId());
             meetingRepository.save(x);
@@ -381,6 +395,22 @@ public class CollabMeetingService {
             String s = str(body.get("status"));
             if (!Set.of(CollabMeeting.SCHEDULED, CollabMeeting.HELD, CollabMeeting.CANCELLED).contains(s)) {
                 throw bad("COLLAB_BAD_STATUS", "Status must be SCHEDULED, HELD or CANCELLED");
+            }
+            // A meeting people actually attended cannot be cancelled. Cancelling
+            // is a statement that it will not happen; once somebody has joined,
+            // that is no longer available as a fact. "Mark held" is the honest
+            // button, and the error says so rather than just refusing.
+            //
+            // Deliberately narrow: an EMPTY past meeting can still be cancelled,
+            // because "nobody came" is a reasonable thing to record, and a future
+            // meeting is untouched by this.
+            if (CollabMeeting.CANCELLED.equals(s) && !CollabMeeting.CANCELLED.equals(m.getStatus())) {
+                boolean attended = attendeeRepository.findByMeetingId(m.getId()).stream()
+                        .anyMatch(a -> Boolean.TRUE.equals(a.getAttended()));
+                if (attended) {
+                    throw bad("COLLAB_ALREADY_HELD",
+                            "People joined this meeting, so it cannot be cancelled. Mark it held instead.");
+                }
             }
             m.setStatus(s);
         }
@@ -476,6 +506,51 @@ public class CollabMeetingService {
         }
     }
 
+    /**
+     * Can the in-app call for this meeting be joined right now?
+     *
+     * -- WHY THE SERVER ANSWERS THIS ------------------------------------------
+     *
+     * The browser used to decide, in Meetings.jsx:
+     *
+     *     callOpen = (m) => m.inApp && m.status === 'SCHEDULED'
+     *                       && new Date(m.endsAt).getTime() + 2h >= Date.now()
+     *
+     * That is clock arithmetic across two machines on a value that carries no
+     * zone. startsAt/endsAt are LocalDateTime, so they serialise as a bare
+     * "2026-10-08T10:52:00" and new Date() reads them as BROWSER-local.
+     *
+     * A meeting the user scheduled is immune, because their own browser wrote
+     * that wall-clock string and reads the same one back. An AD-HOC call is not:
+     * callNow stamps it with the SERVER's clock. With a UTC server and IST
+     * users, endsAt arrives looking 5h30m in the past, sails past the two-hour
+     * grace, and callOpen is false the instant the "join now" notification is
+     * clicked. Hence "it just notifies, and there is no way to join" — while a
+     * scheduled meeting works perfectly.
+     *
+     * Here both sides of the comparison come from the same clock, so the
+     * arithmetic is simply correct, in any deployment zone.
+     *
+     * -- WHY HELD COUNTS -----------------------------------------------------
+     *
+     * The old rule demanded SCHEDULED, which excluded two real cases: a room
+     * drop-in session is CREATED as HELD (CollabCallService.joinRoom), so it
+     * could never be joined from a meeting row; and now that joining promotes a
+     * started meeting to HELD, the first person in would otherwise shut the door
+     * behind them. Only CANCELLED blocks a join — which is exactly the rule
+     * joinMeeting already enforces when it issues the token, so the button and
+     * the endpoint can no longer disagree.
+     */
+    boolean joinable(CollabMeeting m) {
+        if (!EMBEDDED.equals(m.getProvider())) return false;
+        if (CollabMeeting.CANCELLED.equals(m.getStatus())) return false;
+        LocalDateTime end = m.getEndsAt() != null ? m.getEndsAt() : m.getStartsAt();
+        if (end == null) return true;
+        // The same two-hour grace as before, so a call that runs long stays
+        // joinable — just measured against the server's own clock.
+        return !LocalDateTime.now().isAfter(end.plusHours(2));
+    }
+
     List<Map<String, Object>> summaries(Caller c, List<CollabMeeting> list) {
         if (list.isEmpty()) return new ArrayList<>();
         Map<Long, List<CollabMeetingAttendee>> att = attendeeRepository
@@ -525,6 +600,7 @@ public class CollabMeetingService {
                 p.put("attended", a.getAttended());
                 return p;
             }).toList());
+            x.put("joinable", joinable(m));
             x.put("canRun", canRun(c, m));
             x.put("hasMinutes", m.getMinutes() != null && !m.getMinutes().isBlank());
             out.add(x);
@@ -674,6 +750,21 @@ public class CollabMeetingService {
         }
         String s = o.toString().trim();
         try {
+            // A string carrying an offset ("...Z" or "...+05:30") is a real
+            // MOMENT, not a wall clock, so convert it into this server's own
+            // wall clock — which is what starts_at/ends_at store.
+            //
+            // The meeting form now sends this. It used to post the browser's
+            // bare wall clock, which the old code below parsed verbatim: pick
+            // 2pm in Delhi and the server stored 2pm in ITS zone, so the meeting
+            // was really at 19:30 IST. Invisible, because reading it back
+            // ignored zones in the same direction — but the reminder scheduler
+            // did not, which is why "starting soon" fired at the wrong time.
+            if (s.endsWith("Z") || s.matches(".*[+-]\\d{2}:\\d{2}$")) {
+                return OffsetDateTime.parse(s).atZoneSameInstant(ZoneId.systemDefault()).toLocalDateTime();
+            }
+            // No offset: unchanged from before, treated as this server's wall
+            // clock. Keeps every other caller and any older client working.
             if (s.length() == 16) s = s + ":00";
             return LocalDateTime.parse(s.length() > 19 ? s.substring(0, 19) : s);
         } catch (RuntimeException e) {
