@@ -11,6 +11,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -88,12 +89,55 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
             return ids;
         }
 
-        // REVIEW or EVALUATE on ORGANIZATION side → Reviewers assigned sections
-        if ("ORGANIZATION".equals(side) && ("REVIEW".equals(action) || "EVALUATE".equals(action))) {
-            List<Long> ids = sectionInstanceRepository
+        // ── ORGANIZATION SIDE: THE REVIEW LEAD, THE SECTION REVIEWERS, OR BOTH ─
+        //
+        // Returns the nominated lead CISO AND the reviewers assigned to
+        // sections, and lets the ENGINE's role filter decide which of them this
+        // particular step is for.
+        //
+        // That filter is already there, in the ASSIGNMENT_SCOPED branch of
+        // assignTasksForStep: when a step has workflow_step_actor_roles rows, the
+        // resolver's output is narrowed to users who currently hold one of
+        // them. Every one of these steps has those rows — that is how
+        // ROLE_BASED resolves them today, and a step with none creates no
+        // tasks at all ("has no actorRoles — no ACTOR tasks created"). So:
+        //
+        //   step 10  Org CISO Assigns to Reviewers   CISO role      → the lead
+        //   step 11  Reviewers Evaluate              Reviewer role  → reviewers
+        //   step 12  Reviewers Consolidate Findings  Reviewer role  → reviewers
+        //   step 13  Org CISO Approves and Rates     CISO role      → the lead
+        //
+        // ── WHY THE FILTER RATHER THAN DECIDING HERE ──────────────────────
+        //
+        // Steps 11 and 13 are BOTH ORGANIZATION + EVALUATE, so side and action
+        // cannot separate them — and neither can step order or name without
+        // writing workflow numbers or English into this class. The step's own
+        // actor roles are the data that already says who a step is for, and
+        // reading them is the engine's job, not this resolver's.
+        //
+        // ASSIGN is included for step 10, which matched nothing before and so
+        // fell through to the whole CISO pool. That was the bug.
+        //
+        // The lead goes FIRST so that a tie in any future ordering favours the
+        // nomination, and is added only when set — a null lead leaves this
+        // exactly as it was, which is what every assessment predating the
+        // column needs.
+        if ("ORGANIZATION".equals(side)
+                && ("ASSIGN".equals(action) || "REVIEW".equals(action) || "EVALUATE".equals(action))) {
+
+            Long leadId = resolveReviewLeadUserId(instance);
+
+            List<Long> reviewerIds = sectionInstanceRepository
                     .findDistinctAssignedReviewerIds(templateInstanceId);
-            log.info("[VENDOR-ACTOR-RESOLVER] {} step '{}' | templateInstanceId={} | {} assigned reviewer(s)",
-                    action, si.getSnapName(), templateInstanceId, ids.size());
+
+            List<Long> ids = new ArrayList<>();
+            if (leadId != null) ids.add(leadId);
+            for (Long r : reviewerIds) if (!ids.contains(r)) ids.add(r);
+
+            log.info("[VENDOR-ACTOR-RESOLVER] {} step '{}' | templateInstanceId={} | "
+                            + "reviewLead={} | {} assigned reviewer(s) | {} candidate(s) before role filter",
+                    action, si.getSnapName(), templateInstanceId,
+                    leadId, reviewerIds.size(), ids.size());
             return ids;
         }
 
@@ -112,6 +156,26 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
                 .map(assessment -> templateInstanceRepository
                         .findByAssessmentId(assessment.getId()).orElse(null))
                 .map(ti -> ti.getId())
+                .orElse(null);
+    }
+
+    /**
+     * The Org CISO nominated to lead this assessment's review, or null.
+     *
+     * Same walk as resolveTemplateInstanceId, stopping one step earlier. Kept
+     * separate rather than folded into that method because the two answer
+     * different questions and a combined one would have to return a pair just
+     * to serve one caller each.
+     *
+     * Null is the normal, uninteresting case: every assessment created before
+     * step 9 had a picker has no lead, and the caller then returns exactly what
+     * it returned before this change.
+     */
+    private Long resolveReviewLeadUserId(WorkflowInstance instance) {
+        return cycleRepository.findByWorkflowInstanceId(instance.getId())
+                .map(cycle -> assessmentRepository.findByCycleId(cycle.getId())
+                        .stream().findFirst().orElse(null))
+                .map(com.kashi.grc.assessment.domain.VendorAssessment::getReviewLeadUserId)
                 .orElse(null);
     }
 }

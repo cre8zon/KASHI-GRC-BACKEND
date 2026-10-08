@@ -61,6 +61,35 @@ public class VendorAssessment extends TenantAwareEntity {
     @Column(name = "review_findings", columnDefinition = "TEXT")
     private String reviewFindings;
 
+    /**
+     * The one Org CISO who leads the review of THIS assessment.
+     *
+     * Nominated by the Org Admin at step 9 ("Org Admin Assigns Review to Org
+     * CISO") and read back by VendorWorkflowActorResolver, so every org-side
+     * CISO step afterwards belongs to that person rather than to the whole CISO
+     * pool.
+     *
+     * ── WHAT IT REPLACES ──────────────────────────────────────────────────
+     *
+     * Step 10 is ORGANIZATION + ASSIGN, which the resolver matched on neither
+     * side-and-action clause, so it returned an empty list and the engine fell
+     * back to ROLE_BASED — a task for EVERY Org CISO in the tenant. Step 9's
+     * Approve simply advanced the workflow and nominated nobody, because there
+     * was nowhere to record a nomination.
+     *
+     * ── WHY ON THE ASSESSMENT AND NOT THE TASK ────────────────────────────
+     *
+     * A task is per step. This has to outlive step 10 and still be readable at
+     * step 13, so it belongs to the assessment, beside the risk rating and the
+     * findings the same review produces.
+     *
+     * Nullable: every assessment created before this column exists has no lead,
+     * and the resolver treats null as "no nomination" and leaves the previous
+     * ROLE_BASED behaviour exactly as it was.
+     */
+    @Column(name = "review_lead_user_id")
+    private Long reviewLeadUserId;
+
     @Column(name = "open_remediation_count")
     @Builder.Default
     private Integer openRemediationCount = 0;

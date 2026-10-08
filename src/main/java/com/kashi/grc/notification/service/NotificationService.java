@@ -8,6 +8,7 @@ import com.kashi.grc.notification.repository.NotificationRepository;
 import com.kashi.grc.notification.spi.NotificationRouteContributor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.ObjectProvider;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
@@ -70,12 +71,99 @@ public class NotificationService {
      */
     private final ObjectProvider<NotificationRouteContributor> routeContributors;
 
+    /**
+     * The STOMP push, so a notification arrives the moment it is written.
+     *
+     * ObjectProvider for the same reason as routeContributors above: this
+     * service is injected almost everywhere, and eager injection of anything
+     * that transitively reaches one of its dependents fails the context at
+     * startup. It also means a deployment with the websocket broker disabled
+     * simply has no bean here and falls back to polling, which is the
+     * behaviour this service had before the push existed.
+     */
+    private final ObjectProvider<SimpMessagingTemplate> messagingProvider;
+
     public NotificationService(NotificationRepository notificationRepository,
                                ObjectProvider<KafkaEventPublisher> kafkaPublisherProvider,
-                               ObjectProvider<NotificationRouteContributor> routeContributors) {
+                               ObjectProvider<NotificationRouteContributor> routeContributors,
+                               ObjectProvider<SimpMessagingTemplate> messagingProvider) {
         this.notificationRepository = notificationRepository;
         this.kafkaPublisher         = kafkaPublisherProvider.getIfAvailable();
         this.routeContributors      = routeContributors;
+        this.messagingProvider      = messagingProvider;
+    }
+
+    /**
+     * Pushes one saved notification to its recipient's personal topic.
+     *
+     * ── WHY /topic/user/{userId} AND NOT A NEW TOPIC ──────────────────────
+     *
+     * It already exists and is already the right place. WebSocketConfig
+     * documents it as "personal notifications for a user", WorkflowEventListener
+     * and ActionItemService already publish to it, StompAuthChannelInterceptor
+     * already authorises SUBSCRIBE on it against the signed-in user, and
+     * useActionItems on the client is already subscribed. A notification is the
+     * most literal possible case of "personal notification for a user", so
+     * inventing a second channel would mean a second topic, a second
+     * authorisation rule and a second socket for no gain.
+     *
+     * Deliberately NOT the chat topic, which was the other candidate: chat's
+     * pushTopic is handed out only when the caller holds the chat permission
+     * and is not a guest, so riding it would silently drop the push for every
+     * vendor-side user — exactly the people most of these notifications are
+     * for.
+     *
+     * ── WHAT IS SENT ──────────────────────────────────────────────────────
+     *
+     * The id and the route, not the whole row. The client refetches through
+     * the API it already uses, which keeps one shape of the notification in
+     * one place and means the socket payload can never disagree with the list.
+     * The message rides along so the toast can appear without waiting for that
+     * refetch to land.
+     *
+     * ── AFTER COMMIT ──────────────────────────────────────────────────────
+     *
+     * Same contract the email publish above spells out: callers are usually
+     * inside a business transaction, and a push sent before commit can arrive
+     * for a row that is about to be rolled back — the client would refetch and
+     * find nothing. Outside a transaction (scheduler paths) it sends at once.
+     *
+     * Failure here is never allowed to cost the notification. The row is
+     * already saved and the 30-second poll remains as the fallback, so a dead
+     * broker degrades to the old behaviour rather than throwing on the caller's
+     * business operation.
+     */
+    private void pushNotification(Notification n) {
+        SimpMessagingTemplate messaging = messagingProvider.getIfAvailable();
+        if (messaging == null || n.getUserId() == null) return;
+
+        Map<String, Object> payload = new HashMap<>();
+        payload.put("type",           "NOTIFICATION_CREATED");
+        payload.put("notificationId", n.getId());
+        payload.put("notificationType", n.getType());
+        payload.put("message",        n.getMessage());
+        payload.put("entityType",     n.getEntityType());
+        payload.put("entityId",       n.getEntityId());
+        payload.put("actionUrl",      n.getActionUrl());
+
+        String destination = "/topic/user/" + n.getUserId();
+
+        Runnable send = () -> {
+            try {
+                messaging.convertAndSend(destination, payload);
+                log.debug("[NOTIFY-PUSH] {} → {}", n.getId(), destination);
+            } catch (RuntimeException e) {
+                log.debug("[NOTIFY-PUSH] Push failed, client will poll | {}", e.getMessage());
+            }
+        };
+
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { send.run(); }
+            });
+        } else {
+            send.run();
+        }
     }
 
     /**
@@ -163,6 +251,9 @@ public class NotificationService {
                 .sentAt(LocalDateTime.now())
                 .build();
         notificationRepository.save(n);
+        // After the save, so the payload carries the generated id — the client
+        // uses it to dedupe against what it has already shown.
+        pushNotification(n);
         log.debug("Notification sent to user {} — [{}] {}", userId, type, message);
     }
 
