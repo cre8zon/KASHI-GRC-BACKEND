@@ -1586,6 +1586,94 @@ public class AssessmentController {
     // that TaskSectionCompletionService routes to the correct section.
     // ══════════════════════════════════════════════════════════════
 
+    /**
+     * POST /v1/assessments/{assessmentId}/assign-review-lead?taskId=&userId=
+     *
+     * Step 9: the Org Admin nominates the ONE Org CISO who leads this
+     * assessment's review.
+     *
+     * ── WHAT IT FIXES ───────────────────────────────────────────────────────
+     *
+     * Step 9 ("Org Admin Assigns Review to Org CISO") had nothing to assign
+     * with. Its Approve advanced the workflow and that was all, because there
+     * was nowhere to record a nomination and nothing that read one.
+     *
+     * Step 10 is ORGANIZATION + ASSIGN. VendorWorkflowActorResolver handled
+     * VENDOR + FILL/REVIEW and ORGANIZATION + REVIEW/EVALUATE, so ASSIGN
+     * matched neither clause, the resolver returned an empty list, and
+     * assignTasksForStep fell back to ROLE_BASED — a task for EVERY Org CISO in
+     * the tenant. Step 13 behaved the same way.
+     *
+     * Writing review_lead_user_id lets the resolver answer, and the engine's
+     * own role filter then keeps that one person on the CISO steps (10 and 13)
+     * while the section reviewers keep 11 and 12.
+     *
+     * ── WHY IT FIRES A GATE RATHER THAN APPROVING ───────────────────────────
+     *
+     * sql/100 gives step 9 one required section, ASSIGN_REVIEW_LEAD. Firing its
+     * event completes the gate, which auto-approves the task and advances the
+     * workflow — "auto-complete on assign", through the same mechanism every
+     * other step in this workflow uses, rather than a second code path that
+     * approves tasks directly.
+     *
+     * It also makes the control scopable: steps 9 AND 10 are both ASSIGN +
+     * ORGANIZATION, so side and step action cannot tell them apart, and the
+     * section key can.
+     */
+    @PostMapping("/v1/assessments/{assessmentId}/assign-review-lead")
+    @Transactional
+    @Operation(summary = "Step 9: nominate the Org CISO who leads this review, and complete the step")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> assignReviewLead(
+            @PathVariable Long assessmentId,
+            @RequestParam Long taskId,
+            @RequestParam Long userId) {
+
+        Long actorId  = utilityService.getLoggedInDataContext().getId();
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        VendorAssessment assessment = assessmentRepository
+                .findByIdAndTenantId(assessmentId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+
+        // The task is yours — the same check every other step action makes, and
+        // in front of the write rather than after it.
+        TaskInstance task = taskInstanceRepository.findById(taskId)
+                .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskId));
+        if (!actorId.equals(task.getAssignedUserId())) {
+            throw new BusinessException("ACCESS_DENIED", "Task does not belong to you.",
+                    HttpStatus.FORBIDDEN);
+        }
+
+        // The nominee must be a real user in this tenant. Not a role check: the
+        // picker is fed by /eligible-users, which already resolves the NEXT
+        // step's actor roles, and the engine's own role filter is what finally
+        // decides whether this person receives step 10. A role assertion here
+        // would be a third opinion on the same question and the one most likely
+        // to drift.
+        userRepository.findByIdAndTenantId(userId, tenantId)
+                .orElseThrow(() -> new BusinessException("INVALID_REVIEW_LEAD",
+                        "That user does not exist in this organisation.", HttpStatus.BAD_REQUEST));
+
+        Long previous = assessment.getReviewLeadUserId();
+        assessment.setReviewLeadUserId(userId);
+        assessmentRepository.save(assessment);
+
+        log.info("[REVIEW-LEAD] assessmentId={} | lead={} (was {}) | by={} | taskId={}",
+                assessmentId, userId, previous, actorId, taskId);
+
+        // Completes step 9. onSectionEvent is idempotent, so re-nominating
+        // before the step advances replaces the lead and fires a no-op.
+        eventPublisher.publishEvent(
+                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
+                        "REVIEW_LEAD_ASSIGNED", taskId, actorId, "VENDOR_ASSESSMENT", assessmentId));
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("assessmentId", assessmentId);
+        out.put("reviewLeadUserId", userId);
+        out.put("previousReviewLeadUserId", previous);
+        return ResponseEntity.ok(ApiResponse.success(out));
+    }
+
     /** Step 3: CISO confirms all questionnaire sections are assigned */
     @PostMapping("/v1/assessments/{assessmentId}/confirm-assignment")
     @Transactional

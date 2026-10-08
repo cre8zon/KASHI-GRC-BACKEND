@@ -4,10 +4,12 @@ import com.kashi.grc.chat.domain.ChatConversation;
 import com.kashi.grc.chat.domain.ChatMember;
 import com.kashi.grc.chat.domain.ChatMessage;
 import com.kashi.grc.chat.domain.ChatReaction;
+import com.kashi.grc.chat.domain.ChatReadMark;
 import com.kashi.grc.chat.repository.ChatConversationRepository;
 import com.kashi.grc.chat.repository.ChatMemberRepository;
 import com.kashi.grc.chat.repository.ChatMessageRepository;
 import com.kashi.grc.chat.repository.ChatReactionRepository;
+import com.kashi.grc.chat.repository.ChatReadMarkRepository;
 import com.kashi.grc.document.domain.Document;
 import com.kashi.grc.document.repository.DocumentLinkRepository;
 import com.kashi.grc.document.repository.DocumentRepository;
@@ -102,6 +104,7 @@ public class ChatService {
     private final ChatMemberRepository       memberRepository;
     private final ChatMessageRepository      messageRepository;
     private final ChatReactionRepository     reactionRepository;
+    private final ChatReadMarkRepository     readMarkRepository;
     private final DocumentRepository         documentRepository;
     private final DocumentLinkRepository     documentLinkRepository;
     private final ObjectMapper               objectMapper;
@@ -242,17 +245,23 @@ public class ChatService {
         List<ChatMember> members = memberRepository.findByConversationId(conv.getId());
         Map<Long, User> users = users(members.stream().map(ChatMember::getUserId).collect(Collectors.toSet()));
         return members.stream().map(m -> {
-            User u = users.get(m.getUserId());
-            Map<String, Object> p = new LinkedHashMap<>();
-            p.put("userId", m.getUserId());
-            p.put("name", name(u));
-            p.put("email", u == null ? null : u.getEmail());
-            p.put("role", m.getRole());
-            p.put("joinedAt", m.getCreatedAt());
-            p.put("you", m.getUserId().equals(c.userId()));
-            return p;
-        }).sorted(Comparator.comparing((Map<String, Object> p) -> !ChatMember.OWNER.equals(p.get("role")))
-                .thenComparing(p -> String.valueOf(p.get("name")).toLowerCase()))
+                    User u = users.get(m.getUserId());
+                    Map<String, Object> p = new LinkedHashMap<>();
+                    p.put("userId", m.getUserId());
+                    p.put("name", name(u));
+                    p.put("email", u == null ? null : u.getEmail());
+                    p.put("role", m.getRole());
+                    p.put("joinedAt", m.getCreatedAt());
+                    p.put("you", m.getUserId().equals(c.userId()));
+                    // Same watermarks as summary(), so the receipt detail can be exact on
+                    // a channel past summary()'s 200-member cap.
+                    p.put("lastReadMessageId", m.getLastReadMessageId());
+                    p.put("lastReadAt", m.getLastReadAt());
+                    p.put("lastDeliveredMessageId", m.getLastDeliveredMessageId());
+                    p.put("lastDeliveredAt", m.getLastDeliveredAt());
+                    return p;
+                }).sorted(Comparator.comparing((Map<String, Object> p) -> !ChatMember.OWNER.equals(p.get("role")))
+                        .thenComparing(p -> String.valueOf(p.get("name")).toLowerCase()))
                 .toList();
     }
 
@@ -326,7 +335,20 @@ public class ChatService {
         }).toList();
     }
 
-    @Transactional(readOnly = true)
+    /**
+     * Not readOnly any more: fetching the newest page of a conversation is proof
+     * of delivery, so it advances that watermark.
+     *
+     * This is the backstop for the two cases the socket cannot cover — a tab that
+     * was closed when the message was sent, and a push that was dropped. Without
+     * it, a message sent to somebody who is offline would sit on one tick until
+     * they happened to read it, which reads as "never arrived" rather than
+     * "arrived, not read yet".
+     *
+     * Only when before == null, i.e. the first page. Scrolling back through
+     * history must not move a watermark forward.
+     */
+    @Transactional
     public Map<String, Object> messages(Long conversationId, Long before, int limit) {
         Caller c = requireChat();
         ChatConversation conv = requireConversation(c, conversationId);
@@ -336,10 +358,26 @@ public class ChatService {
         boolean more = page.size() > n;
         if (more) page = page.subList(0, n);
         java.util.Collections.reverse(page);
+        if (before == null && me != null && !page.isEmpty()) {
+            Long newest = page.get(page.size() - 1).getId();
+            if (me.getLastDeliveredMessageId() == null || newest > me.getLastDeliveredMessageId()) {
+                LocalDateTime now = LocalDateTime.now();
+                me.setLastDeliveredMessageId(newest);
+                me.setLastDeliveredAt(now);
+                memberRepository.save(me);
+                mark(conv, c.userId(), ChatReadMark.DELIVERED, newest, now);
+                Set<Long> others = memberIds(conv.getId());
+                others.remove(c.userId());
+                push(others, Map.of("type", "delivered", "conversationId", conv.getId(),
+                        "userId", c.userId(), "messageId", newest, "at", now.toString()));
+            }
+        }
+
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("messages", render(c, page));
         out.put("hasMore", more);
         out.put("lastReadMessageId", me == null ? null : me.getLastReadMessageId());
+        out.put("lastDeliveredMessageId", me == null ? null : me.getLastDeliveredMessageId());
         return out;
     }
 
@@ -544,9 +582,20 @@ public class ChatService {
         messageRepository.save(m);
         conv.setLastMessageAt(LocalDateTime.now());
         conversationRepository.save(conv);
+        // Sending catches you up on both counts: your own message is, by
+        // definition, both delivered to you and read by you.
         me.setLastReadMessageId(m.getId());
+        me.setLastReadAt(LocalDateTime.now());
+        me.setLastDeliveredMessageId(m.getId());
+        me.setLastDeliveredAt(LocalDateTime.now());
         memberRepository.save(me);
-        ping(conv.getId(), members);
+
+        // messageId and senderId ride along so a recipient's tab can report
+        // delivery without first fetching anything, and so the sender's own tab
+        // can tell this push apart from somebody else's message. Every existing
+        // consumer reads only type and conversationId, so this is additive.
+        push(members, Map.of("type", "chat", "conversationId", conv.getId(),
+                "messageId", m.getId(), "senderId", c.userId()));
 
         String where = ChatConversation.CHANNEL.equals(conv.getKind()) ? "#" + conv.getName() : "a conversation";
         String who = null;
@@ -617,14 +666,70 @@ public class ChatService {
         if (me == null) return;
         Long upTo = messageId != null ? messageId : messageRepository.maxId(conv.getId());
         if (upTo != null && (me.getLastReadMessageId() == null || upTo > me.getLastReadMessageId())) {
+            LocalDateTime now = LocalDateTime.now();
             me.setLastReadMessageId(upTo);
+            me.setLastReadAt(now);
+            // Reading implies delivery. Without this a message read straight from
+            // a cold load — tab opened on the conversation, nothing pushed to it —
+            // would show as read but never delivered, which is a state the ticks
+            // cannot represent and the reader would see as a single tick on
+            // something they had plainly just read.
+            if (me.getLastDeliveredMessageId() == null || upTo > me.getLastDeliveredMessageId()) {
+                me.setLastDeliveredMessageId(upTo);
+                me.setLastDeliveredAt(now);
+                mark(conv, c.userId(), ChatReadMark.DELIVERED, upTo, now);
+            }
             memberRepository.save(me);
+            mark(conv, c.userId(), ChatReadMark.READ, upTo, now);
             ping(conv.getId(), Set.of(c.userId()));    // my other tabs clear the badge too
-            // Everyone else: "Seen by" moves — a light push, no refetch of messages.
+            // Everyone else: the ticks move. A light push, no refetch of messages.
             Set<Long> others = memberIds(conv.getId());
             others.remove(c.userId());
-            push(others, Map.of("type", "read", "conversationId", conv.getId(), "userId", c.userId(), "messageId", upTo));
+            push(others, Map.of("type", "read", "conversationId", conv.getId(),
+                    "userId", c.userId(), "messageId", upTo, "at", now.toString()));
         }
+    }
+
+    /**
+     * "My client has this." Advances the delivered watermark and nothing else.
+     *
+     * -- WHY THIS IS A SEPARATE CALL AND NOT A SIDE EFFECT ------------------
+     *
+     * Delivery and reading are different facts and happen at different moments.
+     * The chat socket is open app-wide (the sidebar mounts it on every page), so
+     * a push lands in the recipient's browser whether or not they are looking at
+     * chat — that is the moment a message has reached them, and it is the only
+     * moment anything on the server can learn about it. Reading cannot stand in
+     * for it: somebody with chat closed all afternoon has still received
+     * everything sent to them.
+     *
+     * Advance-only and silent when the watermark does not move, so a tab that
+     * reports the same id twice (two listeners, a reconnect replay) costs one
+     * SELECT and no push.
+     *
+     * The push goes to everyone else rather than only the sender because in a
+     * group every member's ticks depend on every other member's delivery.
+     */
+    @Transactional
+    public void delivered(Long conversationId, Long messageId) {
+        Caller c = requireChat();
+        ChatConversation conv = requireConversation(c, conversationId);
+        ChatMember me = memberRepository.findByConversationIdAndUserId(conv.getId(), c.userId()).orElse(null);
+        if (me == null) return;
+        Long upTo = messageId != null ? messageId : messageRepository.maxId(conv.getId());
+        if (upTo == null) return;
+        if (me.getLastDeliveredMessageId() != null && upTo <= me.getLastDeliveredMessageId()) return;
+
+        LocalDateTime now = LocalDateTime.now();
+        me.setLastDeliveredMessageId(upTo);
+        me.setLastDeliveredAt(now);
+        memberRepository.save(me);
+        mark(conv, c.userId(), ChatReadMark.DELIVERED, upTo, now);
+
+        Set<Long> others = memberIds(conv.getId());
+        others.remove(c.userId());
+        push(others, Map.of("type", "delivered", "conversationId", conv.getId(),
+                "userId", c.userId(), "messageId", upTo, "at", now.toString()));
     }
 
     // ══════════════════════ REACTIONS · PINS · SEARCH · TYPING ═══════════════
@@ -781,12 +886,21 @@ public class ChatService {
         x.put("description", conv.getDescription());
         x.put("archived", conv.isArchived());
         x.put("memberCount", members.size());
-        x.put("members", members.stream().limit(60).map(m -> {
+        // The cap is what the ticks count against, so it is 200 rather than 60:
+        // a channel bigger than that reports "read by 200 of 340" and the detail
+        // list is the exact answer (GET /conversations/{id}/members is
+        // untruncated and carries the same watermarks). Each row is five small
+        // fields, so 200 is nothing next to the message page it travels beside.
+        x.put("memberReceiptsComplete", members.size() <= 200);
+        x.put("members", members.stream().limit(200).map(m -> {
             Map<String, Object> p = new LinkedHashMap<>();
             p.put("userId", m.getUserId());
             p.put("name", name(users.containsKey(m.getUserId()) ? users.get(m.getUserId()) : userRepository.findById(m.getUserId()).orElse(null)));
             p.put("role", m.getRole());
-            p.put("lastReadMessageId", m.getLastReadMessageId());   // "Seen by"
+            p.put("lastReadMessageId", m.getLastReadMessageId());         // read ticks
+            p.put("lastReadAt", m.getLastReadAt());
+            p.put("lastDeliveredMessageId", m.getLastDeliveredMessageId()); // delivered ticks
+            p.put("lastDeliveredAt", m.getLastDeliveredAt());
             return p;
         }).toList());
         String display = conv.getName();
@@ -962,6 +1076,90 @@ public class ChatService {
                 log.warn("[CHAT] Added notification failed (non-fatal) | {}", e.getMessage());
             }
         }
+    }
+
+    /**
+     * Record that somebody's pointer moved, alongside moving it.
+     *
+     * Called from every place that advances a watermark, so the log cannot
+     * drift from the columns: same instant, same transaction, same id.
+     *
+     * One row per MOVE. A pointer jumping from 100 to 140 writes one row saying
+     * "reached 140 at 09:14", which is the read time for every one of messages
+     * 101-140 — see ChatReadMark for why that beats a row per message.
+     */
+    private void mark(ChatConversation conv, Long userId, String kind, Long upTo, LocalDateTime at) {
+        ChatReadMark k = ChatReadMark.builder()
+                .conversationId(conv.getId())
+                .userId(userId)
+                .kind(kind)
+                .upToMessageId(upTo)
+                .markedAt(at)
+                .build();
+        k.setTenantId(conv.getTenantId());
+        readMarkRepository.save(k);
+    }
+
+    /**
+     * Who had this message, and when. The info panel.
+     *
+     * The STATE comes from the watermarks on chat_members, which is the same
+     * comparison the ticks use, so the panel can never disagree with the tick
+     * above it. The TIMES come from the advance log, which is the only thing
+     * that knows when a pointer crossed this particular message.
+     *
+     * A null time next to a set state means the crossing happened before the
+     * log existed. Shown as the state without a time rather than as the
+     * member's last-read time, which would be an upper bound wearing the
+     * clothes of an exact answer.
+     */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> messageReceipts(Long messageId) {
+        Caller c = requireChat();
+        ChatMessage m = messageRepository.findById(messageId)
+                .orElseThrow(() -> bad("CHAT_NO_MESSAGE", "That message no longer exists"));
+        ChatConversation conv = requireConversation(c, m.getConversationId());
+        requireReader(c, conv);
+
+        List<ChatMember> members = memberRepository.findByConversationId(conv.getId());
+        Map<Long, User> users = users(members.stream().map(ChatMember::getUserId).collect(Collectors.toSet()));
+
+        // [userId, kind, firstReachedAt] -> userId -> kind -> time
+        Map<Long, Map<String, Object>> times = new HashMap<>();
+        for (Object[] r : readMarkRepository.firstReachedBy(conv.getId(), m.getId())) {
+            times.computeIfAbsent((Long) r[0], k -> new HashMap<>()).put((String) r[1], r[2]);
+        }
+
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (ChatMember mem : members) {
+            // The sender is not a recipient of their own message.
+            if (mem.getUserId().equals(m.getSenderId())) continue;
+
+            boolean read = mem.getLastReadMessageId() != null
+                    && mem.getLastReadMessageId() >= m.getId();
+            boolean delivered = read || (mem.getLastDeliveredMessageId() != null
+                    && mem.getLastDeliveredMessageId() >= m.getId());
+
+            Map<String, Object> t = times.getOrDefault(mem.getUserId(), Map.of());
+            Map<String, Object> p = new LinkedHashMap<>();
+            p.put("userId", mem.getUserId());
+            p.put("name", name(users.get(mem.getUserId())));
+            p.put("state", read ? "READ" : delivered ? "DELIVERED" : "SENT");
+            p.put("readAt", read ? t.get(ChatReadMark.READ) : null);
+            // Reading implies delivery, but the DELIVERED advance is the one that
+            // carries the delivery time, so it is read from its own kind rather
+            // than inferred from the read time.
+            p.put("deliveredAt", delivered ? t.get(ChatReadMark.DELIVERED) : null);
+            out.add(p);
+        }
+
+        // Read first, then delivered, then not yet — and alphabetical inside each,
+        // so a long channel reads as a status list rather than member order.
+        List<String> order = List.of("READ", "DELIVERED", "SENT");
+        out.sort(Comparator
+                .comparingInt((Map<String, Object> p) -> order.indexOf(String.valueOf(p.get("state"))))
+                .thenComparing(p -> String.valueOf(p.get("name")).toLowerCase()));
+        return out;
     }
 
     /** After the transaction commits, tell these people's browsers that the conversation changed. */

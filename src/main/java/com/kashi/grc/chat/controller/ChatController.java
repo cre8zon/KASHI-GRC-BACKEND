@@ -149,6 +149,37 @@ public class ChatController {
         return ResponseEntity.ok(ApiResponse.success());
     }
 
+    /**
+     * "My client has this message." Sets the second tick.
+     *
+     * Deliberately the same shape as /read, and deliberately separate from it:
+     * the caller is the recipient's app-wide chat socket listener, which fires
+     * the moment a push lands in any tab, long before anyone has read anything.
+     * Idempotent and advance-only, so a reconnect replaying the same id costs a
+     * SELECT and nothing else.
+     */
+    @PostMapping("/conversations/{id}/delivered")
+    @Operation(summary = "Mark as delivered to my client")
+    public ResponseEntity<ApiResponse<Void>> delivered(@PathVariable Long id, @RequestBody(required = false) Map<String, Object> body) {
+        Object m = body == null ? null : body.get("messageId");
+        service.delivered(id, m == null ? null : Long.valueOf(m.toString()));
+        return ResponseEntity.ok(ApiResponse.success());
+    }
+
+    /**
+     * Who had this message, and when. The info panel.
+     *
+     * Per message rather than per conversation: the state is the same
+     * comparison the tick makes, but the TIMES are specific to this message and
+     * come from the advance log, so they are only worth fetching when somebody
+     * actually opens the panel. The ticks themselves need no request at all.
+     */
+    @GetMapping("/messages/{id}/receipts")
+    @Operation(summary = "Who this message reached, and when")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> messageReceipts(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.success(service.messageReceipts(id)));
+    }
+
     @PatchMapping("/messages/{id}")
     @Operation(summary = "Edit my message")
     public ResponseEntity<ApiResponse<Map<String, Object>>> edit(@PathVariable Long id, @RequestBody Map<String, Object> body) {
@@ -206,7 +237,7 @@ public class ChatController {
         return ResponseEntity.ok(ApiResponse.success(service.pin(id, Boolean.parseBoolean(String.valueOf(body.get("pinned"))))));
     }
 
-        @DeleteMapping("/messages/{id}")
+    @DeleteMapping("/messages/{id}")
     @Operation(summary = "Delete a message")
     public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {
         service.delete(id);
