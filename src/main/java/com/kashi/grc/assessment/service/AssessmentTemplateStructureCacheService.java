@@ -124,7 +124,11 @@ public class AssessmentTemplateStructureCacheService {
                             .filter(java.util.Objects::nonNull)
                             .toList();
                     return new QuestionSnapshot(q.getId(), q.getQuestionText(), q.getResponseType(),
-                            q.getQuestionTag(), sqm.getWeight(), sqm.isMandatory(), sqm.getOrderNo(), options);
+                            q.getQuestionTag(), sqm.getWeight(), sqm.isMandatory(), sqm.getOrderNo(),
+                            // From the LIBRARY question, like questionText and
+                            // responseType — the per-template mapping (sqm)
+                            // carries weight/mandatory/order, not this.
+                            q.isRequiresEvidence(), options);
                 })
                 .filter(java.util.Objects::nonNull)
                 .toList();

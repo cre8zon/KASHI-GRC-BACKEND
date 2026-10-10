@@ -230,19 +230,32 @@ public class ExecuteAssessmentAction implements AutomatedActionHandler {
             }
         }
 
+        // requires_evidence is in this list because the column is NOT NULL with
+        // no DB default. Hand-written SQL names every column, so a column added
+        // to the entity later is simply absent from the INSERT — and MySQL in
+        // strict mode answers that with 1364, "Field 'requires_evidence' doesn't
+        // have a default value", failing the entire batch. Every assessment
+        // creation died there, and because this runs from the workflow's system
+        // step it retried and failed on a loop.
+        //
+        // Keep this list and the column list below in the same order, and keep
+        // both in step with AssessmentQuestionInstance. The entity is the
+        // contract; this SQL is a hand copy of it that cannot be checked by the
+        // compiler, which is exactly how the two drifted apart.
         List<Object[]> questionRows = flatQuestions.stream()
                 .map(p -> new Object[]{
                         assessment.getId(), p.sectionInstanceId(), p.question().libraryQuestionId(),
                         p.question().questionText(), p.question().responseType(),
                         p.question().weight(), p.question().mandatory(), p.question().orderNo(),
-                        p.question().questionTag(), now, now
+                        p.question().questionTag(), p.question().requiresEvidence(), now, now
                 })
                 .toList();
         List<Long> questionInstanceIds = jdbcBatchInsertHelper.batchInsertAndGetIds(
                 "INSERT INTO assessment_question_instances " +
                         "(assessment_id, section_instance_id, original_question_id, question_text_snapshot, " +
-                        "response_type, weight, is_mandatory, order_no, question_tag_snapshot, created_at, updated_at) " +
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        "response_type, weight, is_mandatory, order_no, question_tag_snapshot, " +
+                        "requires_evidence, created_at, updated_at) " +
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 questionRows);
         int questionCount = questionInstanceIds.size();
 

@@ -38,6 +38,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.LinkedHashMap;
+import com.kashi.grc.usermanagement.domain.User;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -569,10 +571,44 @@ public class VendorController {
                     builder.assessmentInstantiated(instantiated);  // ← ADD to VendorResponse
                 });
 
-        // VRM user — first user with this vendorId
-        userRepository.findByVendorIdAndIsDeletedFalse(v.getId())
-                .stream().findFirst()
-                .ifPresent(u -> builder.vrmUserId(u.getId()));
+        // ── THE PRIMARY CONTACT ───────────────────────────────────────────
+        //
+        // This was `findFirst()` on an unordered query, and it set only the id.
+        // Two faults: the list could never show a NAME, and "first" is whichever
+        // row MySQL happened to return — a vendor with a VRM plus two
+        // contributors could report a contributor as its vrmUserId.
+        //
+        // Same single query as before. Nothing new is fetched; the result is
+        // simply read properly instead of being thrown away after .getId().
+        //
+        // ── HOW THE RIGHT PERSON IS PICKED ────────────────────────────────
+        //
+        // By the email the vendor itself records, not by a role name. Onboarding
+        // writes vendors.primary_contact_email and creates that person as a user
+        // on the same vendor, so the address is the link the data already has —
+        // and it keeps working if the VENDOR_VRM role is renamed, split, or a
+        // second vendor-side role is added later.
+        //
+        // Falling back to the EARLIEST-created user rather than an arbitrary one
+        // matters: onboarding creates the primary contact first, so oldest is
+        // the best guess available, and it is at least stable between requests
+        // instead of changing with the query plan.
+        List<User> vendorUsers = userRepository.findByVendorIdAndIsDeletedFalse(v.getId());
+        if (!vendorUsers.isEmpty()) {
+            String contactEmail = v.getPrimaryContactEmail();
+            User contact = vendorUsers.stream()
+                    .filter(u -> contactEmail != null && !contactEmail.isBlank()
+                            && contactEmail.equalsIgnoreCase(u.getEmail()))
+                    .findFirst()
+                    .orElseGet(() -> vendorUsers.stream()
+                            .min(Comparator.comparing(User::getId))
+                            .orElse(null));
+            if (contact != null) {
+                builder.vrmUserId(contact.getId())
+                        .primaryContactUserId(contact.getId())
+                        .primaryContactName(contact.getFullName());
+            }
+        }
 
         return builder.build();
     }
