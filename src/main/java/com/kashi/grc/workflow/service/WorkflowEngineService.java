@@ -167,6 +167,52 @@ public class WorkflowEngineService {
     // returns null when it's off, which is the signal to fall back to
     // synchronous dispatch (see createStepInstance).
     private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaEventPublisherProvider;
+
+    /**
+     * Whether EXECUTE_ASSESSMENT is handed to Kafka instead of running inline.
+     *
+     * DEFAULTS TO FALSE — the inline path, which is what this was before the
+     * Kafka handoff and what the 5-minute retry sweep still uses today.
+     *
+     * ── WHY A FLAG, AND WHY OFF ──────────────────────────────────────────────
+     * The handoff committed to the async path on the strength of the PUBLISHER
+     * BEAN EXISTING, which only tells you kashi.kafka.enabled=true. It says
+     * nothing about whether a broker is reachable or a consumer is subscribed.
+     * publish() is contractually non-throwing and the send is asynchronous
+     * (KafkaEventPublisher.doSend), and since the fix that defers it to
+     * afterCommit it does not even leave until this transaction has committed —
+     * long after dispatchedAsync was set. So when there is no broker, or the
+     * consumer is not running, the step is left IN_PROGRESS, the inline branch
+     * below is skipped, and the assessment is not created. Nothing reports it:
+     * the only trace is one ERROR line from the producer callback.
+     *
+     * What rescues it is StepSlaMonitor.retryStuckSystemSteps, which is
+     * @Scheduled(fixedDelay = 5 minutes) with NO initialDelay — so it also runs
+     * once at startup. That is why the assessment appears on redeploy and not on
+     * creation: the sweep, not the consumer, is doing the work.
+     *
+     * Creating the assessment is the point of the step, so it fails CLOSED now.
+     * Set kashi.workflow.execute-assessment.async=true to put it back on Kafka
+     * once a broker and that consumer are verified — the async code path is
+     * untouched and one property away.
+     */
+    @org.springframework.beans.factory.annotation.Value("${kashi.workflow.execute-assessment.async:false}")
+    private boolean executeAssessmentAsync;
+
+    /**
+     * States the resolved value at startup.
+     *
+     * Added because there was no way to tell from a running instance which path
+     * provisioning would take, so "did that file get deployed" could only be
+     * answered by creating an assessment and reading what happened afterwards.
+     * One line at boot answers it before anything is tried.
+     */
+    @jakarta.annotation.PostConstruct
+    void logExecuteAssessmentDispatchMode() {
+        log.info("[WORKFLOW-AUTO] EXECUTE_ASSESSMENT dispatch = {} "
+                        + "(kashi.workflow.execute-assessment.async={})",
+                executeAssessmentAsync ? "KAFKA" : "INLINE", executeAssessmentAsync);
+    }
     private final ApplicationEventPublisher eventPublisher;
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
@@ -1607,9 +1653,23 @@ public class WorkflowEngineService {
                                 .initiatedBy(instance.getInitiatedBy())
                                 .build();
 
+                // How long this sat before the sweep reached it. The whole
+                // reason EXECUTE_ASSESSMENT looked broken is that nothing
+                // measured this: the work completed, minutes after the step was
+                // created, and the only way to notice was to diff two
+                // timestamps by hand. A retry that rescues a step is also
+                // evidence that dispatch-at-creation did not happen, so it
+                // should say so where it will be read.
+                long parkedSeconds = si.getStartedAt() == null ? -1
+                        : java.time.Duration.between(si.getStartedAt(),
+                        java.time.LocalDateTime.now()).getSeconds();
+
                 Optional<Boolean> result = automatedActionRegistry.dispatch(step.getAutomatedAction(), ctx);
 
                 if (result.isPresent() && Boolean.TRUE.equals(result.get())) {
+                    log.warn("[WORKFLOW-RETRY] '{}' succeeded on RETRY after {}s parked — it should have "
+                                    + "run when the step was created | stepInstanceId={} | instanceId={}",
+                            step.getAutomatedAction(), parkedSeconds, si.getId(), instance.getId());
                     completeStep(si, StepStatus.APPROVED,
                             "Auto-approved by " + step.getAutomatedAction() + " (retry)");
                     expirePendingTasks(si, null);   // same omission as the manual-advance path
@@ -2844,7 +2904,8 @@ public class WorkflowEngineService {
         // handler that does meaningful bulk work, not a general async
         // dispatch mechanism.
         boolean dispatchedAsync = false;
-        if ("SYSTEM".equals(step.getSide()) && "EXECUTE_ASSESSMENT".equals(step.getAutomatedAction())) {
+        if (executeAssessmentAsync
+                && "SYSTEM".equals(step.getSide()) && "EXECUTE_ASSESSMENT".equals(step.getAutomatedAction())) {
             com.kashi.grc.common.kafka.KafkaEventPublisher publisher = kafkaEventPublisherProvider.getIfAvailable();
             if (publisher != null) {
                 // Same IN_PROGRESS status the synchronous failure branch below
@@ -2872,6 +2933,14 @@ public class WorkflowEngineService {
             // publisher == null (kashi.kafka.enabled=false) — fall through to
             // the normal synchronous path below, same "flip a flag, zero
             // blast radius" contract as every other Kafka producer call site.
+        } else if ("SYSTEM".equals(step.getSide())
+                && "EXECUTE_ASSESSMENT".equals(step.getAutomatedAction())) {
+            // Says which path provisioning took, so this is answerable from the
+            // log instead of by reading the config. The async branch already
+            // logs its own line.
+            log.info("[WORKFLOW-AUTO] EXECUTE_ASSESSMENT running inline "
+                            + "(kashi.workflow.execute-assessment.async=false) | instanceId={} | stepInstanceId={}",
+                    instance.getId(), si.getId());
         }
 
         if (!dispatchedAsync && "SYSTEM".equals(step.getSide()) && step.getAutomatedAction() != null) {

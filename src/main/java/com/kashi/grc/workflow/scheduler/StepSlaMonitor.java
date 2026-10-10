@@ -261,11 +261,44 @@ public class StepSlaMonitor {
     }
 
     /**
-     * Retry stuck SYSTEM steps every 5 minutes.
-     * Handles cases where automated action returned false on step creation
-     * (e.g. backend restarted mid-execution, or action conditions not yet met).
+     * Retry stuck SYSTEM steps.
+     *
+     * -- WHY THE DEFAULT MOVED FROM 5 MINUTES TO 30 SECONDS -------------------
+     *
+     * This was written as a backstop for a rare case: a restart mid-execution,
+     * or an action whose conditions are not met yet, such as
+     * MonitorProjectEngagementsAction waiting on engagements that are still
+     * running. Five minutes is right for those. Nobody is watching, and the
+     * condition will not change in the meantime.
+     *
+     * It has turned out to be the PRIMARY path for EXECUTE_ASSESSMENT, which is
+     * a different kind of work entirely. The vendor's questionnaire is supposed
+     * to exist the moment the template is chosen; instead there is a window of
+     * up to five minutes where the workflow sits on "Execute Assessment Setup -
+     * IN_PROGRESS" with nothing to show the admin who just chose it. Measured on
+     * instance 402: step created 08:10:18, assessment written 08:14:43 - 4m25s,
+     * landing two seconds into this sweep's second run after startup.
+     *
+     * Thirty seconds is a backstop you can wait through rather than one that
+     * looks like a hang. It is a CAP ON THE DAMAGE, not a fix: provisioning
+     * belongs at step creation, and while it is not happening there, something
+     * upstream of here is still wrong.
+     *
+     * -- WHAT IT COSTS --------------------------------------------------------
+     *
+     * WorkflowEngineService.retryStuckSystemSteps does findByStatus(IN_PROGRESS)
+     * across every tenant and filters SYSTEM in Java, so this is one indexed
+     * query plus a small in-memory filter every 30s, holding one pooled
+     * connection for its duration. Against a pool of 20 and a table this size
+     * that is noise. If the step table ever grows enough for it not to be,
+     * narrow the query rather than lengthening the interval - the interval is
+     * what the vendor experiences.
+     *
+     * fixedDelayString, so it is tunable without a rebuild:
+     *   kashi.workflow.system-step-retry-ms=5000     tight, while debugging
+     *   kashi.workflow.system-step-retry-ms=300000   the old 5 minutes
      */
-    @Scheduled(fixedDelay = 5 * 60 * 1000)  // 5 minutes
+    @Scheduled(fixedDelayString = "${kashi.workflow.system-step-retry-ms:30000}")
     @Transactional
     public void retryStuckSystemSteps() {
         workflowEngineService.retryStuckSystemSteps();

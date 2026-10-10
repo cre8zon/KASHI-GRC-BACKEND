@@ -29,6 +29,23 @@ public record TemplateStructureSnapshot(List<SectionSnapshot> sections) {
             Double weight,
             boolean mandatory,
             Integer orderNo,
+            /**
+             * Snapshot of AssessmentQuestion.requiresEvidence.
+             *
+             * Missing here was the whole bug. assessment_question_instances
+             * .requires_evidence is NOT NULL with no DB default, and
+             * ExecuteAssessmentAction inserts that table with hand-written SQL
+             * naming its columns explicitly. The column was added to the entity
+             * and to the library question, but never threaded through this
+             * record, so instantiation could not have supplied it even if the
+             * INSERT had asked for it — MySQL in strict mode then rejected the
+             * whole batch with 1364, and no assessment could be created.
+             *
+             * Carried as a snapshot for the same reason as questionTag: turning
+             * evidence on for a library question next quarter must not
+             * retroactively make an already-submitted answer incomplete.
+             */
+            boolean requiresEvidence,
             List<OptionSnapshot> options) {}
 
     public record OptionSnapshot(
