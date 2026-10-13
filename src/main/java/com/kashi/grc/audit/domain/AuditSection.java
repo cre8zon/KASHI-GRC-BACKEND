@@ -47,18 +47,19 @@ import lombok.*;
  */
 @Entity
 @Table(name = "audit_sections",
-    indexes = {
-        @Index(name = "idx_audit_sec_tenant",   columnList = "tenant_id"),
-        @Index(name = "idx_audit_sec_parent",   columnList = "parent_id"),
-        @Index(name = "idx_audit_sec_path",     columnList = "path"),
-        @Index(name = "idx_audit_sec_code",     columnList = "section_code"),
-        @Index(name = "idx_audit_sec_framework",columnList = "framework_ref")
-    }
+        indexes = {
+                @Index(name = "idx_audit_sec_tenant",   columnList = "tenant_id"),
+                @Index(name = "idx_audit_sec_parent",   columnList = "parent_id"),
+                @Index(name = "idx_audit_sec_path",     columnList = "path"),
+                @Index(name = "idx_audit_sec_code",     columnList = "section_code"),
+                @Index(name = "idx_audit_sec_framework",columnList = "framework_ref")
+        }
 )
 @Getter @Setter
 @lombok.experimental.SuperBuilder
 @NoArgsConstructor @AllArgsConstructor
-public class AuditSection extends GlobalOrTenantEntity {
+@org.hibernate.annotations.SQLRestriction("is_deleted = false")
+public class AuditSection extends GlobalOrTenantEntity implements com.kashi.grc.common.domain.SoftDeletable {
 
     // ── Tree structure ────────────────────────────────────────────────────────
 
@@ -117,4 +118,32 @@ public class AuditSection extends GlobalOrTenantEntity {
 
     @Column(name = "created_by")
     private Long createdBy;
+    // -- SOFT DELETE ----------------------------------------------------------
+    //
+    // These four, and the @SQLRestriction on the class above, replace what used
+    // to be a repository.delete(). See common/domain/SoftDeletable and
+    // common/service/SoftDeleteService; the column names match what Personnel
+    // already uses so one restore screen can serve every table.
+    //
+    // @SQLRestriction filters HQL, criteria queries and collection loads, which
+    // is every module list (they all run through DbRepository's criteria
+    // builder) and every mapped association. It is NOT applied to a load by
+    // primary key, so findById still returns a retired row - that is what makes
+    // restore possible, and it is why detail paths should call
+    // SoftDeleteService.requireLive.
+    //
+    // ddl-auto=update adds the columns on the next boot. sql/113 adds the index.
+
+    @Column(name = "is_deleted", nullable = false)
+    @lombok.Builder.Default
+    private boolean isDeleted = false;
+
+    @Column(name = "deleted_at")
+    private java.time.LocalDateTime deletedAt;
+
+    @Column(name = "deleted_by")
+    private Long deletedBy;
+
+    @Column(name = "deletion_reason", length = 500)
+    private String deletionReason;
 }

@@ -134,6 +134,7 @@ public class AssessmentController {
     // same loop and the same early-return bug above it.
     private final AssessmentObligationService          obligationService;
     private final UtilityService                       utilityService;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
     private final GuardEvaluator                        guardEvaluator;
     private final ActionItemRepository                   actionItemRepository;
     private final NotificationService                    notificationService;
@@ -438,6 +439,51 @@ public class AssessmentController {
     // CHANGED: assertUserHasActiveTask() called before saving any response.
     // Only users with an active task can submit answers.
 
+    /**
+     * Load an assessment, or refuse — the ONLY way this controller should
+     * reach one by id.
+     *
+     * -- WHY THIS EXISTS ------------------------------------------------------
+     *
+     * Fourteen endpoints here did
+     *
+     *     assessmentRepository.findById(assessmentId)
+     *             .orElseThrow(() -> new ResourceNotFoundException(...));
+     *
+     * and nothing else. Assessment ids are one global sequence, so any
+     * authenticated user holding the relevant assessment permission in their
+     * OWN organisation could pass another organisation's id and act on it:
+     * consolidate its scores, write its findings, set its risk rating, submit
+     * on the CISO's behalf, approve it. For a TPRM product that is the
+     * customer's vendor risk position, editable by a stranger.
+     *
+     * assign-review-lead already did this correctly, checking both the tenant
+     * and the task owner. This is that check, written once, where every caller
+     * gets it instead of every caller having to remember it.
+     *
+     * -- WHAT IT DOES NOT DO --------------------------------------------------
+     *
+     * It answers "is this assessment yours", not "may you do this to it".
+     * Per-action authority stays exactly where it is: the workflow task check,
+     * the section gate, assessment.findings.edit and the rest are untouched.
+     * This closes the tenant boundary and nothing else, so no existing
+     * permission behaviour changes.
+     *
+     * -- 404, NOT 403 ---------------------------------------------------------
+     *
+     * A cross-tenant id reads as missing. "Forbidden" would confirm the id
+     * exists, which turns these endpoints into a way to count and probe
+     * another customer's assessments.
+     */
+    private VendorAssessment loadAssessmentInTenant(Long assessmentId) {
+        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
+                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        permissionGate.requireSameTenant(
+                assessment.getTenantId(),
+                utilityService.getLoggedInDataContext().getTenantId());
+        return assessment;
+    }
+
     @PostMapping("/v1/assessments/{assessmentId}/responses")
     @Transactional
     @Operation(summary = "Submit or update answer to a question")
@@ -448,8 +494,7 @@ public class AssessmentController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         Long userId   = utilityService.getLoggedInDataContext().getId();
 
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
 
         // ── STEP-GATED ACCESS GUARD ───────────────────────────────────────────
         assertUserHasActiveTask(assessment, userId, "submit answer");
@@ -1610,8 +1655,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
         // Fire SECTIONS_ASSIGNED first — marks the "assign sections" gate complete.
         // This section has requiresAssignment=true in the blueprint but no workflow
         // sub-tasks are created for step 3 (responder tasks come at step 4 via engine fan-out).
@@ -1650,8 +1694,7 @@ public class AssessmentController {
             @RequestParam(required = false) Long taskId) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
 
         // ── THIS ENDPOINT HAD NO GUARD OF ANY KIND ──────────────────────────
         //
@@ -1852,8 +1895,7 @@ public class AssessmentController {
                     HttpStatus.FORBIDDEN);
         }
 
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
 
         AssessmentSectionInstance section = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sectionInstanceId));
@@ -2408,8 +2450,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
         try {
             eventPublisher.publishEvent(
                     com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -2434,8 +2475,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
                         "SECTION_PUBLISHED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
@@ -2465,8 +2505,7 @@ public class AssessmentController {
         Long userId   = utilityService.getLoggedInDataContext().getId();
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
 
         // ── 1. Build QuestionContext list for generic guard sweep ─────────────
         // Map questionInstanceId → latest response (null if never answered)
@@ -2582,8 +2621,7 @@ public class AssessmentController {
             @RequestParam(required = false) Long cisoUserId) {
 
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
 
         // Directly approve the task — advances step 7 and triggers step 8 task creation.
         // Step 8 uses PUSH_TO_ROLES with ORG_CISO actor role, so it automatically fans
@@ -2609,8 +2647,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
         // Same pattern as step 3 — fire both required section events so the gate passes.
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -2974,8 +3011,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
 
         // Fire the section event — works when step 9 has workflow_step_sections configured.
         eventPublisher.publishEvent(
@@ -3012,8 +3048,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
 
         // Recalculate total earned score applying reviewer verdicts:
         // PASS → full credit, PARTIAL → 50% credit, FAIL → 0, PENDING → full credit.
@@ -3039,8 +3074,7 @@ public class AssessmentController {
             @RequestParam Long taskId,
             @RequestBody(required = false) Map<String, String> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
         String findings = body != null ? body.getOrDefault("findings", "") : "";
         if (!findings.isBlank()) {
             // Resolve reviewer name for the findings header
@@ -3082,8 +3116,7 @@ public class AssessmentController {
             @PathVariable Long assessmentId,
             @RequestParam Long taskId) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        loadAssessmentInTenant(assessmentId);
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
                         "CISO_APPROVED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
@@ -3101,8 +3134,7 @@ public class AssessmentController {
             @RequestParam(required = false) String riskRating,
             @RequestBody(required = false) Map<String, String> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
-                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
 
         // ── THE RATING MAY ARRIVE AS A QUERY PARAM OR IN A BODY ─────────────
         //

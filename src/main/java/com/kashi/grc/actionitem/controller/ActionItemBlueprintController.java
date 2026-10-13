@@ -37,6 +37,8 @@ public class ActionItemBlueprintController {
         return ResponseEntity.ok(ApiResponse.success(items));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @PostMapping("/v1/action-item-blueprints")
     @Operation(summary = "Create a blueprint")
     public ResponseEntity<ApiResponse<ActionItemBlueprint>> create(
@@ -77,6 +79,8 @@ public class ActionItemBlueprintController {
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(bp));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @PutMapping("/v1/action-item-blueprints/{id}")
     @Operation(summary = "Update a blueprint")
     public ResponseEntity<ApiResponse<ActionItemBlueprint>> update(
@@ -111,6 +115,8 @@ public class ActionItemBlueprintController {
         return ResponseEntity.ok(ApiResponse.success(bp));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @DeleteMapping("/v1/action-item-blueprints/{id}")
     @Operation(summary = "Delete a blueprint")
     public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {

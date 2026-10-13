@@ -45,6 +45,14 @@ public class IntegrationConfig extends TenantAwareEntity {
      *   Azure:            { "tenantId": "...", "clientId": "...", "clientSecret": "..." }
      *   Google Workspace: { "serviceAccountJson": "...", "adminEmail": "admin@company.com" }
      */
+    // Encrypted at rest with AES-256-GCM. The javadoc above has claimed this
+    // since the class was written; EncryptedStringConverter is what finally
+    // makes it true. Applied here explicitly rather than by autoApply, which
+    // would have encrypted every String column in the application.
+    //
+    // Reads tolerate plaintext, so rows written before this converter keep
+    // working and upgrade themselves on the next save. Nothing to migrate.
+    @Convert(converter = com.kashi.grc.common.security.EncryptedStringConverter.class)
     @Column(name = "auth_config", columnDefinition = "TEXT")
     private String authConfig;
 

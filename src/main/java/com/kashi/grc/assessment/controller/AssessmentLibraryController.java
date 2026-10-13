@@ -57,6 +57,7 @@ public class AssessmentLibraryController {
     private final DbRepository                       dbRepository;
     private final UtilityService                     utilityService;
     private final CsvImportService                   csvImportService;
+    private final com.kashi.grc.common.service.SoftDeleteService softDelete;
 
     // ═══════════════════════════════════════════════════════════
     // OPTIONS
@@ -101,18 +102,25 @@ public class AssessmentLibraryController {
     @DeleteMapping("/options/{optionId}")
     @Transactional
     @Operation(summary = "Delete a library option — removes all question-option mappings")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteOption(@PathVariable Long optionId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteOption(
+            @PathVariable Long optionId,
+            @RequestParam(required = false) String reason) {
 
         log.info("[LIBRARY] Deleting option | id={}", optionId);
         optionRepository.findById(optionId)
                 .orElseThrow(() -> new ResourceNotFoundException("Option", optionId));
 
+        // The mappings stay. They record which questions offered this option,
+        // which is what makes a historic answer readable; removing them left
+        // every past response pointing at a score nobody could account for.
+        // @SQLRestriction keeps the option itself out of every list and picker.
         int mappings = questionOptionMappingRepository.findByOptionId(optionId).size();
-        questionOptionMappingRepository.deleteByOptionId(optionId);
-        log.info("[LIBRARY] Removed {} question-option mappings for option id={}", mappings, optionId);
 
-        optionRepository.deleteById(optionId);
-        log.info("[LIBRARY] Option deleted | id={}", optionId);
+        var option = optionRepository.findById(optionId).orElseThrow();
+        softDelete.mark(option, reason);
+        optionRepository.save(option);
+        log.info("[LIBRARY] Option retired | id={} | {} mappings kept | reason=\"{}\"",
+                optionId, mappings, reason);
 
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", true, "optionId", optionId)));
     }
@@ -223,7 +231,9 @@ public class AssessmentLibraryController {
     @DeleteMapping("/questions/{questionId}")
     @Transactional
     @Operation(summary = "Delete a library question — removes all its mappings")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteQuestion(@PathVariable Long questionId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteQuestion(
+            @PathVariable Long questionId,
+            @RequestParam(required = false) String reason) {
 
         log.info("[LIBRARY] Deleting question | id={}", questionId);
         questionRepository.findById(questionId)
@@ -231,13 +241,16 @@ public class AssessmentLibraryController {
 
         int optMappings = questionOptionMappingRepository.findByQuestionIdOrderByOrderNo(questionId).size();
         int secMappings = sectionQuestionMappingRepository.findByQuestionId(questionId).size();
-        questionOptionMappingRepository.deleteByQuestionId(questionId);
-        sectionQuestionMappingRepository.deleteByQuestionId(questionId);
-        log.info("[LIBRARY] Removed {} option-mappings and {} section-mappings for question id={}",
-                optMappings, secMappings, questionId);
+        // Mappings kept, for the reason above: a template built on this
+        // question used to lose it outright, with nothing left to say a
+        // question had ever stood there.
+        log.info("[LIBRARY] Retiring question id={} | {} option-mappings and {} section-mappings kept",
+                questionId, optMappings, secMappings);
 
-        questionRepository.deleteById(questionId);
-        log.info("[LIBRARY] Question deleted | id={}", questionId);
+        var question = questionRepository.findById(questionId).orElseThrow();
+        softDelete.mark(question, reason);
+        questionRepository.save(question);
+        log.info("[LIBRARY] Question retired | id={} | reason=\"{}\"", questionId, reason);
 
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", true, "questionId", questionId)));
     }
@@ -298,7 +311,8 @@ public class AssessmentLibraryController {
     @Transactional
     @Operation(summary = "Delete multiple library questions by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteQuestions(
-            @RequestBody List<Long> questionIds) {
+            @RequestBody List<Long> questionIds,
+            @RequestParam(required = false) String reason) {
 
         if (questionIds == null || questionIds.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
@@ -314,9 +328,10 @@ public class AssessmentLibraryController {
         if (!existing.isEmpty()) {
             // 3 bulk DELETE WHERE IN queries instead of N×5 individual queries.
             // For 100 questions this cuts ~500 DB round-trips down to 3.
-            questionOptionMappingRepository.deleteByQuestionIdIn(existing);
-            sectionQuestionMappingRepository.deleteByQuestionIdIn(existing);
-            questionRepository.deleteAllById(existing);
+            // One saveAll rather than N saves, keeping the bulk path's point.
+            var rows = questionRepository.findAllById(existing);
+            rows.forEach(q -> softDelete.mark(q, reason));
+            questionRepository.saveAll(rows);
         }
 
         log.info("[LIBRARY] Bulk delete questions complete | deleted={} | skipped={}", existing.size(), skipped);
@@ -329,7 +344,8 @@ public class AssessmentLibraryController {
     @Transactional
     @Operation(summary = "Delete multiple library options by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteOptions(
-            @RequestBody List<Long> optionIds) {
+            @RequestBody List<Long> optionIds,
+            @RequestParam(required = false) String reason) {
 
         if (optionIds == null || optionIds.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
@@ -342,8 +358,9 @@ public class AssessmentLibraryController {
 
         if (!existing.isEmpty()) {
             // 2 bulk DELETE WHERE IN queries instead of N×3 individual queries.
-            questionOptionMappingRepository.deleteByOptionIdIn(existing);
-            optionRepository.deleteAllById(existing);
+            var rows = optionRepository.findAllById(existing);
+            rows.forEach(o -> softDelete.mark(o, reason));
+            optionRepository.saveAll(rows);
         }
 
         log.info("[LIBRARY] Bulk delete options complete | deleted={} | skipped={}", existing.size(), skipped);
@@ -356,7 +373,8 @@ public class AssessmentLibraryController {
     @Transactional
     @Operation(summary = "Delete multiple library sections by ID list")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteSections(
-            @RequestBody List<Long> sectionIds) {
+            @RequestBody List<Long> sectionIds,
+            @RequestParam(required = false) String reason) {
 
         if (sectionIds == null || sectionIds.isEmpty()) {
             return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", 0, "skipped", 0, "requested", 0)));
@@ -369,9 +387,9 @@ public class AssessmentLibraryController {
 
         if (!existing.isEmpty()) {
             // 3 bulk DELETE WHERE IN queries instead of N×4 individual queries.
-            sectionQuestionMappingRepository.deleteBySectionIdIn(existing);
-            templateSectionMappingRepository.deleteBySectionIdIn(existing);
-            sectionRepository.deleteAllById(existing);
+            var rows = sectionRepository.findAllById(existing);
+            rows.forEach(x -> softDelete.mark(x, reason));
+            sectionRepository.saveAll(rows);
         }
 
         log.info("[LIBRARY] Bulk delete sections complete | deleted={} | skipped={}", existing.size(), skipped);
@@ -441,7 +459,9 @@ public class AssessmentLibraryController {
     @DeleteMapping("/sections/{sectionId}")
     @Transactional
     @Operation(summary = "Delete a library section — removes all template and question mappings")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteSection(@PathVariable Long sectionId) {
+    public ResponseEntity<ApiResponse<Map<String, Object>>> deleteSection(
+            @PathVariable Long sectionId,
+            @RequestParam(required = false) String reason) {
 
         log.info("[LIBRARY] Deleting section | id={}", sectionId);
         sectionRepository.findById(sectionId)
@@ -449,13 +469,13 @@ public class AssessmentLibraryController {
 
         long qMappings = sectionQuestionMappingRepository.countBySectionId(sectionId);
         long tMappings = templateSectionMappingRepository.findBySectionId(sectionId).size();
-        sectionQuestionMappingRepository.deleteBySectionId(sectionId);
-        templateSectionMappingRepository.deleteBySectionId(sectionId);
-        log.info("[LIBRARY] Removed {} question-mappings and {} template-mappings for section id={}",
-                qMappings, tMappings, sectionId);
+        log.info("[LIBRARY] Retiring section id={} | {} question-mappings and {} template-mappings kept",
+                sectionId, qMappings, tMappings);
 
-        sectionRepository.deleteById(sectionId);
-        log.info("[LIBRARY] Section deleted | id={}", sectionId);
+        var section = sectionRepository.findById(sectionId).orElseThrow();
+        softDelete.mark(section, reason);
+        sectionRepository.save(section);
+        log.info("[LIBRARY] Section retired | id={} | reason=\"{}\"", sectionId, reason);
 
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", true, "sectionId", sectionId)));
     }

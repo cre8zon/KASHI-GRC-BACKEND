@@ -57,6 +57,7 @@ public class ModuleBlueprintController {
     private final DbRepository              dbRepository;
     private final UtilityService            utilityService;
     private final FeatureFlagRepository      featureFlagRepository;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
 
     // ══════════════════════════════════════════════════════════════
     // LIST
@@ -112,9 +113,28 @@ public class ModuleBlueprintController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
 
         // Tenant-specific blueprint takes precedence over global (tenantId = null)
+        //
+        // -- isActive IS NOW HONOURED ----------------------------------------
+        //
+        // There are activate and deactivate endpoints below, the admin page has
+        // the toggle, and the field is returned on every detail map - and this
+        // lookup, the only one the Universal Module Page uses at runtime, never
+        // read it. Deactivating a blueprint wrote is_active = false and changed
+        // nothing a user could see: the module page carried on loading exactly
+        // as before. The button did nothing at all.
+        //
+        // An INACTIVE TENANT BLUEPRINT FALLS BACK to the platform one rather
+        // than 404ing. A tenant row is an override of the global, so switching
+        // it off means "stop using our variant", not "take this module away" -
+        // and taking the module away is the one outcome nobody chooses a toggle
+        // for. A tenant that wants the module gone deactivates the global copy
+        // it inherits, or loses the entitlement, which the feature gate below
+        // already handles.
         ModuleBlueprint bp = blueprintRepository
                 .findByEntityTypeIgnoreCaseAndTenantId(entityType.toUpperCase(), tenantId)
-                .or(() -> blueprintRepository.findByEntityTypeIgnoreCaseAndTenantIdIsNull(entityType.toUpperCase()))
+                .filter(ModuleBlueprint::isActive)
+                .or(() -> blueprintRepository.findByEntityTypeIgnoreCaseAndTenantIdIsNull(entityType.toUpperCase())
+                        .filter(ModuleBlueprint::isActive))
                 .orElseThrow(() -> new ResourceNotFoundException("ModuleBlueprint", "entityType", entityType));
 
         // Feature entitlement gate: if this module requires a feature the tenant
@@ -258,10 +278,39 @@ public class ModuleBlueprintController {
     // ══════════════════════════════════════════════════════════════
 
     @DeleteMapping("/{id}")
-    @Operation(summary = "Delete a module blueprint — existing records of this entityType are unaffected")
+    @Operation(summary = "Delete a module blueprint — platform rows are platform-only; prefer Deactivate")
     public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {
+        // -- WHO MAY DELETE WHAT ---------------------------------------------
+        //
+        // This was deleteById(id) and nothing else: no permission, no tenant
+        // check. A blueprint with tenant_id = NULL is the platform copy that
+        // every tenant without an override of their own reads at
+        // /by-type/{entityType}, so one DELETE from any signed-in user took
+        // that module page offline for the entire customer base - a 404 on the
+        // screen, for everybody, with no way back but re-seeding the row.
+        //
+        // Deleting a TENANT row is a smaller act: that tenant stops overriding
+        // and falls back to the platform blueprint. Still theirs alone to do.
+        ModuleBlueprint bp = blueprintRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("ModuleBlueprint", id));
+
+        if (bp.getTenantId() == null) {
+            permissionGate.requirePlatform();
+        } else {
+            permissionGate.require("platform:ui:design");
+            permissionGate.requireSameTenant(
+                    bp.getTenantId(), utilityService.getLoggedInDataContext().getTenantId());
+        }
+
+        // Not soft-deleted, on purpose. A blueprint is configuration, and it
+        // already has the switch for "stop using this": is_active, which as of
+        // this change actually works. Deactivate is the reversible option and
+        // the one the admin page should offer first; delete stays for a row
+        // created by mistake.
         blueprintRepository.deleteById(id);
-        log.info("[MODULE-BP] Deleted id={}", id);
+        log.info("[MODULE-BP] Deleted id={} | entityType={} | tenantId={} | by={}",
+                id, bp.getEntityType(), bp.getTenantId(),
+                utilityService.getLoggedInDataContext().getId());
         return ResponseEntity.ok(ApiResponse.success());
     }
 

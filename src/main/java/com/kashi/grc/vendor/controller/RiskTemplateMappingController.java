@@ -29,12 +29,29 @@ public class RiskTemplateMappingController {
     private final RiskTemplateMappingRepository mappingRepository;
     private final VendorTierRepository          tierRepository;
     private final UtilityService                utilityService;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
 
     @PostMapping
     @Transactional
     @Operation(summary = "Replace all global risk-to-template mappings (Platform Admin only)")
     public ResponseEntity<ApiResponse<Map<String, Object>>> configureMappings(
             @Valid @RequestBody RiskMappingConfigRequest req) {
+
+        // "(Platform Admin only)" in the summary above was the whole of the
+        // enforcement. These rows are tenant_id = NULL, so they are the risk
+        // bands EVERY organisation's vendors are scored against, and this
+        // endpoint REPLACES the set wholesale. Any authenticated user could
+        // rewrite which questionnaire every customer's CRITICAL vendors
+        // receive, or delete the mapping entirely and leave
+        // QUEUE_ASSESSMENT_CANDIDATES with nothing to offer.
+        //
+        // platform:assessment-library:manage is the code SQL 110 created for
+        // exactly this area, and it is what 110 put on the sys_risk_mappings
+        // sidebar entry. Gating the endpoint on the same code keeps the button
+        // and the server in agreement, and lets a narrow platform role do this
+        // without holding system:write. require() lets platform operators
+        // through regardless, so nothing that works today stops working.
+        permissionGate.require("platform:assessment-library:manage");
 
         // Global mappings — owned by platform, tenant_id = NULL
         // Any org automatically uses these; no per-tenant override needed

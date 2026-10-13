@@ -86,8 +86,22 @@ public class AuthController {
         )));
     }
 
+    /**
+     * Regenerate a user's temporary password.
+     *
+     * The summary has said "Platform Admin" since the day it was written and
+     * nothing enforced it, at either layer. AuthServiceImpl.resendInvitation
+     * now carries the real checks - USER_EDIT, the caller's tenant, and who
+     * the new password is allowed to reach - because that is where the target
+     * user is loaded and its tenant is known.
+     *
+     * The class javadoc above still says "all public (no JWT required)". That
+     * was true of login and the reset-token pair and has never been true of
+     * this one; SecurityConfig decides what is public, not the comment.
+     */
     @PostMapping("/resend-invitation")
-    @Operation(summary = "Platform Admin: regenerate temp password and optionally resend welcome email")
+    @Operation(summary = "Regenerate temp password and optionally resend welcome email — "
+            + "requires USER_EDIT and the target user must be in your own tenant")
     public ResponseEntity<ApiResponse<Map<String, Object>>> resendInvitation(
             @Valid @RequestBody ResendInvitationRequest req) {
         ApiResponse<Map<String, Object>> response = authService.resendInvitation(req);

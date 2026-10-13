@@ -46,7 +46,8 @@ import lombok.*;
 @Getter @Setter
 @lombok.experimental.SuperBuilder
 @NoArgsConstructor @AllArgsConstructor
-public class AuditControl extends GlobalOrTenantEntity {
+@org.hibernate.annotations.SQLRestriction("is_deleted = false")
+public class AuditControl extends GlobalOrTenantEntity implements com.kashi.grc.common.domain.SoftDeletable {
 
     @Column(name = "name", nullable = false, length = 500)
     private String name;
@@ -117,4 +118,32 @@ public class AuditControl extends GlobalOrTenantEntity {
         TECHNICAL_TEST,
         WALKTHROUGH
     }
+    // -- SOFT DELETE ----------------------------------------------------------
+    //
+    // These four, and the @SQLRestriction on the class above, replace what used
+    // to be a repository.delete(). See common/domain/SoftDeletable and
+    // common/service/SoftDeleteService; the column names match what Personnel
+    // already uses so one restore screen can serve every table.
+    //
+    // @SQLRestriction filters HQL, criteria queries and collection loads, which
+    // is every module list (they all run through DbRepository's criteria
+    // builder) and every mapped association. It is NOT applied to a load by
+    // primary key, so findById still returns a retired row - that is what makes
+    // restore possible, and it is why detail paths should call
+    // SoftDeleteService.requireLive.
+    //
+    // ddl-auto=update adds the columns on the next boot. sql/113 adds the index.
+
+    @Column(name = "is_deleted", nullable = false)
+    @lombok.Builder.Default
+    private boolean isDeleted = false;
+
+    @Column(name = "deleted_at")
+    private java.time.LocalDateTime deletedAt;
+
+    @Column(name = "deleted_by")
+    private Long deletedBy;
+
+    @Column(name = "deletion_reason", length = 500)
+    private String deletionReason;
 }
