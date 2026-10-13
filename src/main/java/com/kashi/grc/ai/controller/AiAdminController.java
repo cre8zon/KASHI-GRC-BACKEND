@@ -84,6 +84,8 @@ public class AiAdminController {
      * `scope=tenant` creates an override for the caller's organisation only,
      * which is how an enterprise customer gets house tone without forking.
      */
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/prompts")
     public ApiResponse<AiPromptTemplate> publishPrompt(@RequestBody AiPromptTemplate edited,
                                                        @RequestParam(defaultValue = "global") String scope,
@@ -110,6 +112,8 @@ public class AiAdminController {
      * short-circuit on the content hash, so re-running is cheap and safe — which
      * is what makes this fit as a nightly sweep later.
      */
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/corpus/ingest-policies")
     public ApiResponse<Map<String, Object>> ingestPolicies() {
         User user = utilityService.getLoggedInDataContext();
@@ -145,6 +149,8 @@ public class AiAdminController {
      * directly. Call this after a bulk adoption if the tenant wants to draft
      * immediately rather than wait for the next sweep.
      */
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/corpus/reconcile")
     public ApiResponse<Map<String, Object>> reconcileCorpus() {
         return ApiResponse.success(corpusReconciler.reconcile());
@@ -182,6 +188,8 @@ public class AiAdminController {
     }
 
     /** Re-embed everything built with a stale model or dimension. */
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/corpus/reindex")
     public ApiResponse<Map<String, Object>> reindex() {
         ingestionAsync.reindexStale();
@@ -197,6 +205,8 @@ public class AiAdminController {
         return ApiResponse.success(usageService.summary(user.getTenantId()));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/usage/reconcile")
     public ApiResponse<Map<String, Object>> reconcile(@RequestParam(required = false) String period) {
         User user = utilityService.getLoggedInDataContext();
@@ -258,6 +268,8 @@ public class AiAdminController {
     // ── Evals ─────────────────────────────────────────────────────────────────
 
     /** Run the golden set. Wire this into CI and gate prompt merges on the pass rate. */
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:ai:manage','system:write')")
     @PostMapping("/v1/ai/admin/eval/run")
     public ApiResponse<Map<String, Object>> runEvals() {
         User user = utilityService.getLoggedInDataContext();

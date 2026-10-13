@@ -91,6 +91,7 @@ public class AuditLibraryController {
     private final DbRepository                          dbRepository;
     private final UtilityService                        utilityService;
     private final AuditReferenceListCacheService auditReferenceListCacheService;
+    private final com.kashi.grc.common.service.SoftDeleteService softDelete;
 
     // ══════════════════════════════════════════════════════════════════════════
     // CONTROLS
@@ -203,7 +204,8 @@ public class AuditLibraryController {
     @Transactional
     @Operation(summary = "Delete a control — also removes all section mappings referencing it")
     public ResponseEntity<ApiResponse<Map<String, Object>>> deleteControl(
-            @PathVariable Long controlId) {
+            @PathVariable Long controlId,
+            @RequestParam(required = false) String reason) {
 
         boolean isSystem = utilityService.isSystemUser();
         var ctx          = utilityService.getLoggedInDataContext();
@@ -215,10 +217,15 @@ public class AuditLibraryController {
             throw new BusinessException("CONTROL_ACCESS_DENIED",
                     "You can only delete controls belonging to your organisation");
 
-        sectionControlMappingRepository.deleteByControlId(controlId);
-        controlRepository.delete(control);
+        // The section mappings stay: they record where this control used to
+        // sit, which is exactly what someone reviewing a retired control wants.
+        // @SQLRestriction on AuditControl takes it out of every list and out of
+        // any join that loads it, so the mappings resolve to nothing on their own.
+        softDelete.mark(control, reason);
+        controlRepository.save(control);
 
-        log.info("[AUDIT-LIBRARY] Control deleted | id={} | name=\"{}\"", controlId, control.getName());
+        log.info("[AUDIT-LIBRARY] Control retired | id={} | name=\"{}\" | reason=\"{}\"",
+                controlId, control.getName(), reason);
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", controlId)));
     }
 
@@ -226,20 +233,25 @@ public class AuditLibraryController {
     @Transactional
     @Operation(summary = "Bulk delete controls by ID list — also removes all section mappings")
     public ResponseEntity<ApiResponse<Map<String, Object>>> bulkDeleteControls(
-            @RequestParam List<Long> ids) {
+            @RequestParam List<Long> ids,
+            @RequestParam(required = false) String reason) {
         boolean isSystem = utilityService.isSystemUser();
         var ctx          = utilityService.getLoggedInDataContext();
+        // `deleted` used to be incremented outside the ifPresent, so a missing
+        // id or one belonging to another tenant still counted as deleted and the
+        // caller was told a number that was not true. Counted here instead.
         int deleted = 0;
         for (Long id : ids) {
-            controlRepository.findById(id).ifPresent(c -> {
-                if (isSystem || Objects.equals(c.getTenantId(), ctx.getTenantId())) {
-                    sectionControlMappingRepository.deleteByControlId(id);
-                    controlRepository.delete(c);
-                }
-            });
-            deleted++;
+            var found = controlRepository.findById(id);
+            if (found.isEmpty()) continue;
+            AuditControl c = found.get();
+            if (!isSystem && !Objects.equals(c.getTenantId(), ctx.getTenantId())) continue;
+            if (softDelete.mark(c, reason)) {
+                controlRepository.save(c);
+                deleted++;
+            }
         }
-        log.info("[AUDIT-LIBRARY] Bulk deleted {} controls", deleted);
+        log.info("[AUDIT-LIBRARY] Bulk retired {} of {} requested controls", deleted, ids.size());
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", deleted)));
     }
 
@@ -680,7 +692,8 @@ public class AuditLibraryController {
     @Transactional
     @Operation(summary = "Delete template — removes section mappings; Platform Admin can delete PUBLISHED")
     public ResponseEntity<ApiResponse<Map<String, Object>>> deleteTemplate(
-            @PathVariable Long templateId) {
+            @PathVariable Long templateId,
+            @RequestParam(required = false) String reason) {
 
         boolean isSystem = utilityService.isSystemUser();
         var ctx          = utilityService.getLoggedInDataContext();
@@ -696,12 +709,26 @@ public class AuditLibraryController {
             throw new BusinessException("TEMPLATE_ACCESS_DENIED",
                     "You can only delete templates belonging to your organisation");
 
-        templateSectionMappingRepository.deleteByTemplateId(templateId);
-        // Remove links from project plans — FK on audit_project_templates.template_id
-        projectTemplateRepository.findAll().stream()
-                .filter(pt -> templateId.equals(pt.getTemplateId()))
-                .forEach(projectTemplateRepository::delete);
-        templateRepository.delete(template);
+        // -- REFUSE IF A PLAN ENTRY HAS ALREADY STARTED ----------------------
+        //
+        // This used to find every audit_project_templates row for the template
+        // and delete it, started or not. A plan entry with an engagementId has
+        // produced a real engagement; removing its link left that engagement
+        // pointing at a plan entry that no longer existed, and the project plan
+        // silently lost a line it had already acted on.
+        //
+        // findByTemplateId replaces findAll().stream().filter(...), which loaded
+        // the whole table to find a handful of rows.
+        long started = projectTemplateRepository.findByTemplateId(templateId).stream()
+                .filter(pt -> pt.getEngagementId() != null)
+                .count();
+        softDelete.refuseIfInUse(started, "project plan entries have already started from this template");
+
+        // Mappings and unstarted plan entries stay. The template is retired, so
+        // @SQLRestriction stops it appearing anywhere it could be picked again,
+        // and the rows that reference it keep their history.
+        softDelete.mark(template, reason);
+        templateRepository.save(template);
         auditReferenceListCacheService.evictTemplateList();   // list is @Cacheable for 15m — stale without this
 
         log.info("[AUDIT-LIBRARY] Template deleted | id={} | name=\"{}\"", templateId, template.getName());

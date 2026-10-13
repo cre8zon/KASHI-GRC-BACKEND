@@ -55,6 +55,7 @@ public class AuditPolicyController {
     private final com.kashi.grc.audit.service.ControlAccessGuard      controlAccessGuard;
     private final com.kashi.grc.audit.service.AuditObligationService  obligationService;
     private final com.kashi.grc.audit.service.AuditFieldworkService   fieldworkService;
+    private final com.kashi.grc.common.security.PermissionGate        permissionGate;
 
     // ── Library — Policies CRUD ───────────────────────────────────────────────
 
@@ -635,6 +636,16 @@ public class AuditPolicyController {
 
         AuditPolicy source = policyRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+
+        // tenantId was read two lines up and then not used for the lookup, so
+        // this took any policy id in the system. "New version" copies the whole
+        // of a policy - title, ref, description, every mapped control - into a
+        // DRAFT in the CALLER's tenant, which made it a one-click way to lift
+        // another organisation's approved policy content into your own library.
+        //
+        // 404 rather than 403: "forbidden" on an id would confirm the policy
+        // exists, which is a way to enumerate what other customers have written.
+        permissionGate.requireSameTenant(source.getTenantId(), tenantId);
 
         if (source.getStatus() != AuditPolicy.PolicyStatus.APPROVED) {
             throw new BusinessException("INVALID_STATUS",

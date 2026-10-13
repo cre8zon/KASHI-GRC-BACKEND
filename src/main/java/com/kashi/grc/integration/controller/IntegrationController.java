@@ -84,6 +84,8 @@ public class IntegrationController {
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('integration:manage','system:write')")
     @PostMapping("/{key}/connect")
     @Operation(summary = "Connect an integration — saves auth config and snapshots checks into tenant layer")
     public ResponseEntity<ApiResponse<Map<String, Object>>> connect(
@@ -124,7 +126,7 @@ public class IntegrationController {
         IntegrationConfig config = configRepo
                 .findByTenantIdAndIntegrationKey(tenantId, key.toUpperCase())
                 .map(existing -> {
-                    existing.setAuthConfig(authConfigJson); // TODO: encrypt
+                    existing.setAuthConfig(authConfigJson); // encrypted by EncryptedStringConverter on the column
                     existing.setActive(true);
                     existing.setDisplayName((String) body.getOrDefault("displayName", key + " Integration"));
                     return existing;
@@ -133,7 +135,7 @@ public class IntegrationController {
                         .tenantId(tenantId)
                         .integrationKey(key.toUpperCase())
                         .displayName((String) body.getOrDefault("displayName", key + " Integration"))
-                        .authConfig(authConfigJson) // TODO: encrypt before saving
+                        .authConfig(authConfigJson) // encrypted by EncryptedStringConverter on the column
                         .isActive(true)
                         .build());
         configRepo.save(config);
@@ -149,6 +151,8 @@ public class IntegrationController {
         )));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('integration:manage','system:write')")
     @DeleteMapping("/{key}")
     @Operation(summary = "Disconnect an integration — deactivates checks and auth, keeps run history")
     public ResponseEntity<ApiResponse<Void>> disconnect(@PathVariable String key) {
@@ -199,6 +203,8 @@ public class IntegrationController {
         return ResponseEntity.ok(ApiResponse.success(result));
     }
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('integration:manage','system:write')")
     @PutMapping("/{key}/checks/{checkKey}")
     @Operation(summary = "Customise a tenant check instance — override config, criteria, frequency")
     public ResponseEntity<ApiResponse<Map<String, Object>>> customiseCheck(

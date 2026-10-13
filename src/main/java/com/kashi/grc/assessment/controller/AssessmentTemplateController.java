@@ -61,6 +61,8 @@ public class AssessmentTemplateController {
     private final com.kashi.grc.assessment.service.AssessmentTemplateStructureCacheService templateStructureCacheService;
     private final UtilityService                    utilityService;
     private final CsvImportService                  csvImportService;
+    private final com.kashi.grc.common.service.SoftDeleteService softDelete;
+    private final com.kashi.grc.assessment.repository.AssessmentTemplateInstanceRepository templateInstanceRepository;
 
     // ═══════════════════════════════════════════════════════════
     // TEMPLATE CRUD
@@ -112,7 +114,8 @@ public class AssessmentTemplateController {
     @Transactional
     @Operation(summary = "Delete a template — Platform Admin can delete even PUBLISHED templates")
     public ResponseEntity<ApiResponse<Map<String, Object>>> deleteTemplate(
-            @PathVariable Long templateId) {
+            @PathVariable Long templateId,
+            @RequestParam(required = false) String reason) {
 
         boolean isSystem = utilityService.isSystemUser();
         Long tenantId    = isSystem ? null : utilityService.getLoggedInDataContext().getTenantId();
@@ -124,14 +127,30 @@ public class AssessmentTemplateController {
                     "Only Platform Admin can delete a published template. Unpublish it first.");
         }
 
-        // Remove all template→section mappings
-        // Sections themselves stay in the library for reuse
-        long sectionMappings = templateSectionMappingRepository.countByTemplateId(templateId);
-        templateSectionMappingRepository.deleteByTemplateId(templateId);
-        log.info("[TEMPLATE] Removed {} section mappings for template id={}", sectionMappings, templateId);
+        // -- REFUSE IF IT HAS BEEN INSTANTIATED ------------------------------
+        //
+        // An assessment_template_instances row is a snapshot taken when a real
+        // vendor assessment started from this template. Those live assessments
+        // read their questions through the snapshot, so retiring the template
+        // does not break them — but deleting the template out from under a
+        // running assessment is a different thing from retiring one nobody has
+        // used, and the person clicking Delete should be told which they are
+        // doing rather than finding out afterwards.
+        //
+        // Blocked rather than cascaded, exactly as the audit template delete
+        // blocks on started project plans.
+        long instantiated = templateInstanceRepository.countByOriginalTemplateId(templateId);
+        softDelete.refuseIfInUse(instantiated, "assessments have already started from this template");
 
-        templateRepository.deleteById(templateId);
-        log.info("[TEMPLATE] Template deleted | id={}", templateId);
+        // Mappings stay. They are the record of what this template contained,
+        // and a retired template that can still show its sections is what
+        // anyone reviewing an old assessment needs.
+        long sectionMappings = templateSectionMappingRepository.countByTemplateId(templateId);
+
+        softDelete.mark(t, reason);
+        templateRepository.save(t);
+        log.info("[TEMPLATE] Template retired | id={} | {} section mappings kept | reason=\"{}\"",
+                templateId, sectionMappings, reason);
 
         return ResponseEntity.ok(ApiResponse.success(Map.of("deleted", true, "templateId", templateId)));
     }

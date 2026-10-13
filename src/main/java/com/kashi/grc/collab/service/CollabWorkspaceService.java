@@ -494,10 +494,44 @@ public class CollabWorkspaceService {
     // ══════════════════════ HELPERS ══════════════════════════════════════════
 
     /** Client side: every programme. Firm side: only programmes they are on. */
+    /**
+     * The programmes this caller may see in this workspace.
+     *
+     * -- WHAT CHANGED, AND WHY ------------------------------------------------
+     *
+     * This used to read
+     *
+     *     if (!c.guest()) return all;
+     *
+     * so programme membership filtered the FIRM side and nobody else. Every
+     * client-side member of the workspace saw every programme, which is not
+     * what a programme is for: a workspace with ten people and a "Bug List"
+     * programme of four showed that plan, its items and its dates to all ten.
+     * The Overview card has always said "Each programme has its own plan" —
+     * this makes the plan match the sentence.
+     *
+     * Membership now decides for everybody. Programmes are the unit of
+     * confidentiality inside a workspace, and which side of the engagement
+     * somebody sits on says nothing about whether they are on a given piece of
+     * work.
+     *
+     * -- WHY MANAGERS ARE EXEMPT ----------------------------------------------
+     *
+     * A workspace OWNER, or someone holding collab:workspace:manage, keeps
+     * seeing all of them. They are the people who create programmes and assign
+     * members, and an owner who has not put themselves on a programme would
+     * otherwise open the Plan tab, find nothing, and have no way to fix it —
+     * the controls for adding members live on the programme rows that just
+     * disappeared. Everyone else sees only what they are on.
+     *
+     * requireVisibleProgramme below runs through this same method, so an id
+     * typed into the URL is refused on exactly these terms rather than on a
+     * separate rule that could drift from this one.
+     */
     List<CollabProgramme> visibleProgrammes(Caller c, CollabWorkspace ws) {
         List<CollabProgramme> all = programmeRepository
                 .findByWorkspaceIdAndIsDeletedFalseOrderByPlannedStartAscNameAsc(ws.getId());
-        if (!c.guest()) return all;
+        if (access.canManage(c, ws)) return all;
         Set<Long> mine = programmeMemberRepository.findByWorkspaceId(ws.getId()).stream()
                 .filter(pm -> pm.getUserId().equals(c.userId()))
                 .map(CollabProgrammeMember::getProgrammeId).collect(Collectors.toSet());

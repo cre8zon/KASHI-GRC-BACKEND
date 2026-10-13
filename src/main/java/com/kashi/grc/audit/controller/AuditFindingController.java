@@ -68,6 +68,7 @@ public class AuditFindingController {
     private final AuditTestPolicySnapshotService snapshotService;
     // ADDED: full finding-aware compliance recalculation (Vanta/AuditBoard model)
     private final ComplianceScoreService         complianceScoreService;
+    private final com.kashi.grc.common.service.SoftDeleteService softDelete;
 
     // ── CREATE ────────────────────────────────────────────────────────────────
 
@@ -364,8 +365,10 @@ public class AuditFindingController {
     }
 
     @DeleteMapping("/v1/audit/findings/{id}")
-    @Operation(summary = "Delete a finding (hard delete — use with caution)")
-    public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {
+    @Operation(summary = "Delete a finding — retires it; it can be restored")
+    public ResponseEntity<ApiResponse<Void>> delete(
+            @PathVariable Long id,
+            @RequestParam(required = false) String reason) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         AuditFinding f = findingRepository.findByIdAndTenantId(id, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditFinding", id));
@@ -374,7 +377,14 @@ public class AuditFindingController {
         // finding belongs to the client tenant they are legitimately inside. Only
         // the engagement narrows it to their own work.
         auditScope.requireEngagementVisible(f.getEngagementId());
-        findingRepository.delete(f);
+
+        // Retired, not destroyed. A finding is the output of an audit, and that
+        // one was raised and later withdrawn is itself a fact the next auditor
+        // needs — deleting the row took the evidence of it away too.
+        // @SQLRestriction on AuditFinding removes it from every list and count
+        // from here on; restore brings it back with its history intact.
+        softDelete.mark(f, reason);
+        findingRepository.save(f);
         return ResponseEntity.ok(ApiResponse.success());
     }
 

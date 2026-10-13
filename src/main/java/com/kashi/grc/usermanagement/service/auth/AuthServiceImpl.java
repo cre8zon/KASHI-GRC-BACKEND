@@ -51,6 +51,8 @@ public class AuthServiceImpl implements AuthService {
     private final PasswordEncoder     passwordEncoder;
     private final JwtTokenProvider    tokenProvider;
     private final MailService         mailService;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
+    private final com.kashi.grc.common.util.UtilityService      utilityService;
 
     @Value("${kashi.app.base-url:https://app.kashigrc.com}")
     private String appBaseUrl;
@@ -387,8 +389,33 @@ public class AuthServiceImpl implements AuthService {
     @Transactional
     public ApiResponse<Map<String, Object>> resendInvitation(ResendInvitationRequest req) {
 
+        // -- AUTHORISATION ----------------------------------------------------
+        //
+        // This endpoint had none. Not a missing @PreAuthorize on an otherwise
+        // careful method - no check of any kind, at either layer, on an
+        // operation that overwrites a password hash. Combined with the
+        // findById below, which had no tenant filter, and the response at the
+        // bottom, which returned the new password in clear, any authenticated
+        // caller - including a vendor-side user of a customer org - could take
+        // over any account in the system, platform admins included, by posting
+        // its numeric id.
+        //
+        // Three things were wrong and all three are fixed here. This is the
+        // first: hold USER_EDIT, or be a platform operator.
+        permissionGate.require("USER_EDIT");
+
         User admin = userRepository.findById(req.getUserId())
                 .orElseThrow(() -> new ResourceNotFoundException("User", req.getUserId()));
+
+        // The second: a permission says you may reset passwords, never WHOSE.
+        // The id space is global, so without this an org admin legitimately
+        // holding USER_EDIT reaches every account in every other tenant.
+        // Platform operators are exempt - crossing tenants is the job - and a
+        // mismatch answers 404 rather than 403 so this cannot be used to probe
+        // which ids exist elsewhere.
+        permissionGate.requireSameTenant(
+                admin.getTenantId(),
+                utilityService.getLoggedInDataContext().getTenantId());
 
         // Generate new temp password with guaranteed complexity
         String newTempPassword = UUID.randomUUID().toString().replace("-", "").substring(0, 16) + "Aa1!";
@@ -412,7 +439,13 @@ public class AuthServiceImpl implements AuthService {
         if (req.isSendEmail()) {
             String firstName = admin.getFirstName() != null ? admin.getFirstName() : "Admin";
             String loginUrl  = appBaseUrl + "/auth/login";
-            mailService.send("user-invitation", req.getEmail(), Map.ofEntries(
+            // admin.getEmail(), not req.getEmail(). The request carried the
+            // destination, so the caller chose where a working credential was
+            // delivered - the password did not even have to reach the account
+            // holder. The address on the account is the only correct one; the
+            // field stays on the DTO so existing callers do not break, and is
+            // now ignored.
+            mailService.send("user-invitation", admin.getEmail(), Map.ofEntries(
                     Map.entry("firstName",         firstName),
                     Map.entry("email",             admin.getEmail()),
                     Map.entry("admin_email",       admin.getEmail()),
@@ -428,13 +461,21 @@ public class AuthServiceImpl implements AuthService {
             ));
         }
 
-        return ApiResponse.success(Map.of(
-                "userId",            admin.getId(),
-                "email",             admin.getEmail(),
-                "temporaryPassword", newTempPassword,
-                "passwordReset",     true,
-                "emailSent",         req.isSendEmail()
-        ));
+        // The third: the new password came back in the response body to
+        // whoever called. Platform admins genuinely need it - the tenant
+        // onboarding flow reads it out of this reply and shows it on the
+        // welcome-email screen (SendWelcomeEmailPage) - so it is kept for
+        // them and for nobody else. An org admin resetting one of their own
+        // users gets the reset and the email, which is all that flow needs.
+        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        body.put("userId",        admin.getId());
+        body.put("email",         admin.getEmail());
+        body.put("passwordReset", true);
+        body.put("emailSent",     req.isSendEmail());
+        if (permissionGate.isPlatform()) {
+            body.put("temporaryPassword", newTempPassword);
+        }
+        return ApiResponse.success(body);
     }
 
     // ─────────────────────────────────────────────────────────────

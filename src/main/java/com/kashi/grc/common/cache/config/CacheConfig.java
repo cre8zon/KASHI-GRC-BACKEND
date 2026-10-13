@@ -189,7 +189,63 @@ public class CacheConfig implements CachingConfigurer {
         // Compound "template structure" snapshot (see AssessmentTemplateStructureCacheService)
         // — read on every instantiation, changes only when an admin edits a
         // template in the library. Longer TTL is safe; explicit evict on write.
-        perCache.put(CacheNames.ASSESSMENT_TEMPLATE_STRUCTURE, defaults.entryTtl(Duration.ofMinutes(30)));
+        // -- ASSESSMENT_TEMPLATE_STRUCTURE: a RECORD, so it needs its own serializer --
+        //
+        // TTL unchanged at 30 minutes. What changes is how the value is written.
+        //
+        // Observed on every single read, never once a hit:
+        //
+        //   [CACHE] assessmentTemplateStructure GET failed, treating as miss
+        //   | key=template:20 - SerializationException: Could not read JSON:
+        //   Unexpected token (START_OBJECT), expected START_ARRAY: need Array
+        //   value to contain `As.WRAPPER_ARRAY` type information for class
+        //   java.lang.Object
+        //
+        // TemplateStructureSnapshot is a `record`, and a record is implicitly
+        // FINAL. The shared serializer activates typing with
+        // DefaultTyping.NON_FINAL, which by definition writes NO type id for a
+        // final type - so the value goes into Redis as a bare
+        // {"sections":[...]}. Coming back out, GenericJackson2JsonRedisSerializer
+        // deserializes against Object.class, which IS non-final, so the reader
+        // demands the wrapper array the writer was never going to produce.
+        //
+        // Asymmetric in the same way the As.PROPERTY bug below was, with a
+        // nastier failure mode: it cannot self-heal. ResilientRedisCache
+        // swallows the read as a miss, the method runs, and the result is
+        // written back in exactly the same unreadable shape. Which is why
+        // template:20 failed at 14:00:54 and again at 14:02:00, 70s later.
+        //
+        // So this is a permanent 100% miss on the one cache built to keep 5 bulk
+        // MySQL queries out of every assessment instantiation. Against Aiven at
+        // roughly a second per round trip, that is most of the ~2.6s
+        // EXECUTE_ASSESSMENT currently spends.
+        //
+        // The fix is not more typing, it is NO typing. Typing exists so an
+        // Object-typed slot can be rebuilt as its original class; here the class
+        // is known at configuration time, so Jackson is told it directly and the
+        // type id becomes dead weight. Same reasoning as the two list caches
+        // below, different mechanism: a concrete Jackson2JsonRedisSerializer
+        // rather than a generic one with typing off, because this value is a
+        // single object that must come back as the record, not a LinkedHashMap.
+        //
+        // TemplateStructureSnapshot's own javadoc says plain records are
+        // "exactly what GenericJackson2JsonRedisSerializer needs to round-trip
+        // cleanly". It is the reverse: records are final, and final is the one
+        // thing NON_FINAL typing refuses to tag. Worth correcting there too.
+        //
+        // Stale entries written by the old serializer are read once, fail once,
+        // are swallowed as a miss, and overwritten correctly. No flush needed.
+        ObjectMapper structureMapper = objectMapper.copy();
+        org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer
+                <com.kashi.grc.assessment.dto.internal.TemplateStructureSnapshot> structureSerializer =
+                new org.springframework.data.redis.serializer.Jackson2JsonRedisSerializer<>(
+                        structureMapper,
+                        com.kashi.grc.assessment.dto.internal.TemplateStructureSnapshot.class);
+
+        perCache.put(CacheNames.ASSESSMENT_TEMPLATE_STRUCTURE,
+                defaults.entryTtl(Duration.ofMinutes(30))
+                        .serializeValuesWith(RedisSerializationContext.SerializationPair
+                                .fromSerializer(structureSerializer)));
 
         // Templates/workflows change only via rare admin actions (publish,
         // edit blueprint) but this dropdown is re-queried on every "New

@@ -55,6 +55,7 @@ public class UserServiceImpl implements UserService {
     private final EmailSenderService emailSenderService;
     private final DbRepository dbRepository;
     private final UtilityService utilityService;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
 
     // ─────────────────────────────────────────────────────────────
     // CREATE
@@ -63,11 +64,31 @@ public class UserServiceImpl implements UserService {
     @Transactional
     public UserResponse createUser(UserCreateRequest request) {
         Long loggedInTenantId = utilityService.getLoggedInDataContext().getTenantId();
+
+        // -- WHO MAY NAME ANOTHER TENANT --------------------------------------
+        //
+        // The comment below is the original and it describes the INTENT
+        // correctly: a platform admin creating a user inside a customer org.
+        // Nothing checked that the caller was one. request.getTenantId() came
+        // straight off the wire and was used whenever it differed from the
+        // caller's own, so any authenticated user holding USER_CREATE in their
+        // own org could place an account - with roles - inside anyone else's.
+        //
+        // Naming your OWN tenant is not a cross-tenant act and stays allowed
+        // for everybody, so a client that fills the field in from its session
+        // keeps working unchanged. Only the differing case is gated, which is
+        // the only case that was ever a privilege escalation.
+        boolean namesAnotherTenant =
+                request.getTenantId() != null && !request.getTenantId().equals(loggedInTenantId);
+        if (namesAnotherTenant) {
+            permissionGate.requirePlatform();
+            log.info("[USER-CREATE] Cross-tenant create | by={} | callerTenant={} | targetTenant={}",
+                    utilityService.getLoggedInDataContext().getId(), loggedInTenantId, request.getTenantId());
+        }
+
         // If request explicitly provides a tenantId (e.g. Platform Admin creating org user),
         // use it — otherwise fall back to the logged-in user's tenant
-        Long tenantId = (request.getTenantId() != null && !request.getTenantId().equals(loggedInTenantId))
-                ? request.getTenantId()
-                : loggedInTenantId;
+        Long tenantId = namesAnotherTenant ? request.getTenantId() : loggedInTenantId;
         // Email is now a globally unique identity — was scoped per-tenant here,
         // which let the same email exist as separate accounts in different
         // tenants. login() has always assumed the opposite (findByEmail

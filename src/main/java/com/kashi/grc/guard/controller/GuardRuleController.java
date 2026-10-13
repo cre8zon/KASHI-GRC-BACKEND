@@ -82,6 +82,8 @@ public class GuardRuleController {
 
     // ── Create ────────────────────────────────────────────────────────────────
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @PostMapping("/v1/guard/rules")
     @Operation(summary = "Create a guard rule for a question tag")
     public ResponseEntity<ApiResponse<GuardRuleResponse>> create(
@@ -115,6 +117,8 @@ public class GuardRuleController {
 
     // ── Update ────────────────────────────────────────────────────────────────
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @PutMapping("/v1/guard/rules/{id}")
     @Operation(summary = "Update a guard rule")
     public ResponseEntity<ApiResponse<GuardRuleResponse>> update(
@@ -161,6 +165,8 @@ public class GuardRuleController {
 
     // ── Delete ────────────────────────────────────────────────────────────────
 
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAnyAuthority('platform:kashiguard:manage','system:write')")
     @DeleteMapping("/v1/guard/rules/{id}")
     @Operation(summary = "Delete a guard rule — prefer toggle (disable) for auditability")
     public ResponseEntity<ApiResponse<Void>> delete(@PathVariable Long id) {

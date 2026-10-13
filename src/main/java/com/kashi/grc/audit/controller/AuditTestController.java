@@ -61,6 +61,7 @@ public class AuditTestController {
     private final com.kashi.grc.audit.service.ControlAccessGuard      controlAccessGuard;
     private final com.kashi.grc.audit.service.AuditObligationService  obligationService;
     private final com.kashi.grc.audit.service.AuditFieldworkService   fieldworkService;
+    private final com.kashi.grc.common.service.SoftDeleteService      softDelete;
 
     // ══════════════════════════════════════════════════════════════════════════
     // LIBRARY — TESTS CRUD
@@ -249,16 +250,23 @@ public class AuditTestController {
     }
 
     @DeleteMapping("/v1/audit/library/tests/{id}")
-    public ResponseEntity<ApiResponse<Void>> deleteTest(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<Void>> deleteTest(
+            @PathVariable Long id,
+            @RequestParam(required = false) String reason) {
         // Loaded solely to check ownership — deleteById(id) previously took the
         // path variable straight to the database.
         AuditTest test = testRepository.findById(id)
                 .orElseThrow(() -> new ResourceNotFoundException("AuditTest", id));
         requireOwnedTest(test);
 
-        controlTestMappingRepository.deleteByTestId(id);
-        testRepository.deleteById(id);
-        log.info("[AUDIT-TEST] Deleted test id={}", id);
+        // The control mappings stay. They record which controls this test used
+        // to cover, and a retired test that still shows its coverage is what an
+        // auditor wants to see; a mapping pointing at nothing is not.
+        // @SQLRestriction hides the test from every list and from any join that
+        // loads it, so the mappings go quiet on their own.
+        softDelete.mark(test, reason);
+        testRepository.save(test);
+        log.info("[AUDIT-TEST] Retired test id={} | reason=\"{}\"", id, reason);
         // See AuditPolicyController — library lists are cached, mutations evict.
         libraryCache.evictLibraryLists();
 
