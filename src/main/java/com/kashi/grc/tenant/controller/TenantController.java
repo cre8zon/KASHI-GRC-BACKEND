@@ -44,6 +44,7 @@ public class TenantController {
     private final MailService      mailService;
     private final com.kashi.grc.uiconfig.repository.FeatureFlagRepository featureFlagRepository;
     private final com.kashi.grc.uiconfig.service.FeatureEntitlementService featureEntitlementService;
+    private final com.kashi.grc.firmverification.service.AuditFirmVerificationService firmVerificationService;
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -66,14 +67,26 @@ public class TenantController {
                     "Organization code \"" + req.getCode() + "\" is already in use", HttpStatus.CONFLICT);
         }
 
+        // is_audit_firm is NEVER set here. It is written only by
+        // AuditFirmVerificationService when a platform reviewer approves an
+        // application with evidence and the firm's email confirmation. Ticking
+        // "audit firm" on Create Tenant now opens that application as a DRAFT,
+        // to be completed on the tenant's Audit firm tab.
         Tenant t = Tenant.builder()
                 .name(req.getName()).code(req.getCode())
                 .description(req.getDescription()).plan(req.getPlan())
                 .maxUsers(req.getMaxUsers()).maxVendors(req.getMaxVendors())
-                .isAuditFirm(Boolean.TRUE.equals(req.getIsAuditFirm()))
+                .isAuditFirm(false)
+                .acquisitionChannel(req.getAcquisitionChannel())
+                .industry(req.getIndustry())
+                .employeeBand(req.getEmployeeBand())
+                .country(req.getCountry() != null ? req.getCountry().toUpperCase() : null)
                 .status("ACTIVE")
                 .build();
         tenantRepository.save(t);
+        if (Boolean.TRUE.equals(req.getIsAuditFirm())) {
+            firmVerificationService.openDraft(t.getId(), utilityService.getLoggedInDataContext().getId());
+        }
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(toResponse(t)));
     }
 
@@ -86,7 +99,7 @@ public class TenantController {
 
     @GetMapping("/{tenantId}/features")
     @Operation(summary = "List the feature catalogue with this tenant's entitlement state")
-    public ResponseEntity<ApiResponse<java.util.List<Map<String, Object>>>> getTenantFeatures(
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getTenantFeatures(
             @PathVariable Long tenantId) {
         // catalogue: global definitions
         var catalogue = featureFlagRepository.findByTenantIdIsNull();
@@ -174,6 +187,18 @@ public class TenantController {
         if (req.getStatus()      != null) t.setStatus(req.getStatus());
         if (req.getMaxUsers()    != null) t.setMaxUsers(req.getMaxUsers());
         if (req.getMaxVendors()  != null) t.setMaxVendors(req.getMaxVendors());
+        // Commercial profile and bill-to. An empty string clears a field.
+        if (req.getAcquisitionChannel() != null) t.setAcquisitionChannel(blankToNull(req.getAcquisitionChannel()));
+        if (req.getIndustry()           != null) t.setIndustry(blankToNull(req.getIndustry()));
+        if (req.getEmployeeBand()       != null) t.setEmployeeBand(blankToNull(req.getEmployeeBand()));
+        if (req.getCountry()            != null) {
+            String c = blankToNull(req.getCountry());
+            t.setCountry(c == null ? null : c.toUpperCase());
+        }
+        if (req.getLegalName()      != null) t.setLegalName(blankToNull(req.getLegalName()));
+        if (req.getBillingEmail()   != null) t.setBillingEmail(blankToNull(req.getBillingEmail()));
+        if (req.getBillingAddress() != null) t.setBillingAddress(blankToNull(req.getBillingAddress()));
+        if (req.getTaxId()          != null) t.setTaxId(blankToNull(req.getTaxId()));
         tenantRepository.save(t);
         return ResponseEntity.ok(ApiResponse.success(toResponse(t)));
     }
@@ -269,7 +294,20 @@ public class TenantController {
                 .plan(t.getPlan()).maxUsers(t.getMaxUsers()).maxVendors(t.getMaxVendors())
                 .isAuditFirm(t.isAuditFirm())
                 .createdAt(t.getCreatedAt())
+                .acquisitionChannel(t.getAcquisitionChannel())
+                .firstPaidAt(t.getFirstPaidAt())
+                .industry(t.getIndustry())
+                .employeeBand(t.getEmployeeBand())
+                .country(t.getCountry())
+                .legalName(t.getLegalName())
+                .billingEmail(t.getBillingEmail())
+                .billingAddress(t.getBillingAddress())
+                .taxId(t.getTaxId())
                 .build();
+    }
+
+    private static String blankToNull(String s) {
+        return s == null || s.isBlank() ? null : s.trim();
     }
 
     // ── DTOs ──────────────────────────────────────────────────────
