@@ -10,4 +10,16 @@ public class TenantUpdateRequest {
     public String status;
     public Integer maxUsers;
     public Integer maxVendors;
+
+    // Commercial profile
+    public String acquisitionChannel;
+    public String industry;
+    public String employeeBand;
+    public String country;
+
+    // Bill-to
+    public String legalName;
+    public String billingEmail;
+    public String billingAddress;
+    public String taxId;
 }

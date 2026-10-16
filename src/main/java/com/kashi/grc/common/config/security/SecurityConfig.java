@@ -132,6 +132,25 @@ public class SecurityConfig {
                         .requestMatchers(HttpMethod.POST, "/v1/trust/public/*/request-access").permitAll()
                         .requestMatchers(HttpMethod.GET,  "/v1/trust/public/download/*/*").permitAll()
                         .requestMatchers("/v1/trust/public/**").denyAll()
+                        // ── AUDIT-FIRM EMAIL CONFIRMATION ──────────────────────
+                        // The firm's contact clicks a one-time link mailed to
+                        // their own domain; they have no account. The token in
+                        // the POST body is the credential (SecureRandom, stored
+                        // hashed, single-use, expiring) — validated in
+                        // AuditFirmVerificationService. Same discipline as the
+                        // trust-centre block: each endpoint listed, rest denied.
+                        .requestMatchers(HttpMethod.POST, "/v1/firm-verification/public/preview").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/firm-verification/public/confirm").permitAll()
+                        .requestMatchers("/v1/firm-verification/public/**").denyAll()
+                        // www.kashiguard.com: the live price list and the enquiry
+                        // forms (demo, trial, contact sales, support, audit firm).
+                        // Same discipline: each endpoint listed, the prefix denied.
+                        // The enquiry POST is honeypot- and rate-limited in
+                        // EnquiryService; it never reveals whether an email exists.
+                        .requestMatchers(HttpMethod.GET,  "/v1/billing/public/plans").permitAll()
+                        .requestMatchers("/v1/billing/public/**").denyAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/enquiries/public").permitAll()
+                        .requestMatchers("/v1/enquiries/public/**").denyAll()
                         .requestMatchers(
                                 "/v1/admin/**",
                                 "/v1/tenants/**"
@@ -207,4 +226,4 @@ public class SecurityConfig {
             return Optional.empty();
         };
     }
-}
+}
