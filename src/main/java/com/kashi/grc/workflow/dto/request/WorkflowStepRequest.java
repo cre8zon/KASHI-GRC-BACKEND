@@ -59,6 +59,9 @@ public class WorkflowStepRequest {
     /** If true, assigner can redirect task to a specific person */
     public Boolean allowOverride;
 
+    /** Whether workflow:step:override holders may force this step. Defaults false. */
+    public Boolean allowStepOverride;
+
     /** What the actor does: ASSIGN|FILL|REVIEW|APPROVE|ACKNOWLEDGE|EVALUATE|GENERATE|CUSTOM */
     public StepAction stepAction;
 

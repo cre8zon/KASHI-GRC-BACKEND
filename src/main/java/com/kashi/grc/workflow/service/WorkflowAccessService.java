@@ -140,7 +140,7 @@ public class WorkflowAccessService {
         // for a lead holding the permission, because this path never considered
         // override.
         return mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
-                resolveCanOverride(user, si.getSnapSide(), resolvedPermissions),
+                resolveCanOverride(user, si, resolvedPermissions),
                 si.getSnapName(),
                 si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
                 Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()),
@@ -165,10 +165,10 @@ public class WorkflowAccessService {
         String activeStepAction = null;
         String activeStepLabel  = null;
         boolean canAct = false;
-        String  activeStepSide = null;
         List<String> availableActions = null;
         Long activeTaskId = null;
         Long activeStepInstanceId = null;
+        StepInstance activeStep = null;
 
         if (entityId != null) {
             Optional<WorkflowInstance> activeInstance = instanceRepository
@@ -224,17 +224,17 @@ public class WorkflowAccessService {
                         entityType, resolvedPermissions);
 
                 List<StepInstance> activeSteps = stepInstanceRepository
-                        .findByWorkflowInstanceIdAndStatus(
-                                activeInstance.get().getId(), StepStatus.IN_PROGRESS);
+                        .findByWorkflowInstanceIdAndStatusInOrderBySnapStepOrderAsc(
+                                activeInstance.get().getId(), StepStatus.LIVE);
 
                 if (!activeSteps.isEmpty()) {
-                    StepInstance currentStep = activeSteps.get(0);
+                    StepInstance currentStep = pickStepForUser(user, activeSteps);
+                    activeStep = currentStep;
                     activeStepInstanceId = currentStep.getId();
                     stepOverride     = parseOverride(currentStep.getSnapUiOverrideJson());
                     activeStepAction = currentStep.getSnapStepAction() != null
                             ? currentStep.getSnapStepAction().name() : null;
                     activeStepLabel  = currentStep.getSnapName();
-                    activeStepSide   = currentStep.getSnapSide();
 
                     // ── Check if user can act on this step ──────────────────
                     // Path A: user has an open task (PENDING or IN_PROGRESS)
@@ -271,7 +271,7 @@ public class WorkflowAccessService {
                         // canOverride carries the override authority, and the
                         // action gate accepts either — so the button still
                         // appears, without the edit-mode side effect.
-                        if (resolveCanOverride(user, activeStepSide, resolvedPermissions)) {
+                        if (resolveCanOverride(user, activeStep, resolvedPermissions)) {
                             // No taskId — frontend sends stepInstanceId to override endpoint
                             availableActions = List.of("APPROVE", "REJECT", "SEND_BACK");
                         }
@@ -299,7 +299,7 @@ public class WorkflowAccessService {
                 // Independent of canAct: someone may hold override authority
                 // while having no task here, and must not thereby gain edit
                 // rights on every tab.
-                .canOverride(resolveCanOverride(user, activeStepSide, effectivePermissions))
+                .canOverride(resolveCanOverride(user, activeStep, effectivePermissions))
                 .taskId(activeTaskId)
                 .stepInstanceId(activeStepInstanceId)
                 .stepAction(activeStepAction)
@@ -651,7 +651,8 @@ public class WorkflowAccessService {
         if (activeInstance.isEmpty()) return false;
 
         List<StepInstance> activeSteps = stepInstanceRepository
-                .findByWorkflowInstanceIdAndStatus(activeInstance.get().getId(), StepStatus.IN_PROGRESS);
+                .findByWorkflowInstanceIdAndStatusInOrderBySnapStepOrderAsc(
+                        activeInstance.get().getId(), StepStatus.LIVE);
         if (activeSteps.isEmpty()) return false;
 
         var openStatuses = List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS);
@@ -671,31 +672,93 @@ public class WorkflowAccessService {
                             && openStatuses.contains(t.getStatus()));
             if (hasOpenTask) return true;
 
-            if (resolveCanOverride(user, stepSide, permissions)) return true;
+            if (resolveCanOverride(user, step, permissions)) return true;
         }
         return false;
     }
 
-    private boolean resolveCanOverride(User user, String stepSide, List<String> permissions) {
-        boolean hasPerm = permissions != null && permissions.contains("workflow:step:override");
+    /**
+     * Which live step this user is actually standing on.
+     *
+     * A workflow can have more than one step live at once — a parallel branch,
+     * or a duplicate left behind by an out-of-band advance. The caller used to
+     * take get(0) of an unordered query, so the answer depended on row order,
+     * and with it the SIDE that canOverride was judged against: an ORGANIZATION
+     * step left open on a workflow whose real step was VENDOR handed
+     * organisation-side users an override button for a vendor's work.
+     *
+     * In the order of what the person is actually doing:
+     *   1. a step they hold an open task on — that one is unambiguously theirs
+     *   2. a step on their own side
+     *   3. the earliest live step, so the answer is at least the same twice
+     */
+    private StepInstance pickStepForUser(User user, List<StepInstance> liveSteps) {
+        if (liveSteps.size() == 1) return liveSteps.get(0);
 
-        java.util.Set<String> userSides = user.getRoles() == null ? java.util.Set.of()
+        var openStatuses = List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS);
+        for (StepInstance s : liveSteps) {
+            boolean mine = taskInstanceRepository.findByStepInstanceId(s.getId()).stream()
+                    .anyMatch(t -> user.getId().equals(t.getAssignedUserId())
+                            && openStatuses.contains(t.getStatus()));
+            if (mine) return s;
+        }
+
+        java.util.Set<String> userSides = sidesOf(user);
+        for (StepInstance s : liveSteps) {
+            String side = s.getSnapSide();
+            if (side == null || "SYSTEM".equalsIgnoreCase(side)
+                    || userSides.stream().anyMatch(x -> x.equalsIgnoreCase(side))) {
+                return s;
+            }
+        }
+        return liveSteps.get(0);
+    }
+
+    private java.util.Set<String> sidesOf(User user) {
+        return user.getRoles() == null ? java.util.Set.of()
                 : user.getRoles().stream()
                   .map(r -> r.getSide() != null ? r.getSide().name() : null)
                   .filter(java.util.Objects::nonNull)
                   .collect(java.util.stream.Collectors.toSet());
+    }
 
+    /**
+     * Three things have to be true before a step may be forced, and until now
+     * only two were asked.
+     *
+     *   1. THE BLUEPRINT ALLOWS IT. snap_allow_step_override, snapshotted onto
+     *      the step from WorkflowStep.allowStepOverride. This is the one that
+     *      was missing: resolveCanOverride asked only for the permission and a
+     *      side, neither of which knows which workflow it is looking at — so a
+     *      grant made for audit engagements produced override buttons on vendor
+     *      assessments, policies and issues too. Null means an instance created
+     *      before the field existed, and is read as not allowed rather than
+     *      guessed at; sql/118 backfills the live ones.
+     *   2. THE USER HOLDS workflow:step:override.
+     *   3. THE SIDE MATCHES. An auditee may not force an auditor's step.
+     */
+    private boolean resolveCanOverride(User user, StepInstance step, List<String> permissions) {
+        if (step == null) return false;
+
+        boolean stepAllows = Boolean.TRUE.equals(step.getSnapAllowStepOverride());
+        boolean hasPerm = permissions != null && permissions.contains("workflow:step:override");
+
+        String stepSide = step.getSnapSide();
+        java.util.Set<String> userSides = sidesOf(user);
         boolean sideOk = stepSide == null || "SYSTEM".equalsIgnoreCase(stepSide)
                 || userSides.stream().anyMatch(s -> s.equalsIgnoreCase(stepSide));
 
-        boolean result = hasPerm && sideOk;
+        boolean result = stepAllows && hasPerm && sideOk;
 
-        // Logged at INFO on purpose while this is being commissioned: the two
-        // inputs live in different places (permission_grants for the grant,
-        // step_instances.snap_side for the step) and a false result is otherwise
-        // indistinguishable between "no permission" and "wrong side".
-        log.info("[OVERRIDE-CHK] userId={} stepSide={} userSides={} hasPerm={} sideOk={} → canOverride={}",
-                user.getId(), stepSide, userSides, hasPerm, sideOk, result);
+        // Logged at INFO on purpose while this is being commissioned: the three
+        // inputs live in different places (workflow_steps.allow_step_override for
+        // the blueprint, permission_grants for the grant, step_instances.snap_side
+        // for the step) and a false result is otherwise indistinguishable between
+        // "this workflow does not allow it", "no permission" and "wrong side".
+        log.info("[OVERRIDE-CHK] userId={} stepInstanceId={} step='{}' stepSide={} userSides={} "
+                        + "stepAllows={} hasPerm={} sideOk={} → canOverride={}",
+                user.getId(), step.getId(), step.getSnapName(), stepSide, userSides,
+                stepAllows, hasPerm, sideOk, result);
 
         return result;
     }

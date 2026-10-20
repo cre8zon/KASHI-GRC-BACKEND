@@ -100,6 +100,16 @@ public class StepInstance extends BaseEntity {
     @Column(name = "snap_actor_resolution", length = 50)
     private ActorResolution snapActorResolution;
 
+    /**
+     * Snapshot of WorkflowStep.allowStepOverride.
+     *
+     * Nullable on purpose: step instances created before this field existed
+     * have no answer, and resolveCanOverride reads null as "not allowed"
+     * rather than inventing one. sql/118 backfills it for live instances.
+     */
+    @Column(name = "snap_allow_step_override")
+    private Boolean snapAllowStepOverride;
+
     @Column(name = "snap_allow_override")
     private Boolean snapAllowOverride;
 
@@ -183,7 +193,7 @@ public class StepInstance extends BaseEntity {
     private Long overriddenBy;
 
     @Column(name = "overridden_at")
-    private java.time.LocalDateTime overriddenAt;
+    private LocalDateTime overriddenAt;
 
     /** How many tasks were still outstanding when it was forced through. */
     @Column(name = "override_expired_tasks")
