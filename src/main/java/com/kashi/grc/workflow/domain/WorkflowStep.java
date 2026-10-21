@@ -103,6 +103,29 @@ public class WorkflowStep extends BaseEntity {
     private boolean allowOverride = true;
 
     /**
+     * Whether somebody holding workflow:step:override may force THIS step past
+     * work that is not done.
+     *
+     * ── WHY A NEW FIELD AND NOT allowOverride ────────────────────────────────
+     *
+     * allowOverride above is documented as assigner redirection, defaults true
+     * on every step ever created, and is read by nothing. Reusing it would mean
+     * a field whose name matches two features and whose existing value — true
+     * everywhere — is the opposite of the default wanted here.
+     *
+     * ── WHY IT DEFAULTS TO FALSE ─────────────────────────────────────────────
+     *
+     * Override had no per-workflow switch at all: resolveCanOverride asked only
+     * for the workflow:step:override permission and a matching side, so a grant
+     * made for one workflow appeared on every module that had a live step on
+     * that side. Off unless somebody turned it on is the only default that
+     * makes "set it where it is needed" true.
+     */
+    @Column(name = "allow_step_override", nullable = false)
+    @Builder.Default
+    private boolean allowStepOverride = false;
+
+    /**
      * What kind of work the ACTOR does on this step.
      * Drives frontend routing: (entityType + stepSide + stepAction) → URL.
      * ASSIGN | FILL | REVIEW | APPROVE | ACKNOWLEDGE | EVALUATE | GENERATE | CUSTOM

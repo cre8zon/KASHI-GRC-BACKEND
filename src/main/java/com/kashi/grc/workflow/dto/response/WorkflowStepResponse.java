@@ -43,6 +43,7 @@ public class WorkflowStepResponse {
     /** Assigner roles for PUSH_TO_ROLES — any side (workflow_step_assigner_roles) */
     private List<Long>       assignerRoleIds;
     private Boolean          allowOverride;
+    private Boolean          allowStepOverride;
 
     /** What the actor does on this step — drives frontend routing */
     private StepAction       stepAction;

@@ -74,5 +74,30 @@ public enum StepStatus {
      * Recorded by StepSlaMonitor. Step remains actionable.
      * Initiator and assignerRole holders are notified to escalate.
      */
-    SLA_BREACHED
+    SLA_BREACHED;
+
+    /**
+     * The statuses in which a step is still the workflow's business.
+     *
+     * ── WHY THIS EXISTS IN ONE PLACE ─────────────────────────────────────────
+     *
+     * "Live" was being spelled as `status == IN_PROGRESS` at every call site,
+     * and SLA_BREACHED is live — StepSlaMonitor sets it on a step that is still
+     * running, and WorkflowEngineService.handleApprove already says so:
+     * "SLA_BREACHED is NOT terminal … Allow advance through SLA_BREACHED so
+     * late approvals work."
+     *
+     * Everything that asked for IN_PROGRESS alone disagreed with that. A step
+     * that merely ran late vanished from the access context, so its detail
+     * screen offered no workflow actions and override refused it outright —
+     * on exactly the steps somebody most wants to force. One set, used by
+     * both services, so the two cannot drift again.
+     *
+     * AWAITING_ASSIGNMENT and UNASSIGNED are here because a step waiting for
+     * somebody to be found is not a finished step. They matter most to the
+     * duplicate guard: without them, an advance onto a step stuck without
+     * assignees creates a second copy of it.
+     */
+    public static final java.util.Set<StepStatus> LIVE = java.util.Set.of(
+            AWAITING_ASSIGNMENT, UNASSIGNED, IN_PROGRESS, SLA_BREACHED);
 }

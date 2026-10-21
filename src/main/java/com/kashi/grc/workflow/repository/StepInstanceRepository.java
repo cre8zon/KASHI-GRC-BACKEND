@@ -23,6 +23,16 @@ public interface StepInstanceRepository
 
     List<StepInstance> findByWorkflowInstanceIdAndStatus(Long workflowInstanceId, StepStatus status);
 
+    /**
+     * Live steps in step order. Callers used findByWorkflowInstanceIdAndStatus
+     * with IN_PROGRESS and took get(0) off an unordered result — so on a
+     * workflow with more than one live step, which one answered "the current
+     * step" depended on the order MySQL happened to return rows in, and step
+     * ids do not follow step order once a blueprint has been edited.
+     */
+    List<StepInstance> findByWorkflowInstanceIdAndStatusInOrderBySnapStepOrderAsc(
+            Long workflowInstanceId, java.util.Collection<StepStatus> statuses);
+
     List<StepInstance> findByStepIdAndStatus(Long stepId, StepStatus status);
 
     long countByWorkflowInstanceIdAndStatus(Long workflowInstanceId, StepStatus status);
