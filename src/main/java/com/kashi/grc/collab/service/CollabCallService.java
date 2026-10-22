@@ -256,6 +256,19 @@ public class CollabCallService {
         if (roomMemberRepository.findByRoomIdAndUserId(r.getId(), c.userId()).isEmpty()) {
             throw new BusinessException("COLLAB_NOT_MEMBER", "Only the room's members can join it", HttpStatus.FORBIDDEN);
         }
+        return joinRoomSession(c, r);
+    }
+
+    /**
+     * The join itself, after the caller's right to be in the room is settled —
+     * by membership (joinRoom) or by a call link that colleagues of the same
+     * organisation may use (CollabCallLinkService). They attend the session;
+     * they do not become members of the room.
+     */
+    @Transactional
+    Map<String, Object> joinRoomSession(Caller c, CollabRoom r) {
+        requireEnabled();
+        if (r.isArchived()) throw bad("COLLAB_ROOM_ARCHIVED", "This room is archived");
         CollabMeeting session = currentSession(r);
         if (session == null) {
             LocalDateTime now = LocalDateTime.now().truncatedTo(ChronoUnit.MINUTES);
@@ -276,7 +289,7 @@ public class CollabCallService {
     }
 
     /** The meeting a join should attach to, or null to start a new drop-in session. */
-    private CollabMeeting currentSession(CollabRoom r) {
+    CollabMeeting currentSession(CollabRoom r) {
         LocalDateTime now = LocalDateTime.now();
         List<CollabMeeting> ms = meetingRepository.findByRoomIdAndIsDeletedFalseOrderByStartsAtDesc(r.getId());
         for (CollabMeeting m : ms) {
@@ -453,14 +466,14 @@ public class CollabCallService {
         return out;
     }
 
-    private boolean canSee(Caller c, CollabRoom r) {
+    boolean canSee(Caller c, CollabRoom r) {
         if (!r.getTenantId().equals(c.tenantId())) return false;
         if (r.getWorkspaceId() == null) return !c.guest();
         return workspaceRepository.findByIdAndTenantIdAndIsDeletedFalse(r.getWorkspaceId(), c.tenantId())
                 .filter(ws -> access.canSee(c, ws)).isPresent();
     }
 
-    private boolean canManage(Caller c, CollabRoom r) {
+    boolean canManage(Caller c, CollabRoom r) {
         if (!canSee(c, r)) return false;
         if (c.userId().equals(r.getCreatedBy())) return true;
         return r.getWorkspaceId() != null && workspaceRepository.findByIdAndTenantIdAndIsDeletedFalse(r.getWorkspaceId(), c.tenantId())
@@ -530,7 +543,7 @@ public class CollabCallService {
         }
     }
 
-    private static String name(User u) {
+    static String name(User u) {
         if (u == null) return "Unknown user";
         String n = ((u.getFirstName() == null ? "" : u.getFirstName()) + " "
                 + (u.getLastName() == null ? "" : u.getLastName())).trim();
