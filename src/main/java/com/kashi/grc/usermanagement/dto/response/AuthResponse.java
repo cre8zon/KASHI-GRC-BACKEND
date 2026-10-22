@@ -77,6 +77,14 @@ public class AuthResponse {
         private String token;
         private LocalDateTime expiresAt;
         private String refreshToken;
+        /**
+         * Lifetime of the access token in ms. expiresAt is a zone-less
+         * LocalDateTime in the SERVER's zone, which a browser in another zone
+         * reads hours off; clients should schedule from this relative value.
+         */
+        private Long expiresInMs;
+        /** Lifetime of the refresh token in ms (same reasoning). */
+        private Long refreshExpiresInMs;
     }
 
     // ── Used for PASSWORD_RESET_REQUIRED response ─────────────────

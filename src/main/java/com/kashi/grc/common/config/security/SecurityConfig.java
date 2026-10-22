@@ -34,6 +34,8 @@ public class SecurityConfig {
 
     private final JwtAuthenticationFilter jwtFilter;
     private final CustomUserDetailsService userDetailsService;
+    private final RestAuthenticationEntryPoint authenticationEntryPoint;
+    private final RestAccessDeniedHandler accessDeniedHandler;
 
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
@@ -41,14 +43,27 @@ public class SecurityConfig {
                 .cors(cors -> cors.configurationSource(corsConfigurationSource()))
                 .csrf(AbstractHttpConfigurer::disable)
                 .sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+                // 401 (with a reason) for "not signed in / session expired",
+                // 403 for "signed in but not allowed". Without these Spring
+                // answered an expired token with a bare 403 — see
+                // RestAuthenticationEntryPoint for what that broke.
+                .exceptionHandling(e -> e
+                        .authenticationEntryPoint(authenticationEntryPoint)
+                        .accessDeniedHandler(accessDeniedHandler))
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.OPTIONS, "/**").permitAll()
                         .requestMatchers(
                                 "/",
                                 "/v1/auth/login",
+                                "/v1/auth/refresh",
+                                "/v1/auth/logout",
                                 "/v1/auth/request-password-reset",
                                 "/v1/auth/reset-password",
-                                "/v1/users/password",
+                                // /v1/users/password used to be listed here. It
+                                // changes the CALLER's password, so it needs a
+                                // caller: anonymous requests now get a clean 401
+                                // instead of failing inside the service.
+
                                 "/swagger-ui/**",
                                 "/v3/api-docs/**",
                                 "/actuator/health",
@@ -226,4 +241,4 @@ public class SecurityConfig {
             return Optional.empty();
         };
     }
-}
+}

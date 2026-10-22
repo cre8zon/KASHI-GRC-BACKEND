@@ -171,7 +171,14 @@ public class CollabCallService {
         }
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("enabled", liveKit.enabled());
-        out.put("canCreate", liveKit.enabled() && c.holds(CollabMeetingService.PERM_MEETING));
+        // Workspace rooms: any owner or MEMBER of that workspace. Rooms outside
+        // a workspace still need collab:meeting:manage.
+        List<Long> canCreateIn = access.visibleWorkspaces(c).stream()
+                .filter(ws -> access.canContribute(c, ws) || c.holds(CollabMeetingService.PERM_MEETING))
+                .map(CollabWorkspace::getId).toList();
+        out.put("canCreate", liveKit.enabled() && (c.holds(CollabMeetingService.PERM_MEETING) || !canCreateIn.isEmpty()));
+        out.put("canCreateInternal", liveKit.enabled() && c.holds(CollabMeetingService.PERM_MEETING) && !c.guest());
+        out.put("canCreateIn", canCreateIn);
         out.put("rooms", list);
         return out;
     }
@@ -180,12 +187,18 @@ public class CollabCallService {
     public Map<String, Object> createRoom(Map<String, Object> body) {
         requireEnabled();
         Caller c = access.caller();
-        access.requirePermission(c, CollabMeetingService.PERM_MEETING);
         Long wsId = longOrNull(body.get("workspaceId"));
         if (wsId != null) {
             CollabWorkspace ws = access.requireVisible(c, wsId);
             if (!CollabWorkspace.ACTIVE.equals(ws.getStatus())) throw bad("COLLAB_ARCHIVED", "This workspace is archived");
-        } else if (c.guest()) {
+            if (!access.canContribute(c, ws) && !c.holds(CollabMeetingService.PERM_MEETING)) {
+                throw new BusinessException("COLLAB_NOT_CONTRIBUTOR",
+                        "Only members of this workspace can create rooms in it", HttpStatus.FORBIDDEN);
+            }
+        } else {
+            access.requirePermission(c, CollabMeetingService.PERM_MEETING);
+        }
+        if (wsId == null && c.guest()) {
             throw new BusinessException("COLLAB_INTERNAL_ONLY", "Rooms outside a workspace are for the organisation's own staff", HttpStatus.FORBIDDEN);
         }
         CollabRoom r = CollabRoom.builder()

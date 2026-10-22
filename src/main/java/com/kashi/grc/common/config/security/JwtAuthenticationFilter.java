@@ -31,7 +31,14 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
                                     FilterChain filterChain) throws ServletException, IOException {
         String token = extractToken(request);
 
-        if (StringUtils.hasText(token) && tokenProvider.validateToken(token)) {
+        JwtTokenProvider.TokenStatus status = StringUtils.hasText(token)
+                ? tokenProvider.inspectAccessToken(token) : null;
+        // Remembered for RestAuthenticationEntryPoint, so a request that ends
+        // up unauthenticated can be answered "session expired" rather than a
+        // bare 403 the client cannot tell apart from a permission problem.
+        if (status != null) request.setAttribute(JwtTokenProvider.TOKEN_STATUS_ATTR, status);
+
+        if (status == JwtTokenProvider.TokenStatus.VALID) {
             try {
                 Long userId   = tokenProvider.getUserId(token);
                 Long tenantId = tokenProvider.getTenantId(token);
@@ -61,7 +68,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
     private String extractToken(HttpServletRequest request) {
         // Primary: Authorization header (all normal API calls)
         String bearer = request.getHeader("Authorization");
-        if (org.springframework.util.StringUtils.hasText(bearer) && bearer.startsWith("Bearer ")) {
+        if (StringUtils.hasText(bearer) && bearer.startsWith("Bearer ")) {
             return bearer.substring(7);
         }
         // Fallback: ?token= query param — used by iframe-based preview endpoints
@@ -70,7 +77,7 @@ public class JwtAuthenticationFilter extends OncePerRequestFilter {
         String path = request.getRequestURI();
         if (path.contains("/v1/documents/") && (path.endsWith("/stream") || path.endsWith("/preview-content"))) {
             String qpToken = request.getParameter("token");
-            if (org.springframework.util.StringUtils.hasText(qpToken)) {
+            if (StringUtils.hasText(qpToken)) {
                 return qpToken;
             }
         }

@@ -210,14 +210,17 @@ public class CollabMeetingService {
     public Map<String, Object> options() {
         Caller c = access.caller();
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("canSchedule", c.holds(PERM_MEETING));
         out.put("canScheduleInternal", c.holds(PERM_MEETING) && !c.guest());
-        out.put("workspaces", access.visibleWorkspaces(c).stream()
+        // Per workspace: owners and MEMBERS schedule there; the meeting
+        // permission covers the rest. The picker lists only these.
+        List<Map<String, Object>> wss = access.visibleWorkspaces(c).stream()
                 .filter(ws -> CollabWorkspace.ACTIVE.equals(ws.getStatus()))
+                .filter(ws -> access.canContribute(c, ws) || c.holds(PERM_MEETING))
                 .map(ws -> {
                     Map<String, Object> w = new LinkedHashMap<>();
                     w.put("id", ws.getId());
                     w.put("name", ws.getName());
+                    w.put("canSchedule", true);
                     w.put("programmes", workspaceService.visibleProgrammes(c, ws).stream().map(p -> {
                         Map<String, Object> x = new LinkedHashMap<>();
                         x.put("id", p.getId());
@@ -225,7 +228,9 @@ public class CollabMeetingService {
                         return x;
                     }).toList());
                     return w;
-                }).toList());
+                }).toList();
+        out.put("workspaces", wss);
+        out.put("canSchedule", c.holds(PERM_MEETING) || !wss.isEmpty());
         return out;
     }
 
@@ -266,7 +271,18 @@ public class CollabMeetingService {
     @Transactional
     public Map<String, Object> create(Map<String, Object> body) {
         Caller c = access.caller();
-        access.requirePermission(c, PERM_MEETING);
+        // In a workspace: any owner or MEMBER may schedule. Outside one (an
+        // internal meeting): still needs collab:meeting:manage.
+        Long wsId = longOrNull(body.get("workspaceId"));
+        if (wsId != null) {
+            CollabWorkspace ws = access.requireVisible(c, wsId);
+            if (!access.canContribute(c, ws) && !c.holds(PERM_MEETING)) {
+                throw new BusinessException("COLLAB_NOT_CONTRIBUTOR",
+                        "Only members of this workspace can schedule meetings in it", HttpStatus.FORBIDDEN);
+            }
+        } else {
+            access.requirePermission(c, PERM_MEETING);
+        }
         return get(createCore(c, body, null, null, null, null, null).getId());
     }
 

@@ -65,6 +65,7 @@ public class VendorController {
     private final VendorAssessmentCycleRepository cycleRepository;
     private final AssessmentTemplateInstanceRepository templateInstanceRepository;
     private final UserRepository userRepository;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
 
     // 8.1 Initiate Vendor Onboarding
     @PostMapping("/v1/vendors/onboard")
@@ -131,11 +132,21 @@ public class VendorController {
     public ResponseEntity<ApiResponse<PaginatedResponse<VendorResponse>>> listVendors(
             @RequestParam Map<String, String> allParams) {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        // Platform operators may look into ONE other tenant's vendors (the
+        // Users hub's Vendor tab, for a tenant picked in the tenant picker).
+        // Without this the list was always scoped to the operator's own System
+        // tenant, which has no vendors, so the picker was permanently empty.
+        // Everyone else is pinned to their own tenant; the param is ignored.
+        String requestedTenant = allParams.get("tenantId");
+        if (requestedTenant != null && !requestedTenant.isBlank() && permissionGate.isPlatform()) {
+            try { tenantId = Long.parseLong(requestedTenant.trim()); } catch (NumberFormatException ignored) { }
+        }
+        final Long scopeTenantId = tenantId;
         return ResponseEntity.ok(ApiResponse.success(dbRepository.findAll(
                 Vendor.class,
                 utilityService.getpageDetails(allParams),
                 (cb, root) -> List.of(
-                        cb.equal(root.get("tenantId"), tenantId),
+                        cb.equal(root.get("tenantId"), scopeTenantId),
                         cb.isFalse(root.get("isDeleted"))
                 ),
                 (cb, root) -> Map.of(

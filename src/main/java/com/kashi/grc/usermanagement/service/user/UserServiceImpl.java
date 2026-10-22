@@ -137,7 +137,7 @@ public class UserServiceImpl implements UserService {
             // already in a state (multi-side) that's supposed to be
             // unreachable.
             long distinctSides = roles.stream()
-                    .map(Role::getSide).filter(java.util.Objects::nonNull).distinct().count();
+                    .map(Role::getSide).filter(Objects::nonNull).distinct().count();
             if (distinctSides > 1) {
                 throw new ValidationException(
                         "Cannot assign roles from more than one side to a single user. "
@@ -202,7 +202,7 @@ public class UserServiceImpl implements UserService {
                         }
                         boolean conflictsWithExistingSide = savedUser.getRoles().stream()
                                 .map(Role::getSide)
-                                .filter(java.util.Objects::nonNull)
+                                .filter(Objects::nonNull)
                                 .anyMatch(s -> s != role.getSide());
                         if (conflictsWithExistingSide) {
                             throw new ValidationException(
@@ -330,20 +330,20 @@ public class UserServiceImpl implements UserService {
                 : vendorIdParam;               // org/system: use supplied param (may be null)
 
         // Parse RoleSide enum safely
-        com.kashi.grc.usermanagement.domain.RoleSide roleSide = null;
+        RoleSide roleSide = null;
         if (side != null && !side.isBlank()) {
             try {
-                roleSide = com.kashi.grc.usermanagement.domain.RoleSide.valueOf(side.toUpperCase());
+                roleSide = RoleSide.valueOf(side.toUpperCase());
             } catch (IllegalArgumentException ignored) {}
         }
-        final com.kashi.grc.usermanagement.domain.RoleSide finalRoleSide = roleSide;
+        final RoleSide finalRoleSide = roleSide;
         final Long finalRoleId = roleIdParam;
         final String finalMembershipType =
                 (membershipType != null && !membershipType.isBlank()) ? membershipType.toUpperCase() : null;
         final Long finalFirmTenantId = firmTenantId;
         // Holders of the permission in the tenant this list is scoped to — the
         // same tenant the membership filter uses. null = no permission filter.
-        final java.util.Set<Long> finalPermissionHolders = (permission != null && !permission.isBlank())
+        final Set<Long> finalPermissionHolders = (permission != null && !permission.isBlank())
                 ? permissionHolderService.holderIds(
                 effectiveTenantId, permission)
                 : null;
@@ -353,7 +353,7 @@ public class UserServiceImpl implements UserService {
                 pageDetails,
                 (cb, root) -> {
                     List<jakarta.persistence.criteria.Predicate> predicates =
-                            new java.util.ArrayList<>();
+                            new ArrayList<>();
                     predicates.add(cb.isFalse(root.get("isDeleted")));
                     // Tenant scope resolves through user_tenant_memberships, not
                     // users.tenant_id. An invited external auditor's home tenant is
@@ -370,7 +370,7 @@ public class UserServiceImpl implements UserService {
                     // else: SYSTEM caller with no tenantIdParam — unscoped, all tenants
                     // Filter by role side — only users who have at least one role with this side
                     if (finalRoleSide != null) {
-                        if (finalRoleSide == com.kashi.grc.usermanagement.domain.RoleSide.VENDOR) {
+                        if (finalRoleSide == RoleSide.VENDOR) {
                             // VENDOR side — must have a vendor_id (i.e. be a vendor user)
                             predicates.add(cb.isNotNull(root.get("vendorId")));
                             // ── VENDOR SCOPING FIX ──────────────────────────────────────────
@@ -397,8 +397,8 @@ public class UserServiceImpl implements UserService {
                                         sub.from(com.kashi.grc.usermanagement.domain.UserRole.class);
                                 jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.UserTenantMembership> memRoot =
                                         sub.from(com.kashi.grc.usermanagement.domain.UserTenantMembership.class);
-                                jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.Role> roleRoot =
-                                        sub.from(com.kashi.grc.usermanagement.domain.Role.class);
+                                jakarta.persistence.criteria.Root<Role> roleRoot =
+                                        sub.from(Role.class);
                                 sub.select(urRoot.get("userId"))
                                         .where(
                                                 cb.equal(urRoot.get("userId"), root.get("id")),
@@ -421,7 +421,7 @@ public class UserServiceImpl implements UserService {
                     if (finalRoleId != null) {
                         jakarta.persistence.criteria.Subquery<Long> roleSub =
                                 cb.createQuery(Long.class).subquery(Long.class);
-                        jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.User> roleSubRoot =
+                        jakarta.persistence.criteria.Root<User> roleSubRoot =
                                 roleSub.correlate(root);
                         jakarta.persistence.criteria.Join<Object, Object> rJoin = roleSubRoot.join("roles");
                         roleSub.select(roleSubRoot.get("id"))
@@ -467,7 +467,7 @@ public class UserServiceImpl implements UserService {
         jakarta.persistence.criteria.Root<com.kashi.grc.usermanagement.domain.UserTenantMembership> m =
                 sub.from(com.kashi.grc.usermanagement.domain.UserTenantMembership.class);
 
-        List<jakarta.persistence.criteria.Predicate> preds = new java.util.ArrayList<>();
+        List<jakarta.persistence.criteria.Predicate> preds = new ArrayList<>();
         preds.add(cb.equal(m.get("userId"), userRoot.get("id")));
         preds.add(cb.equal(m.get("tenantId"), tenantId));
         preds.add(cb.equal(m.get("status"), "ACTIVE"));
@@ -644,11 +644,31 @@ public class UserServiceImpl implements UserService {
         Long userId = utilityService.getLoggedInDataContext().getId();
         User user = userRepository.findById(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        if (!req.isFirstLoginReset() && req.getCurrentPassword() != null) {
-            if (!passwordEncoder.matches(req.getCurrentPassword(), user.getPasswordHash())) {
-                throw new BusinessException("AUTH_INVALID_CREDENTIALS",
-                        "Current password is incorrect", HttpStatus.UNAUTHORIZED);
+        // The current password is ALWAYS required, except for an account the
+        // server itself has flagged for a forced reset. Previously the client
+        // could skip this check by omitting currentPassword or sending
+        // isFirstLoginReset=true — anyone holding a session token could set a
+        // new password without knowing the old one.
+        boolean forcedReset = Boolean.TRUE.equals(user.getPasswordResetRequired());
+        if (!forcedReset) {
+            if (req.getCurrentPassword() == null || req.getCurrentPassword().isBlank()) {
+                throw new BusinessException("VALIDATION_ERROR", "Enter your current password",
+                        HttpStatus.UNPROCESSABLE_ENTITY,
+                        Map.of("field", "currentPassword"));
             }
+            if (!passwordEncoder.matches(req.getCurrentPassword(), user.getPasswordHash())) {
+                // 422, not 401: a 401 means "your session is over" to the client,
+                // which would sign the user out for mistyping a password.
+                throw new BusinessException("AUTH_INVALID_CREDENTIALS",
+                        "Current password is incorrect", HttpStatus.UNPROCESSABLE_ENTITY,
+                        Map.of("field", "currentPassword"));
+            }
+        }
+        if (passwordEncoder.matches(req.getNewPassword(), user.getPasswordHash())) {
+            throw new BusinessException("AUTH_PASSWORD_REUSED",
+                    "New password must be different from your current password",
+                    HttpStatus.UNPROCESSABLE_ENTITY,
+                    Map.of("field", "newPassword"));
         }
         user.setPasswordHash(passwordEncoder.encode(req.getNewPassword()));
         user.setPasswordResetRequired(false);
@@ -783,7 +803,7 @@ public class UserServiceImpl implements UserService {
     }
 
     private static final List<String> ALLOWED_PREF_KEYS =
-            java.util.Arrays.asList("ui_app_theme", "ui_sidebar_theme", "ui_sidebar_color");
+            Arrays.asList("ui_app_theme", "ui_sidebar_theme", "ui_sidebar_color");
 
     @Override
     @Transactional
@@ -808,7 +828,7 @@ public class UserServiceImpl implements UserService {
     @Transactional(readOnly = true)
     public Map<String, String> getPreferences() {
         User user = utilityService.getLoggedInDataContext();
-        Map<String, String> result = new java.util.HashMap<>();
+        Map<String, String> result = new HashMap<>();
         ALLOWED_PREF_KEYS.forEach(key ->
                 attributeRepository.findByUserIdAndAttributeKey(user.getId(), key)
                         .ifPresent(attr -> result.put(key, attr.getAttributeValue()))

@@ -17,7 +17,7 @@ public interface AuthService {
      * The only way a token can name a tenant other than the user's home one,
      * which is what makes an external auditor's GUEST membership usable.
      */
-    com.kashi.grc.common.dto.ApiResponse<?> switchTenant(Long userId, Long tenantId);
+    ApiResponse<?> switchTenant(Long userId, Long tenantId);
 
     /**
      * Authenticate user. Returns:
@@ -26,8 +26,15 @@ public interface AuthService {
      */
     ApiResponse<?> login(LoginRequest request);
 
-    /** Invalidate session / log logout event */
-    void logout(Long userId);
+    /**
+     * Exchanges a refresh token for a new session in the given tenant (or the
+     * user's home tenant when null). Re-checks account status and tenant
+     * membership exactly as login/switch-tenant do.
+     */
+    ApiResponse<?> refresh(String refreshToken, Long tenantId);
+
+    /** End a session: revokes the presented refresh token (if any) and logs the event. */
+    void logout(Long userId, String refreshToken);
 
     /** Send password reset link to email */
     void requestPasswordReset(PasswordResetRequest request);
