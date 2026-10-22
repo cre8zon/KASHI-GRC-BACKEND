@@ -4,6 +4,7 @@ import com.kashi.grc.common.config.multitenancy.TenantContext;
 import com.kashi.grc.common.config.security.JwtTokenProvider;
 import com.kashi.grc.common.dto.ApiResponse;
 import com.kashi.grc.common.dto.ErrorResponse;
+import com.kashi.grc.common.exception.BusinessException;
 import com.kashi.grc.common.exception.ResourceNotFoundException;
 import com.kashi.grc.common.exception.ValidationException;
 import com.kashi.grc.common.service.MailService;
@@ -24,6 +25,7 @@ import com.kashi.grc.usermanagement.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -50,6 +52,7 @@ public class AuthServiceImpl implements AuthService {
     private final com.kashi.grc.vendor.repository.VendorRepository vendorRepository;
     private final PasswordEncoder     passwordEncoder;
     private final JwtTokenProvider    tokenProvider;
+    private final com.kashi.grc.usermanagement.repository.RevokedTokenRepository revokedTokenRepository;
     private final MailService         mailService;
     private final com.kashi.grc.common.security.PermissionGate permissionGate;
     private final com.kashi.grc.common.util.UtilityService      utilityService;
@@ -94,14 +97,9 @@ public class AuthServiceImpl implements AuthService {
             throw new ValidationException("Account is not active");
         }
 
-        log.info("--- LOGIN DEBUG START ---");
-        log.info("Email: {}", request.getEmail());
-        log.info("Raw Password Length: {}", request.getPassword().length());
-        log.info("Stored Hash: {}", user.getPasswordHash());
-
-        boolean isMatch = passwordEncoder.matches(request.getPassword(), user.getPasswordHash());
-        log.info("Matches? {}", isMatch);
-        log.info("--- LOGIN DEBUG END ---");
+        // (The LOGIN DEBUG block that logged the stored bcrypt hash and the
+        //  password length at INFO on every attempt has been removed — those
+        //  lines shipped credential material to the application logs.)
 
         // 4. Verify password
         if (!passwordEncoder.matches(request.getPassword(), user.getPasswordHash())) {
@@ -304,14 +302,128 @@ public class AuthServiceImpl implements AuthService {
     }
 
     // ─────────────────────────────────────────────────────────────
+    // REFRESH
+    // ─────────────────────────────────────────────────────────────
+
+    /**
+     * Exchanges a refresh token for a fresh session.
+     *
+     * Every check login makes about the ACCOUNT is repeated (deleted, not
+     * active, locked, forced password change) — a refresh must not keep alive
+     * a session the account could no longer start. A guest tenant goes through
+     * switchTenant, which re-checks that the membership is still usable.
+     *
+     * Any failure is a 401 AUTH_SESSION_EXPIRED, so the client has exactly one
+     * thing to do: send the user to sign in.
+     */
+    @Override
+    @Transactional
+    public ApiResponse<?> refresh(String refreshToken, Long tenantId) {
+        JwtTokenProvider.RefreshClaims rc = (refreshToken == null || refreshToken.isBlank())
+                ? null : tokenProvider.parseRefreshToken(refreshToken);
+        if (rc == null) throw sessionExpired();
+        if (isRevoked(rc.jti())) {
+            log.info("[AUTH-REFRESH] revoked refresh token presented userId={} jti={}", rc.userId(), rc.jti());
+            throw sessionExpired();
+        }
+        Long userId = rc.userId();
+
+        User user = userRepository.findById(userId)
+                .filter(u -> !u.isDeleted())
+                .orElseThrow(this::sessionExpired);
+
+        if (!UserStatus.ACTIVE.equals(user.getStatus())
+                || Boolean.TRUE.equals(user.getPasswordResetRequired())) {
+            log.info("[AUTH-REFRESH] refused for userId={} status={} resetRequired={}",
+                    userId, user.getStatus(), user.getPasswordResetRequired());
+            throw sessionExpired();
+        }
+
+        // Rotation: the token just presented is spent. Whatever happens next,
+        // it cannot be exchanged again (beyond the short grace in isRevoked).
+        revoke(rc, "ROTATED");
+
+        Long target = tenantId != null ? tenantId : user.getTenantId();
+        if (!target.equals(user.getTenantId())) {
+            try {
+                return switchTenant(userId, target);
+            } catch (ValidationException e) {
+                log.info("[AUTH-REFRESH] guest membership no longer usable userId={} tenantId={}", userId, target);
+                throw sessionExpired();
+            }
+        }
+
+        TenantContext.setCurrentTenant(target);
+        List<String> roleIds = user.getRoles().stream().map(r -> r.getName()).collect(Collectors.toList());
+        List<String> permissions = user.getRoles().stream()
+                .flatMap(r -> r.getPermissions().stream())
+                .map(p -> p.getCode()).distinct().collect(Collectors.toList());
+
+        String accessToken = tokenProvider.generateAccessToken(
+                user.getId(), target, user.getEmail(), roleIds, permissions);
+        String newRefresh  = tokenProvider.generateRefreshToken(user.getId());
+
+        AuthResponse response = buildAuthResponse(user, permissions, accessToken, newRefresh);
+        List<com.kashi.grc.usermanagement.domain.UserTenantMembership> memberships =
+                membershipRepository.findByUserIdAndStatus(userId, "ACTIVE").stream()
+                        .filter(com.kashi.grc.usermanagement.domain.UserTenantMembership::isUsable)
+                        .toList();
+        attachMemberships(response, memberships, target);
+        log.debug("[AUTH-REFRESH] userId={} tenantId={}", userId, target);
+        return ApiResponse.success(response);
+    }
+
+    /**
+     * Grace for rotated tokens. Two tabs sharing a "keep me signed in" session
+     * can both refresh within the same moment; the second would otherwise be
+     * signed out by the first one's rotation. A LOGOUT revocation has no grace.
+     */
+    private static final long ROTATION_GRACE_SECONDS = 60;
+
+    private boolean isRevoked(String jti) {
+        if (jti == null) return false;   // pre-revocation token; expires on its own
+        return revokedTokenRepository.findById(jti)
+                .map(r -> !"ROTATED".equals(r.getReason())
+                        || r.getRevokedAt().isBefore(LocalDateTime.now().minusSeconds(ROTATION_GRACE_SECONDS)))
+                .orElse(false);
+    }
+
+    private void revoke(JwtTokenProvider.RefreshClaims rc, String reason) {
+        if (rc == null || rc.jti() == null) return;
+        var existing = revokedTokenRepository.findById(rc.jti()).orElse(null);
+        if (existing != null) {
+            // A LOGOUT always wins over an earlier ROTATED (closes the grace).
+            if ("LOGOUT".equals(reason) && !"LOGOUT".equals(existing.getReason())) {
+                existing.setReason("LOGOUT");
+                existing.setRevokedAt(LocalDateTime.now());
+                revokedTokenRepository.save(existing);
+            }
+            return;
+        }
+        revokedTokenRepository.save(com.kashi.grc.usermanagement.domain.RevokedToken.builder()
+                .jti(rc.jti()).userId(rc.userId()).expiresAt(rc.expiresAt())
+                .revokedAt(LocalDateTime.now()).reason(reason).build());
+    }
+
+    private BusinessException sessionExpired() {
+        return new BusinessException("AUTH_SESSION_EXPIRED",
+                "Your session has expired. Please sign in again.", HttpStatus.UNAUTHORIZED);
+    }
+
+    // ─────────────────────────────────────────────────────────────
     // LOGOUT
     // ─────────────────────────────────────────────────────────────
     @Override
     @Transactional
-    public void logout(Long userId) {
-        // JWT is stateless; client discards token.
-        // Log the event for audit purposes.
-        log.info("User logged out: userId={}", userId);
+    public void logout(Long userId, String refreshToken) {
+        // The access token is short-lived and discarded by the client. The
+        // refresh token is the long-lived credential, so it is revoked here —
+        // a copy of it can no longer mint new sessions.
+        JwtTokenProvider.RefreshClaims rc = (refreshToken == null || refreshToken.isBlank())
+                ? null : tokenProvider.parseRefreshToken(refreshToken);
+        if (rc != null) revoke(rc, "LOGOUT");
+        log.info("User logged out: userId={} refreshRevoked={}",
+                rc != null ? rc.userId() : userId, rc != null && rc.jti() != null);
     }
 
     // ─────────────────────────────────────────────────────────────
@@ -320,10 +432,10 @@ public class AuthServiceImpl implements AuthService {
     @Override
     @Transactional
     public void requestPasswordReset(PasswordResetRequest request) {
-        // Security: always succeed even if email doesn't exist (prevent enumeration)
-        if (userRepository.findByEmailAndIsDeletedFalse(request.getEmail()).isEmpty()) {
-            throw new ResourceNotFoundException("User", "email", request.getEmail());
-        }
+        // Security: ALWAYS succeed, whether or not the email has an account.
+        // This used to throw a 404 for unknown emails, which let anyone test
+        // which addresses have accounts. The response is now identical either
+        // way; only a real account receives an email.
         userRepository.findByEmailAndIsDeletedFalse(request.getEmail()).ifPresent(user -> {
             String token = generateSecureToken();
             user.setPasswordResetToken(token);
@@ -353,17 +465,34 @@ public class AuthServiceImpl implements AuthService {
     @Override
     @Transactional
     public void resetPassword(ResetPasswordRequest request) {
+        // Distinct codes so the client can show "request a new link" instead of
+        // a generic validation error next to the password field.
         User user = userRepository.findByPasswordResetTokenAndIsDeletedFalse(request.getToken())
-                .orElseThrow(() -> new ValidationException("Invalid or expired reset token"));
+                .orElseThrow(() -> new BusinessException("AUTH_RESET_TOKEN_INVALID",
+                        "This reset link is invalid or has already been used. Please request a new one.",
+                        HttpStatus.UNPROCESSABLE_ENTITY));
 
         if (DateTimeUtils.isExpired(user.getPasswordResetExpiry())) {
-            throw new ValidationException("Reset token has expired. Please request a new one.");
+            throw new BusinessException("AUTH_RESET_TOKEN_EXPIRED",
+                    "This reset link has expired. Please request a new one.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+
+        if (user.getPasswordHash() != null
+                && passwordEncoder.matches(request.getNewPassword(), user.getPasswordHash())) {
+            throw new BusinessException("AUTH_PASSWORD_REUSED",
+                    "Choose a password you have not used for this account before.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
 
         user.setPasswordHash(passwordEncoder.encode(request.getNewPassword()));
         user.setPasswordResetToken(null);
         user.setPasswordResetExpiry(null);
         user.setPasswordResetRequired(false);
+        // A successful reset proves control of the mailbox — clear any lockout
+        // so the user can sign in with the password they just set.
+        user.resetFailedAttempts();
+        if (UserStatus.LOCKED.equals(user.getStatus())) user.setStatus(UserStatus.ACTIVE);
         userRepository.save(user);
 
         log.info("Password reset successfully for userId={}", user.getId());
@@ -467,7 +596,7 @@ public class AuthServiceImpl implements AuthService {
         // welcome-email screen (SendWelcomeEmailPage) - so it is kept for
         // them and for nobody else. An org admin resetting one of their own
         // users gets the reset and the email, which is all that flow needs.
-        java.util.Map<String, Object> body = new java.util.LinkedHashMap<>();
+        Map<String, Object> body = new java.util.LinkedHashMap<>();
         body.put("userId",        admin.getId());
         body.put("email",         admin.getEmail());
         body.put("passwordReset", true);
@@ -518,8 +647,13 @@ public class AuthServiceImpl implements AuthService {
                         .build())
                 .session(AuthResponse.SessionInfo.builder()
                         .token(accessToken)
-                        .expiresAt(LocalDateTime.now().plusSeconds(86400))
+                        // Read from the token itself. This was hard-coded to
+                        // now()+86400s, which only matched while nobody changed
+                        // app.jwt.expiration-ms.
+                        .expiresAt(tokenProvider.getExpirationDateTime(accessToken))
+                        .expiresInMs(tokenProvider.getAccessTokenTtlMs())
                         .refreshToken(refreshToken)
+                        .refreshExpiresInMs(tokenProvider.getRefreshTokenTtlMs())
                         .build())
                 .build();
     }

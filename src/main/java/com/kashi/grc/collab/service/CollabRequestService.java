@@ -88,7 +88,7 @@ public class CollabRequestService {
                 .toList();
         boolean manage = access.canManage(c, ws);
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("canRaise", c.holds(PERM_RAISE) && CollabWorkspace.ACTIVE.equals(ws.getStatus()));
+        out.put("canRaise", access.canContribute(c, ws));
         out.put("requests", toMaps(c, items, manage));
         return out;
     }
@@ -308,11 +308,12 @@ public class CollabRequestService {
         return actionItemRepository.findById(id).orElseThrow();
     }
 
+    /**
+     * Raise a request: the owner or any MEMBER of the workspace (not a VIEWER).
+     * Was gated on collab:request:raise, which ordinary members did not hold.
+     */
     private CollabWorkspace requireRaise(Caller c, Long workspaceId) {
-        CollabWorkspace ws = access.requireVisible(c, workspaceId);
-        access.requirePermission(c, PERM_RAISE);
-        if (!CollabWorkspace.ACTIVE.equals(ws.getStatus())) throw bad("COLLAB_ARCHIVED", "This workspace is archived");
-        return ws;
+        return access.requireContribute(c, workspaceId);
     }
 
     /** In the workspace, and — for a firm member on a programme request — on that programme. */

@@ -128,6 +128,7 @@ public class CollabPlanService {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("workspaceId", ws.getId());
         out.put("canEditPlan", fullEdit);
+        out.put("canEditColumns", access.canManage(c, ws));   // column layout is owner-only
         out.put("today", LocalDate.now());
         out.put("programmes", programmes.stream().map(p -> {
             Map<String, Object> m = new LinkedHashMap<>();
@@ -458,7 +459,11 @@ public class CollabPlanService {
     public List<Map<String, Object>> saveColumns(Long workspaceId, Object columns) {
         Caller c = access.caller();
         CollabWorkspace ws = access.requireVisible(c, workspaceId);
-        requireEditPlan(c, ws);
+        // Columns shape the plan for EVERY programme — that is management.
+        if (!access.canManage(c, ws)) {
+            throw new BusinessException("COLLAB_NOT_OWNER",
+                    "Only the workspace owner can change the plan's columns", HttpStatus.FORBIDDEN);
+        }
         return columnsService.save(ws, c.userId(), columns);
     }
 
@@ -473,7 +478,13 @@ public class CollabPlanService {
         CollabWorkspace ws = access.requireVisible(c, workspaceId);
         requireEditPlan(c, ws);
         if (!(rawIds instanceof Collection<?> list) || list.isEmpty()) throw bad("COLLAB_BAD_ORDER", "Expected a list of item ids");
+        // Only items the caller can see: a member reordering their programme
+        // must not be able to move rows of a programme they are not on by
+        // sending its ids.
+        Set<Long> visibleProgs = workspaceService.visibleProgrammes(c, ws).stream()
+                .map(CollabProgramme::getId).collect(Collectors.toSet());
         Map<Long, CollabPlanItem> all = itemRepository.findByWorkspaceIdAndIsDeletedFalse(ws.getId()).stream()
+                .filter(i -> i.getProgrammeId() == null || visibleProgs.contains(i.getProgrammeId()))
                 .collect(Collectors.toMap(CollabPlanItem::getId, x -> x));
         List<CollabPlanItem> rows = new ArrayList<>();
         Set<Long> seen = new HashSet<>();
@@ -545,7 +556,7 @@ public class CollabPlanService {
                         m.get("status"), m.get("progress"),
                         link == null ? "" : (link.get("ref") != null ? link.get("ref") + " " : "") + link.get("name"),
                         m.get("dependsOn") == null ? "" : ((List<?>) m.get("dependsOn")).stream()
-                                .map(String::valueOf).collect(Collectors.joining(","))
+                                                          .map(String::valueOf).collect(Collectors.joining(","))
                 };
                 for (int k = 0; k < v.length; k++) {
                     Object val = v[k];
@@ -821,8 +832,17 @@ public class CollabPlanService {
 
     // ══════════════════════ HELPERS ══════════════════════════════════════════
 
+    /**
+     * Add and edit plan items: the owner, or any MEMBER of the workspace (not a
+     * VIEWER). A member only ever reaches items of programmes they are on —
+     * visibleProgrammes() filters every read and requireVisibleItem/
+     * programmeFor refuse anything else — so "may edit the plan" can never
+     * reach a programme they are not part of. (Previously gated on the
+     * collab:plan:edit permission, which members usually lacked and which,
+     * paired with collab:workspace:manage, opened every programme.)
+     */
     boolean canEditPlan(Caller c, CollabWorkspace ws) {
-        return CollabWorkspace.ACTIVE.equals(ws.getStatus()) && (access.canManage(c, ws) || c.holds(PERM_PLAN_EDIT));
+        return access.canContribute(c, ws);
     }
 
     private void requireEditPlan(Caller c, CollabWorkspace ws) {

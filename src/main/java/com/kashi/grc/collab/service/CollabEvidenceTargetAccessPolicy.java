@@ -68,9 +68,9 @@ public class CollabEvidenceTargetAccessPolicy implements EvidenceTargetAccessPol
         boolean ok = switch (entityType) {
             case WORKSPACE -> {
                 CollabWorkspace ws = workspace(c, entityId);
-                yield ws != null && CollabWorkspace.ACTIVE.equals(ws.getStatus())
-                        && (memberRepository.findByWorkspaceIdAndUserId(ws.getId(), c.userId()).isPresent()
-                            || access.canManage(c, ws));
+                // Owner or MEMBER (a VIEWER reads only); canContribute also
+                // requires the workspace to be ACTIVE.
+                yield ws != null && access.canContribute(c, ws);
             }
             case MEETING -> {
                 CollabMeeting m = meeting(c, entityId);

@@ -215,7 +215,9 @@ public class CollabWorkspaceService {
         Map<String, Object> out = summary(ws, tenantNames);
         out.put("clientName", tenantNames(Set.of(ws.getTenantId())).get(ws.getTenantId()));
         boolean manage = access.canManage(c, ws);
-        out.put("canManage", manage);
+        out.put("canManage", manage);                       // owner: members, programmes, settings
+        out.put("canContribute", access.canContribute(c, ws)); // owner or MEMBER: plan items, requests, rooms, meetings, documents
+        out.put("canTransferOwnership", manage || access.canOversee(c, ws));
         out.put("mySide", c.side());
 
         List<CollabWorkspaceMember> members = memberRepository.findByWorkspaceId(ws.getId());
@@ -312,7 +314,7 @@ public class CollabWorkspaceService {
                 .workspaceId(ws.getId())
                 .userId(userId)
                 .side(side)
-                .workspaceRole(normaliseRole(role))
+                .workspaceRole(nonOwnerRole(role))
                 .addedBy(c.userId())
                 .build();
         m.setTenantId(ws.getTenantId());
@@ -328,11 +330,15 @@ public class CollabWorkspaceService {
         CollabWorkspaceMember m = memberRepository.findById(memberId)
                 .filter(x -> x.getWorkspaceId().equals(ws.getId()))
                 .orElseThrow(() -> new ResourceNotFoundException("CollabWorkspaceMember", memberId));
-        String newRole = normaliseRole(role);
-        if (CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())
-                && !CollabWorkspaceMember.ROLE_OWNER.equals(newRole)) {
-            requireAnotherOwner(ws.getId());
+        // A workspace has exactly ONE owner. Ownership moves only through
+        // transferOwnership(), so this endpoint switches people between MEMBER
+        // and VIEWER and never touches the owner's row.
+        if (CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())) {
+            throw new BusinessException("COLLAB_OWNER_ROLE_FIXED",
+                    "The owner's role can't be changed here — transfer ownership to someone else first",
+                    HttpStatus.CONFLICT);
         }
+        String newRole = nonOwnerRole(role);
         m.setWorkspaceRole(newRole);
         memberRepository.save(m);
         return memberMap(m, users(Set.of(m.getUserId())).get(m.getUserId()));
@@ -345,9 +351,52 @@ public class CollabWorkspaceService {
         CollabWorkspaceMember m = memberRepository.findById(memberId)
                 .filter(x -> x.getWorkspaceId().equals(ws.getId()))
                 .orElseThrow(() -> new ResourceNotFoundException("CollabWorkspaceMember", memberId));
-        if (CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())) requireAnotherOwner(ws.getId());
+        if (CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())) {
+            throw new BusinessException("COLLAB_OWNER_CANNOT_LEAVE",
+                    "The owner can't be removed — transfer ownership to someone else first",
+                    HttpStatus.CONFLICT);
+        }
         programmeMemberRepository.deleteByWorkspaceIdAndUserId(ws.getId(), m.getUserId());
         memberRepository.delete(m);
+    }
+
+    /**
+     * Hands the workspace to another member. The target becomes the single
+     * OWNER; whoever owned it before (normally the caller) stays on as a MEMBER.
+     *
+     * Allowed for the current owner, and — as a rescue for a workspace whose
+     * owner has left — for organisation staff holding collab:workspace:manage
+     * (oversight). Any extra OWNER rows left over from before single
+     * ownership are folded back to MEMBER at the same time.
+     */
+    @Transactional
+    public Map<String, Object> transferOwnership(Long workspaceId, Long memberId) {
+        Caller c = access.caller();
+        CollabWorkspace ws = access.requireVisible(c, workspaceId);
+        if (!access.canManage(c, ws) && !access.canOversee(c, ws)) {
+            throw new BusinessException("COLLAB_NOT_OWNER",
+                    "Only the workspace owner can transfer ownership", HttpStatus.FORBIDDEN);
+        }
+        CollabWorkspaceMember target = memberRepository.findById(memberId)
+                .filter(x -> x.getWorkspaceId().equals(ws.getId()))
+                .orElseThrow(() -> new ResourceNotFoundException("CollabWorkspaceMember", memberId));
+        if (CollabWorkspaceMember.ROLE_OWNER.equals(target.getWorkspaceRole())
+                && memberRepository.countByWorkspaceIdAndWorkspaceRole(ws.getId(), CollabWorkspaceMember.ROLE_OWNER) == 1) {
+            return overview(ws.getId());   // already the sole owner — nothing to do
+        }
+        for (CollabWorkspaceMember m : memberRepository.findByWorkspaceId(ws.getId())) {
+            if (m.getId().equals(target.getId())) continue;
+            if (CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())) {
+                m.setWorkspaceRole(CollabWorkspaceMember.ROLE_MEMBER);
+                memberRepository.save(m);
+            }
+        }
+        target.setWorkspaceRole(CollabWorkspaceMember.ROLE_OWNER);
+        memberRepository.save(target);
+        notifyAdded(c, target.getUserId(), ws, "made you the owner of the workspace \"" + ws.getName() + "\"");
+        log.info("[COLLAB] Ownership transferred | ws={} | newOwnerUserId={} | by={}",
+                ws.getId(), target.getUserId(), c.userId());
+        return overview(ws.getId());
     }
 
     // ══════════════════════ PROGRAMMES ═══════════════════════════════════════
@@ -577,6 +626,16 @@ public class CollabWorkspaceService {
         if (memberRepository.countByWorkspaceIdAndWorkspaceRole(workspaceId, CollabWorkspaceMember.ROLE_OWNER) <= 1) {
             throw new BusinessException("COLLAB_LAST_OWNER", "A workspace must keep at least one owner");
         }
+    }
+
+    /** MEMBER or VIEWER. OWNER is refused here — it only arrives via transferOwnership(). */
+    private static String nonOwnerRole(String role) {
+        String r = normaliseRole(role);
+        if (CollabWorkspaceMember.ROLE_OWNER.equals(r)) {
+            throw new BusinessException("COLLAB_USE_TRANSFER",
+                    "A workspace has one owner — use Transfer ownership to hand it over", HttpStatus.CONFLICT);
+        }
+        return r;
     }
 
     private static String normaliseRole(String role) {

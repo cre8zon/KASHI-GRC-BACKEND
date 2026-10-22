@@ -22,6 +22,7 @@ import java.util.Map;
 /**
  * Authentication endpoints — all public (no JWT required).
  * POST /v1/auth/login
+ * POST /v1/auth/refresh
  * POST /v1/auth/logout
  * POST /v1/auth/request-password-reset
  * POST /v1/auth/reset-password
@@ -43,6 +44,27 @@ public class AuthController {
         return ResponseEntity.ok(response);
     }
 
+    /**
+     * Exchange a refresh token for a new access token.
+     *
+     * Public at the filter (the caller's access token has typically just
+     * expired — that is why they are here); the refresh token in the body is
+     * the credential. Body: { refreshToken, tenantId? } — tenantId keeps a
+     * guest session in the tenant it was in; omitted means the home tenant.
+     */
+    @PostMapping("/refresh")
+    @Operation(summary = "Exchange a refresh token for a new session")
+    public ResponseEntity<ApiResponse<?>> refresh(@RequestBody Map<String, Object> body) {
+        Object rawToken  = body == null ? null : body.get("refreshToken");
+        Object rawTenant = body == null ? null : body.get("tenantId");
+        Long tenantId = null;
+        if (rawTenant instanceof Number n) tenantId = n.longValue();
+        else if (rawTenant != null && !String.valueOf(rawTenant).isBlank()) {
+            try { tenantId = Long.parseLong(String.valueOf(rawTenant)); } catch (NumberFormatException ignored) { }
+        }
+        return ResponseEntity.ok(authService.refresh(rawToken == null ? null : String.valueOf(rawToken), tenantId));
+    }
+
     @PostMapping("/switch-tenant")
     @Operation(summary = "Re-issue the session scoped to another tenant this user belongs to")
     public ResponseEntity<ApiResponse<?>> switchTenant(@RequestBody Map<String, Object> body) {
@@ -52,10 +74,21 @@ public class AuthController {
         return ResponseEntity.ok(authService.switchTenant(userId, tenantId));
     }
 
+    /**
+     * Ends the session and revokes its refresh token.
+     *
+     * Public at the filter: a user whose access token has just expired must
+     * still be able to sign out, and the refresh token in the body is the only
+     * thing revoked — presenting a token can only ever kill that token.
+     * userId is accepted for backward compatibility and used only for logging.
+     */
     @PostMapping("/logout")
-    @Operation(summary = "Invalidate user session")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> logout(@RequestParam Long userId) {
-        authService.logout(userId);
+    @Operation(summary = "End the session and revoke its refresh token")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> logout(
+            @RequestParam(required = false) Long userId,
+            @RequestBody(required = false) Map<String, Object> body) {
+        Object raw = body == null ? null : body.get("refreshToken");
+        authService.logout(userId, raw == null ? null : String.valueOf(raw));
         return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "message", "Logged out successfully",
                 "logged_out_at", LocalDateTime.now()
@@ -69,7 +102,7 @@ public class AuthController {
         authService.requestPasswordReset(request);
         // Always return success to prevent user enumeration
         return ResponseEntity.ok(ApiResponse.success(Map.of(
-                "message", "Password reset link sent to your email",
+                "message", "If an account exists for this email, a reset link has been sent",
                 "email", request.getEmail(),
                 "expires_in_minutes", 15
         )));

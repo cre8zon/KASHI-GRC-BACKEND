@@ -38,8 +38,17 @@ import java.util.stream.Collectors;
  *       membership's firm IS the workspace's firm, and the client's grant to
  *       that firm is ACTIVE and unexpired.
  *
- *   Manage a workspace (members, programmes, settings): a workspace OWNER, or
- *   CLIENT staff holding collab:workspace:manage.
+ *   Manage a workspace (members, programmes, settings, archive): its OWNER —
+ *   exactly one person, the creator until ownership is transferred. Holding
+ *   collab:workspace:manage no longer makes someone a manager of workspaces
+ *   they do not own: it gives OVERSIGHT — see the workspace (not its
+ *   programmes) and transfer its ownership, so a workspace whose owner has
+ *   left can always be handed to someone.
+ *
+ *   Contribute (add plan items, raise requests, create rooms, schedule
+ *   meetings, upload documents): the owner, or a MEMBER of the workspace.
+ *   A VIEWER reads only. Within a workspace, non-owners see — and so can only
+ *   work in — the programmes they are on (CollabWorkspaceService.visibleProgrammes).
  *
  *   Create a workspace: collab:workspace:create, plus — for a firm workspace —
  *   an ACTIVE grant between this client and that firm. Firm people can only
@@ -114,12 +123,47 @@ public class CollabAccessService {
                 && activeGrant(ws.getTenantId(), ws.getFirmTenantId()).isPresent();
     }
 
+    /** The caller's member row in this workspace, if any. */
+    public Optional<CollabWorkspaceMember> membership(Caller c, CollabWorkspace ws) {
+        return memberRepository.findByWorkspaceIdAndUserId(ws.getId(), c.userId());
+    }
+
+    /** The workspace owner — and only the owner — manages it. */
     public boolean canManage(Caller c, CollabWorkspace ws) {
         if (!canSee(c, ws)) return false;
-        if (!c.guest() && c.holds(PERM_MANAGE)) return true;
-        return memberRepository.findByWorkspaceIdAndUserId(ws.getId(), c.userId())
+        return membership(c, ws)
                 .map(m -> CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole()))
                 .orElse(false);
+    }
+
+    /**
+     * Organisation oversight: CLIENT staff holding collab:workspace:manage.
+     * May see any workspace in their organisation and transfer its ownership;
+     * does NOT manage it or see its programmes unless they are on them.
+     */
+    public boolean canOversee(Caller c, CollabWorkspace ws) {
+        return canSee(c, ws) && !c.guest() && c.holds(PERM_MANAGE);
+    }
+
+    /** Owner or MEMBER (not VIEWER) of an ACTIVE workspace: may add work to it. */
+    public boolean canContribute(Caller c, CollabWorkspace ws) {
+        if (!canSee(c, ws) || !CollabWorkspace.ACTIVE.equals(ws.getStatus())) return false;
+        return membership(c, ws)
+                .map(m -> CollabWorkspaceMember.ROLE_OWNER.equals(m.getWorkspaceRole())
+                        || CollabWorkspaceMember.ROLE_MEMBER.equals(m.getWorkspaceRole()))
+                .orElse(false);
+    }
+
+    public CollabWorkspace requireContribute(Caller c, Long workspaceId) {
+        CollabWorkspace ws = requireVisible(c, workspaceId);
+        if (!CollabWorkspace.ACTIVE.equals(ws.getStatus())) {
+            throw new BusinessException("COLLAB_ARCHIVED", "This workspace is archived", HttpStatus.BAD_REQUEST);
+        }
+        if (!canContribute(c, ws)) {
+            throw new BusinessException("COLLAB_NOT_CONTRIBUTOR",
+                    "Only members of this workspace can add to it", HttpStatus.FORBIDDEN);
+        }
+        return ws;
     }
 
     /** Workspaces in the active tenant the caller may see. */

@@ -29,8 +29,10 @@ import java.util.Map;
  *   PATCH  /v1/collab/workspaces/{id}                             { name?, description?, status? }
  *   GET    /v1/collab/workspaces/{id}/eligible-members            people who can be added
  *   POST   /v1/collab/workspaces/{id}/members                     { userId, role }
- *   PATCH  /v1/collab/workspaces/{id}/members/{memberId}          { role }
- *   DELETE /v1/collab/workspaces/{id}/members/{memberId}
+ *   PATCH  /v1/collab/workspaces/{id}/members/{memberId}          { role: MEMBER | VIEWER }
+ *   DELETE /v1/collab/workspaces/{id}/members/{memberId}            (never the owner)
+ *   POST   /v1/collab/workspaces/{id}/members/{memberId}/transfer-ownership
+ *                                                                  that member becomes the one owner
  *   POST   /v1/collab/workspaces/{id}/programmes                  { name, description, plannedStart, plannedEnd }
  *   PATCH  /v1/collab/workspaces/{id}/programmes/{pid}            same fields + status
  *   POST   /v1/collab/workspaces/{id}/programmes/{pid}/members    { userId }
@@ -102,6 +104,13 @@ public class CollabController {
                                                                        @PathVariable Long memberId,
                                                                        @RequestBody Map<String, Object> body) {
         return ResponseEntity.ok(ApiResponse.success(service.changeRole(id, memberId, str(body.get("role")))));
+    }
+
+    @PostMapping("/workspaces/{id}/members/{memberId}/transfer-ownership")
+    @Operation(summary = "Make this member the workspace's owner (owner, or organisation oversight)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> transferOwnership(@PathVariable Long id,
+                                                                              @PathVariable Long memberId) {
+        return ResponseEntity.ok(ApiResponse.success(service.transferOwnership(id, memberId)));
     }
 
     @DeleteMapping("/workspaces/{id}/members/{memberId}")
