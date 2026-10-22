@@ -162,6 +162,17 @@ public class SecurityConfig {
                         // Same discipline: each endpoint listed, the prefix denied.
                         // The enquiry POST is honeypot- and rate-limited in
                         // EnquiryService; it never reveals whether an email exists.
+                        // ── IN-APP CALL GUESTS ──────────────────────────────────
+                        // Someone without an account opening a call link. The
+                        // link code (80 random bits) names the call and tenant;
+                        // a person in the call must admit them; their poll is
+                        // proved with a 256-bit secret. Rate-limited in
+                        // CollabCallLinkService. Each endpoint listed, rest denied.
+                        .requestMatchers(HttpMethod.GET,  "/v1/collab/public/call-links/*").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/collab/public/call-links/*/knock").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/collab/public/call-links/requests/*/status").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/collab/public/call-links/requests/*/leave").permitAll()
+                        .requestMatchers("/v1/collab/public/**").denyAll()
                         .requestMatchers(HttpMethod.GET,  "/v1/billing/public/plans").permitAll()
                         .requestMatchers("/v1/billing/public/**").denyAll()
                         .requestMatchers(HttpMethod.POST, "/v1/enquiries/public").permitAll()

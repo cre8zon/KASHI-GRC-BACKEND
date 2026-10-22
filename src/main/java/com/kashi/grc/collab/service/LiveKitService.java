@@ -97,6 +97,65 @@ public class LiveKitService {
     }
 
     /**
+     * A token for a GUEST let in through a call link (CollabCallLinkService),
+     * after someone in the call admitted them. Narrower than a member's token:
+     *   • identity "g{requestId}.{random}" — never collides with a user's
+     *     "u{userId}…", so participants() and the UI can tell them apart;
+     *   • metadata {"guest":true} — the call shows them as a guest;
+     *   • publish camera, microphone and screen only (no data-channel tricks
+     *     beyond chat, no metadata changes, never room admin or recording).
+     * Same TTL as everyone (LiveKit refreshes it while they stay connected).
+     */
+    public String guestToken(String identity, String displayName, String room) {
+        Map<String, Object> grant = new LinkedHashMap<>();
+        grant.put("room", room);
+        grant.put("roomJoin", true);
+        grant.put("canPublish", true);
+        grant.put("canPublishSources", List.of("camera", "microphone", "screen_share", "screen_share_audio"));
+        grant.put("canSubscribe", true);
+        grant.put("canPublishData", true);
+        grant.put("canUpdateOwnMetadata", false);
+        Map<String, Object> claims = new LinkedHashMap<>();
+        claims.put("sub", identity);
+        claims.put("name", displayName);
+        claims.put("metadata", "{\"guest\":true}");
+        claims.put("video", grant);
+        return sign(claims, ttlSeconds);
+    }
+
+    /** A fresh guest identity for one admitted request. */
+    public static String guestIdentity(Long requestId) {
+        return "g" + requestId + "." + Long.toString(RANDOM.nextLong() & Long.MAX_VALUE, 36).substring(0, 6);
+    }
+
+    /**
+     * Put someone out of a room now (a removed guest). Best effort: false when
+     * the server could not be reached or they had already left — the request
+     * is marked REMOVED either way, so they cannot get a new token.
+     */
+    public boolean removeParticipant(String room, String identity) {
+        if (!enabled() || room == null || identity == null) return false;
+        try {
+            Map<String, Object> grant = Map.of("room", room, "roomAdmin", true);
+            String token = sign(Map.of("sub", "kashigrc-server", "video", grant), 60);
+            HttpRequest req = HttpRequest.newBuilder(URI.create(apiBase() + "/twirp/livekit.RoomService/RemoveParticipant"))
+                    .timeout(Duration.ofSeconds(3))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(objectMapper.writeValueAsString(Map.of("room", room, "identity", identity))))
+                    .build();
+            return HTTP.send(req, HttpResponse.BodyHandlers.ofString()).statusCode() / 100 == 2;
+        } catch (Exception e) {
+            log.debug("[LIVEKIT] Could not remove {} from {}: {}", identity, room, e.getMessage());
+            return false;
+        }
+    }
+
+    private String apiBase() {
+        return url.replaceFirst("^wss://", "https://").replaceFirst("^ws://", "http://").replaceAll("/+$", "");
+    }
+
+    /**
      * Who is in these rooms right now: room → distinct user ids. Missing from
      * the map when the server could not be asked (calls still work; the UI
      * simply shows no live count).

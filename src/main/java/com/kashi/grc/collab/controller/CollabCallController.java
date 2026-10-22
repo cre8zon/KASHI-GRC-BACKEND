@@ -1,5 +1,6 @@
 package com.kashi.grc.collab.controller;
 
+import com.kashi.grc.collab.service.CollabCallLinkService;
 import com.kashi.grc.collab.service.CollabCallService;
 import com.kashi.grc.common.dto.ApiResponse;
 import io.swagger.v3.oas.annotations.Operation;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.Map;
@@ -31,6 +33,16 @@ import java.util.Map;
  *   POST  /v1/collab/rooms/{id}/join           a token for the room (joins the meeting on now,
  *                                              or the running drop-in session, or starts one)
  *
+ *
+ * Call links and the lobby (CollabCallLinkService):
+ *   POST  /v1/collab/calls/link                { meetingId } → the call's link (created on first ask)
+ *   PATCH /v1/collab/calls/link                { meetingId, allowGuests?, regenerate? } — whoever runs the call
+ *   GET   /v1/collab/calls/lobby?meetingId=    guests waiting to be let in, and guests in the call
+ *   POST  /v1/collab/calls/lobby/{id}/{action}?meetingId=  admit | deny | remove (meetingId = the call you are in)
+ *   POST  /v1/collab/call-links/{code}/join    opened by a signed-in user: { mode: DIRECT, …join } or { mode: GUEST }
+ *   GET   /v1/collab/call-links/{code}         a chat card's preview: { title, active }
+ * The guest's own endpoints are in CollabCallPublicController.
+ *
  * A join answer is { url, token, room, title, expiresIn }. Rules are in
  * CollabCallService.
  */
@@ -41,6 +53,7 @@ import java.util.Map;
 public class CollabCallController {
 
     private final CollabCallService service;
+    private final CollabCallLinkService links;
 
     @GetMapping("/calls/options")
     @Operation(summary = "Whether in-app calls are available, and whether the caller can start one")
@@ -94,5 +107,52 @@ public class CollabCallController {
     @Operation(summary = "Join a standing room")
     public ResponseEntity<ApiResponse<Map<String, Object>>> joinRoom(@PathVariable Long id) {
         return ResponseEntity.ok(ApiResponse.success(service.joinRoom(id)));
+    }
+
+    // ── call links & lobby ────────────────────────────────────────────────────
+
+    @PostMapping("/calls/link")
+    @Operation(summary = "The call's shareable link (created on first ask)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> link(@RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(links.link(meetingId(body))));
+    }
+
+    @PatchMapping("/calls/link")
+    @Operation(summary = "Allow or stop guests, or replace the link")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> updateLink(@RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(links.updateLink(meetingId(body), body)));
+    }
+
+    @GetMapping("/calls/lobby")
+    @Operation(summary = "Guests waiting to join this call, and guests in it")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> lobby(@RequestParam Long meetingId) {
+        return ResponseEntity.ok(ApiResponse.success(links.lobby(meetingId)));
+    }
+
+    @PostMapping("/calls/lobby/{id}/{action}")
+    @Operation(summary = "Admit, turn away or remove a guest")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> decide(@PathVariable Long id, @PathVariable String action,
+                                                                   @RequestParam(required = false) Long meetingId) {
+        return ResponseEntity.ok(ApiResponse.success(links.decide(id, action, meetingId)));
+    }
+
+    @PostMapping("/call-links/{code}/join")
+    @Operation(summary = "Open a call link while signed in")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> openLink(@PathVariable String code) {
+        return ResponseEntity.ok(ApiResponse.success(links.openSignedIn(code)));
+    }
+
+    @GetMapping("/call-links/{code}")
+    @Operation(summary = "What a call link points at, for a chat card")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> preview(@PathVariable String code) {
+        return ResponseEntity.ok(ApiResponse.success(links.preview(code)));
+    }
+
+    private static Long meetingId(Map<String, Object> body) {
+        Object v = body == null ? null : body.get("meetingId");
+        try { return Long.parseLong(String.valueOf(v)); }
+        catch (NumberFormatException e) {
+            throw new com.kashi.grc.common.exception.BusinessException("COLLAB_BAD_ID", "meetingId is required");
+        }
     }
 }
