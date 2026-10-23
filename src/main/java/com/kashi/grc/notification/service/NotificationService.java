@@ -293,4 +293,151 @@ public class NotificationService {
             publish.run();
         }
     }
+
+    // ══════════════════════ READ ══════════════════════════════════════════════
+    //
+    // A notification is read when its subject has been dealt with, not only
+    // when it is clicked on the Notifications page:
+    //   • markReadForEntity — the owning module says so (chat: the conversation
+    //     was read, or replied to);
+    //   • markVisited       — the person opened the page a notification points
+    //     to, by any route (a link, the sidebar, a bookmark);
+    //   • markAllRead       — every unread one, not just the page on screen.
+    // Each pushes NOTIFICATIONS_READ on the user's topic, so the bell, the page
+    // and the sidebar badge update in every open tab at once.
+
+    public long unreadCount(Long userId) {
+        return notificationRepository.countByUserIdAndReadAtIsNull(userId);
+    }
+
+    @Transactional
+    public int markAllRead(Long userId) {
+        int n = notificationRepository.markAllRead(userId, LocalDateTime.now());
+        if (n > 0) pushRead(userId);
+        return n;
+    }
+
+    @Transactional
+    public int markReadForEntity(Long userId, String entityType, Long entityId) {
+        if (userId == null) return 0;
+        int n = notificationRepository.markReadForEntity(userId, entityType, entityId, LocalDateTime.now());
+        if (n > 0) pushRead(userId);
+        return n;
+    }
+
+    /**
+     * The user is looking at {@code path}?{@code query}: their unread
+     * notifications about what is on that screen are read.
+     *
+     *   With an address (action_url): same path, and every query parameter of
+     *   the address present with the same value — so a workspace's REQUESTS
+     *   notification needs the Requests tab open, and a comment notification
+     *   the Comments tab. ?join=1 is ignored (it only starts a call).
+     *   Without one: the entity's own detail page, or the entity open in a
+     *   side drawer (?drawerType=&drawerId=). List pages (the inbox, action
+     *   items) never mark anything — seeing a list is not dealing with it.
+     */
+    @Transactional
+    public int markVisited(Long userId, String path, String query) {
+        if (userId == null || path == null || path.isBlank()) return 0;
+        String p = normPath(path);
+        Map<String, String> q = parseQuery(query);
+        String drawerType = q.get("drawerType");
+        Long drawerId = parseLong(q.get("drawerId"));
+        List<Long> ids = new java.util.ArrayList<>();
+        for (Notification n : notificationRepository.findByUserIdAndReadAtIsNull(userId)) {
+            if (visited(n, p, q, drawerType, drawerId)) ids.add(n.getId());
+        }
+        if (ids.isEmpty()) return 0;
+        int done = notificationRepository.markRead(userId, ids, LocalDateTime.now());
+        if (done > 0) pushRead(userId);
+        return done;
+    }
+
+    private static final java.util.Set<String> IGNORED_PARAMS = java.util.Set.of("join");
+
+    /** Detail pages for entity types whose notifications carry no address (the client's fallback routes). */
+    private static final Map<String, String> ENTITY_PAGES = Map.ofEntries(
+            Map.entry("TASK", "/workflow/tasks/"),
+            Map.entry("VENDOR", "/tprm/vendors/"),
+            Map.entry("ASSESSMENT", "/module/vendor_assessment/"),
+            Map.entry("AUDIT_ENGAGEMENT", "/module/audit_engagement/"),
+            Map.entry("AUDIT_PROJECT", "/module/audit_project/"),
+            Map.entry("AUDIT_CONTROL_INSTANCE", "/module/audit_control_instance/"),
+            Map.entry("AUDIT_TEST_INSTANCE", "/module/audit_test_instance/"),
+            Map.entry("AUDIT_POLICY_INSTANCE", "/module/audit_policy_instance/"),
+            Map.entry("AUDIT_FINDING", "/module/audit_finding/"),
+            Map.entry("ISSUE", "/module/issue/"),
+            Map.entry("COLLAB_MEETING", "/collaboration/meetings/"),
+            Map.entry("COLLAB_ROOM", "/collaboration/rooms/"),
+            Map.entry("CHAT_CONVERSATION", "/chat/"));
+
+    private static boolean visited(Notification n, String path, Map<String, String> query, String drawerType, Long drawerId) {
+        String url = n.getActionUrl();
+        if (url != null && !url.isBlank()) {
+            int qi = url.indexOf('?');
+            String aPath = normPath(qi < 0 ? url : url.substring(0, qi));
+            if (aPath.equals(path)) {
+                Map<String, String> aQuery = parseQuery(qi < 0 ? null : url.substring(qi + 1));
+                for (Map.Entry<String, String> e : aQuery.entrySet()) {
+                    if (IGNORED_PARAMS.contains(e.getKey())) continue;
+                    if (!e.getValue().equals(query.get(e.getKey()))) return false;
+                }
+                return true;
+            }
+        }
+        if (n.getEntityType() == null || n.getEntityId() == null) return false;
+        if (drawerType != null && drawerId != null
+                && drawerType.equalsIgnoreCase(n.getEntityType()) && drawerId.equals(n.getEntityId())) return true;
+        if (url == null || url.isBlank()) {
+            String page = ENTITY_PAGES.get(n.getEntityType());
+            return page != null && path.equals(normPath(page + n.getEntityId()));
+        }
+        return false;
+    }
+
+    private static String normPath(String p) {
+        String s = p == null ? "" : p.trim();
+        int h = s.indexOf('#');
+        if (h >= 0) s = s.substring(0, h);
+        while (s.length() > 1 && s.endsWith("/")) s = s.substring(0, s.length() - 1);
+        return s.toLowerCase();
+    }
+
+    private static Map<String, String> parseQuery(String q) {
+        Map<String, String> out = new HashMap<>();
+        if (q == null || q.isBlank()) return out;
+        for (String part : (q.startsWith("?") ? q.substring(1) : q).split("&")) {
+            if (part.isEmpty()) continue;
+            int eq = part.indexOf('=');
+            String k = java.net.URLDecoder.decode(eq < 0 ? part : part.substring(0, eq), java.nio.charset.StandardCharsets.UTF_8);
+            String v = eq < 0 ? "" : java.net.URLDecoder.decode(part.substring(eq + 1), java.nio.charset.StandardCharsets.UTF_8);
+            out.put(k, v);
+        }
+        return out;
+    }
+
+    private static Long parseLong(String s) {
+        try { return s == null ? null : Long.parseLong(s.trim()); } catch (NumberFormatException e) { return null; }
+    }
+
+    /** Tell the user's open tabs that notifications were read (after commit). */
+    private void pushRead(Long userId) {
+        SimpMessagingTemplate messaging = messagingProvider.getIfAvailable();
+        if (messaging == null || userId == null) return;
+        Runnable send = () -> {
+            try {
+                messaging.convertAndSend("/topic/user/" + userId, Map.of("type", "NOTIFICATIONS_READ"));
+            } catch (RuntimeException e) {
+                log.debug("[NOTIFY-PUSH] Read push failed, clients will poll | {}", e.getMessage());
+            }
+        };
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override public void afterCommit() { send.run(); }
+            });
+        } else {
+            send.run();
+        }
+    }
 }

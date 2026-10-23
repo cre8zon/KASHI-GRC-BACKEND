@@ -40,6 +40,11 @@ public class ChatMessage extends TenantAwareEntity {
     @lombok.Builder.Default
     private boolean deleted = false;
 
+    /** A copy forwarded from another message (shown as "Forwarded", as in WhatsApp). */
+    @Column(name = "forwarded", nullable = false)
+    @lombok.Builder.Default
+    private boolean forwarded = false;
+
     /** The message this one answers (same conversation). */
     @Column(name = "reply_to_id")
     private Long replyToId;

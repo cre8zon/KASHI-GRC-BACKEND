@@ -91,7 +91,7 @@ public class ChatService {
     /** Entity type chat files are linked to in the document module. */
     public static final String DOC_ENTITY = "CHAT_CONVERSATION";
     private static final int MAX_BODY = 8000;
-    private static final int MAX_FILES = 10;
+    private static final int MAX_FILES = 30;   // files in one message (TEXT column: ~200 bytes each)
     private static final int MAX_REACTIONS_PER_PERSON = 20;
     /** Last "typing" push per user + conversation — at most one every 2 seconds. */
     private static final Map<String, Long> TYPING_AT = new ConcurrentHashMap<>();
@@ -549,10 +549,102 @@ public class ChatService {
 
     @Transactional
     public Map<String, Object> send(Long conversationId, Map<String, Object> body) {
+        return send(conversationId, body, false);
+    }
+
+    /** Forward one message — see {@link #forwardMany}. */
+    @Transactional
+    public Map<String, Object> forward(Long messageId, Map<String, Object> body) {
+        return forwardMany(List.of(messageId), ids(body.get("conversationIds")));
+    }
+
+    /** Forward several messages at once: { messageIds, conversationIds } — see {@link #forwardMany}. */
+    @Transactional
+    public Map<String, Object> forwardMessages(Map<String, Object> body) {
+        return forwardMany(ids(body.get("messageIds")), ids(body.get("conversationIds")));
+    }
+
+    public static final int FORWARD_MAX_MESSAGES = 30;
+    public static final int FORWARD_MAX_CHATS = 5;
+
+    /**
+     * Forward up to 30 messages to up to 5 conversations — their text and
+     * files, as new messages marked "Forwarded", in the order they were first
+     * sent (whatever order they were picked in). Each copy goes through send(),
+     * so every rule of sending applies (a member of the target, not archived,
+     * the target's members notified). Not carried over: the originals'
+     * @mentions (nobody is re-notified) and reply links.
+     *
+     * All or nothing: every message and every target is checked before the
+     * first copy is made, and the whole forward is one transaction.
+     *
+     * Files: a chat file is readable only by members of the conversation it is
+     * linked to (ChatDocumentAccessPolicy), so the SAME stored document is
+     * linked to each target — no copy in S3, and the target's members can open
+     * it. The caller may forward only what they can see: a member of each
+     * source conversation, no message deleted.
+     */
+    private Map<String, Object> forwardMany(List<Long> messageIds, List<Long> conversationIds) {
+        Caller c = requireChat();
+        Set<Long> msgIds = new LinkedHashSet<>(messageIds);
+        Set<Long> targets = new LinkedHashSet<>(conversationIds);
+        if (msgIds.isEmpty()) throw bad("CHAT_FORWARD_NONE", "Choose a message to forward");
+        if (msgIds.size() > FORWARD_MAX_MESSAGES) throw bad("CHAT_FORWARD_TOO_MANY", "Forward at most " + FORWARD_MAX_MESSAGES + " messages at a time");
+        if (targets.isEmpty()) throw bad("CHAT_FORWARD_TARGET", "Choose a chat to forward to");
+        if (targets.size() > FORWARD_MAX_CHATS) throw bad("CHAT_FORWARD_LIMIT", "Forward to at most " + FORWARD_MAX_CHATS + " chats at a time");
+
+        List<ChatMessage> sources = new ArrayList<>();
+        for (Long id : msgIds) {
+            ChatMessage src = requireMessage(c, id);
+            if (src.isDeleted()) throw bad("CHAT_DELETED", "A message you picked was deleted");
+            sources.add(src);
+        }
+        sources.sort(java.util.Comparator.comparing(ChatMessage::getId));      // the order they were sent
+
+        List<ChatConversation> convs = new ArrayList<>();
+        for (Long targetId : targets) {
+            ChatConversation conv = requireConversation(c, targetId);
+            requireMember(c, conv);
+            if (conv.isArchived()) throw bad("CHAT_ARCHIVED", (conv.getName() != null ? "\"" + conv.getName() + "\"" : "That chat") + " is archived");
+            convs.add(conv);
+        }
+
+        List<Map<String, Object>> sent = new ArrayList<>();
+        for (ChatConversation conv : convs) {
+            for (ChatMessage src : sources) {
+                List<Long> docIds = new ArrayList<>();
+                for (Map<String, Object> f : readList(src.getAttachmentsJson())) {
+                    Long docId = longOrNull(f.get("documentId"));
+                    if (docId == null) continue;
+                    if (documentLinkRepository.findByDocumentIdAndEntityTypeAndEntityIdAndLinkType(docId, DOC_ENTITY, conv.getId(), "ATTACHMENT").isEmpty()) {
+                        documentLinkRepository.save(com.kashi.grc.document.domain.DocumentLink.builder()
+                                .tenantId(c.tenantId()).documentId(docId)
+                                .entityType(DOC_ENTITY).entityId(conv.getId()).linkType("ATTACHMENT")
+                                .createdBy(c.userId()).createdAt(LocalDateTime.now())
+                                .build());
+                    }
+                    docIds.add(docId);
+                }
+                Map<String, Object> copy = new LinkedHashMap<>();
+                copy.put("body", src.getBody());
+                copy.put("attachmentIds", docIds);
+                sent.add(send(conv.getId(), copy, true));
+            }
+        }
+        log.info("[CHAT] Forwarded | messages={} | to={} | by={}", msgIds, targets, c.userId());
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("forwarded", sent.size());
+        out.put("messages", sent);
+        return out;
+    }
+
+    private Map<String, Object> send(Long conversationId, Map<String, Object> body, boolean forwarded) {
         Caller c = requireChat();
         ChatConversation conv = requireConversation(c, conversationId);
         ChatMember me = requireMember(c, conv);
         if (conv.isArchived()) throw bad("CHAT_ARCHIVED", "This conversation is archived");
+        // Replying means the conversation was read: clear its notifications.
+        readChatNotifications(c.userId(), conv.getId());
         List<Map<String, Object>> files = attachmentsFor(c, conv, ids(body.get("attachmentIds")));
         // A message is text, files, or both — files alone need no text.
         String text = files.isEmpty() ? cleanBody(body.get("body")) : cleanOptionalBody(body.get("body"));
@@ -577,6 +669,7 @@ public class ChatService {
                 .mentions(mentions.isEmpty() ? null : mentions.stream().map(String::valueOf).collect(Collectors.joining(",")))
                 .replyToId(replyTarget == null ? null : replyTarget.getId())
                 .attachmentsJson(files.isEmpty() ? null : write(files))
+                .forwarded(forwarded)
                 .build();
         m.setTenantId(c.tenantId());
         messageRepository.save(m);
@@ -682,6 +775,9 @@ public class ChatService {
             memberRepository.save(me);
             mark(conv, c.userId(), ChatReadMark.READ, upTo, now);
             ping(conv.getId(), Set.of(c.userId()));    // my other tabs clear the badge too
+            // Read the conversation → its notifications (messages, mentions,
+            // replies) are read too, so the bell and the Notifications page agree.
+            readChatNotifications(c.userId(), conv.getId());
             // Everyone else: the ticks move. A light push, no refetch of messages.
             Set<Long> others = memberIds(conv.getId());
             others.remove(c.userId());
@@ -837,6 +933,15 @@ public class ChatService {
 
     // ══════════════════════ HELPERS ══════════════════════════════════════════
 
+    /** This person's notifications about one conversation are read (never fails the chat action). */
+    private void readChatNotifications(Long userId, Long conversationId) {
+        try {
+            notificationService.markReadForEntity(userId, DOC_ENTITY, conversationId);
+        } catch (RuntimeException e) {
+            log.debug("[CHAT] Could not mark notifications read | conv={} | {}", conversationId, e.getMessage());
+        }
+    }
+
     private ChatMessage requireMessage(Caller c, Long id) {
         ChatMessage m = messageRepository.findById(id).filter(x -> x.getTenantId().equals(c.tenantId()))
                 .orElseThrow(() -> new ResourceNotFoundException("ChatMessage", id));
@@ -958,6 +1063,7 @@ public class ChatService {
             x.put("createdAt", m.getCreatedAt());
             x.put("mine", m.getSenderId().equals(c.userId()));
             x.put("attachments", m.isDeleted() ? List.of() : readList(m.getAttachmentsJson()));
+            x.put("forwarded", m.isForwarded());
             ChatMessage r = m.getReplyToId() == null ? null : replied.get(m.getReplyToId());
             if (r != null) {
                 Map<String, Object> rt = new LinkedHashMap<>();
