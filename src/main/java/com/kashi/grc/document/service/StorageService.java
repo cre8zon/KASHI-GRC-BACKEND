@@ -152,6 +152,46 @@ public class StorageService {
      */
     private static final long MAX_VIDEO_FILE_SIZE_BYTES = 500L * 1024 * 1024; // 500MB
 
+    /**
+     * Chat files (documentType CHAT_FILE) follow WhatsApp's rules, not the
+     * evidence ones: almost any kind of file (SVG included), up to 100 MB,
+     * sent as uploaded.
+     *
+     *   • ANY type is accepted except executables and scripts (and HTML pages,
+     *     a phishing vehicle) — by extension AND by MIME type, because browsers
+     *     send an empty type for many real documents (.7z, .msg, .dwg…).
+     *   • 100 MB ceiling — not WhatsApp's 2 GB: chat carries working files,
+     *     and multi-GB uploads are a storage bill and a long wait. A chat
+     *     file goes browser → S3 on a presigned PUT; the app server never
+     *     holds the bytes. Photos up to 10 MB (the server's multipart limit)
+     *     still take the WebP route (/upload-image), like WhatsApp compressing
+     *     a photo; anything larger comes here and is kept at full quality.
+     *   • No WebP conversion on this path: a GIF keeps its animation, a large
+     *     image its resolution.
+     * Scoped to CHAT_FILE so evidence, policies and vendor documents keep
+     * their stricter list and 50 MB ceiling.
+     */
+    public static final String CHAT_DOCUMENT_TYPE = "CHAT_FILE";
+    private static final long MAX_CHAT_FILE_SIZE_BYTES = 100L * 1024 * 1024; // 100 MB — keep in step with chatFiles.js FILE_MAX
+    private static final Set<String> CHAT_BLOCKED_EXTENSIONS = Set.of(
+            "exe", "msi", "msp", "msix", "appx", "bat", "cmd", "com", "scr", "pif", "cpl",
+            "vbs", "vbe", "js", "jse", "mjs", "wsf", "wsh", "hta", "ps1", "psm1", "psd1",
+            "sh", "bash", "zsh", "csh", "ksh", "command", "jar", "jnlp", "apk", "aab", "ipa",
+            "app", "dmg", "pkg", "deb", "rpm", "run", "bin", "elf", "dll", "sys", "drv",
+            "lnk", "reg", "inf", "scf", "url", "html", "htm", "xhtml", "shtml", "mht", "mhtml");
+    private static final Set<String> CHAT_BLOCKED_MIME_TYPES = Set.of(
+            "application/x-msdownload", "application/x-msdos-program", "application/x-ms-installer",
+            "application/x-msi", "application/vnd.microsoft.portable-executable", "application/x-dosexec",
+            "application/x-executable", "application/x-sh", "application/x-csh", "application/x-bat",
+            "application/x-powershell", "application/java-archive", "application/x-java-jnlp-file",
+            "application/vnd.android.package-archive", "application/x-apple-diskimage",
+            "application/javascript", "text/javascript", "application/x-javascript",
+            "text/html", "application/xhtml+xml", "application/hta");
+
+    public static boolean isChatFile(String documentType) {
+        return documentType != null && CHAT_DOCUMENT_TYPE.equalsIgnoreCase(documentType);
+    }
+
     private static final Set<String> IMAGE_MIME_TYPES = Set.of(
             "image/jpeg", "image/png", "image/gif",
             "image/tiff", "image/heic", "image/heif"
@@ -203,11 +243,17 @@ public class StorageService {
             Long fileSizeBytes, String documentType, String entityType, Long entityId) {
 
         // ── Validate ──────────────────────────────────────────────────────
-        validateMimeType(mimeType, documentType);
+        boolean chat = isChatFile(documentType);
+        if (chat) {
+            if (mimeType == null || mimeType.isBlank()) mimeType = "application/octet-stream";
+            validateChatFile(fileName, mimeType);
+        } else {
+            validateMimeType(mimeType, documentType);
+        }
         validateFileSize(fileSizeBytes, documentType);
 
-        // Determine if image needs conversion
-        boolean willConvertToWebP = IMAGE_MIME_TYPES.contains(mimeType);
+        // Determine if image needs conversion (never for chat: kept as sent)
+        boolean willConvertToWebP = !chat && IMAGE_MIME_TYPES.contains(mimeType);
         String effectiveMimeType  = willConvertToWebP ? "image/webp" : mimeType;
         String effectiveExtension = willConvertToWebP
                 ? "webp"
@@ -776,15 +822,50 @@ public class StorageService {
     private void validateFileSize(Long size, String documentType) {
         boolean videoUpload = documentType != null
                 && VIDEO_DOCUMENT_TYPES.contains(documentType.toUpperCase());
-        long ceiling = videoUpload ? MAX_VIDEO_FILE_SIZE_BYTES : MAX_FILE_SIZE_BYTES;
+        long ceiling = isChatFile(documentType) ? MAX_CHAT_FILE_SIZE_BYTES
+                : videoUpload ? MAX_VIDEO_FILE_SIZE_BYTES : MAX_FILE_SIZE_BYTES;
 
         if (size != null && size > ceiling) {
             throw new com.kashi.grc.common.exception.BusinessException(
                     "FILE_TOO_LARGE",
-                    "File size " + (size / 1024 / 1024) + "MB exceeds the "
-                            + (ceiling / 1024 / 1024) + "MB limit.",
+                    "File size " + humanSize(size) + " exceeds the " + humanSize(ceiling) + " limit.",
                     org.springframework.http.HttpStatus.BAD_REQUEST);
         }
+    }
+
+    /**
+     * The real size, checked once the bytes are in S3 (confirm step). The
+     * presigned PUT cannot cap the body, so a client could declare 1 KB and
+     * send 5 GB; this catches it and removes the object. Chat files only —
+     * the other document types keep their existing behaviour.
+     */
+    public void requireChatSizeWithinLimit(String s3Key, Long actualBytes, String documentType) {
+        if (!isChatFile(documentType) || actualBytes == null || actualBytes <= MAX_CHAT_FILE_SIZE_BYTES) return;
+        try {
+            s3Client.deleteObject(b -> b.bucket(bucket).key(s3Key));
+        } catch (RuntimeException e) {
+            log.warn("[STORAGE] Could not delete oversize chat upload {}: {}", s3Key, e.getMessage());
+        }
+        validateFileSize(actualBytes, documentType);   // throws FILE_TOO_LARGE
+    }
+
+    /** A chat file: anything but executables, scripts and web pages. */
+    private void validateChatFile(String fileName, String mimeType) {
+        String ext = extractExtension(fileName == null ? "" : fileName);
+        ext = ext == null ? "" : ext.toLowerCase();
+        String mime = mimeType == null ? "" : mimeType.toLowerCase().split(";")[0].trim();
+        if (CHAT_BLOCKED_EXTENSIONS.contains(ext) || CHAT_BLOCKED_MIME_TYPES.contains(mime)) {
+            throw new com.kashi.grc.common.exception.BusinessException(
+                    "CHAT_FILE_TYPE_BLOCKED",
+                    "Programs, scripts and web pages can't be sent in chat"
+                            + (ext.isEmpty() ? "" : " (." + ext + ")") + ". Zip it, or share it another way.",
+                    org.springframework.http.HttpStatus.BAD_REQUEST);
+        }
+    }
+
+    private static String humanSize(long bytes) {
+        if (bytes >= 1024L * 1024 * 1024) return String.format("%.1f GB", bytes / (1024.0 * 1024 * 1024)).replace(".0 ", " ");
+        return (bytes / 1024 / 1024) + " MB";
     }
 
     private String computeSha256(byte[] bytes) {

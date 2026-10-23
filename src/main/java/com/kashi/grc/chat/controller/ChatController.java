@@ -231,6 +231,18 @@ public class ChatController {
         return ResponseEntity.ok(ApiResponse.success(service.react(id, body)));
     }
 
+    @PostMapping("/messages/forward")
+    @Operation(summary = "Forward several messages (up to 30, in the order sent) to up to 5 chats: { messageIds, conversationIds }")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> forwardMessages(@RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(service.forwardMessages(body)));
+    }
+
+    @PostMapping("/messages/{id}/forward")
+    @Operation(summary = "Forward a message (text and files) to up to 5 chats: { conversationIds }")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> forward(@PathVariable Long id, @RequestBody Map<String, Object> body) {
+        return ResponseEntity.ok(ApiResponse.success(service.forward(id, body)));
+    }
+
     @PostMapping("/messages/{id}/pin")
     @Operation(summary = "Pin or unpin a message")
     public ResponseEntity<ApiResponse<Map<String, Object>>> pin(@PathVariable Long id, @RequestBody Map<String, Object> body) {

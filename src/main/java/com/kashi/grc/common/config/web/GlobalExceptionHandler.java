@@ -69,6 +69,19 @@ public class GlobalExceptionHandler {
                                 "Please check your input and try again."));
     }
 
+    // ── Upload over the server's multipart limit ─────────────────
+    // Thrown before any controller runs (photo uploads post through the
+    // server). Unhandled, it reached the browser as a bare error or a reset
+    // connection, and the upload just stopped with nothing on screen.
+    @ExceptionHandler(org.springframework.web.multipart.MaxUploadSizeExceededException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMaxUpload(org.springframework.web.multipart.MaxUploadSizeExceededException ex) {
+        log.warn("[UPLOAD] Rejected over the multipart limit: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
+                .body(ApiResponse.error("FILE_TOO_LARGE",
+                        "This file is larger than the server accepts for this upload. "
+                                + "Photos can be up to 10 MB; larger ones are sent as files."));
+    }
+
     // ── Business / domain exceptions ─────────────────────────────
     @ExceptionHandler(BusinessException.class)
     public ResponseEntity<ApiResponse<Void>> handleBusiness(BusinessException ex) {

@@ -135,7 +135,9 @@ public class DocumentController {
         targetAccess.requireCanAttach(req.getEntityType(), req.getEntityId(), userId);
 
         // Image files must go through /upload-image (server-side WebP conversion)
-        if (isImageMime(req.getMimeType())) {
+        // Chat sends large images and GIFs here on purpose — at full quality,
+        // like a WhatsApp "document" (see StorageService.CHAT_DOCUMENT_TYPE).
+        if (isImageMime(req.getMimeType()) && !StorageService.isChatFile(req.getDocumentType())) {
             throw new BusinessException("USE_IMAGE_ENDPOINT",
                     "Images must be uploaded via POST /v1/documents/upload-image " +
                             "so they can be converted to WebP server-side.",
@@ -217,6 +219,8 @@ public class DocumentController {
             throw new BusinessException("S3_OBJECT_NOT_FOUND",
                     "File was not found in S3. Please re-upload.", HttpStatus.UNPROCESSABLE_ENTITY);
         }
+        // The declared size was checked at step 1; this checks what arrived.
+        storageService.requireChatSizeWithinLimit(doc.getS3Key(), meta.getContentLength(), doc.getDocumentType());
 
         // Update document with confirmed metadata
         doc.setStatus("ACTIVE");
