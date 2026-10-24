@@ -475,6 +475,12 @@ public class ContentQueryService {
         newsletterService.subscribe(email, name, sourcePath);
     }
 
+    /** As above, with where the visitor came from (landing page, UTM labels). */
+    public void requestSubscription(String email, String name, String sourcePath,
+                                    NewsletterService.Attribution attribution) {
+        newsletterService.subscribe(email, name, sourcePath, attribution);
+    }
+
     @Transactional
     public void confirmSubscription(String token) {
         newsletterService.confirm(token);

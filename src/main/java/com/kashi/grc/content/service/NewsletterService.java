@@ -49,8 +49,21 @@ public class NewsletterService {
      */
     private final ApplicationEventPublisher events;
 
+    /**
+     * Where the visitor came from (the first page of their visit and its UTM
+     * labels), as the website sends it. All optional.
+     */
+    public record Attribution(String landingPage, String utmSource, String utmMedium, String utmCampaign) {
+        public static final Attribution NONE = new Attribution(null, null, null, null);
+    }
+
     @Transactional
     public void subscribe(String rawEmail, String name, String sourcePath) {
+        subscribe(rawEmail, name, sourcePath, Attribution.NONE);
+    }
+
+    @Transactional
+    public void subscribe(String rawEmail, String name, String sourcePath, Attribution attribution) {
         String email = normalise(rawEmail);
         if (email == null) return;   // silently — see the class comment
 
@@ -63,6 +76,13 @@ public class NewsletterService {
         sub.setConfirmToken(token);
         sub.setName(name);
         sub.setSourcePath(sourcePath);
+        // Only what this request carries: a repeat signup without UTM labels
+        // must not wipe the campaign that brought the person the first time.
+        Attribution a = attribution == null ? Attribution.NONE : attribution;
+        if (notBlank(a.landingPage())) sub.setLandingPage(cut(a.landingPage(), 512));
+        if (notBlank(a.utmSource()))   sub.setUtmSource(cut(a.utmSource(), 100));
+        if (notBlank(a.utmMedium()))   sub.setUtmMedium(cut(a.utmMedium(), 100));
+        if (notBlank(a.utmCampaign())) sub.setUtmCampaign(cut(a.utmCampaign(), 150));
         sub.setUnsubscribedAt(null);
         repository.save(sub);
 
@@ -109,6 +129,14 @@ public class NewsletterService {
         // game — the confirmation email is the real validator.
         if (e.length() < 5 || e.length() > 320 || !e.contains("@") || e.contains(" ")) return null;
         return e;
+    }
+
+    private static boolean notBlank(String s) { return s != null && !s.isBlank(); }
+
+    /** Public input, so never longer than its column. */
+    private static String cut(String s, int max) {
+        String t = s.trim();
+        return t.length() <= max ? t : t.substring(0, max);
     }
 
     private String randomToken() {
