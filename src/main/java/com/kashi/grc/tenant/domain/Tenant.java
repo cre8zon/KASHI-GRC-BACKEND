@@ -104,4 +104,25 @@ public class Tenant extends BaseEntity {
     /** GSTIN for Indian customers, VAT/EIN elsewhere. */
     @Column(name = "tax_id", length = 30)
     private String taxId;
+
+    /**
+     * The organisation's one Org Owner (users.id) — the buyer / head of the
+     * organisation, the first user created when the tenant is provisioned.
+     *
+     * A column, not "whoever holds ORG_OWNER": a role can be granted to several
+     * people, removed, or left on a suspended account, and none of that may
+     * happen to ownership. The ORG_OWNER role follows this column; it changes
+     * only through an explicit transfer (OrgOwnerService).
+     */
+    @Column(name = "owner_user_id")
+    private Long ownerUserId;
+
+    /**
+     * When the tenant was suspended. Drives the read-only grace period
+     * (AccountAccessService): users can still sign in, view and export for
+     * app.tenant.suspension.read-only-days, then access is blocked. Cleared on
+     * reactivation.
+     */
+    @Column(name = "suspended_at")
+    private java.time.LocalDateTime suspendedAt;
 }

@@ -57,6 +57,7 @@ public class IntegrationRunner {
     private final EvidenceReuseEngine                  reuseEngine;
     private final ObjectMapper                         objectMapper;
     private final EngagementIntegrationSnapshotService engagementSnapshotService;
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     @Scheduled(fixedRate = 3_600_000)
     public void runScheduled() {
@@ -69,6 +70,10 @@ public class IntegrationRunner {
         List<IntegrationConfig> activeConfigs = configRepo.findByIsActiveTrue();
 
         for (IntegrationConfig config : activeConfigs) {
+            // Suspended organisation: no pulls with its credentials. Checks are
+            // due-date driven (nextRunAt), so they run on the first sweep after
+            // reactivation.
+            if (!accountAccess.tenantOperating(config.getTenantId())) continue;
             tenantCheckRepo
                     .findByIntegrationKeyAndTenantIdAndIsActiveTrue(
                             config.getIntegrationKey(), config.getTenantId())

@@ -33,4 +33,10 @@ public class TenantResponse {
     private String billingEmail;
     private String billingAddress;
     private String taxId;
+
+    /** Org Owner (tenants.owner_user_id). */
+    private Long ownerUserId;
+    /** When suspended, and when the read-only grace period ends (access is blocked after). */
+    private LocalDateTime suspendedAt;
+    private LocalDateTime readOnlyUntil;
 }

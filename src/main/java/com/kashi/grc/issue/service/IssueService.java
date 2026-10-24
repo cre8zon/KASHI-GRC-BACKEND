@@ -66,6 +66,8 @@ public class IssueService {
     private final UserRepository                                     userRepository;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository   tenantRepository;
+    private final com.kashi.grc.common.security.AccountAccessService   accountAccess;
     private final com.kashi.grc.audit.repository.AuditFindingRepository     auditFindingRepository;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository  auditEngagementRepository;
     private final ObjectMapper             objectMapper;
@@ -187,30 +189,45 @@ public class IssueService {
      *   - Starts the AUTOMATED workflow blueprint
      *   - Notifies GRC Manager pool
      */
-    @Transactional
     /**
      * Resolves the "system" user for a given tenant — used as createdBy/initiator
-     * for automated ingestion. Multi-tenant safe: each tenant's own ORG_ADMIN (or
-     * ORG_OWNER if no admin exists) is used as the system actor, not a single
-     * global hardcoded user.
-     * Falls back to app.system.userId (global config) only if the tenant has
-     * neither ORG_ADMIN nor ORG_OWNER.
+     * for automated ingestion. Multi-tenant safe: each tenant's own person, never
+     * a single global hard-coded user.
+     *
+     *   1. the organisation's owner (tenants.owner_user_id) — always exactly one,
+     *      and the one account that cannot be suspended on its own;
+     *   2. else an active organisation-side member holding USER_EDIT — the
+     *      permission user management gates on, i.e. someone who administers
+     *      the organisation. This used to be role id 8: a database id baked
+     *      into the code, pointing at a different role (or none) on any
+     *      database seeded in another order. A permission, not a role name,
+     *      so a renamed or added admin role keeps working;
+     *   3. else app.system.userId (global config).
+     *
+     * Suspended people are never picked (the membership query filters them).
      */
     private Long resolveSystemUserId(Long tenantId) {
-        List<Long> orgAdmins = dbRepository.findUserIdsByRoleAndTenant(8L, tenantId); // ORG_ADMIN
-        if (!orgAdmins.isEmpty()) {
-            return orgAdmins.get(0);
+        Long owner = tenantRepository.findById(tenantId)
+                .map(com.kashi.grc.tenant.domain.Tenant::getOwnerUserId).orElse(null);
+        if (owner != null && userRepository.findById(owner)
+                .filter(u -> !u.isDeleted() && (u.getStatus() == com.kashi.grc.usermanagement.domain.UserStatus.ACTIVE
+                        || u.getStatus() == com.kashi.grc.usermanagement.domain.UserStatus.LOCKED))
+                .isPresent()) {
+            return owner;
         }
-        List<Long> orgOwners = dbRepository.findUserIdsByRoleAndTenant(7L, tenantId); // ORG_OWNER
-        if (!orgOwners.isEmpty()) {
-            log.info("[ISSUE-INGEST] No ORG_ADMIN for tenantId={} — using ORG_OWNER as system user", tenantId);
-            return orgOwners.get(0);
+        List<Long> admins = dbRepository.findUserIdsByPermissionAndTenant(
+                com.kashi.grc.usermanagement.service.user.UserLifecycleService.EDIT_PERMISSION, tenantId,
+                com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION.name());
+        if (!admins.isEmpty()) {
+            log.info("[ISSUE-INGEST] No usable owner for tenantId={} — using an organisation administrator as system user", tenantId);
+            return admins.get(0);
         }
-        log.warn("[ISSUE-INGEST] No ORG_ADMIN or ORG_OWNER found for tenantId={} — falling back to app.system.userId={}",
+        log.warn("[ISSUE-INGEST] No owner or administrator found for tenantId={} — falling back to app.system.userId={}",
                 tenantId, systemUserId);
         return systemUserId;
     }
 
+    @Transactional
     public IssueResponse ingest(IssueIngestRequest req, Long tenantId) {
         // Resolve tenant-scoped system user (each tenant's own ORG_ADMIN)
         Long tenantSystemUserId = resolveSystemUserId(tenantId);
@@ -320,8 +337,8 @@ public class IssueService {
         // Capture old values BEFORE mutation, for generic advanceOnFieldSet check below.
         // Only fields that are realistically used as "fill this to advance" triggers
         // need to be captured — extend this map as new advanceOnFieldSet use cases arise.
-        java.util.Map<String, Object> oldValues = java.util.Map.of(
-                "ownerId", java.util.Optional.ofNullable(issue.getOwnerId())
+        Map<String, Object> oldValues = Map.of(
+                "ownerId", Optional.ofNullable(issue.getOwnerId())
         );
 
         if (req.getOwnerId()             != null) issue.setOwnerId(req.getOwnerId());
@@ -359,11 +376,11 @@ public class IssueService {
         if (issue.getWorkflowInstanceId() != null) {
             String advanceField = getAdvanceOnFieldSet(issue);
             if (advanceField != null) {
-                java.util.Map<String, Object> newValues = java.util.Map.of(
-                        "ownerId", java.util.Optional.ofNullable(issue.getOwnerId())
+                Map<String, Object> newValues = Map.of(
+                        "ownerId", Optional.ofNullable(issue.getOwnerId())
                 );
-                Object oldVal = ((java.util.Optional<?>) oldValues.getOrDefault(advanceField, java.util.Optional.empty())).orElse(null);
-                Object newVal = ((java.util.Optional<?>) newValues.getOrDefault(advanceField, java.util.Optional.empty())).orElse(null);
+                Object oldVal = ((Optional<?>) oldValues.getOrDefault(advanceField, Optional.empty())).orElse(null);
+                Object newVal = ((Optional<?>) newValues.getOrDefault(advanceField, Optional.empty())).orElse(null);
                 if (oldVal == null && newVal != null) {
                     log.info("[ISSUE-WF] advanceOnFieldSet '{}' transitioned null -> {} | issueId={}",
                             advanceField, newVal, issue.getId());
@@ -388,7 +405,7 @@ public class IssueService {
                     stepInstanceRepository.findById(wfInst.getCurrentStepId()).orElse(null);
             if (si == null || si.getSnapUiOverrideJson() == null) return null;
             com.fasterxml.jackson.databind.JsonNode node =
-                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(si.getSnapUiOverrideJson());
+                    new ObjectMapper().readTree(si.getSnapUiOverrideJson());
             com.fasterxml.jackson.databind.JsonNode field = node.get("advanceOnFieldSet");
             return (field != null && !field.isNull()) ? field.asText() : null;
         } catch (Exception e) {
@@ -425,7 +442,7 @@ public class IssueService {
         if (holdsTask) return;
         String step = stepInstanceRepository.findById(wf.getCurrentStepId())
                 .map(si -> si.getSnapName()).orElse("the current step");
-        throw new com.kashi.grc.common.exception.BusinessException("ISSUE_NOT_YOUR_STEP",
+        throw new BusinessException("ISSUE_NOT_YOUR_STEP",
                 "This issue is at \"" + step + "\", which is assigned to someone else. "
                         + "Only the person holding that step (or someone with override) can move it on.",
                 org.springframework.http.HttpStatus.FORBIDDEN);
@@ -556,6 +573,10 @@ public class IssueService {
         // First-time breaches
         List<Issue> breached = issueRepository.findBreachedIssues(now);
         for (Issue issue : breached) {
+            // Suspended organisation: not escalated while suspended. The query is
+            // "past due and not yet marked", so it is caught on the first run after
+            // reactivation.
+            if (!accountAccess.tenantOperating(issue.getTenantId())) continue;
             issue.setSlaBreached(true);
             issue.setEscalationCount(issue.getEscalationCount() + 1);
             issue.setLastEscalatedAt(now);
@@ -576,7 +597,7 @@ public class IssueService {
             if (issue.getOwnerId() != null) {
                 notificationService.send(issue.getOwnerId(), "ISSUE_SLA_BREACH", message,
                         "ISSUE", issue.getId(),
-                        null, java.util.Map.of(
+                        null, Map.of(
                                 "issueRef", issue.getIssueRef() != null ? issue.getIssueRef() : "",
                                 "severity", String.valueOf(issue.getSeverity())));
             }
@@ -586,6 +607,7 @@ public class IssueService {
         LocalDateTime reescCutoff = now.minusHours(24);
         List<Issue> reescalate = issueRepository.findActiveBreachedForReescalation(reescCutoff);
         for (Issue issue : reescalate) {
+            if (!accountAccess.tenantOperating(issue.getTenantId())) continue;
             issue.setEscalationCount(issue.getEscalationCount() + 1);
             issue.setLastEscalatedAt(now);
             issueRepository.save(issue);
@@ -757,14 +779,14 @@ public class IssueService {
             }
             log.info("[ISSUE-WF] currentStepId={} | wfStatus={}", wfInst.getCurrentStepId(), wfInst.getStatus());
 
-            java.util.List<com.kashi.grc.workflow.domain.TaskInstance> allTasks =
+            List<com.kashi.grc.workflow.domain.TaskInstance> allTasks =
                     taskInstanceRepository.findByStepInstanceId(wfInst.getCurrentStepId());
             log.info("[ISSUE-WF] Tasks on currentStep={} | count={} | statuses={}",
                     wfInst.getCurrentStepId(), allTasks.size(),
                     allTasks.stream().map(t -> t.getId() + ":" + t.getStatus() + ":" + t.getTaskRole())
                             .collect(java.util.stream.Collectors.joining(", ")));
 
-            java.util.Optional<com.kashi.grc.workflow.domain.TaskInstance> pendingTask =
+            Optional<com.kashi.grc.workflow.domain.TaskInstance> pendingTask =
                     allTasks.stream()
                             .filter(t -> t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING)
                             .findFirst();

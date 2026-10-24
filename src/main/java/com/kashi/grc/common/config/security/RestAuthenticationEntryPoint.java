@@ -27,6 +27,9 @@ import java.io.IOException;
  *   AUTH_SESSION_EXPIRED   the bearer token was valid once and has expired
  *   AUTH_TOKEN_INVALID     the bearer token is malformed / tampered / a refresh token
  *   AUTH_REQUIRED          no credentials were sent at all
+ *   AUTH_ACCOUNT_SUSPENDED / AUTH_TENANT_SUSPENDED / AUTH_VENDOR_SUSPENDED
+ *                          a valid token for an account that may not be used
+ *                          any more (AccountAccessService)
  */
 @Component
 @RequiredArgsConstructor
@@ -38,10 +41,17 @@ public class RestAuthenticationEntryPoint implements AuthenticationEntryPoint {
     public void commence(HttpServletRequest request, HttpServletResponse response,
                          AuthenticationException authException) throws IOException {
         Object status = request.getAttribute(JwtTokenProvider.TOKEN_STATUS_ATTR);
+        Object block  = request.getAttribute(JwtAuthenticationFilter.ACCOUNT_BLOCK_ATTR);
 
         String code;
         String message;
-        if (status == JwtTokenProvider.TokenStatus.EXPIRED) {
+        if (block instanceof com.kashi.grc.common.security.AccountAccessService.Verdict v && v.code() != null) {
+            // A valid token for an account that may not be used any more:
+            // suspended user, tenant or vendor. The client signs out and shows
+            // this message on the sign-in page.
+            code = v.code();
+            message = v.message();
+        } else if (status == JwtTokenProvider.TokenStatus.EXPIRED) {
             code = "AUTH_SESSION_EXPIRED";
             message = "Your session has expired. Please sign in again.";
         } else if (status != null) {

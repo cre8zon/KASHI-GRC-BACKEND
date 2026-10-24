@@ -214,6 +214,7 @@ public class WorkflowEngineService {
                 executeAssessmentAsync ? "KAFKA" : "INLINE", executeAssessmentAsync);
     }
     private final ApplicationEventPublisher eventPublisher;
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
     private final TaskSectionCompletionService sectionCompletionService;
     private final WorkflowStepSectionRepository stepSectionRepository;
     private final TaskSectionCompletionRepository taskSectionCompletionRepository;
@@ -1644,6 +1645,9 @@ public class WorkflowEngineService {
                 WorkflowInstance instance = instanceRepository
                         .findById(si.getWorkflowInstanceId()).orElse(null);
                 if (instance == null) continue;
+                // Suspended organisation: automation waits; the next sweep after
+                // reactivation picks the step up again.
+                if (!accountAccess.tenantOperating(instance.getTenantId())) continue;
 
                 com.kashi.grc.workflow.automation.AutomatedActionContext ctx =
                         com.kashi.grc.workflow.automation.AutomatedActionContext.builder()
@@ -3154,10 +3158,12 @@ public class WorkflowEngineService {
         // Blueprint has specific userIds — bypass role resolution entirely.
         List<WorkflowStepUser> directUsers = stepUserRepository.findByStepId(step.getId());
         if (!directUsers.isEmpty()) {
-            directUsers.forEach(su -> {
-                TaskInstance t = createTask(si, su.getUserId(), false, TaskRole.ACTOR, si.getSnapSide(), tenantId);
-                sectionCompletionService.snapshotSectionsForTask(t, si, instance);
-            });
+            directUsers.stream()
+                    .filter(su -> isAssignable(su.getUserId(), tenantId))   // suspended / deactivated skipped
+                    .forEach(su -> {
+                        TaskInstance t = createTask(si, su.getUserId(), false, TaskRole.ACTOR, si.getSnapSide(), tenantId);
+                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    });
             si.setStatus(StepStatus.IN_PROGRESS);
             stepInstanceRepository.save(si);
             log.info("[WORKFLOW] Tasks created for {} direct user(s) | step='{}'",
@@ -3193,8 +3199,10 @@ public class WorkflowEngineService {
                 }
 
                 case POOL -> {
+                    if (isAssignable(instance.getInitiatedBy(), tenantId)) {
                     TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    }
                     log.info("[WORKFLOW] Step '{}' POOL — ASSIGNER task for initiator (placeholder)", si.getSnapName());
                 }
 
@@ -3204,8 +3212,10 @@ public class WorkflowEngineService {
                     if (assignerRoles.isEmpty()) {
                         log.warn("[WORKFLOW] Step '{}' PUSH_TO_ROLES but no assignerRoles — ASSIGNER task for initiator",
                                 si.getSnapName());
-                        TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
-                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                        if (isAssignable(instance.getInitiatedBy(), tenantId)) {
+                            TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
+                            sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                        }
                     } else {
                         int assignerTaskCount = 0;
                         for (WorkflowStepAssignerRole ar : assignerRoles) {
@@ -3215,6 +3225,7 @@ public class WorkflowEngineService {
                                     ? dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, instance.getEntityId())
                                     : dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
                             for (Long uid : uids) {
+                                if (!isAssignable(uid, tenantId)) continue;
                                 TaskInstance t = createTask(si, uid, true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                                 sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                                 assignerTaskCount++;
@@ -3226,7 +3237,10 @@ public class WorkflowEngineService {
                 }
 
                 case PREVIOUS_ACTOR -> {
-                    Long previousActor = getPreviousStepActor(instance);
+                    Long previousActorRaw = getPreviousStepActor(instance);
+                    // A previous actor who has since been suspended is treated as
+                    // no previous actor: the initiator coordinates instead.
+                    Long previousActor = isAssignable(previousActorRaw, tenantId) ? previousActorRaw : null;
                     if (previousActor != null) {
                         // Deduplicate: skip ASSIGNER task if this user already has an ACTOR task
                         // on this step. Happens when PREVIOUS_ACTOR resolves to a user who is
@@ -3245,7 +3259,7 @@ public class WorkflowEngineService {
                             log.info("[WORKFLOW] Step '{}' PREVIOUS_ACTOR — ASSIGNER task for userId={}",
                                     si.getSnapName(), previousActor);
                         }
-                    } else {
+                    } else if (isAssignable(instance.getInitiatedBy(), tenantId)) {
                         TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                         sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                         log.info("[WORKFLOW] Step '{}' PREVIOUS_ACTOR — no prior actor, ASSIGNER task for initiator",
@@ -3254,8 +3268,10 @@ public class WorkflowEngineService {
                 }
 
                 case INITIATOR -> {
+                    if (isAssignable(instance.getInitiatedBy(), tenantId)) {
                     TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    }
                     log.info("[WORKFLOW] Step '{}' INITIATOR — ASSIGNER task for initiator userId={}",
                             si.getSnapName(), instance.getInitiatedBy());
                 }
@@ -3283,14 +3299,14 @@ public class WorkflowEngineService {
         // Creates exactly 1 task — no pool fan-out.
         if (actorResolution == ActorResolution.ENTITY_CREATOR) {
             Long creatorId = instance.getInitiatedBy();
-            if (creatorId != null) {
+            if (creatorId != null && isAssignable(creatorId, tenantId)) {
                 TaskInstance t = createTask(si, creatorId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
                 sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                 actorTaskCount++;
                 log.info("[WORKFLOW] Step '{}' ENTITY_CREATOR — 1 ACTOR task for creator userId={}",
                         si.getSnapName(), creatorId);
             } else {
-                log.warn("[WORKFLOW] Step '{}' ENTITY_CREATOR — initiatedBy is null, falling back to ROLE_BASED",
+                log.warn("[WORKFLOW] Step '{}' ENTITY_CREATOR — initiator missing or suspended, falling back to ROLE_BASED",
                         si.getSnapName());
                 actorResolution = ActorResolution.ROLE_BASED; // fall through
             }
@@ -3301,7 +3317,9 @@ public class WorkflowEngineService {
         // Resolved via WorkflowEntityResolverRegistry.resolveOwnerId().
         // Falls back to PREVIOUS_ACTOR then ROLE_BASED if owner not set.
         if (actorResolution == ActorResolution.ENTITY_OWNER) {
-            Long ownerId = entityResolverRegistry.resolveOwnerId(instance);
+            Long ownerIdRaw = entityResolverRegistry.resolveOwnerId(instance);
+            // A suspended owner is treated as no owner: the step falls back below.
+            Long ownerId = isAssignable(ownerIdRaw, tenantId) ? ownerIdRaw : null;
             if (ownerId != null) {
                 TaskInstance t = createTask(si, ownerId, true, TaskRole.ACTOR, si.getSnapSide(), tenantId);
                 sectionCompletionService.snapshotSectionsForTask(t, si, instance);
@@ -3312,8 +3330,10 @@ public class WorkflowEngineService {
                 // Owner not set — for AUTOMATED issues ingested by system, fall through to ROLE_BASED
                 // so GRC_MANAGER pool gets the triage task instead of the system user.
                 // For other cases fall back to previous actor or initiator.
-                Long previousActor = getPreviousStepActor(instance);
-                Long fallbackId = previousActor != null ? previousActor : instance.getInitiatedBy();
+                Long previousActorRaw = getPreviousStepActor(instance);
+                Long previousActor = isAssignable(previousActorRaw, tenantId) ? previousActorRaw : null;
+                Long fallbackId = previousActor != null ? previousActor
+                        : (isAssignable(instance.getInitiatedBy(), tenantId) ? instance.getInitiatedBy() : null);
                 Long systemUid = instance.getInitiatedBy();
                 // If fallback resolves to the system/initiator and they are the same as
                 // the workflow initiator (automated ingest), skip to ROLE_BASED pool.
@@ -3336,7 +3356,9 @@ public class WorkflowEngineService {
 
         if (actorResolution == ActorResolution.ASSIGNMENT_SCOPED) {
             // Ask the domain resolver for the specifically-assigned users
-            List<Long> assignedUserIds = actorResolverRegistry.resolve(instance, si);
+            List<Long> assignedUserIds = actorResolverRegistry.resolve(instance, si).stream()
+                    .filter(uid -> isAssignable(uid, tenantId))   // a suspended assignee is not one
+                    .toList();
 
             // OPTIONAL role filter: if this step has actor roles configured
             // (workflow_step_actor_roles — the SAME table ROLE_BASED steps use),
@@ -3438,6 +3460,7 @@ public class WorkflowEngineService {
                 }
                 final String resolvedRoleName = lastRoleName;
                 for (Long uid : seenUids) {
+                    if (!isAssignable(uid, tenantId)) continue;
                     TaskInstance t = createTask(si, uid, true, TaskRole.ACTOR, si.getSnapSide(), tenantId, resolvedRoleName);
                     sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     actorTaskCount++;
@@ -3498,6 +3521,7 @@ public class WorkflowEngineService {
                 fallbackUserId = instance.getInitiatedBy();
                 fallbackReason = "Fallback: required role has no users — assigned to workflow initiator for resolution";
             }
+            if (!isAssignable(fallbackUserId, tenantId)) fallbackUserId = null;
 
             if (fallbackUserId != null) {
                 TaskInstance fallbackTask = createTask(
@@ -3510,13 +3534,15 @@ public class WorkflowEngineService {
                 log.warn("[WORKFLOW] Step '{}' — fallback task → userId={} | {}",
                         si.getSnapName(), fallbackUserId, fallbackReason);
             } else {
-                log.error("[WORKFLOW] Step '{}' — fallback failed: initiatedBy is null. " +
-                        "Step will be stuck. | tenantId={}", si.getSnapName(), tenantId);
+                log.error("[WORKFLOW] Step '{}' — fallback failed: no active initiator. " +
+                        "Step left UNASSIGNED. | tenantId={}", si.getSnapName(), tenantId);
             }
         }
 
-        // Step is IN_PROGRESS — both task sets are live
-        si.setStatus(StepStatus.IN_PROGRESS);
+        // Step is IN_PROGRESS — both task sets are live. With nobody to do the
+        // work (every candidate suspended), it waits as UNASSIGNED instead, so
+        // it shows as needing someone rather than silently stalling.
+        si.setStatus(actorTaskCount == 0 && !actorRoles.isEmpty() ? StepStatus.UNASSIGNED : StepStatus.IN_PROGRESS);
         stepInstanceRepository.save(si);
 
         // FYI notifications to configured step observers (dormant
@@ -3634,6 +3660,11 @@ public class WorkflowEngineService {
             log.warn("[WORKFLOW] createTaskForUser: userId is null (reason={}) — no task created", reason);
             return;
         }
+        if (!isAssignable(userId, tenantId)) {
+            log.warn("[WORKFLOW] createTaskForUser: userId={} is suspended or deactivated (reason={}) — no task created",
+                    userId, reason);
+            return;
+        }
         createTask(si, userId, true, tenantId);
         log.info("[WORKFLOW] Task created for userId={} via {} | stepInstanceId={}",
                 userId, reason, si.getId());
@@ -3658,6 +3689,15 @@ public class WorkflowEngineService {
 
     private TaskInstance createTask(StepInstance si, Long userId, boolean isAutoAssigned,
                                     TaskRole role, String assignerSide, Long tenantId, String actorRoleName) {
+        // The last line of defence: every automatic path above already skips
+        // inactive people, so this is only reached by an explicit choice —
+        // reassign, delegate, manual assign — and says plainly why it failed.
+        if (!isAssignable(userId, tenantId)) {
+            String who = userRepository.findById(userId).map(u -> u.getFullName().trim()).orElse("This user");
+            throw new BusinessException("ASSIGNEE_INACTIVE",
+                    who + " is suspended or deactivated and cannot be given tasks. Choose someone else.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
         TaskInstance task = TaskInstance.builder()
                 .stepInstanceId(si.getId())
                 .assignedUserId(userId)
@@ -4565,6 +4605,135 @@ public class WorkflowEngineService {
         log.info("[WORKFLOW] Sub-task created | id={} | userId={} | step='{}' | navKeyOverride={}",
                 subTask.getId(), userId, stepName, navKeyOverride);
         return subTask;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // INACTIVE PEOPLE
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * May this person be given work in this tenant? Not when their account, their
+     * organisation or their vendor is suspended (AccountAccessService). A user
+     * locked out after failed sign-ins still is — that is not a suspension.
+     */
+    public boolean isAssignable(Long userId, Long tenantId) {
+        return userId != null && !accountAccess.check(userId, tenantId).blocked();
+    }
+
+    /** History event marking a step whose last assignee was suspended. */
+    public static final String EVT_RETURNED_UNASSIGNED = "STEP_RETURNED_UNASSIGNED";
+
+    /**
+     * A user was suspended or deactivated: their open tasks go back to
+     * unassigned (the organisation's choice), so nothing waits on someone who
+     * can no longer act and nothing silently lands on somebody else.
+     *
+     *  • each PENDING / IN_PROGRESS task of theirs on a live step is closed
+     *    (REASSIGNED, with the reason in its remarks and the workflow history);
+     *  • a step left with no open ACTOR task becomes UNASSIGNED, and the
+     *    workflow's initiator is told it needs someone. StepSlaMonitor leaves
+     *    such steps alone; a person picks the new assignee from the workflow
+     *    timeline (manual assign).
+     *
+     * Returns how many tasks were released. Runs in the caller's transaction.
+     */
+    @Transactional
+    public int releaseTasksOfInactiveUser(Long userId, Long performedBy, String reason) {
+        List<TaskInstance> open = taskInstanceRepository.findByAssignedUserIdAndStatusIn(
+                userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS));
+        if (open.isEmpty()) return 0;
+
+        String who = userRepository.findById(userId).map(u -> u.getFullName().trim()).orElse("user " + userId);
+        String note = "Returned to unassigned — " + who + " was suspended"
+                + (reason == null || reason.isBlank() ? "" : " (" + reason.trim() + ")");
+        Long actor = performedBy != null ? performedBy : userId;
+
+        int released = 0;
+        Map<Long, StepInstance> touched = new LinkedHashMap<>();
+        for (TaskInstance t : open) {
+            StepInstance si = stepInstanceRepository.findById(t.getStepInstanceId()).orElse(null);
+            if (si == null || !StepStatus.LIVE.contains(si.getStatus())) continue;
+            WorkflowInstance wi = instanceRepository.findById(si.getWorkflowInstanceId()).orElse(null);
+            if (wi == null) continue;
+
+            String from = t.getStatus().name();
+            t.setStatus(TaskStatus.REASSIGNED);
+            t.setActedAt(LocalDateTime.now());
+            t.setRemarks(note);
+            taskInstanceRepository.save(t);
+            recordHistory(wi, si, t, "TASK_RELEASED_INACTIVE_ASSIGNEE", from, TaskStatus.REASSIGNED.name(), actor, note);
+            touched.putIfAbsent(si.getId(), si);
+            released++;
+        }
+
+        for (StepInstance si : touched.values()) {
+            boolean someoneLeft = taskInstanceRepository.findByStepInstanceId(si.getId()).stream()
+                    .anyMatch(x -> x.getTaskRole() == TaskRole.ACTOR
+                            && (x.getStatus() == TaskStatus.PENDING || x.getStatus() == TaskStatus.IN_PROGRESS));
+            if (someoneLeft) continue;
+            WorkflowInstance wi = instanceRepository.findById(si.getWorkflowInstanceId()).orElse(null);
+            if (wi == null) continue;
+
+            String from = si.getStatus().name();
+            si.setStatus(StepStatus.UNASSIGNED);
+            stepInstanceRepository.save(si);
+            recordHistory(wi, si, null, EVT_RETURNED_UNASSIGNED, from, StepStatus.UNASSIGNED.name(), actor, note);
+
+            Long initiator = wi.getInitiatedBy();
+            if (isAssignable(initiator, wi.getTenantId()) && !initiator.equals(userId)) {
+                notificationService.send(initiator, "STEP_UNASSIGNED",
+                        "\"" + si.getSnapName() + "\" needs someone — " + who + " was suspended. Open it to assign a person.",
+                        "STEP", si.getId());
+            }
+        }
+        log.info("[WORKFLOW] Released {} task(s) of inactive userId={} | steps now unassigned={}",
+                released, userId, touched.size());
+        return released;
+    }
+
+    /** The workflow instance a step belongs to (for controllers). */
+    public WorkflowInstance getInstanceOfStep(StepInstance si) {
+        return instanceRepository.findById(si.getWorkflowInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", si.getWorkflowInstanceId()));
+    }
+
+    /** Open tasks a user holds right now (for the suspend dialog's "what this affects"). */
+    public long countOpenTasks(Long userId) {
+        return taskInstanceRepository.findByAssignedUserIdAndStatusIn(
+                userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)).stream()
+                .map(t -> stepInstanceRepository.findById(t.getStepInstanceId()).orElse(null))
+                .filter(si -> si != null && StepStatus.LIVE.contains(si.getStatus()))
+                .count();
+    }
+
+    /**
+     * Who can be given this step: active holders of the step's own actor roles,
+     * scoped to its side (and to its vendor on a vendor-side step).
+     */
+    public List<Map<String, Object>> getStepActorCandidates(StepInstance si, Long tenantId) {
+        if (si.getStepId() == null) return List.of();
+        List<Long> roleIds = stepRoleRepository.findByStepId(si.getStepId()).stream()
+                .map(WorkflowStepRole::getRoleId).distinct().toList();
+        if (roleIds.isEmpty()) return List.of();
+        return getUsersByRolesScoped(roleIds, tenantId, si, si.getSnapSide());
+    }
+
+    /**
+     * May this caller pick the assignee of a step that has nobody? The workflow's
+     * initiator, anyone holding one of the step's ASSIGNER roles, the
+     * organisation's owner, or a platform administrator.
+     */
+    public boolean canAssignStep(StepInstance si, WorkflowInstance wi, Long callerId) {
+        if (callerId == null) return false;
+        if (callerId.equals(wi.getInitiatedBy())) return true;
+        if (tenantRepository.findById(wi.getTenantId())
+                .map(t -> callerId.equals(t.getOwnerUserId())).orElse(false)) return true;
+        if (si.getStepId() != null) {
+            for (WorkflowStepAssignerRole ar : stepAssignerRoleRepository.findByStepId(si.getStepId())) {
+                if (dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), wi.getTenantId()).contains(callerId)) return true;
+            }
+        }
+        return false;
     }
 
     // ══════════════════════════════════════════════════════════════

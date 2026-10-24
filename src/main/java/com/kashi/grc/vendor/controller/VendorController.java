@@ -66,6 +66,18 @@ public class VendorController {
     private final AssessmentTemplateInstanceRepository templateInstanceRepository;
     private final UserRepository userRepository;
     private final com.kashi.grc.common.security.PermissionGate permissionGate;
+    private final com.kashi.grc.common.security.LiveSessionRegistry liveSessions;
+    private final com.kashi.grc.usermanagement.repository.AccountStatusChangeRepository statusChangeRepository;
+
+    /**
+     * Suspending, offboarding or reactivating a vendor: vendor.lifecycle
+     * ("Suspend, offboard or reactivate a vendor") and nothing broader.
+     * vendor.edit / vendor.create / VENDOR_EDIT were accepted while the right
+     * code was unconfirmed; vendor.create is held by reviewers and review
+     * assistants, who must not be able to cut a vendor off. Platform
+     * administrators pass PermissionGate.require regardless.
+     */
+    private static final String[] VENDOR_LIFECYCLE_PERMS = {"vendor.lifecycle"};
 
     // 8.1 Initiate Vendor Onboarding
     @PostMapping("/v1/vendors/onboard")
@@ -297,6 +309,17 @@ public class VendorController {
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
         Long userId   = utilityService.getLoggedInDataContext().getId();
 
+        // Had no check at all: any signed-in user of the tenant — vendor users
+        // included, since they share the organisation's tenant — could suspend
+        // or offboard any vendor, their own among them. Now: the organisation's
+        // side only, holding a vendor lifecycle permission.
+        if (utilityService.getLoggedInDataContext().getVendorId() != null && !permissionGate.isPlatform()) {
+            throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
+                    "Only the organisation can change a vendor's status.",
+                    org.springframework.http.HttpStatus.FORBIDDEN);
+        }
+        permissionGate.require(VENDOR_LIFECYCLE_PERMS);
+
         String target = body.get("status") == null ? null : body.get("status").trim().toUpperCase();
         String reason = body.get("reason") == null ? "" : body.get("reason").trim();
 
@@ -350,6 +373,22 @@ public class VendorController {
                     .forEach(wi -> workflowEngineService.cancelInstance(
                             wi.getId(), userId, "Vendor offboarded: " + reason));
         }
+
+        // Who, when and why — the reason used to go only to the log file.
+        statusChangeRepository.save(com.kashi.grc.usermanagement.domain.AccountStatusChange.builder()
+                .subjectType(com.kashi.grc.usermanagement.domain.AccountStatusChange.VENDOR)
+                .subjectId(vendorId)
+                .tenantId(tenantId)
+                .fromStatus(current)
+                .toStatus(target)
+                .reason(reason.isEmpty() ? null : reason)
+                .actorUserId(userId)
+                .build());
+        // A suspended or offboarded vendor's people are signed out on their next
+        // request (AccountAccessService) and get no new work (DbRepository).
+        com.kashi.grc.common.security.AccountAccessService.invalidateAll();
+        // …and any connection they have open is closed as soon as this is saved.
+        liveSessions.sweepAfterCommit();
 
         log.info("[VENDOR-STATUS] vendorId={} | {} -> {} | by={} | reason='{}'",
                 vendorId, current, target, userId, reason);

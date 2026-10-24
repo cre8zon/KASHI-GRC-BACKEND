@@ -32,6 +32,8 @@ public class AuditEvidenceReminderScheduler {
 
     private final AuditControlInstanceRepository controlInstanceRepository;
     private final NotificationService            notificationService;
+    /** Suspended organisations and people are not reminded — they cannot act. */
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     @Scheduled(cron = "0 0 8 * * *")   // 08:00 daily
     public void sendEvidenceReminders() {
@@ -45,6 +47,7 @@ public class AuditEvidenceReminderScheduler {
 
             int reminded = 0;
             for (AuditControlInstance ctrl : dueSoon) {
+                if (!accountAccess.userOperating(ctrl.getAuditeeAssignedUserId(), ctrl.getTenantId())) continue;
                 LocalDate due     = ctrl.getEvidenceDueDate();
                 boolean   overdue = due.isBefore(today);
 
@@ -75,4 +78,4 @@ public class AuditEvidenceReminderScheduler {
             log.error("[AUDIT-REMINDER] Reminder job failed: {}", e.getMessage(), e);
         }
     }
-}
+}

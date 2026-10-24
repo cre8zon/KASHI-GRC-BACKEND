@@ -165,6 +165,10 @@ public class DbRepository {
      * Expired and revoked memberships are excluded here, not just at login — an
      * auditor whose audit period has ended must stop appearing as an assignable
      * user, otherwise they can still be handed new work.
+     *
+     * The same goes for suspended and deactivated accounts: only ACTIVE users
+     * (and LOCKED — a temporary lockout after failed sign-ins, not a
+     * suspension) are returned. Every picker and role-based step uses this.
      */
     private static final String MEMBERSHIP_USER_SQL = """
             SELECT DISTINCT u.id
@@ -177,10 +181,43 @@ public class DbRepository {
               AND  m.status = 'ACTIVE'
               AND  (m.access_expires_at IS NULL OR m.access_expires_at > NOW())
               AND  u.is_deleted = 0
+              AND  u.status IN ('ACTIVE', 'LOCKED')
             """;
 
     public List<Long> findUserIdsByRoleAndTenant(Long roleId, Long tenantId) {
         return findUserIdsByRoleAndTenant(roleId, tenantId, null, null);
+    }
+
+    /**
+     * Active members of a tenant who hold a permission (through any role of
+     * that membership), optionally on one side — lowest user id first, so the
+     * answer is stable. For "someone who may act for the organisation" without
+     * naming a role: a renamed or newly added role keeps working.
+     */
+    public List<Long> findUserIdsByPermissionAndTenant(String permissionCode, Long tenantId, String side) {
+        String sql = """
+                SELECT DISTINCT u.id
+                FROM   users u
+                JOIN   user_tenant_memberships m ON m.user_id = u.id
+                JOIN   user_roles ur             ON ur.membership_id = m.id
+                JOIN   roles r                   ON r.id = ur.role_id
+                JOIN   role_permissions rp       ON rp.role_id = r.id
+                JOIN   permissions p             ON p.id = rp.permission_id
+                WHERE  p.code = :code
+                  AND  m.tenant_id = :tenantId
+                  AND  m.status = 'ACTIVE'
+                  AND  (m.access_expires_at IS NULL OR m.access_expires_at > NOW())
+                  AND  u.is_deleted = 0
+                  AND  u.status IN ('ACTIVE', 'LOCKED')
+                """ + (side != null ? " AND r.side = :side" : "") + " ORDER BY u.id";
+        var q = entityManager.createNativeQuery(sql)
+                .setParameter("code", permissionCode)
+                .setParameter("tenantId", tenantId);
+        if (side != null) q.setParameter("side", side);
+        List<Object> rows = q.getResultList();
+        List<Long> ids = new ArrayList<>(rows.size());
+        for (Object row : rows) ids.add(((Number) row).longValue());
+        return ids;
     }
 
     /**
@@ -234,6 +271,14 @@ public class DbRepository {
             return findUserIdsByRoleAndTenant(roleId, tenantId);
         }
 
+        // A suspended or offboarded vendor's people get no new work at all.
+        com.kashi.grc.vendor.domain.Vendor vendor =
+                entityManager.find(com.kashi.grc.vendor.domain.Vendor.class, vendorId);
+        if (vendor != null && vendor.getStatus() != null
+                && java.util.Set.of("SUSPENDED", "TERMINATED").contains(vendor.getStatus().toUpperCase())) {
+            return List.of();
+        }
+
         CriteriaBuilder cb = entityManager.getCriteriaBuilder();
         CriteriaQuery<Long> cq = cb.createQuery(Long.class);
         Root<com.kashi.grc.usermanagement.domain.User> root =
@@ -247,7 +292,11 @@ public class DbRepository {
                         cb.equal(rolesJoin.get("id"), roleId),
                         cb.equal(root.get("tenantId"), tenantId),
                         cb.equal(root.get("vendorId"), vendorId),
-                        cb.isFalse(root.get("isDeleted"))
+                        cb.isFalse(root.get("isDeleted")),
+                        // Active people only — see MEMBERSHIP_USER_SQL.
+                        root.get("status").in(
+                                com.kashi.grc.usermanagement.domain.UserStatus.ACTIVE,
+                                com.kashi.grc.usermanagement.domain.UserStatus.LOCKED)
                 );
 
         return entityManager.createQuery(cq).getResultList();

@@ -8,6 +8,8 @@ public class TenantUpdateRequest {
     public String description;
     public String plan;
     public String status;
+    /** Why the status is changing — required when suspending (kept in account_status_changes). */
+    public String statusReason;
     public Integer maxUsers;
     public Integer maxVendors;
 

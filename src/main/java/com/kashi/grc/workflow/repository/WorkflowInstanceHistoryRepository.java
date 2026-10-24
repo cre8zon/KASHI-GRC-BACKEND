@@ -40,4 +40,7 @@ public interface WorkflowInstanceHistoryRepository
      */
     Optional<WorkflowInstanceHistory> findTopByWorkflowInstanceIdAndEventTypeOrderByPerformedAtDesc(
             Long workflowInstanceId, String eventType);
+
+    /** True when this step carries this history event (e.g. STEP_RETURNED_UNASSIGNED). */
+    boolean existsByStepInstanceIdAndEventType(Long stepInstanceId, String eventType);
 }

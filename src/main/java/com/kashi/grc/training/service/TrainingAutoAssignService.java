@@ -55,6 +55,8 @@ public class TrainingAutoAssignService {
     private final TrainingAssignmentRepository      assignmentRepository;
     private final PersonnelRepository               personnelRepository;
     private final PersonnelExclusionRepository      exclusionRepository;
+    /** Suspended organisations are skipped; the next sweep after reactivation catches up. */
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     private static final String REQ_TRAINING = "TRAINING";
 
@@ -125,6 +127,7 @@ public class TrainingAutoAssignService {
 
         int created = 0;
         for (TenantCourseRequirement r : all) {
+            if (!accountAccess.tenantOperating(r.getTenantId())) continue;
             TrainingCourse course = courseRepository.findById(r.getCourseId())
                     .filter(c -> !c.isDeleted())
                     .orElse(null);
@@ -274,4 +277,4 @@ public class TrainingAutoAssignService {
                 .map(TenantCourseRequirement::getCourseId)
                 .collect(Collectors.toSet());
     }
-}
+}

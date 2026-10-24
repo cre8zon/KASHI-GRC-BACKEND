@@ -71,6 +71,7 @@ import java.util.Map;
 public class WorkflowInstanceController {
 
     private final WorkflowEngineService service;
+    private final com.kashi.grc.common.security.PermissionGate permissionGate;
     private final DbRepository          dbRepository;
     private final UtilityService        utilityService;
     private final WorkflowAccessService accessService;
@@ -255,7 +256,7 @@ public class WorkflowInstanceController {
     @Operation(summary = "Override-advance a step without a task (requires workflow:step:override permission)")
     public ResponseEntity<ApiResponse<WorkflowInstanceResponse>> overrideStep(
             @PathVariable Long stepInstanceId,
-            @RequestBody(required = false) java.util.Map<String, Object> body) {
+            @RequestBody(required = false) Map<String, Object> body) {
 
         Long performedBy = utilityService.getLoggedInDataContext().getId();
         String action  = body != null && body.get("action")  != null ? body.get("action").toString()  : "APPROVE";
@@ -307,7 +308,7 @@ public class WorkflowInstanceController {
 
     @GetMapping("/tasks/my-next")
     @Operation(summary = "After task completion — find current user's next pending task on the same entity or its parent project")
-    public ResponseEntity<ApiResponse<java.util.Map<String, Object>>> getMyNextTask(
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMyNextTask(
             @RequestParam String entityType,
             @RequestParam Long entityId) {
 
@@ -337,10 +338,10 @@ public class WorkflowInstanceController {
         }
 
         if (next == null) {
-            return ResponseEntity.ok(ApiResponse.success(java.util.Map.of()));
+            return ResponseEntity.ok(ApiResponse.success(Map.of()));
         }
 
-        return ResponseEntity.ok(ApiResponse.success(java.util.Map.of(
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "taskId",         next.getId(),
                 "stepInstanceId", next.getStepInstanceId(),
                 "stepName",       next.getStepName()   != null ? next.getStepName()   : "",
@@ -371,8 +372,19 @@ public class WorkflowInstanceController {
             @RequestParam Long stepInstanceId,
             @RequestParam Long userId) {
 
-        Long assignedBy = utilityService.getLoggedInDataContext().getId();
+        var caller = utilityService.getLoggedInDataContext();
+        Long assignedBy = caller.getId();
         log.info("[WF-TASK] ASSIGN | stepInstanceId={} | userId={} | assignedBy={}", stepInstanceId, userId, assignedBy);
+        // Same rule as manual-assign — this legacy path had no check either.
+        com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
+        if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
+        WorkflowInstance wi = service.getInstanceOfStep(si);
+        permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
+        if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
+            throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
+                    "Only the workflow's initiator, its assigners or the organisation's owner can assign this step.",
+                    HttpStatus.FORBIDDEN);
+        }
         return ResponseEntity.status(HttpStatus.CREATED).body(
                 ApiResponse.success(service.assignTaskToUser(stepInstanceId, userId, assignedBy)));
     }
@@ -410,9 +422,33 @@ public class WorkflowInstanceController {
             @PathVariable Long stepInstanceId,
             @RequestParam Long userId) {
 
-        Long assignedBy = utilityService.getLoggedInDataContext().getId();
+        var caller = utilityService.getLoggedInDataContext();
+        Long assignedBy = caller.getId();
         log.info("[WF-MANUAL-ASSIGN] instanceId={} | stepInstanceId={} | userId={} | assignedBy={}",
                 instanceId, stepInstanceId, userId, assignedBy);
+
+        // Had no check at all: any signed-in user could push a task onto any
+        // step in any tenant. Now: same organisation, and a person allowed to
+        // choose this step's assignee (WorkflowEngineService.canAssignStep).
+        com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
+        if (si == null || !si.getWorkflowInstanceId().equals(instanceId)) {
+            throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
+        }
+        WorkflowInstance wi = service.getInstanceOfStep(si);
+        permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
+        if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
+            throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
+                    "Only the workflow's initiator, its assigners or the organisation's owner can assign this step.",
+                    HttpStatus.FORBIDDEN);
+        }
+        // Only someone who could do this step: an active holder of its roles.
+        // (A step with no actor roles configured accepts any active person.)
+        List<Map<String, Object>> candidates = service.getStepActorCandidates(si, wi.getTenantId());
+        if (!candidates.isEmpty() && candidates.stream()
+                .noneMatch(c -> c.get("id") instanceof Number n && n.longValue() == userId)) {
+            throw new com.kashi.grc.common.exception.BusinessException("NOT_ELIGIBLE",
+                    "That person does not hold a role that can do this step.", HttpStatus.UNPROCESSABLE_ENTITY);
+        }
 
         TaskInstanceResponse task = service.manualAssignTask(stepInstanceId, userId, assignedBy);
 
@@ -420,6 +456,32 @@ public class WorkflowInstanceController {
                 task.getId(), stepInstanceId, userId);
 
         return ResponseEntity.status(HttpStatus.CREATED).body(ApiResponse.success(task));
+    }
+
+    /**
+     * GET /v1/workflow-instances/steps/{stepInstanceId}/actor-candidates
+     *
+     * For a step that has nobody on it (e.g. its assignee was suspended): who
+     * can be given it, and whether the caller may choose. Feeds the timeline's
+     * "Assign someone" control; the choice goes to manual-assign.
+     */
+    @GetMapping("/steps/{stepInstanceId}/actor-candidates")
+    @Operation(summary = "Active users who can be given this step, and whether the caller may assign it")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> actorCandidates(@PathVariable Long stepInstanceId) {
+        var caller = utilityService.getLoggedInDataContext();
+        com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
+        if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
+        WorkflowInstance wi = service.getInstanceOfStep(si);
+        permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
+        boolean canAssign = permissionGate.isPlatform() || service.canAssignStep(si, wi, caller.getId());
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("stepInstanceId", si.getId());
+        out.put("workflowInstanceId", wi.getId());
+        out.put("stepName", si.getSnapName());
+        out.put("status", si.getStatus());
+        out.put("canAssign", canAssign);
+        out.put("candidates", canAssign ? service.getStepActorCandidates(si, wi.getTenantId()) : List.of());
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -496,7 +558,7 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
             @PathVariable Long id,
             @PathVariable Long taskId,
-            @RequestBody(required = false) java.util.Map<String, Object> body) {
+            @RequestBody(required = false) Map<String, Object> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         boolean rollbackDownstream = body != null
                 && Boolean.TRUE.equals(body.get("rollbackDownstream"));
