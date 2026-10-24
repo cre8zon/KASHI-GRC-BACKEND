@@ -154,7 +154,10 @@ public class ContentPublicController {
     @PostMapping("/newsletter/subscribe")
     public ResponseEntity<ApiResponse<Map<String, String>>> subscribe(
             @RequestBody Map<String, String> body) {
-        queryService.requestSubscription(body.get("email"), body.get("name"), body.get("sourcePath"));
+        queryService.requestSubscription(body.get("email"), body.get("name"), body.get("sourcePath"),
+                new com.kashi.grc.content.service.NewsletterService.Attribution(
+                        body.get("landingPage"), body.get("utmSource"),
+                        body.get("utmMedium"), body.get("utmCampaign")));
         // Same response whether or not the address was already on the list —
         // otherwise this endpoint tells anyone who asks who is subscribed.
         return ResponseEntity.ok(ApiResponse.success(

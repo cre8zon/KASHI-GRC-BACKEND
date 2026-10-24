@@ -51,4 +51,24 @@ public class NewsletterSubscriber extends BaseEntity {
     /** Which page the signup came from. */
     @Column(name = "source_path", length = 512)
     private String sourcePath;
+
+    /*
+     * Where the visitor arrived from — the first page of their visit and its
+     * UTM labels, captured by the website exactly as for enquiries (see
+     * Enquiry). sourcePath says which ARTICLE earned the signup; these say
+     * which POST, EMAIL or CAMPAIGN brought the reader to it.
+     */
+
+    /** First page of the visit that ended in this signup. */
+    @Column(name = "landing_page", length = 512)
+    private String landingPage;
+
+    @Column(name = "utm_source", length = 100)
+    private String utmSource;
+
+    @Column(name = "utm_medium", length = 100)
+    private String utmMedium;
+
+    @Column(name = "utm_campaign", length = 150)
+    private String utmCampaign;
 }
