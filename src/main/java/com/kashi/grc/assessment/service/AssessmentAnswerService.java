@@ -70,6 +70,8 @@ public class AssessmentAnswerService {
     private final AssessmentAccessGuard                accessGuard;
     private final AssessmentScoringService             scoring;
     private final GuardEvaluator                       guardEvaluator;
+    private final com.kashi.grc.assessment.repository.AssessmentSectionInstanceRepository sectionInstanceRepository;
+    private final com.kashi.grc.document.repository.DocumentLinkRepository              documentLinkRepository;
     private final NotificationService                  notificationService;
     private final UtilityService                       utilityService;
 
@@ -208,18 +210,29 @@ public class AssessmentAnswerService {
                         + "\"questionInstanceId\":%d}",
                 assessment.getId(), assessment.getId(), qi.getId());
 
-        guardEvaluator.evaluate(
+        // Evidence and an owner, as the submit sweep passes them. Without them
+        // a real-time save raised findings over answers that carried evidence,
+        // and raised them with nobody named — so they could not be escalated,
+        // and the sweep's idempotence kept the ownerless copy.
+        Long assignee = qi.getAssignedUserId();
+        if (assignee == null && qi.getSectionInstanceId() != null) {
+            assignee = sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                    .map(s -> s.getAssignedUserId()).orElse(null);
+        }
+        if (assignee == null) assignee = utilityService.getLoggedInDataContext().getId();
+        boolean hasEvidence = documentLinkRepository.countActiveAttachments(
+                "QUESTION_RESPONSE", qi.getId()) > 0;
+
+        guardEvaluator.evaluate(new com.kashi.grc.guard.event.ModuleSubmitEvent.QuestionContext(
                 qi.getQuestionTagSnapshot(),
                 qi.getId(),
                 scored.responseText(),
-                // Real-time submit never carries a file; uploads are evaluated
-                // separately through DocumentLink. Preserved.
-                false,
+                hasEvidence,
                 scored.scoreEarned(),
                 navCtx,
                 scoring.selectedOptionValues(qi.getResponseType(),
                         scored.selectedOptionInstanceId(), scored.responseText(), options),
-                tenantId);
+                assignee), tenantId);
     }
 
     /**

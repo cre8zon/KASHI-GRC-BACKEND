@@ -987,6 +987,53 @@ public class WorkflowEngineService {
                     HttpStatus.FORBIDDEN);
         }
 
+        return doSendBack(task, stepInstance, instance, req, performedBy);
+    }
+
+    /**
+     * A module returns its record to an earlier step of its own workflow — an
+     * issue validator asking the owner for changes is the case.
+     *
+     * Same mechanics as SEND_BACK (the step closes, a fresh instance of the
+     * target step opens with new tasks), without SEND_BACK's ORG_ADMIN /
+     * ORG_OWNER guard. That guard is right for the generic action, which can
+     * rewind any workflow anywhere; here the CALLER has already decided who
+     * may do it for its domain (the issue's current step holder), and the
+     * caller must hold the task — ownership is checked below as for any
+     * action.
+     *
+     * @param targetStepId blueprint step to return to; null = the previous step
+     */
+    @Transactional
+    public WorkflowInstanceResponse returnToEarlierStep(Long taskInstanceId, Long targetStepId,
+                                                        String remarks, Long performedBy) {
+        TaskInstance task = taskInstanceRepository.findById(taskInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("TaskInstance", taskInstanceId));
+        if (task.getStatus() != TaskStatus.PENDING && task.getStatus() != TaskStatus.IN_PROGRESS)
+            throw new BusinessException("TASK_TERMINAL",
+                    "Task is already in terminal state: " + task.getStatus());
+        requireTaskOwnership(task, performedBy);
+
+        StepInstance stepInstance = stepInstanceRepository.findByIdForUpdate(task.getStepInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", task.getStepInstanceId()));
+        WorkflowInstance instance = instanceRepository.findById(stepInstance.getWorkflowInstanceId())
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance",
+                        stepInstance.getWorkflowInstanceId()));
+        if (instance.getStatus() != WorkflowStatus.IN_PROGRESS)
+            throw new BusinessException("INSTANCE_NOT_ACTIVE",
+                    "Workflow is not IN_PROGRESS. Current: " + instance.getStatus());
+
+        TaskActionRequest req = new TaskActionRequest();
+        req.setTaskInstanceId(taskInstanceId);
+        req.setActionType(ActionType.SEND_BACK);
+        req.setRemarks(remarks);
+        req.setTargetStepId(targetStepId);
+        return doSendBack(task, stepInstance, instance, req, performedBy);
+    }
+
+    /** SEND_BACK's mechanics, after whoever called it has been authorised. */
+    private WorkflowInstanceResponse doSendBack(TaskInstance task, StepInstance stepInstance,
+                                                WorkflowInstance instance, TaskActionRequest req, Long performedBy) {
         log.info("[WORKFLOW-ACTION] SEND_BACK | instanceId={} | from='{}' | targetStepId={}",
                 instance.getId(), stepInstance.getSnapName(), req.getTargetStepId());
 
@@ -2367,7 +2414,7 @@ public class WorkflowEngineService {
                                 boolean hasLiveTask = taskInstanceRepository
                                         .findByStepInstanceId(existing.getId()).stream()
                                         .anyMatch(t -> t.getStatus() == TaskStatus.PENDING
-                                                    || t.getStatus() == TaskStatus.IN_PROGRESS);
+                                                || t.getStatus() == TaskStatus.IN_PROGRESS);
                                 if (!hasLiveTask) {
                                     log.info("[WORKFLOW] Adopted step has no live task — re-arming assignment | "
                                                     + "stepInstanceId={} | status={}",
@@ -3200,8 +3247,8 @@ public class WorkflowEngineService {
 
                 case POOL -> {
                     if (isAssignable(instance.getInitiatedBy(), tenantId)) {
-                    TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
-                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                        TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
+                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     }
                     log.info("[WORKFLOW] Step '{}' POOL — ASSIGNER task for initiator (placeholder)", si.getSnapName());
                 }
@@ -3269,8 +3316,8 @@ public class WorkflowEngineService {
 
                 case INITIATOR -> {
                     if (isAssignable(instance.getInitiatedBy(), tenantId)) {
-                    TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
-                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                        TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
+                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     }
                     log.info("[WORKFLOW] Step '{}' INITIATOR — ASSIGNER task for initiator userId={}",
                             si.getSnapName(), instance.getInitiatedBy());
@@ -3696,7 +3743,7 @@ public class WorkflowEngineService {
             String who = userRepository.findById(userId).map(u -> u.getFullName().trim()).orElse("This user");
             throw new BusinessException("ASSIGNEE_INACTIVE",
                     who + " is suspended or deactivated and cannot be given tasks. Choose someone else.",
-                    HttpStatus.UNPROCESSABLE_ENTITY);
+                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
         }
         TaskInstance task = TaskInstance.builder()
                 .stepInstanceId(si.getId())
@@ -4700,7 +4747,7 @@ public class WorkflowEngineService {
     /** Open tasks a user holds right now (for the suspend dialog's "what this affects"). */
     public long countOpenTasks(Long userId) {
         return taskInstanceRepository.findByAssignedUserIdAndStatusIn(
-                userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)).stream()
+                        userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)).stream()
                 .map(t -> stepInstanceRepository.findById(t.getStepInstanceId()).orElse(null))
                 .filter(si -> si != null && StepStatus.LIVE.contains(si.getStatus()))
                 .count();
@@ -5150,6 +5197,28 @@ public class WorkflowEngineService {
                 performedBy,
                 rollbackDownstream
         ));
+
+        // ── TELL THE OPEN PAGES ──────────────────────────────────────────────
+        // A reset moves the workflow backwards, and nothing said so: every page
+        // showing this instance kept the old live step (and the rolled-back
+        // step's tasks) until someone refreshed. The same two pushes a forward
+        // move makes — STEP_ADVANCED to the instance room, so timelines and
+        // view-context refetch, and TASK_ASSIGNED to the task's owner, so their
+        // page moves back onto the task that is live again.
+        eventPublisher.publishEvent(new WorkflowEvent.StepAdvanced(
+                instance.getId(), si.getId(), si.getSnapName(), si.getSnapStepOrder(),
+                si.getStatus() != null ? si.getStatus().name() : null, performedBy));
+        if (task.getAssignedUserId() != null) {
+            eventPublisher.publishEvent(new WorkflowEvent.TaskAssigned(
+                    instance.getId(), si.getId(), task.getId(), task.getAssignedUserId(),
+                    si.getSnapName() != null ? si.getSnapName() : "workflow step",
+                    instance.getEntityType(), instance.getEntityId(),
+                    entityResolverRegistry.resolveArtifactId(instance),
+                    si.getSnapNavKey(),
+                    si.getSnapSide(),
+                    si.getSnapStepAction() != null ? si.getSnapStepAction().name() : StepAction.APPROVE.name(),
+                    task.getTaskRole() != null ? task.getTaskRole().name() : "ACTOR"));
+        }
 
         return Map.of(
                 "reset",          true,

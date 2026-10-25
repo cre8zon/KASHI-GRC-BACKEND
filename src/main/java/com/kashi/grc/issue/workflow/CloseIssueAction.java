@@ -133,6 +133,39 @@ public class CloseIssueAction implements AutomatedActionHandler {
         log.info("[CLOSE_ISSUE] Done | issueId={} | issueRef={} | closedBy={}",
                 issue.getId(), issue.getIssueRef(), closedBy);
 
+        cascadeToSource(issue, tenantId, closedBy);
+        return true;
+    }
+
+    /**
+     * The issue was closed by a person — the "Close" button on the sign-off
+     * step — rather than by this handler on a SYSTEM step.
+     *
+     * The engine dispatches automated actions only on SYSTEM-side steps.
+     * "Audit Finding Remediation" names CLOSE_ISSUE on its ORGANIZATION-side
+     * step 4, and "Vendor Remediation Lifecycle" has no auto-close step at all,
+     * so on both the issue closed and the finding or remediation it came from
+     * stayed open. The cascade belongs to the issue closing, however it closed.
+     *
+     * Synchronous, inside the closing transaction, so the finding and the issue
+     * close together. A failure here is logged and swallowed: the issue's own
+     * close must not be undone because a linked record could not be updated,
+     * and the cascade is idempotent, so a later close attempt or the automated
+     * step repairs it.
+     */
+    @org.springframework.context.event.EventListener
+    public void onIssueClosed(IssueClosedEvent event) {
+        try {
+            issueRepository.findById(event.issueId()).ifPresent(issue ->
+                    cascadeToSource(issue, event.tenantId(), event.closedBy()));
+        } catch (Exception e) {
+            log.warn("[CLOSE_ISSUE] Cascade after manual close failed | issueId={} | {}",
+                    event.issueId(), e.getMessage(), e);
+        }
+    }
+
+    /** Closes the audit finding or resolves the assessment remediation this issue was raised from. */
+    void cascadeToSource(Issue issue, Long tenantId, Long closedBy) {
         // Close linked AuditFinding if this issue was escalated from one
         if ("AUDIT_FINDING".equals(issue.getSourceEntityType())
                 && issue.getSourceEntityId() != null) {
@@ -217,6 +250,5 @@ public class CloseIssueAction implements AutomatedActionHandler {
             });
         }
 
-        return true;
     }
 }

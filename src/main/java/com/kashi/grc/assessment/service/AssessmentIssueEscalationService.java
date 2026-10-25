@@ -79,6 +79,9 @@ public class AssessmentIssueEscalationService {
     private final ActionItemRepository         actionItemRepository;
     private final VendorAssessmentRepository   assessmentRepository;
     private final WorkflowRepository           workflowRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentQuestionInstanceRepository questionInstanceRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentSectionInstanceRepository  sectionInstanceRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentResponseRepository         responseRepository;
 
     /** What we stamp on the issue so the closure cascade can find its way back. */
     public static final String SOURCE_MODULE      = "VENDOR_ASSESSMENT";
@@ -164,7 +167,7 @@ public class AssessmentIssueEscalationService {
         // that is the item's assignee — the vendor user the reviewer raised it
         // against. Falling back to the raiser would put the issue back on the
         // reviewer's desk, which reads as done when it is not.
-        Long ownerId = item.getAssignedTo() != null ? item.getAssignedTo() : item.getResolutionReservedFor();
+        Long ownerId = resolveOwnerId(item);
         if (ownerId == null) {
             throw new BusinessException("NO_OWNER",
                     "This remediation has no assignee, so the issue would have no owner. "
@@ -236,6 +239,50 @@ public class AssessmentIssueEscalationService {
     // ══════════════════════════════════════════════════════════════════════
     // RESOLUTION
     // ══════════════════════════════════════════════════════════════════════
+
+    /**
+     * The vendor user who has to fix this finding, or null when nobody can be named.
+     *
+     * A KashiGuard rule that assigns by GROUP ROLE leaves assignedTo empty, and
+     * every such finding failed to escalate with NO_OWNER — automatically, and
+     * again when a reviewer pressed Escalate, because nothing on the Findings tab
+     * lets them pick an owner. But the finding is about one question, and the
+     * question already says who is responsible for it. So, in order:
+     *
+     *   1. the item's own assignee                — set by the raiser
+     *   2. the question's contributor             — assigned to answer it
+     *   3. the section's responder                — owns the section it sits in
+     *   4. whoever submitted the answer           — the vendor user who wrote it
+     *   5. resolutionReservedFor                  — the reviewer who raised it, last,
+     *                                               so an Issue never lands back on
+     *                                               the reviewer while a vendor user
+     *                                               could be named
+     *
+     * Public so AssessmentGuardFindingListener skips exactly the findings this
+     * would refuse, and no others.
+     */
+    public Long resolveOwnerId(ActionItem item) {
+        if (item.getAssignedTo() != null) return item.getAssignedTo();
+
+        if (item.getEntityType() == ActionItem.EntityType.QUESTION_RESPONSE && item.getEntityId() != null) {
+            var qi = questionInstanceRepository.findById(item.getEntityId()).orElse(null);
+            if (qi != null) {
+                if (qi.getAssignedUserId() != null) return qi.getAssignedUserId();
+                if (qi.getSectionInstanceId() != null) {
+                    Long responder = sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                            .map(s -> s.getAssignedUserId()).orElse(null);
+                    if (responder != null) return responder;
+                }
+                if (qi.getAssessmentId() != null) {
+                    Long answeredBy = responseRepository
+                            .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(qi.getAssessmentId(), qi.getId())
+                            .map(r -> r.getSubmittedBy()).orElse(null);
+                    if (answeredBy != null) return answeredBy;
+                }
+            }
+        }
+        return item.getResolutionReservedFor();
+    }
 
     /**
      * The ISSUE workflow to run, by name, most specific first.

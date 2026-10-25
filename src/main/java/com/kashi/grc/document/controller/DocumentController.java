@@ -413,6 +413,14 @@ public class DocumentController {
                 .orElseThrow(() -> new ResourceNotFoundException("DocumentLink", linkId));
         if (!tenantId.equals(link.getTenantId()))
             throw new BusinessException("ACCESS_DENIED", "Not your tenant.", HttpStatus.FORBIDDEN);
+        // Evidence someone has accepted or rejected is part of the record of
+        // that decision. Removing it would leave an acceptance with nothing
+        // behind it, or erase why a fix was sent back. Upload a new file instead.
+        if (link.getReviewStatus() != null)
+            throw new BusinessException("EVIDENCE_REVIEWED",
+                    "This file has been reviewed (" + link.getReviewStatus().toLowerCase()
+                            + ") and stays on the record. Upload a new file instead.",
+                    HttpStatus.CONFLICT);
 
         var recordOpt = findEvidenceRecordFor(link.getDocumentId(), tenantId);
         List<com.kashi.grc.evidence.domain.EvidenceLink> allLinks = recordOpt
@@ -528,6 +536,8 @@ public class DocumentController {
         java.util.Set<Long> uploaderIds = documentsById.values().stream()
                 .map(Document::getUploadedBy).filter(Objects::nonNull)
                 .collect(java.util.stream.Collectors.toSet());
+        // Reviewers too — same single lookup.
+        links.stream().map(DocumentLink::getReviewedBy).filter(Objects::nonNull).forEach(uploaderIds::add);
         Map<Long, String> uploaderNames = new java.util.HashMap<>();
         if (!uploaderIds.isEmpty()) {
             userRepository.findAllById(uploaderIds).forEach(u -> uploaderNames.put(u.getId(),
@@ -553,6 +563,12 @@ public class DocumentController {
             m.put("notes",         lnk.getNotes());
             m.put("uploadedBy",     doc.getUploadedBy());
             m.put("uploadedByName", doc.getUploadedBy() != null ? uploaderNames.get(doc.getUploadedBy()) : null);
+            // Review state, where this link is reviewed (null everywhere else)
+            m.put("reviewStatus",   lnk.getReviewStatus());
+            m.put("reviewedBy",     lnk.getReviewedBy());
+            m.put("reviewedByName", lnk.getReviewedBy() != null ? uploaderNames.get(lnk.getReviewedBy()) : null);
+            m.put("reviewedAt",     lnk.getReviewedAt() != null ? lnk.getReviewedAt().toString() : null);
+            m.put("reviewNote",     lnk.getReviewNote());
             // Omit s3Key — never expose S3 keys to frontend (security)
             // Use /download-url endpoint to get a time-limited presigned GET URL
 

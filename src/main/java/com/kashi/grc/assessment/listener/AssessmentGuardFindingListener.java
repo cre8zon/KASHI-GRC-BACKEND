@@ -204,7 +204,10 @@ public class AssessmentGuardFindingListener {
             // sits in OPEN with nobody told. It stays in the Findings tab and
             // a reviewer escalates it once they have picked someone — which is
             // exactly the manual path, reached honestly.
-            if (fresh.getAssignedTo() == null && fresh.getResolutionReservedFor() == null) {
+            // The same owner chain escalate() uses — contributor, section
+            // responder, the vendor user who answered — so a group-assigned
+            // guard finding is skipped only when nobody at all can be named.
+            if (escalationService.resolveOwnerId(fresh) == null) {
                 log.info("[FINDING-ESCALATE] Skipped, no owner | itemId={} assessmentId={} source={} "
                                 + "— nobody is named on it, so a person must pick an owner and escalate "
                                 + "from the Findings tab",

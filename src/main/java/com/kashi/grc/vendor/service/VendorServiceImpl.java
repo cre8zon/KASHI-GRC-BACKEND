@@ -53,6 +53,7 @@ public class VendorServiceImpl implements VendorService {
     private final UtilityService         utilityService;
     private final UserService            userService;
     private final RoleRepository         roleRepository;
+    private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
 
     @PersistenceContext
     private EntityManager entityManager;
@@ -62,6 +63,18 @@ public class VendorServiceImpl implements VendorService {
     public VendorOnboardResponse onboard(VendorOnboardRequest req) {
         Long tenantId    = utilityService.getLoggedInDataContext().getTenantId();
         Long initiatedBy = utilityService.getLoggedInDataContext().getId();
+
+        // ── 0. Refuse up front what would fail later ──────────────────
+        // The primary contact becomes a user, and an email is one account
+        // across the whole platform. Checked BEFORE anything is created, so
+        // the person sees which field to change instead of a failed submit.
+        if (req.getPrimaryContact() != null && req.getPrimaryContact().getEmail() != null
+                && userRepository.existsByEmailAndIsDeletedFalse(req.getPrimaryContact().getEmail().trim())) {
+            throw new BusinessException("CONTACT_EMAIL_IN_USE",
+                    req.getPrimaryContact().getEmail().trim() + " already has a Kashiguard account. "
+                            + "Use a different email for the vendor's primary contact.",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
 
         // ── 1. Save vendor ────────────────────────────────────────────
         Vendor vendor = Vendor.builder()
@@ -114,8 +127,12 @@ public class VendorServiceImpl implements VendorService {
                     .orElse(null);
 
             if (vrmRoleId == null) {
-                log.warn("[VENDOR] VENDOR_VRM role not found — VRM user will have no role | vendorId={}",
-                        vendor.getId());
+                // A vendor user without a vendor-side role is refused by
+                // createUser anyway; say what is actually missing.
+                throw new BusinessException("VENDOR_VRM_ROLE_MISSING",
+                        "The VENDOR_VRM role is missing, so the primary contact cannot be set up. "
+                                + "Ask a platform administrator to restore it.",
+                        org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
             }
 
             var userReq = new com.kashi.grc.usermanagement.dto.request.UserCreateRequest();
@@ -128,14 +145,16 @@ public class VendorServiceImpl implements VendorService {
             userReq.setSendWelcomeEmail(true);
             if (vrmRoleId != null) userReq.setRoleIds(Set.of(vrmRoleId));
 
-            try {
-                userService.createUser(userReq);
-                log.info("[VENDOR] VRM user created | email={} | vendorId={}",
-                        contact.getEmail(), vendor.getId());
-            } catch (Exception e) {
-                log.warn("[VENDOR] VRM user creation failed | email={} | vendorId={} | err={}",
-                        contact.getEmail(), vendor.getId(), e.getMessage());
-            }
+            // No try/catch. This used to catch and log the failure and carry on —
+            // but createUser runs in THIS transaction, so its failure had already
+            // marked the whole onboarding for rollback. The vendor was never
+            // saved, the commit was refused ("rolled back because it has been
+            // marked as rollback-only") and the person saw only "An unexpected
+            // error occurred", with the real reason (say, an email already in
+            // use) left in a log line. Now that reason is what they see.
+            userService.createUser(userReq);
+            log.info("[VENDOR] VRM user created | email={} | vendorId={}",
+                    contact.getEmail(), vendor.getId());
         }
 
         // ── 4. Start workflow ─────────────────────────────────────────

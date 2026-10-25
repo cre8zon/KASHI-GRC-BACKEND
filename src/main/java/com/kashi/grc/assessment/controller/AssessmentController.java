@@ -98,6 +98,8 @@ import java.util.*;
 public class AssessmentController {
 
     private final VendorAssessmentRepository           assessmentRepository;
+    /** Who may evaluate which question, and who may delegate — see assertCanEvaluate. */
+    private final com.kashi.grc.assessment.service.AssessmentAccessGuard accessGuard;
     private final VendorAssessmentCycleRepository      cycleRepository;
     private final AssessmentTemplateInstanceRepository templateInstanceRepository;
     private final AssessmentSectionInstanceRepository  sectionInstanceRepository;
@@ -140,6 +142,8 @@ public class AssessmentController {
     private final NotificationService                    notificationService;
     private final com.kashi.grc.document.repository.DocumentLinkRepository documentLinkRepository;
     private final com.kashi.grc.comment.repository.EntityCommentRepository entityCommentRepository;
+    private final com.kashi.grc.assessment.service.AssessmentScoreSyncService scoreSyncService;
+    private final com.kashi.grc.assessment.repository.AssessmentReportRepository reportRepository;
 
     // ── 9.1 Execute Assessment (logic unchanged) ───────────────────────────────
 
@@ -680,16 +684,27 @@ public class AssessmentController {
                     }
                 } catch (Exception ignored) {}
             }
-            guardEvaluator.evaluate(
+            // Evidence and an owner, the same as the submit sweep passes. Without
+            // them a real-time save raised findings over answers that carried
+            // evidence, and raised them with nobody named — so they could not be
+            // escalated, and the sweep's idempotence kept the ownerless copy.
+            Long guardAssignee = qi.getAssignedUserId();
+            if (guardAssignee == null && qi.getSectionInstanceId() != null) {
+                guardAssignee = sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                        .map(AssessmentSectionInstance::getAssignedUserId).orElse(null);
+            }
+            if (guardAssignee == null) guardAssignee = userId;
+            boolean hasEvidence = documentLinkRepository.countActiveAttachments(
+                    "QUESTION_RESPONSE", qi.getId()) > 0;
+            guardEvaluator.evaluate(new ModuleSubmitEvent.QuestionContext(
                     qi.getQuestionTagSnapshot(),
                     qi.getId(),
                     response.getResponseText(),
-                    false,  // real-time: file uploads handled separately via DocumentLink
+                    hasEvidence,
                     response.getScoreEarned(),
                     navCtx,
                     selectedOptionValues.isEmpty() ? null : selectedOptionValues,
-                    tenantId
-            );
+                    guardAssignee), tenantId);
         }
 
         // ── Re-answer: transition action items to PENDING_REVIEW ────────────
@@ -900,10 +915,30 @@ public class AssessmentController {
         // ── STEP-GATED ACCESS GUARD ───────────────────────────────────────────
         // COMPLETED assessments are read-only — allow any participant (past or present).
         // Active steps still require an active task to prevent premature access.
-        if ("COMPLETED".equals(assessment.getStatus())) {
+        //
+        // This is also what the report page reads. Once the CISO assigns the
+        // rating their task is done and the workflow sits on the admin's
+        // sign-off — not COMPLETED, and no live task for the CISO — so the
+        // report they had just approved came back 403, shown as "Report not
+        // found". Someone who has worked this assessment may read it at any
+        // point; the live-task rule still applies to everyone else.
+        //
+        // And once a report has been generated it is a published document:
+        // its card shows on the Reports tab and the Reports page to everyone
+        // who can see the assessment (this tenant — the lookup above already
+        // enforces that), so opening it must not then be refused.
+        boolean reportPublished = reportRepository.countByAssessmentId(assessmentId) > 0;
+        if (reportPublished) {
+            log.debug("[ASSESSMENT-GUARD] Report generated — readable in tenant | assessmentId={} | userId={}",
+                    assessmentId, userId);
+        } else if ("COMPLETED".equals(assessment.getStatus())) {
             assertUserHasParticipated(assessment, userId, "view completed assessment");
         } else {
-            assertUserHasActiveTask(assessment, userId, "review assessment");
+            try {
+                assertUserHasActiveTask(assessment, userId, "review assessment");
+            } catch (BusinessException noLiveTask) {
+                assertUserHasParticipated(assessment, userId, "view assessment report");
+            }
         }
 
         if ("SUBMITTED".equals(assessment.getStatus())) {
@@ -1553,6 +1588,13 @@ public class AssessmentController {
             if (s.getReviewerAssignedUserId() != null) sectionUserIds.add(s.getReviewerAssignedUserId());
             if (s.getSubmittedBy()            != null) sectionUserIds.add(s.getSubmittedBy());
         });
+        // Question-level assignees too: the Review tab's per-question reviewer
+        // picker and the contributor label read them off this payload, and
+        // without them every picker showed "Reviewer…" over an assigned question.
+        allQuestions.forEach(q -> {
+            if (q.getAssignedUserId()         != null) sectionUserIds.add(q.getAssignedUserId());
+            if (q.getReviewerAssignedUserId() != null) sectionUserIds.add(q.getReviewerAssignedUserId());
+        });
         // Collectors.toMap yields a HashMap — get(null) is safe, unlike Map.of().
         Map<Long, String> sectionNameMap = userRepository.findAllById(sectionUserIds).stream()
                 .collect(java.util.stream.Collectors.toMap(
@@ -1615,6 +1657,10 @@ public class AssessmentController {
                                         .questionTag(qi.getQuestionTagSnapshot())
                                         .requiresEvidence(qi.isRequiresEvidence())
                                         .evidenceCount(fileAttachCounts.getOrDefault(qi.getId(), 0L).intValue())
+                                        .assignedUserId(qi.getAssignedUserId())
+                                        .assignedUserName(sectionNameMap.get(qi.getAssignedUserId()))
+                                        .reviewerAssignedUserId(qi.getReviewerAssignedUserId())
+                                        .reviewerAssignedUserName(sectionNameMap.get(qi.getReviewerAssignedUserId()))
                                         .options(optionsByQuestion.getOrDefault(qi.getId(), List.of()))
                                         .currentResponse(answer)
                                         .build();
@@ -2522,9 +2568,11 @@ public class AssessmentController {
                             AssessmentResponse r =
                                     responseMap.get(qi.getId());
 
-                            // ── FILE_UPLOAD: check DocumentLink not responseText ──────────
-                            boolean fileUploaded = "FILE_UPLOAD".equals(qi.getResponseType())
-                                    && documentLinkRepository.countActiveAttachments(
+                            // ── Evidence: a DocumentLink on the question, whatever its type ──
+                            // It was checked for FILE_UPLOAD questions only, so a choice or
+                            // text answer backed by a file was judged as if it had none, and
+                            // KashiGuard raised a finding the evidence already answered.
+                            boolean fileUploaded = documentLinkRepository.countActiveAttachments(
                                     "QUESTION_RESPONSE", qi.getId()) > 0;
 
                             // ── SINGLE/MULTI_CHOICE: resolve option text for OPTION_SELECTED ──
@@ -2692,6 +2740,10 @@ public class AssessmentController {
         // non-null: no side, no role, not even a tenant check. The dropdown was
         // the whole control, and a dropdown is not a control.
         assignmentService.assertAssignable(reviewAssistantId, assessmentId, StepAction.REVIEW);
+        // Delegating is the reviewer's, on the step — an assistant cannot pass
+        // their questions on, as a contributor cannot reassign theirs.
+        accessGuard.assertHasLiveTask(loadAssessmentInTenant(assessmentId),
+                utilityService.getLoggedInDataContext().getId(), "delegate a question");
 
         AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("QuestionInstance", questionInstanceId));
@@ -2735,6 +2787,12 @@ public class AssessmentController {
                 .sourceId(questionInstanceId)
                 .entityType(ActionItem.EntityType.QUESTION_RESPONSE)
                 .entityId(questionInstanceId)
+                // The assessment the question belongs to. The inbox opens the
+                // nav row's route with :id = parentEntityId ?? entityId, so
+                // without this a question-level item opened
+                // /module/vendor_assessment/{questionId} — "not found".
+                .parentEntityType(ActionItem.EntityType.ASSESSMENT)
+                .parentEntityId(assessmentId)
                 .title(qi.getQuestionTextSnapshot()
                         .substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
                 .status(ActionItem.Status.OPEN)
@@ -2862,6 +2920,15 @@ public class AssessmentController {
             throw new com.kashi.grc.common.exception.ValidationException(
                     "verdict must be PASS, PARTIAL, or FAIL");
         }
+        // Tenant, then ownership: a reviewer on the step evaluates anything, a
+        // review assistant only the questions delegated to them.
+        VendorAssessment evalAssessment = loadAssessmentInTenant(assessmentId);
+        AssessmentQuestionInstance evalQi = questionInstanceRepository.findById(questionInstanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("QuestionInstance", questionInstanceId));
+        if (!assessmentId.equals(evalQi.getAssessmentId()))
+            throw new com.kashi.grc.common.exception.ValidationException(
+                    "QuestionInstance does not belong to assessment " + assessmentId);
+        accessGuard.assertCanEvaluate(evalAssessment, evalQi, userId);
 
         AssessmentResponse response = responseRepository
                 .findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(assessmentId, questionInstanceId)
@@ -3053,10 +3120,14 @@ public class AssessmentController {
         // Recalculate total earned score applying reviewer verdicts:
         // PASS → full credit, PARTIAL → 50% credit, FAIL → 0, PENDING → full credit.
         // This is the authoritative score that gets persisted and flows into all reports.
-        double liveScore = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
-        assessment.setTotalEarnedScore(liveScore);
-        assessmentRepository.save(assessment);
-        log.info("[CONSOLIDATE] reviewer-adjusted totalEarnedScore={} | assessmentId={}", liveScore, assessmentId);
+        //
+        // Earned AND possible, through the same sync the report and issue
+        // closure use. Setting only the earned score left totalPossibleScore
+        // null, and compliancePercent — earned / possible — is null whenever
+        // possible is, so the consolidated score never appeared anywhere.
+        scoreSyncService.syncAssessmentScore(assessmentId, assessment.getTenantId());
+        log.info("[CONSOLIDATE] score synced | earned={} possible={} | assessmentId={}",
+                assessment.getTotalEarnedScore(), assessment.getTotalPossibleScore(), assessmentId);
 
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
@@ -3106,6 +3177,51 @@ public class AssessmentController {
                         "FINDINGS_DOCUMENTED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
         log.info("[SECTION-EVENT] FINDINGS_DOCUMENTED | assessmentId={} | taskId={}", assessmentId, taskId);
         return ResponseEntity.ok(ApiResponse.success(null));
+    }
+
+    /**
+     * The reviewer-adjusted score as it stands now, and the rating it suggests.
+     *
+     * Read-only and computed live from the responses, so it is right before
+     * anything has been consolidated and on assessments whose stored
+     * totalPossibleScore was never written. Used by the consolidate and risk
+     * rating dialogs, which show the score and pre-select the suggestion; the
+     * CISO may pick any other rating.
+     *
+     * Suggestion bands are the review page's: 80%+ LOW, 60%+ MEDIUM,
+     * 40%+ HIGH, below that CRITICAL. Null when there is nothing to score.
+     */
+    @GetMapping("/v1/assessments/{assessmentId}/score-summary")
+    @Transactional(readOnly = true)
+    @Operation(summary = "Live reviewer-adjusted score, compliance % and suggested risk rating")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> scoreSummary(@PathVariable Long assessmentId) {
+        VendorAssessment assessment = loadAssessmentInTenant(assessmentId);
+        Double earned   = responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId);
+        Double possible = questionInstanceRepository.sumWeightByAssessmentId(assessmentId);
+        double e = earned   != null ? earned   : 0.0;
+        double p = possible != null ? possible : 0.0;
+        Integer pct = p > 0 ? (int) Math.round(e / p * 100) : null;
+        String suggested = pct == null ? null
+                : pct >= 80 ? "LOW" : pct >= 60 ? "MEDIUM" : pct >= 40 ? "HIGH" : "CRITICAL";
+
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("assessmentId",        assessmentId);
+        out.put("earnedScore",         e);
+        out.put("possibleScore",       p);
+        out.put("compliancePct",       pct);
+        out.put("suggestedRiskRating", suggested);
+        out.put("riskRating",          assessment.getRiskRating());
+        out.put("reviewFindings",      assessment.getReviewFindings());
+        templateInstanceRepository.findByAssessmentId(assessmentId).ifPresent(ti -> {
+            List<AssessmentSectionInstance> secs =
+                    sectionInstanceRepository.findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+            out.put("sectionsTotal",  secs.size());
+            out.put("totalQuestions", secs.stream()
+                    .mapToLong(sec -> questionInstanceRepository.findBySectionInstanceIdOrderByOrderNo(sec.getId()).size())
+                    .sum());
+        });
+        out.put("answeredQuestions",   responseRepository.countAnsweredByAssessmentId(assessmentId));
+        return ResponseEntity.ok(ApiResponse.success(out));
     }
 
     /** Step 11: Org CISO approves the consolidated review */
@@ -3162,14 +3278,25 @@ public class AssessmentController {
                     "riskRating must be one of: LOW, MEDIUM, HIGH, CRITICAL");
         }
         assessment.setRiskRating(riskRating.toUpperCase());
-        // Persist reviewer-adjusted score alongside the rating so totalEarnedScore
-        // on the assessment record is always consistent with the final risk decision.
-        assessment.setTotalEarnedScore(responseRepository.sumReviewerAdjustedScoreByAssessmentId(assessmentId));
         assessmentRepository.save(assessment);
+        // Earned and possible together, so the score saved with the rating is
+        // complete — see consolidateScores.
+        scoreSyncService.syncAssessmentScore(assessmentId, assessment.getTenantId());
         log.info("[RISK-RATING] {} | assessmentId={} | by={}", riskRating.toUpperCase(), assessmentId, userId);
         eventPublisher.publishEvent(
                 com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
                         "RISK_RATING_ASSIGNED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
+        // ── ASSIGNING THE RATING IS THE APPROVAL ─────────────────────────
+        // The CISO's step owes two gates, the rating and the approval, and the
+        // review page always closed both with one button (rating, then
+        // ciso-approve). As two separate header actions the CISO could assign
+        // a rating and leave the step open. Firing the approval here keeps the
+        // one-gesture behaviour; on a step with no CISO_APPROVED gate the
+        // section service logs it and does nothing, and a task the rating has
+        // already completed ignores it as terminal.
+        eventPublisher.publishEvent(
+                com.kashi.grc.workflow.event.TaskSectionEvent.sectionDone(
+                        "CISO_APPROVED", taskId, userId, "VENDOR_ASSESSMENT", assessmentId));
         return ResponseEntity.ok(ApiResponse.success(null));
     }
 
@@ -3557,6 +3684,12 @@ public class AssessmentController {
                 .sourceId(qi.getId())
                 .entityType(ActionItem.EntityType.QUESTION_RESPONSE)
                 .entityId(qi.getId())
+                // The assessment the question belongs to. The inbox opens the
+                // nav row's route with :id = parentEntityId ?? entityId, so
+                // without this a question-level item opened
+                // /module/vendor_assessment/{questionId} — "not found".
+                .parentEntityType(ActionItem.EntityType.ASSESSMENT)
+                .parentEntityId(assessmentId)
                 .title(qi.getQuestionTextSnapshot()
                         .substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
                 .status(ActionItem.Status.OPEN)

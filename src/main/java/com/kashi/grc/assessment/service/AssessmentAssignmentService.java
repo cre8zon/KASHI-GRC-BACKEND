@@ -140,7 +140,13 @@ public class AssessmentAssignmentService {
                 .orElseThrow(() -> new BusinessException("INVALID_ASSIGNEE",
                         "That user is not available for assignment.", HttpStatus.FORBIDDEN));
 
-        StepInstance si = stepInstanceForAction(assessmentId, action);
+        // The step the caller is actually working, when they hold a live task on
+        // this assessment's workflow — that is the step whose rule applies.
+        // Guessing by action type picked the wrong one: reviewer assignment
+        // (step 10, ASSIGN) was judged as REVIEW, which resolved to the finished
+        // vendor step 8, and every organisation reviewer was refused.
+        StepInstance si = callerLiveStep(assessmentId);
+        if (si == null) si = stepInstanceForAction(assessmentId, action);
         if (si == null) {
             log.debug("[ASSIGNABLE] No step instance for action={} on assessment={} — allowing",
                     action, assessmentId);
@@ -218,7 +224,12 @@ public class AssessmentAssignmentService {
         }
         // Same scope on the mode 2 path. Leaving one unscoped means the hole
         // survives on whichever step happens to fall through to it.
-        return workflowEngineService.getUsersByRolesScoped(roleIds, tenantId, si, null);
+        //
+        // Scoped by the NEXT step's side — the side of the people being listed.
+        // Passing null fell back to the CURRENT step's side, so on a
+        // vendor→organisation handoff every organisation user was filtered out
+        // by the vendor scope ("0 of 2 users kept").
+        return workflowEngineService.getUsersByRolesScoped(roleIds, tenantId, si, next.get().getSide());
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -247,6 +258,28 @@ public class AssessmentAssignmentService {
             throw new ResourceNotFoundException("TaskInstance", taskId);
         }
         return si;
+    }
+
+    /**
+     * The live step the caller holds a task on, on this assessment's workflow —
+     * or null (no task of theirs there, e.g. an admin acting outside a task).
+     */
+    private StepInstance callerLiveStep(Long assessmentId) {
+        var caller = utilityService.getLoggedInDataContext();
+        VendorAssessment assessment = assessmentRepository
+                .findByIdAndTenantId(assessmentId, caller.getTenantId()).orElse(null);
+        if (assessment == null || assessment.getCycleId() == null) return null;
+        VendorAssessmentCycle cycle = cycleRepository.findById(assessment.getCycleId()).orElse(null);
+        if (cycle == null || cycle.getWorkflowInstanceId() == null) return null;
+        Long wf = cycle.getWorkflowInstanceId();
+        return taskInstanceRepository.findByAssignedUserIdAndStatusIn(caller.getId(),
+                        List.of(com.kashi.grc.workflow.enums.TaskStatus.PENDING,
+                                com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS)).stream()
+                .map(t -> stepInstanceRepository.findById(t.getStepInstanceId()).orElse(null))
+                .filter(s -> s != null && wf.equals(s.getWorkflowInstanceId())
+                        && StepStatus.LIVE.contains(s.getStatus()))
+                .reduce((a, b) -> b)
+                .orElse(null);
     }
 
     /** The step instance this action refers to on this assessment, or null. */

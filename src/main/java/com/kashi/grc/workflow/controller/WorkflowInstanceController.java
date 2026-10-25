@@ -256,7 +256,7 @@ public class WorkflowInstanceController {
     @Operation(summary = "Override-advance a step without a task (requires workflow:step:override permission)")
     public ResponseEntity<ApiResponse<WorkflowInstanceResponse>> overrideStep(
             @PathVariable Long stepInstanceId,
-            @RequestBody(required = false) Map<String, Object> body) {
+            @RequestBody(required = false) java.util.Map<String, Object> body) {
 
         Long performedBy = utilityService.getLoggedInDataContext().getId();
         String action  = body != null && body.get("action")  != null ? body.get("action").toString()  : "APPROVE";
@@ -308,7 +308,7 @@ public class WorkflowInstanceController {
 
     @GetMapping("/tasks/my-next")
     @Operation(summary = "After task completion — find current user's next pending task on the same entity or its parent project")
-    public ResponseEntity<ApiResponse<Map<String, Object>>> getMyNextTask(
+    public ResponseEntity<ApiResponse<java.util.Map<String, Object>>> getMyNextTask(
             @RequestParam String entityType,
             @RequestParam Long entityId) {
 
@@ -324,7 +324,27 @@ public class WorkflowInstanceController {
                 .findFirst()
                 .orElse(null);
 
-        // 2. If this is an engagement page, also look for tasks on its parent project
+        // 2. The record a task opens on, when it is not the workflow's own
+        //    entity. A vendor assessment runs on the VENDOR workflow, so its
+        //    tasks carry entityType VENDOR and the assessment as artifactId —
+        //    and a page asking "my next task on VENDOR_ASSESSMENT 74" matched
+        //    nothing. Same rule the WebSocket handler already uses.
+        //
+        //    ONLY when the artifact is a different record from the workflow's
+        //    own entity. An issue task opens its own issue (artifactId ==
+        //    entityId), so it is an ISSUE task and step 1 is where it matches.
+        //    Without this, signing off Vendor Assessment 74 found the user's
+        //    task on Issue 74 — same number, different record — and the page
+        //    followed it to the issue screen.
+        if (next == null) {
+            next = pending.stream()
+                    .filter(t -> entityId.equals(t.getArtifactId())
+                            && !t.getArtifactId().equals(t.getEntityId()))
+                    .findFirst()
+                    .orElse(null);
+        }
+
+        // 3. If this is an engagement page, also look for tasks on its parent project
         if (next == null && "AUDIT_ENGAGEMENT".equals(entityType)) {
             var eng = engagementRepository.findById(entityId).orElse(null);
             if (eng != null && eng.getProjectInstanceId() != null) {
@@ -338,10 +358,10 @@ public class WorkflowInstanceController {
         }
 
         if (next == null) {
-            return ResponseEntity.ok(ApiResponse.success(Map.of()));
+            return ResponseEntity.ok(ApiResponse.success(java.util.Map.of()));
         }
 
-        return ResponseEntity.ok(ApiResponse.success(Map.of(
+        return ResponseEntity.ok(ApiResponse.success(java.util.Map.of(
                 "taskId",         next.getId(),
                 "stepInstanceId", next.getStepInstanceId(),
                 "stepName",       next.getStepName()   != null ? next.getStepName()   : "",
@@ -378,7 +398,7 @@ public class WorkflowInstanceController {
         // Same rule as manual-assign — this legacy path had no check either.
         com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
         if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
-        WorkflowInstance wi = service.getInstanceOfStep(si);
+        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
             throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
@@ -434,7 +454,7 @@ public class WorkflowInstanceController {
         if (si == null || !si.getWorkflowInstanceId().equals(instanceId)) {
             throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
         }
-        WorkflowInstance wi = service.getInstanceOfStep(si);
+        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
             throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
@@ -471,7 +491,7 @@ public class WorkflowInstanceController {
         var caller = utilityService.getLoggedInDataContext();
         com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
         if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
-        WorkflowInstance wi = service.getInstanceOfStep(si);
+        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         boolean canAssign = permissionGate.isPlatform() || service.canAssignStep(si, wi, caller.getId());
         Map<String, Object> out = new java.util.LinkedHashMap<>();
@@ -558,7 +578,7 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
             @PathVariable Long id,
             @PathVariable Long taskId,
-            @RequestBody(required = false) Map<String, Object> body) {
+            @RequestBody(required = false) java.util.Map<String, Object> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         boolean rollbackDownstream = body != null
                 && Boolean.TRUE.equals(body.get("rollbackDownstream"));

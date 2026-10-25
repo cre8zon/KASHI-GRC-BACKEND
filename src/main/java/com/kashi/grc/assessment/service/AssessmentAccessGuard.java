@@ -154,7 +154,7 @@ public class AssessmentAccessGuard {
 
         boolean hasParticipated =
                 taskInstanceRepository.existsByUserIdAndWorkflowInstanceId(userId, workflowInstanceId)
-                || actionItemRepository.existsByAssignedToAndAssessmentId(userId, assessment.getId());
+                        || actionItemRepository.existsByAssignedToAndAssessmentId(userId, assessment.getId());
 
         if (!hasParticipated) {
             log.warn("[ASSESSMENT-GUARD] Read access denied | userId={} | assessmentId={} | action='{}'",
@@ -208,6 +208,57 @@ public class AssessmentAccessGuard {
         }
         log.info("[SECTION-LOCK] Bypass for open obligation | userId={} | qi={} | si={}",
                 userId, qi.getId(), si.getId());
+    }
+
+    // ═════════════════════════════════════════════════════════════════════════
+    // ORGANISATION-SIDE REVIEW
+    // ═════════════════════════════════════════════════════════════════════════
+
+    /**
+     * May this caller record a verdict on this question?
+     *
+     * The org-side mirror of the contributor rule. A reviewer works the step
+     * through a live workflow task and may evaluate any question in the
+     * assessment. A review assistant holds no task — they hold questions a
+     * reviewer delegated to them — so they may evaluate exactly those questions
+     * (question.reviewerAssignedUserId = them) and nothing else.
+     *
+     * Before this, saving a verdict checked nothing at all: any signed-in user
+     * could set PASS/FAIL on any question of any assessment.
+     */
+    @Transactional(readOnly = true)
+    public void assertCanEvaluate(VendorAssessment assessment, AssessmentQuestionInstance qi, Long userId) {
+        if (hasLiveTask(assessment, userId)) return;
+        if (qi != null && userId != null && userId.equals(qi.getReviewerAssignedUserId())) return;
+        log.warn("[ASSESSMENT-GUARD] Evaluate denied | userId={} | assessmentId={} | qi={}",
+                userId, assessment.getId(), qi != null ? qi.getId() : null);
+        throw new BusinessException("QUESTION_NOT_YOURS",
+                "This question was not given to you to evaluate. Ask the section's reviewer to delegate it.",
+                HttpStatus.FORBIDDEN);
+    }
+
+    /**
+     * Work that belongs to whoever holds the step — raising a remediation,
+     * delegating a question. A review assistant has questions, not the step,
+     * exactly as a contributor has answers but not the responder's controls.
+     */
+    @Transactional(readOnly = true)
+    public void assertHasLiveTask(VendorAssessment assessment, Long userId, String action) {
+        if (hasLiveTask(assessment, userId)) return;
+        log.warn("[ASSESSMENT-GUARD] No live task | userId={} | assessmentId={} | action='{}'",
+                userId, assessment.getId(), action);
+        throw new BusinessException("ACCESS_DENIED",
+                "Only someone holding this step's task can " + action + ".",
+                HttpStatus.FORBIDDEN);
+    }
+
+    /** SYSTEM users and assessments outside a workflow pass, as in assertCanAct. */
+    private boolean hasLiveTask(VendorAssessment assessment, Long userId) {
+        if (hasSide(utilityService.getLoggedInDataContext(), RoleSide.SYSTEM)) return true;
+        Long workflowInstanceId = workflowInstanceOf(assessment);
+        if (workflowInstanceId == null) return true;
+        return taskInstanceRepository.existsByUserIdAndWorkflowInstanceIdAndStatusIn(
+                userId, workflowInstanceId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS));
     }
 
     // ═════════════════════════════════════════════════════════════════════════

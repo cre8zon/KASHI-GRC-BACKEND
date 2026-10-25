@@ -109,6 +109,26 @@ public class WorkflowAccessService {
         String stepStatus     = si.getStatus().name();
         String workflowStatus = wi.getStatus().name();
 
+        // ── A STEP WITH NO TASK: THE VIEWER'S OWN OPEN TASK ON IT, IF ANY ────
+        // "No taskId" used to mean observer, full stop. But a URL loses its
+        // taskId in ordinary ways — a link to the step, a saved tab, a page
+        // that followed the workflow forward — and the person reading it may
+        // hold the task. They were shown the step read-only, with override
+        // buttons if they had the permission, and had to go back to the inbox
+        // to get their own actions. Their open task on THIS step is theirs to
+        // act on however they arrived; with none, this stays observer.
+        if (taskId == null) {
+            taskId = taskInstanceRepository.findByStepInstanceId(stepInstanceId).stream()
+                    .filter(t -> user.getId().equals(t.getAssignedUserId()))
+                    .filter(t -> t.getStatus() == TaskStatus.PENDING || t.getStatus() == TaskStatus.IN_PROGRESS)
+                    .min(java.util.Comparator
+                            .comparing((com.kashi.grc.workflow.domain.TaskInstance t) ->
+                                    t.getTaskRole() == null || t.getTaskRole() == TaskRole.ACTOR ? 0 : 1)
+                            .thenComparing(com.kashi.grc.workflow.domain.TaskInstance::getId))
+                    .map(com.kashi.grc.workflow.domain.TaskInstance::getId)
+                    .orElse(null);
+        }
+
         log.debug("[ACCESS] Resolving | userId={} | stepInstanceId={} | taskId={} | stepStatus={} | wfStatus={}",
                 user.getId(), stepInstanceId, taskId, stepStatus, workflowStatus);
 
@@ -308,6 +328,7 @@ public class WorkflowAccessService {
                 .visibleTabs(nullIfEmpty(stepOverride.getVisibleTabs()))
                 .hiddenTabs(nullIfEmpty(stepOverride.getHiddenTabs()))
                 .editableTabs(nullIfEmpty(stepOverride.getEditableTabs()))
+                .transitions(nullIfEmpty(stepOverride.getTransitions()))
                 .permissions(effectivePermissions)
                 .sodViolations(sodViolations.isEmpty() ? null : sodViolations)
                 .autoCompleteActorOnSubmit(false)
@@ -816,6 +837,7 @@ public class WorkflowAccessService {
                 .hiddenTabs(nullIfEmpty(override.getHiddenTabs()))
                 // ── Actions ───────────────────────────────────────────────────
                 .availableActions(nullIfEmpty(availableActions))
+                .transitions(nullIfEmpty(override.getTransitions()))
                 // ── Permissions (with step-scoped overrides applied) ──────────
                 .permissions(applyPermissionOverrides(permissions, override))
                 // ── SoD ───────────────────────────────────────────────────────
@@ -872,6 +894,14 @@ public class WorkflowAccessService {
         private List<String> hiddenFields;
         /** When non-empty: only these actions are available */
         private List<String> availableActions;
+        /**
+         * When non-empty: the status-flow buttons (module blueprint
+         * status_flow_json actionKeys) that complete THIS step. Others are
+         * hidden on this step, and the module's server refuses the moves they
+         * would make. For modules whose status buttons drive the workflow —
+         * issues — where status alone cannot tell two steps apart.
+         */
+        private List<String> transitions;
         /**
          * Step-scoped permission overrides.
          * add[]    — grant extra permissions for this step only.

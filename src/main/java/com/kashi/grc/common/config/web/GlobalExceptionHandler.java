@@ -20,7 +20,10 @@ import org.springframework.web.method.annotation.MethodArgumentTypeMismatchExcep
 import org.springframework.web.servlet.NoHandlerFoundException;
 
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 /**
  * Centralised error handler for all controllers.
@@ -30,6 +33,19 @@ import java.util.Map;
 @Slf4j
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    /**
+     * Show the underlying cause (exception type + message) next to the plain
+     * message for EVERYONE — for a staging or test server. Platform
+     * administrators always see it. Off by default: on production a customer
+     * sees the plain message and a reference to quote.
+     */
+    @org.springframework.beans.factory.annotation.Value("${kashi.errors.show-details:false}")
+    private boolean showDetailsToAll;
+
+    /** Lazily, so the error handler never depends on security wiring at startup. */
+    @org.springframework.beans.factory.annotation.Autowired
+    private org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.security.PermissionGate> permissionGate;
 
     // ── Validation (@Valid) ───────────────────────────────────────
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -62,11 +78,138 @@ public class GlobalExceptionHandler {
     // a pre-check added to every single create/update endpoint individually.
     @ExceptionHandler(DataIntegrityViolationException.class)
     public ResponseEntity<ApiResponse<Void>> handleDataIntegrity(DataIntegrityViolationException ex) {
-        log.warn("[DATA-INTEGRITY] Constraint violation: {}", ex.getMostSpecificCause().getMessage());
+        String raw = String.valueOf(ex.getMostSpecificCause().getMessage());
+        log.warn("[DATA-INTEGRITY] Constraint violation: {}", raw);
+        // Name what clashed instead of "a value is already in use" — the
+        // database says which value and which column; that is what the person
+        // needs to fix it. Only the value they typed and a column name are
+        // shown, never SQL.
+        String message;
+        Matcher m;
+        if ((m = DUPLICATE.matcher(raw)).find()) {
+            message = "\"" + m.group(1) + "\" is already in use" + keyHint(m.group(2))
+                    + ". It must be unique — use a different value.";
+        } else if ((m = NOT_NULL.matcher(raw)).find()) {
+            message = humanise(m.group(1)) + " is required.";
+        } else if ((m = TOO_LONG.matcher(raw)).find()) {
+            message = humanise(m.group(1)) + " is too long. Shorten it and try again.";
+        } else if (raw.contains("Cannot delete or update a parent row")) {
+            message = "This record is still used by other records, so it can't be removed or changed this way. "
+                    + "Remove or reassign what uses it first.";
+        } else if (raw.contains("Cannot add or update a child row")) {
+            message = "This refers to a record that doesn't exist (it may have been deleted). Refresh and try again.";
+        } else {
+            message = "This conflicts with an existing record. Check your input and try again.";
+        }
         return ResponseEntity.status(HttpStatus.CONFLICT)
-                .body(ApiResponse.error("DATA_INTEGRITY_VIOLATION",
-                        "This action conflicts with an existing record (a value that must be unique is already in use). " +
-                                "Please check your input and try again."));
+                .body(ApiResponse.error(error("DATA_INTEGRITY_VIOLATION", message, ex)));
+    }
+
+    private static final Pattern DUPLICATE = Pattern.compile("Duplicate entry '(.*?)' for key '([^']*)'");
+    private static final Pattern NOT_NULL  = Pattern.compile("Column '([^']*)' cannot be null");
+    private static final Pattern TOO_LONG  = Pattern.compile("Data too long for column '([^']*)'");
+
+    /** uk_vendor_tenant_registration_number → " (registration number)". */
+    private static String keyHint(String key) {
+        String k = key.contains(".") ? key.substring(key.lastIndexOf('.') + 1) : key;
+        k = k.replaceFirst("^(uk|uq|ux|unique|idx)_", "");
+        if (k.isBlank() || k.equalsIgnoreCase("PRIMARY")) return "";
+        return " (" + k.replace('_', ' ') + ")";
+    }
+
+    private static String humanise(String column) {
+        String s = column.replace('_', ' ').trim();
+        return s.isEmpty() ? "A value" : Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    // ── Malformed request body ────────────────────────────────────
+    // A wrong value for a dropdown/enum, a number where text was expected,
+    // broken JSON. Was a 500 "unexpected error"; it is the caller's input.
+    @ExceptionHandler(org.springframework.http.converter.HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnreadable(org.springframework.http.converter.HttpMessageNotReadableException ex) {
+        Throwable c = ex.getMostSpecificCause();
+        String message = "The request could not be read. Check the values entered and try again.";
+        if (c instanceof com.fasterxml.jackson.databind.exc.InvalidFormatException ife) {
+            String field = path(ife.getPath());
+            message = "\"" + ife.getValue() + "\" is not a valid value" + (field.isEmpty() ? "" : " for " + field) + ".";
+        } else if (c instanceof com.fasterxml.jackson.databind.exc.MismatchedInputException mie && !mie.getPath().isEmpty()) {
+            message = "The value for " + path(mie.getPath()) + " has the wrong format.";
+        }
+        log.warn("[BAD-REQUEST] Unreadable body: {}", c.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(error("INVALID_REQUEST", message, ex)));
+    }
+
+    private static String path(java.util.List<com.fasterxml.jackson.databind.JsonMappingException.Reference> refs) {
+        StringBuilder sb = new StringBuilder();
+        for (var r : refs) {
+            if (r.getFieldName() != null) { if (sb.length() > 0) sb.append('.'); sb.append(r.getFieldName()); }
+            else if (r.getIndex() >= 0) sb.append('[').append(r.getIndex() + 1).append(']');
+        }
+        return sb.toString();
+    }
+
+    @ExceptionHandler(org.springframework.web.bind.MissingServletRequestParameterException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMissingParam(org.springframework.web.bind.MissingServletRequestParameterException ex) {
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error("MISSING_PARAMETER", "Missing required value '" + ex.getParameterName() + "'."));
+    }
+
+    @ExceptionHandler(org.springframework.web.HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethod(org.springframework.web.HttpRequestMethodNotSupportedException ex) {
+        return ResponseEntity.status(HttpStatus.METHOD_NOT_ALLOWED)
+                .body(ApiResponse.error("METHOD_NOT_ALLOWED",
+                        "This action isn't available here (" + ex.getMethod() + " is not supported). "
+                                + "The page may be out of date — refresh and try again."));
+    }
+
+    // ── Bean validation outside @RequestBody (@Validated params, entity checks) ──
+    @ExceptionHandler(jakarta.validation.ConstraintViolationException.class)
+    public ResponseEntity<ApiResponse<Void>> handleConstraint(jakarta.validation.ConstraintViolationException ex) {
+        Map<String, String> fields = new LinkedHashMap<>();
+        ex.getConstraintViolations().forEach(v -> {
+            String p = String.valueOf(v.getPropertyPath());
+            fields.put(p.contains(".") ? p.substring(p.lastIndexOf('.') + 1) : p, v.getMessage());
+        });
+        String first = fields.entrySet().stream().findFirst()
+                .map(e -> humanise(e.getKey()) + ": " + e.getValue()).orElse("Some values are not valid.");
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_ENTITY)
+                .body(ApiResponse.error(ErrorResponse.builder()
+                        .code("VALIDATION_ERROR").message(first).fieldErrors(fields).build()));
+    }
+
+    // ── A record that is gone ─────────────────────────────────────
+    @ExceptionHandler(jakarta.persistence.EntityNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleEntityGone(jakarta.persistence.EntityNotFoundException ex) {
+        log.warn("[NOT-FOUND] {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error(error("NOT_FOUND",
+                        "This record no longer exists — it may have been deleted. Refresh and try again.", ex)));
+    }
+
+    // ── Someone else saved first ──────────────────────────────────
+    @ExceptionHandler(org.springframework.orm.ObjectOptimisticLockingFailureException.class)
+    public ResponseEntity<ApiResponse<Void>> handleOptimistic(org.springframework.orm.ObjectOptimisticLockingFailureException ex) {
+        log.warn("[CONFLICT] Concurrent update: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResponse.error("CONCURRENT_UPDATE",
+                        "Someone else changed this at the same time. Refresh to see their change, then try again."));
+    }
+
+    // ── A step failed inside a larger save, and was hidden ────────
+    // Some code catches an error from a step that runs in the same
+    // transaction and carries on. The step has already doomed the save, so the
+    // commit is refused here. Nothing was saved; say so, and leave a reference
+    // that leads to the log line of the step that actually failed.
+    @ExceptionHandler(org.springframework.transaction.UnexpectedRollbackException.class)
+    public ResponseEntity<ApiResponse<Void>> handleRollback(org.springframework.transaction.UnexpectedRollbackException ex) {
+        String ref = reference();
+        log.error("[{}] Save rolled back after a step failed inside it — look for the WARN/ERROR just before this line: {}",
+                ref, ex.getMessage());
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error(error("SAVE_ROLLED_BACK",
+                        "One step of this action failed, so nothing was saved. Reference " + ref
+                                + " — share it with support so they can find the exact cause.", ex, ref)));
     }
 
     // ── Upload over the server's multipart limit ─────────────────
@@ -150,10 +293,61 @@ public class GlobalExceptionHandler {
     }
 
     // ── Catch-all ─────────────────────────────────────────────────
+    // Still the last resort, but never a dead end: the message says nothing
+    // was saved, and carries a reference that is also on the log line with the
+    // full stack trace — "ERR-7F3A2C" finds the cause in seconds.
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ApiResponse<Void>> handleGeneral(Exception ex) {
-        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        String ref = reference();
+        log.error("[{}] Unexpected error: {}", ref, ex.getMessage(), ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                .body(ApiResponse.error("INTERNAL_ERROR", "An unexpected error occurred"));
+                .body(ApiResponse.error(error("INTERNAL_ERROR",
+                        "Something went wrong on our side and this wasn't saved. Reference " + ref
+                                + " — share it with support so they can find the exact cause.", ex, ref)));
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────
+
+    private static String reference() {
+        return "ERR-" + Long.toHexString(System.nanoTime() ^ Double.doubleToLongBits(Math.random()))
+                .toUpperCase().substring(0, 6);
+    }
+
+    private ErrorResponse error(String code, String message, Throwable ex) {
+        return error(code, message, ex, null);
+    }
+
+    /**
+     * The plain message, plus — for platform administrators, or everyone when
+     * kashi.errors.show-details=true — the underlying cause, so whoever is
+     * testing sees the real reason without opening the server log.
+     */
+    private ErrorResponse error(String code, String message, Throwable ex, String ref) {
+        Map<String, Object> details = new LinkedHashMap<>();
+        if (ref != null) details.put("reference", ref);
+        String shown = message;
+        if (ex != null && showDetails()) {
+            Throwable root = org.springframework.core.NestedExceptionUtils.getMostSpecificCause(ex);
+            String cause = root.getClass().getSimpleName()
+                    + (root.getMessage() == null ? "" : ": " + truncate(root.getMessage(), 300));
+            details.put("cause", cause);
+            shown = message + " [" + cause + "]";
+        }
+        return ErrorResponse.builder().code(code).message(shown)
+                .details(details.isEmpty() ? null : details).build();
+    }
+
+    private boolean showDetails() {
+        if (showDetailsToAll) return true;
+        try {
+            var gate = permissionGate.getIfAvailable();
+            return gate != null && gate.isPlatform();
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    private static String truncate(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 }
