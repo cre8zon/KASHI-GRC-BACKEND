@@ -56,6 +56,8 @@ public class UserServiceImpl implements UserService {
     private final DbRepository dbRepository;
     private final UtilityService utilityService;
     private final com.kashi.grc.common.security.PermissionGate permissionGate;
+    /** Suspend / activate / deactivate / reactivate / delete — rules and cleanup in one place. */
+    private final UserLifecycleService lifecycle;
 
     // ─────────────────────────────────────────────────────────────
     // CREATE
@@ -176,6 +178,20 @@ public class UserServiceImpl implements UserService {
             user.setRoles(roles);
         }
 
+        // The Org Owner role makes someone THE owner. Allowed only for an
+        // organisation that has none yet (its first user, at provisioning);
+        // after that, ownership moves by transfer, never by creating a second.
+        boolean ownerByIds = user.getRoles().stream()
+                .anyMatch(OrgOwnerService::isOwnerRole);
+        boolean ownerByDefault = OrgOwnerService.OWNER_ROLE.equals(request.getDefaultRoleName());
+        com.kashi.grc.tenant.domain.Tenant ownerTenant = (ownerByIds || ownerByDefault)
+                ? tenantRepository.findById(tenantId).orElse(null) : null;
+        if (ownerTenant != null && ownerTenant.getOwnerUserId() != null) {
+            throw new ValidationException(
+                    "This organisation already has an owner. Add the person with another role, "
+                            + "then transfer ownership to them if needed.");
+        }
+
         // 3. Ensure data is written to DB now
         user = userRepository.save(user);
         userRepository.flush();
@@ -220,6 +236,12 @@ public class UserServiceImpl implements UserService {
         // Stamp them once, after the roles are flushed.
         userRepository.flush();
         membershipRoleSync.ensureHomeMembership(savedUser.getId(), savedUser.getTenantId());
+
+        // First owner of the organisation: record it on the tenant.
+        if (ownerTenant != null && savedUser.getRoles().stream().anyMatch(OrgOwnerService::isOwnerRole)) {
+            ownerTenant.setOwnerUserId(savedUser.getId());
+            tenantRepository.save(ownerTenant);
+        }
 
         if (request.getAttributes() != null) {
             request.getAttributes().forEach((k, v) -> attributeRepository.save(
@@ -516,124 +538,58 @@ public class UserServiceImpl implements UserService {
     }
 
     // ─────────────────────────────────────────────────────────────
-    // DELETE (soft)
+    // DELETE (soft) and STATUS — all through UserLifecycleService, which checks
+    // who may do it (USER_EDIT, same organisation, own vendor, never yourself,
+    // never the owner) and cleans up (open tasks back to unassigned,
+    // delegations ended, history recorded, access cut on the next request).
+    // These methods used to change the status column and nothing else.
     // ─────────────────────────────────────────────────────────────
     @Override
     @Transactional
     public void deleteUser(Long userId) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setDeleted(true);
-        user.setStatus(UserStatus.DEACTIVATED);
-        userRepository.save(user);
-        log.info("User soft-deleted: id={}", userId);
+        lifecycle.delete(userId);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // STATUS MANAGEMENT
-    // ─────────────────────────────────────────────────────────────
     @Override
     @Transactional
     public UserResponse suspendUser(Long userId) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setStatus(UserStatus.SUSPENDED);
-        user = userRepository.save(user);
-        log.info("User suspended: id={}", userId);
-        return toResponse(user);
+        return toResponse(lifecycle.suspend(userId, null));
     }
 
     @Override
     @Transactional
     public UserResponse activateUser(Long userId) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setStatus(UserStatus.ACTIVE);
-        user.resetFailedAttempts();
-        user = userRepository.save(user);
-        log.info("User activated: id={}", userId);
-        return toResponse(user);
+        return toResponse(lifecycle.activate(userId));
     }
-
-    // ── STATUS ────────────────────────────────────────────────────
 
     @Override
     @Transactional
     public Map<String, Object> updateStatus(Long userId, UserStatusRequest req) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setStatus(UserStatus.valueOf(req.getStatus()));
-        userRepository.save(user);
-        return Map.of("user_id", userId, "new_status", req.getStatus(), "updated_at", java.time.LocalDateTime.now());
+        User user = lifecycle.changeStatus(userId, req.getStatus(), req.getReason());
+        return Map.of("user_id", userId, "new_status", user.getStatus().name(),
+                "updated_at", java.time.LocalDateTime.now());
     }
-
-    // ── RESPONSIBILITIES ──────────────────────────────────────────
 
     @Override
     @Transactional(readOnly = true)
     public Map<String, Object> getResponsibilities(Long userId, boolean includeDelegations) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantId(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        long activeDelegations = includeDelegations
-                ? delegationRepository.countActiveDelegationsToMe(userId) : 0;
-        return Map.of(
-                "user_id", userId,
-                "user_name", user.getFullName(),
-                "can_deactivate", activeDelegations == 0,
-                "blocking_responsibilities", Map.of(
-                        "open_tasks", 0, "pending_workflows", 0,
-                        "active_delegations", activeDelegations,
-                        "owned_audits", 0, "assigned_assessments", 0),
-                "recommended_actions", Collections.emptyList()
-        );
+        return lifecycle.responsibilities(userId);
     }
-
-    // ── DEACTIVATE / REACTIVATE ───────────────────────────────────
 
     @Override
     @Transactional
     public Map<String, Object> deactivateUser(Long userId, UserDeactivateRequest req) {
-        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        User user = userRepository.findByIdAndTenantId(userId, tenantId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setStatus(UserStatus.DEACTIVATED);
-        user.setDeleted(true);
-        userRepository.save(user);
-        return Map.of(
-                "user_id", userId, "email", user.getEmail(),
-                "deactivated_at", java.time.LocalDateTime.now(),
-                "reassignments_completed", req.getReassignments() != null ? req.getReassignments().size() : 0,
-                "audit_trail_preserved", req.isPreserveAuditTrail()
-        );
+        return lifecycle.deactivate(userId, req == null ? null : req.getReason());
     }
 
     @Override
     @Transactional
     public UserResponse reactivateUser(Long userId, UserReactivateRequest req) {
-        User user = userRepository.findById(userId)
-                .orElseThrow(() -> new ResourceNotFoundException("User", userId));
-        user.setStatus(UserStatus.ACTIVE);
-        user.setDeleted(false);
-        String tempPassword = null;
-        if (req.isResetPasswordRequired()) {
-            // Generate temporary password; user must reset on first login
-            tempPassword = UUID.randomUUID().toString();
-            user.setPasswordHash(passwordEncoder.encode(tempPassword));
-            user.setPasswordResetRequired(true);
-            if (req.isSendReactivationEmail()) {
-                mailService.sendUserInvitation(user.getEmail(), user.getFirstName(),
-                        "https://app.kashigrc.com/set-password?token=" + tempPassword);
-            }
-        }
-        userRepository.save(user);
-        UserResponse response = toResponse(user);
-        response.setTemporaryPassword(tempPassword);
-        return response;
+        boolean reset = req == null || req.isResetPasswordRequired();
+        boolean email = req == null || req.isSendReactivationEmail();
+        // No temporary password in the response any more: the person sets
+        // their own through the emailed reset link.
+        return toResponse(lifecycle.reactivate(userId, reset, email));
     }
 
     // ── PASSWORD ──────────────────────────────────────────────────

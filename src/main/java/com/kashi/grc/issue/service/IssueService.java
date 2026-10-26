@@ -66,9 +66,16 @@ public class IssueService {
     private final UserRepository                                     userRepository;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final com.kashi.grc.common.repository.DbRepository       dbRepository;
+    private final com.kashi.grc.tenant.repository.TenantRepository   tenantRepository;
+    private final com.kashi.grc.common.security.AccountAccessService   accountAccess;
     private final com.kashi.grc.audit.repository.AuditFindingRepository     auditFindingRepository;
     private final com.kashi.grc.audit.repository.AuditEngagementRepository  auditEngagementRepository;
     private final ObjectMapper             objectMapper;
+    private final org.springframework.context.ApplicationEventPublisher      eventPublisher;
+    private final com.kashi.grc.document.repository.DocumentLinkRepository   documentLinkRepository;
+    private final com.kashi.grc.module.repository.ModuleBlueprintRepository  blueprintRepository;
+    private final com.kashi.grc.workflow.repository.WorkflowStepRepository   workflowStepRepository;
+    private final com.kashi.grc.actionitem.repository.ActionItemRepository   actionItemRepository;
 
     /**
      * System user ID used when the scheduler creates notifications or escalations
@@ -150,6 +157,7 @@ public class IssueService {
         issueRepository.save(issue);
         log.info("[ISSUE] Created | ref={} | type={} | severity={} | tenantId={}",
                 ref, issue.getIssueType(), issue.getSeverity(), tenantId);
+        linkSourceEvidence(issue, createdBy);
 
         // Auto-start workflow if workflowId provided or default exists
         startWorkflowIfConfigured(issue, req.getWorkflowId(), createdBy, tenantId);
@@ -187,30 +195,45 @@ public class IssueService {
      *   - Starts the AUTOMATED workflow blueprint
      *   - Notifies GRC Manager pool
      */
-    @Transactional
     /**
      * Resolves the "system" user for a given tenant — used as createdBy/initiator
-     * for automated ingestion. Multi-tenant safe: each tenant's own ORG_ADMIN (or
-     * ORG_OWNER if no admin exists) is used as the system actor, not a single
-     * global hardcoded user.
-     * Falls back to app.system.userId (global config) only if the tenant has
-     * neither ORG_ADMIN nor ORG_OWNER.
+     * for automated ingestion. Multi-tenant safe: each tenant's own person, never
+     * a single global hard-coded user.
+     *
+     *   1. the organisation's owner (tenants.owner_user_id) — always exactly one,
+     *      and the one account that cannot be suspended on its own;
+     *   2. else an active organisation-side member holding USER_EDIT — the
+     *      permission user management gates on, i.e. someone who administers
+     *      the organisation. This used to be role id 8: a database id baked
+     *      into the code, pointing at a different role (or none) on any
+     *      database seeded in another order. A permission, not a role name,
+     *      so a renamed or added admin role keeps working;
+     *   3. else app.system.userId (global config).
+     *
+     * Suspended people are never picked (the membership query filters them).
      */
     private Long resolveSystemUserId(Long tenantId) {
-        List<Long> orgAdmins = dbRepository.findUserIdsByRoleAndTenant(8L, tenantId); // ORG_ADMIN
-        if (!orgAdmins.isEmpty()) {
-            return orgAdmins.get(0);
+        Long owner = tenantRepository.findById(tenantId)
+                .map(com.kashi.grc.tenant.domain.Tenant::getOwnerUserId).orElse(null);
+        if (owner != null && userRepository.findById(owner)
+                .filter(u -> !u.isDeleted() && (u.getStatus() == com.kashi.grc.usermanagement.domain.UserStatus.ACTIVE
+                        || u.getStatus() == com.kashi.grc.usermanagement.domain.UserStatus.LOCKED))
+                .isPresent()) {
+            return owner;
         }
-        List<Long> orgOwners = dbRepository.findUserIdsByRoleAndTenant(7L, tenantId); // ORG_OWNER
-        if (!orgOwners.isEmpty()) {
-            log.info("[ISSUE-INGEST] No ORG_ADMIN for tenantId={} — using ORG_OWNER as system user", tenantId);
-            return orgOwners.get(0);
+        List<Long> admins = dbRepository.findUserIdsByPermissionAndTenant(
+                com.kashi.grc.usermanagement.service.user.UserLifecycleService.EDIT_PERMISSION, tenantId,
+                com.kashi.grc.usermanagement.domain.RoleSide.ORGANIZATION.name());
+        if (!admins.isEmpty()) {
+            log.info("[ISSUE-INGEST] No usable owner for tenantId={} — using an organisation administrator as system user", tenantId);
+            return admins.get(0);
         }
-        log.warn("[ISSUE-INGEST] No ORG_ADMIN or ORG_OWNER found for tenantId={} — falling back to app.system.userId={}",
+        log.warn("[ISSUE-INGEST] No owner or administrator found for tenantId={} — falling back to app.system.userId={}",
                 tenantId, systemUserId);
         return systemUserId;
     }
 
+    @Transactional
     public IssueResponse ingest(IssueIngestRequest req, Long tenantId) {
         // Resolve tenant-scoped system user (each tenant's own ORG_ADMIN)
         Long tenantSystemUserId = resolveSystemUserId(tenantId);
@@ -313,10 +336,6 @@ public class IssueService {
         if (!issue.getTenantId().equals(tenantId))
             throw new ForbiddenException("Issue does not belong to this tenant");
 
-        if (req.getTitle()               != null) issue.setTitle(req.getTitle());
-        if (req.getDescription()         != null) issue.setDescription(req.getDescription());
-        if (req.getSeverity()            != null) issue.setSeverity(req.getSeverity());
-        if (req.getCategory()            != null) issue.setCategory(req.getCategory());
         // Capture old values BEFORE mutation, for generic advanceOnFieldSet check below.
         // Only fields that are realistically used as "fill this to advance" triggers
         // need to be captured — extend this map as new advanceOnFieldSet use cases arise.
@@ -324,30 +343,7 @@ public class IssueService {
                 "ownerId", java.util.Optional.ofNullable(issue.getOwnerId())
         );
 
-        if (req.getOwnerId()             != null) issue.setOwnerId(req.getOwnerId());
-        if (req.getDueAt()               != null) issue.setDueAt(req.getDueAt());
-        if (req.getFrameworkRef()        != null) issue.setFrameworkRef(req.getFrameworkRef());
-        if (req.getLinkedControlIds()    != null) issue.setLinkedControlIds(listToJson(req.getLinkedControlIds()));
-        if (req.getLinkedRiskIds()       != null) issue.setLinkedRiskIds(listToJson(req.getLinkedRiskIds()));
-
-        // ── RCA flat fields ──────────────────────────────────────────────────
-        if (req.getRcaMethod()           != null) issue.setRcaMethod(req.getRcaMethod());
-        if (req.getRootCauseCategory()   != null) issue.setRootCauseCategory(req.getRootCauseCategory());
-        if (req.getImmediateCause()      != null) issue.setImmediateCause(req.getImmediateCause());
-        if (req.getRootCause()           != null) issue.setRootCause(req.getRootCause());
-        if (req.getContributingFactors() != null) issue.setContributingFactors(req.getContributingFactors());
-        if (req.getIsSystemic()          != null) issue.setSystemic(req.getIsSystemic());
-        if (req.getRcaJson()             != null) issue.setRcaJson(req.getRcaJson()); // legacy
-
-        // ── Remediation fields ───────────────────────────────────────────────
-        if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
-        if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
-        if (req.getRemediatedAt()        != null) issue.setRemediatedAt(req.getRemediatedAt());
-        if (req.getValidatedAt()         != null) issue.setValidatedAt(req.getValidatedAt());
-        if (req.getAcceptedRisk()        != null) issue.setAcceptedRisk(req.getAcceptedRisk());
-        if (req.getAcceptedRiskNote()    != null) issue.setAcceptedRiskNote(req.getAcceptedRiskNote());
-        if (req.getClosureSummary()      != null) issue.setClosureSummary(req.getClosureSummary());
-
+        applyFields(issue, req);
         issueRepository.save(issue);
 
         // ── Generic advanceOnFieldSet ───────────────────────────────────────
@@ -373,6 +369,390 @@ public class IssueService {
         }
 
         return toResponse(issue, tenantId);
+    }
+
+    /** Every editable field on IssueRequest that is present, onto the issue. Shared by update and transition. */
+    private void applyFields(Issue issue, IssueRequest req) {
+        if (req.getTitle()               != null) issue.setTitle(req.getTitle());
+        if (req.getDescription()         != null) issue.setDescription(req.getDescription());
+        if (req.getSeverity()            != null) issue.setSeverity(req.getSeverity());
+        if (req.getCategory()            != null) issue.setCategory(req.getCategory());
+        if (req.getOwnerId()             != null) issue.setOwnerId(req.getOwnerId());
+        if (req.getDueAt()               != null) issue.setDueAt(req.getDueAt());
+        if (req.getFrameworkRef()        != null) issue.setFrameworkRef(req.getFrameworkRef());
+        if (req.getLinkedControlIds()    != null) issue.setLinkedControlIds(listToJson(req.getLinkedControlIds()));
+        if (req.getLinkedRiskIds()       != null) issue.setLinkedRiskIds(listToJson(req.getLinkedRiskIds()));
+
+        // ── RCA flat fields ──────────────────────────────────────────────────
+        if (req.getRcaMethod()           != null) issue.setRcaMethod(req.getRcaMethod());
+        if (req.getRootCauseCategory()   != null) issue.setRootCauseCategory(req.getRootCauseCategory());
+        if (req.getImmediateCause()      != null) issue.setImmediateCause(req.getImmediateCause());
+        if (req.getRootCause()           != null) issue.setRootCause(req.getRootCause());
+        if (req.getContributingFactors() != null) issue.setContributingFactors(req.getContributingFactors());
+        if (req.getIsSystemic()          != null) issue.setSystemic(req.getIsSystemic());
+        if (req.getRcaJson()             != null) issue.setRcaJson(req.getRcaJson()); // legacy
+
+        // ── Remediation fields ───────────────────────────────────────────────
+        if (req.getRemediationPlan()     != null) issue.setRemediationPlan(req.getRemediationPlan());
+        if (req.getRemediationType()     != null) issue.setRemediationType(req.getRemediationType());
+        if (req.getRemediatedAt()        != null) issue.setRemediatedAt(req.getRemediatedAt());
+        if (req.getValidatedAt()         != null) issue.setValidatedAt(req.getValidatedAt());
+        if (req.getAcceptedRisk()        != null) issue.setAcceptedRisk(req.getAcceptedRisk());
+        if (req.getAcceptedRiskNote()    != null) issue.setAcceptedRiskNote(req.getAcceptedRiskNote());
+        if (req.getClosureSummary()      != null) issue.setClosureSummary(req.getClosureSummary());
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // TRANSITION — the step's form and its completion, in one request
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Saves the fields the current step owns, checks the move is complete, then
+     * moves the status — which approves the step's task (updateStatus →
+     * advanceWorkflowTask).
+     *
+     * Every issue status button ends a step, so this is where "a step cannot
+     * finish half-done" is enforced. The page's modal collects the fields and
+     * marks them required, but the rule lives here so a direct call to the
+     * endpoint is held to it too. What each move needs is a property of the
+     * issue's lifecycle, not of any one workflow, so it holds on every issue
+     * workflow without naming a step:
+     *
+     *   → IN_PROGRESS     a plan: root cause, remediation type and plan
+     *   → PENDING_REVIEW  at least one remediation evidence file — the basis
+     *                     on which anyone can validate the fix
+     *   → CLOSED          a closure summary
+     *   → ACCEPTED_RISK   the reason the risk is accepted
+     *
+     * The check runs after the fields are applied and throws on a gap, so the
+     * transaction rolls back and nothing half-written is kept; the user's input
+     * stays in the modal to correct.
+     *
+     * @param fields may be null — a move with nothing to fill in.
+     */
+    @Transactional
+    public IssueResponse transition(Long id, Issue.Status to, IssueRequest fields, Long userId, Long tenantId) {
+        Issue issue = issueRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
+        if (!issue.getTenantId().equals(tenantId))
+            throw new ForbiddenException("Issue does not belong to this tenant");
+
+        requireStepAllowsMove(issue, to, tenantId);
+
+        if (fields != null) applyFields(issue, fields);
+
+        java.util.List<String> missing = new java.util.ArrayList<>();
+        switch (to) {
+            case IN_PROGRESS -> {
+                if (isBlank(issue.getRootCause()))       missing.add("root cause");
+                if (isBlank(issue.getRemediationType())) missing.add("remediation type");
+                if (isBlank(issue.getRemediationPlan())) missing.add("remediation plan");
+            }
+            case PENDING_REVIEW -> {
+                // Rejected files stay on the record but are not evidence of the fix.
+                boolean anyUsable = remediationEvidence(id).stream()
+                        .anyMatch(l -> !REJECTED.equals(l.getReviewStatus()));
+                if (!anyUsable)
+                    missing.add("remediation evidence (attach it on the Evidence tab)");
+            }
+            case RESOLVED -> {
+                // The validator's decision rests on the evidence, so every file
+                // is decided and at least one is accepted before it can resolve.
+                java.util.List<com.kashi.grc.document.domain.DocumentLink> files = remediationEvidence(id);
+                long undecided = files.stream().filter(l -> l.getReviewStatus() == null).count();
+                boolean anyAccepted = files.stream().anyMatch(l -> ACCEPTED.equals(l.getReviewStatus()));
+                if (undecided > 0)
+                    missing.add("a decision on every remediation evidence file (" + undecided + " not reviewed)");
+                else if (!anyAccepted)
+                    missing.add("at least one accepted remediation evidence file — or use Request changes");
+            }
+            case CLOSED -> {
+                if (isBlank(issue.getClosureSummary()))  missing.add("closure summary");
+            }
+            case ACCEPTED_RISK -> {
+                if (isBlank(issue.getAcceptedRiskNote())) missing.add("the reason the risk is accepted");
+                issue.setAcceptedRisk(true);
+            }
+            default -> { }
+        }
+        if (!missing.isEmpty()) {
+            throw new ValidationException("Before this step can be completed, add: "
+                    + String.join(", ", missing) + ".");
+        }
+
+        issueRepository.save(issue);
+        return updateStatus(id, to, userId, tenantId);
+    }
+
+    private static boolean isBlank(String s) { return s == null || s.isBlank(); }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // EVIDENCE REVIEW — the validator decides each remediation file
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private static final String ACCEPTED = "ACCEPTED";
+    private static final String REJECTED = "REJECTED";
+
+    private java.util.List<com.kashi.grc.document.domain.DocumentLink> remediationEvidence(Long issueId) {
+        return documentLinkRepository.findActiveByEntity("ISSUE", issueId, "REMEDIATION");
+    }
+
+    /**
+     * Whether the issue's current step is the one that validates the fix — the
+     * step whose button is Validate & Resolve. Where a step lists its buttons
+     * ("transitions"), that list decides; on a step without one, the review
+     * statuses decide. The vendor's own CISO review hands on with Send for
+     * validation and does not decide files: the organisation's validator does.
+     */
+    private boolean atValidationStep(Issue issue) {
+        if (issue.getStatus() != Issue.Status.PENDING_REVIEW
+                && issue.getStatus() != Issue.Status.PENDING_VALIDATION) return false;
+        java.util.List<String> keys = issue.getWorkflowInstanceId() != null ? currentStepTransitions(issue) : null;
+        return keys == null || keys.isEmpty() || keys.contains("ISSUE_VALIDATE");
+    }
+
+    /**
+     * Accept or reject one remediation evidence file. Rejecting needs a reason.
+     * A decision can be changed while the issue is still at validation; once
+     * the issue moves on, reviewed files are locked (DocumentController
+     * refuses to remove a reviewed link).
+     *
+     * Who: the holder of the validation step's task — the controller checks
+     * that (requireCanMoveStatus) before calling this.
+     */
+    @Transactional
+    public Map<String, Object> reviewEvidence(Long issueId, Long linkId, String decision, String note,
+                                              Long userId, Long tenantId) {
+        Issue issue = issueRepository.findById(issueId)
+                .filter(i -> i.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", issueId));
+        if (!atValidationStep(issue))
+            throw new BusinessException("ISSUE_NOT_AT_VALIDATION",
+                    "Evidence is reviewed at the validation step. This issue is " + issue.getStatus() + ".",
+                    org.springframework.http.HttpStatus.CONFLICT);
+
+        com.kashi.grc.document.domain.DocumentLink link = documentLinkRepository.findById(linkId)
+                .filter(l -> tenantId.equals(l.getTenantId())
+                        && "ISSUE".equals(l.getEntityType()) && issueId.equals(l.getEntityId())
+                        && "REMEDIATION".equals(l.getLinkType()))
+                .orElseThrow(() -> new ResourceNotFoundException("Remediation evidence", linkId));
+
+        String d = decision == null ? "" : decision.trim().toUpperCase();
+        if (!ACCEPTED.equals(d) && !REJECTED.equals(d))
+            throw new ValidationException("decision must be ACCEPTED or REJECTED.");
+        if (REJECTED.equals(d) && isBlank(note))
+            throw new ValidationException("Say what is wrong with the file, so the owner can fix it.");
+
+        link.setReviewStatus(d);
+        link.setReviewedBy(userId);
+        link.setReviewedAt(LocalDateTime.now());
+        link.setReviewNote(isBlank(note) ? null : note.trim());
+        documentLinkRepository.save(link);
+        log.info("[ISSUE-EVIDENCE] {} | issueId={} | linkId={} | by={}", d, issueId, linkId, userId);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("linkId",       link.getId());
+        out.put("reviewStatus", link.getReviewStatus());
+        out.put("reviewedAt",   link.getReviewedAt());
+        out.put("reviewNote",   link.getReviewNote());
+        return out;
+    }
+
+    /**
+     * The validator sends the fix back to the owner: the workflow returns to
+     * the step that submits it for review, the issue goes back to IN_PROGRESS,
+     * and the reason is recorded on the step's history.
+     *
+     * The target is the step whose button is Submit for Review — read from
+     * the steps' "transitions" lists, so no step number is named — falling
+     * back to the previous step on a workflow that has no lists.
+     */
+    @Transactional
+    public IssueResponse requestChanges(Long issueId, String note, Long userId, Long tenantId) {
+        Issue issue = issueRepository.findById(issueId)
+                .filter(i -> i.getTenantId().equals(tenantId))
+                .orElseThrow(() -> new ResourceNotFoundException("Issue", issueId));
+        if (isBlank(note))
+            throw new ValidationException("Say what needs to change, so the owner knows what to fix.");
+        if (issue.getWorkflowInstanceId() == null)
+            throw new BusinessException("ISSUE_NO_WORKFLOW", "This issue has no running workflow to send back.",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        requireStepAllowsMove(issue, Issue.Status.IN_PROGRESS, tenantId);
+
+        com.kashi.grc.workflow.domain.WorkflowInstance wf =
+                instanceRepository.findById(issue.getWorkflowInstanceId()).orElseThrow(() ->
+                        new ResourceNotFoundException("WorkflowInstance", issue.getWorkflowInstanceId()));
+        com.kashi.grc.workflow.domain.StepInstance current = stepInstanceRepository.findById(wf.getCurrentStepId())
+                .orElseThrow(() -> new ResourceNotFoundException("StepInstance", wf.getCurrentStepId()));
+        com.kashi.grc.workflow.domain.TaskInstance task = taskInstanceRepository.findByStepInstanceId(current.getId())
+                .stream()
+                .filter(t -> userId.equals(t.getAssignedUserId())
+                        && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
+                        || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS))
+                .findFirst()
+                .orElseThrow(() -> new BusinessException("ISSUE_NOT_YOUR_STEP",
+                        "Only the person holding \"" + current.getSnapName() + "\" can send it back.",
+                        org.springframework.http.HttpStatus.FORBIDDEN));
+
+        Integer currentOrder = current.getSnapStepOrder();
+        Long targetStepId = workflowStepRepository.findByWorkflowIdOrderByStepOrderAsc(wf.getWorkflowId()).stream()
+                .filter(s -> currentOrder == null || s.getStepOrder() < currentOrder)
+                .filter(s -> stepTransitions(s.getStepUiOverrideJson()).contains("ISSUE_SUBMIT_REVIEW"))
+                .reduce((a, b) -> b)                     // the latest one before this step
+                .map(com.kashi.grc.workflow.domain.WorkflowStep::getId)
+                .orElse(null);                           // none listed: the previous step
+
+        workflowEngineService.returnToEarlierStep(task.getId(), targetStepId,
+                "Changes requested: " + note.trim(), userId);
+
+        issue.setStatus(Issue.Status.IN_PROGRESS);
+        issue.setRemediatedAt(null);
+        issueRepository.save(issue);
+        log.info("[ISSUE] Changes requested | issueId={} | by={} | targetStepId={}", issueId, userId, targetStepId);
+        return toResponse(issue, tenantId);
+    }
+
+    private java.util.List<String> stepTransitions(String json) {
+        if (json == null || json.isBlank()) return java.util.List.of();
+        try {
+            com.fasterxml.jackson.databind.JsonNode list = objectMapper.readTree(json).path("transitions");
+            java.util.List<String> out = new java.util.ArrayList<>();
+            if (list.isArray()) list.forEach(n -> out.add(n.asText()));
+            return out;
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
+    /**
+     * An issue raised from a finding carries that finding's evidence as its
+     * issue evidence — linked, not copied, so nobody uploads the same files
+     * again and both records point at one document.
+     *
+     *   AUDIT_FINDING           the finding's deficiency / attachment files
+     *   ASSESSMENT_REMEDIATION  the files on the vendor's answer to that question
+     *
+     * Linked as DEFICIENCY ("proof the issue exists"); remediation evidence is
+     * always new. Failure is logged, never fatal to raising the issue.
+     */
+    private void linkSourceEvidence(Issue issue, Long createdBy) {
+        try {
+            String srcType = null;
+            Long   srcId   = null;
+            String label   = null;
+            if ("AUDIT_FINDING".equals(issue.getSourceEntityType()) && issue.getSourceEntityId() != null) {
+                srcType = "AUDIT_FINDING";
+                srcId   = issue.getSourceEntityId();
+                label   = "audit finding";
+            } else if ("ASSESSMENT_REMEDIATION".equals(issue.getSourceEntityType()) && issue.getSourceEntityId() != null) {
+                var item = actionItemRepository.findById(issue.getSourceEntityId()).orElse(null);
+                if (item != null && item.getEntityType() != null && item.getEntityId() != null) {
+                    srcType = item.getEntityType().name();
+                    srcId   = item.getEntityId();
+                    label   = "vendor's answer";
+                }
+            }
+            if (srcType == null) return;
+
+            java.util.Set<Long> already = new java.util.HashSet<>();
+            documentLinkRepository.findByEntityTypeAndEntityIdAndTenantId("ISSUE", issue.getId(), issue.getTenantId())
+                    .forEach(l -> already.add(l.getDocumentId()));
+            int linked = 0;
+            for (var src : documentLinkRepository.findAllActiveByEntity(srcType, srcId)) {
+                if (!issue.getTenantId().equals(src.getTenantId())) continue;
+                if ("REPORT".equals(src.getLinkType()) || "TEMPLATE".equals(src.getLinkType())) continue;
+                if (!already.add(src.getDocumentId())) continue;
+                documentLinkRepository.save(com.kashi.grc.document.domain.DocumentLink.builder()
+                        .tenantId(issue.getTenantId())
+                        .documentId(src.getDocumentId())
+                        .entityType("ISSUE")
+                        .entityId(issue.getId())
+                        .linkType("DEFICIENCY")
+                        .createdBy(createdBy)
+                        .createdAt(LocalDateTime.now())
+                        .notes("Linked from the " + label + " this issue was raised from.")
+                        .build());
+                linked++;
+            }
+            if (linked > 0)
+                log.info("[ISSUE] Linked {} source evidence file(s) | issueId={} | from {}#{}",
+                        linked, issue.getId(), srcType, srcId);
+        } catch (Exception e) {
+            log.warn("[ISSUE] Could not link source evidence | issueId={} | {}", issue.getId(), e.getMessage());
+        }
+    }
+
+    /**
+     * The current step may name the status buttons that complete it
+     * (step_ui_override_json "transitions": [actionKey, …]). When it does, only
+     * the moves those buttons make from the issue's current status are allowed.
+     *
+     * Every status move approves whatever step is current, so a button pressed
+     * on the wrong step completes the wrong step — "Send for validation" on a
+     * step meant for "Validate & Resolve" skips a step and leaves the rest of
+     * the workflow one behind its status. The page hides the other buttons;
+     * this refuses them for anyone calling the endpoint directly.
+     *
+     * The action keys are turned into target statuses through the ISSUE
+     * blueprint's status_flow_json, which is the same table the page uses, so
+     * the two cannot disagree. No list on the step = no restriction, which is
+     * every step that predates this. ACCEPTED_RISK is outside the step flow —
+     * it is the way out of any step — and is never restricted here.
+     */
+    private void requireStepAllowsMove(Issue issue, Issue.Status to, Long tenantId) {
+        if (to == Issue.Status.ACCEPTED_RISK || issue.getWorkflowInstanceId() == null) return;
+        java.util.List<String> allowedKeys = currentStepTransitions(issue);
+        if (allowedKeys == null || allowedKeys.isEmpty()) return;
+
+        String flow = blueprintRepository.findByEntityTypeIgnoreCaseAndTenantId("ISSUE", tenantId)
+                .or(() -> blueprintRepository.findByEntityTypeIgnoreCaseAndTenantIdIsNull("ISSUE"))
+                .map(com.kashi.grc.module.domain.ModuleBlueprint::getStatusFlowJson)
+                .orElse(null);
+        if (flow == null) return;   // no status flow to read — nothing to compare against
+
+        java.util.Set<String> reachable = new java.util.HashSet<>();
+        java.util.List<String> labels = new java.util.ArrayList<>();
+        try {
+            com.fasterxml.jackson.databind.JsonNode transitions = objectMapper.readTree(flow).path("transitions");
+            String from = issue.getStatus() != null ? issue.getStatus().name() : null;
+            for (com.fasterxml.jackson.databind.JsonNode t : transitions) {
+                String key = t.path("actionKey").asText(null);
+                if (key == null || !allowedKeys.contains(key)) continue;
+                if (from != null && !from.equals(t.path("from").asText(null))) continue;
+                reachable.add(t.path("to").asText());
+                labels.add(t.path("label").asText(key));
+            }
+        } catch (Exception e) {
+            log.warn("[ISSUE] Could not read ISSUE status flow — step move check skipped | {}", e.getMessage());
+            return;
+        }
+        if (!reachable.contains(to.name())) {
+            throw new BusinessException("ISSUE_WRONG_STEP_MOVE",
+                    labels.isEmpty()
+                            ? "This step is not completed by moving the issue to " + to.name() + "."
+                            : "This step is completed with: " + String.join(", ", labels) + ".",
+                    org.springframework.http.HttpStatus.CONFLICT);
+        }
+    }
+
+    /** The current step instance's "transitions" list, or null. */
+    private java.util.List<String> currentStepTransitions(Issue issue) {
+        try {
+            com.kashi.grc.workflow.domain.WorkflowInstance wf =
+                    instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
+            if (wf == null || wf.getCurrentStepId() == null) return null;
+            String json = stepInstanceRepository.findById(wf.getCurrentStepId())
+                    .map(com.kashi.grc.workflow.domain.StepInstance::getSnapUiOverrideJson).orElse(null);
+            if (json == null || json.isBlank()) return null;
+            com.fasterxml.jackson.databind.JsonNode list = objectMapper.readTree(json).path("transitions");
+            if (!list.isArray()) return null;
+            java.util.List<String> out = new java.util.ArrayList<>();
+            list.forEach(n -> out.add(n.asText()));
+            return out;
+        } catch (Exception e) {
+            log.warn("[ISSUE] Could not read the step's transitions | issueId={} | {}", issue.getId(), e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -453,13 +833,17 @@ public class IssueService {
             advanceWorkflowTask(issue, userId, "Owner acknowledged and started remediation");
         }
         if (newStatus == Issue.Status.PENDING_REVIEW) {
+            // The fix is done when the owner submits it, not when someone
+            // else validates it — the old code stamped remediatedAt at RESOLVED.
+            if (issue.getRemediatedAt() == null) issue.setRemediatedAt(LocalDateTime.now());
             advanceWorkflowTask(issue, userId, "Submitted for review");
         }
         if (newStatus == Issue.Status.PENDING_VALIDATION) {
             advanceWorkflowTask(issue, userId, "Submitted for validation");
         }
         if (newStatus == Issue.Status.RESOLVED) {
-            issue.setRemediatedAt(LocalDateTime.now());
+            if (issue.getRemediatedAt() == null) issue.setRemediatedAt(LocalDateTime.now());
+            issue.setValidatedAt(LocalDateTime.now());
             advanceWorkflowTask(issue, userId, "Remediation validated");
         }
         if (newStatus == Issue.Status.CLOSED || newStatus == Issue.Status.ACCEPTED_RISK) {
@@ -471,6 +855,13 @@ public class IssueService {
 
         issueRepository.save(issue);
         log.info("[ISSUE] Status updated | id={} | status={} | by={}", id, newStatus, userId);
+        // Close what the issue was raised from — the audit finding or vendor
+        // remediation. See CloseIssueAction.onIssueClosed for why this is not
+        // left to the workflow's automated step.
+        if (newStatus == Issue.Status.CLOSED) {
+            eventPublisher.publishEvent(new com.kashi.grc.issue.workflow.IssueClosedEvent(
+                    issue.getId(), tenantId, userId));
+        }
         return toResponse(issue, tenantId);
     }
 
@@ -556,6 +947,10 @@ public class IssueService {
         // First-time breaches
         List<Issue> breached = issueRepository.findBreachedIssues(now);
         for (Issue issue : breached) {
+            // Suspended organisation: not escalated while suspended. The query is
+            // "past due and not yet marked", so it is caught on the first run after
+            // reactivation.
+            if (!accountAccess.tenantOperating(issue.getTenantId())) continue;
             issue.setSlaBreached(true);
             issue.setEscalationCount(issue.getEscalationCount() + 1);
             issue.setLastEscalatedAt(now);
@@ -586,6 +981,7 @@ public class IssueService {
         LocalDateTime reescCutoff = now.minusHours(24);
         List<Issue> reescalate = issueRepository.findActiveBreachedForReescalation(reescCutoff);
         for (Issue issue : reescalate) {
+            if (!accountAccess.tenantOperating(issue.getTenantId())) continue;
             issue.setEscalationCount(issue.getEscalationCount() + 1);
             issue.setLastEscalatedAt(now);
             issueRepository.save(issue);

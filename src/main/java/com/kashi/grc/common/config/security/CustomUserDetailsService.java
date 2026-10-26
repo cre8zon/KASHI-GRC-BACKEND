@@ -40,6 +40,9 @@ public class CustomUserDetailsService implements UserDetailsService {
             // roles and permissions in ONE query instead of one lazy select per role.
             user = userRepository.findWithRolesAndPermissionsById(userId)
                     .orElseThrow(() -> new UsernameNotFoundException("User not found: " + userId));
+            // A soft-deleted user's token must stop working too. findWithRoles…
+            // does not filter on is_deleted, so it did not.
+            if (user.isDeleted()) throw new UsernameNotFoundException("User deleted: " + userId);
         } catch (NumberFormatException e) {
             user = userRepository.findByEmailAndIsDeletedFalse(userIdOrEmail)
                     .orElseThrow(() -> new UsernameNotFoundException("User not found: " + userIdOrEmail));

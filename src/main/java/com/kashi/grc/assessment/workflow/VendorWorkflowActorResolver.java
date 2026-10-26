@@ -56,6 +56,8 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
     private final VendorAssessmentRepository            assessmentRepository;
     private final AssessmentTemplateInstanceRepository  templateInstanceRepository;
     private final AssessmentSectionInstanceRepository   sectionInstanceRepository;
+    private final com.kashi.grc.workflow.repository.StepInstanceRepository stepInstanceRepository;
+    private final com.kashi.grc.workflow.repository.TaskInstanceRepository taskInstanceRepository;
 
     @Override
     public String entityType() {
@@ -130,6 +132,23 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
             List<Long> reviewerIds = sectionInstanceRepository
                     .findDistinctAssignedReviewerIds(templateInstanceId);
 
+            // ── NO SECTION REVIEWERS: THE PEOPLE WHO DID THE STEP BEFORE ─────
+            // An assessment whose sections were never given to reviewers (one
+            // set up before section assignment, or a lead who skipped it) found
+            // nobody here. The role filter then emptied the list and the engine
+            // fell back to every holder of the role — so "Reviewers Consolidate
+            // Findings" went to every reviewer, including ones who never touched
+            // the assessment. The people who completed the previous step are
+            // the ones carrying this work forward; the role filter still decides
+            // whether this step is theirs.
+            if (reviewerIds.isEmpty()) {
+                reviewerIds = previousStepActors(instance, si);
+                if (!reviewerIds.isEmpty()) {
+                    log.info("[VENDOR-ACTOR-RESOLVER] No section reviewers — using the {} actor(s) "
+                            + "who completed the previous step", reviewerIds.size());
+                }
+            }
+
             List<Long> ids = new ArrayList<>();
             if (leadId != null) ids.add(leadId);
             for (Long r : reviewerIds) if (!ids.contains(r)) ids.add(r);
@@ -144,6 +163,31 @@ public class VendorWorkflowActorResolver implements WorkflowActorResolver {
         log.debug("[VENDOR-ACTOR-RESOLVER] side='{}' action='{}' not assignment-scoped — ROLE_BASED fallback",
                 side, action);
         return List.of();
+    }
+
+    /**
+     * Distinct users whose ACTOR task on the immediately previous step (same
+     * workflow instance, step order one lower, latest run) was approved.
+     * Empty when there is no such step or nobody approved it.
+     */
+    private List<Long> previousStepActors(WorkflowInstance instance, StepInstance si) {
+        Integer order = si.getSnapStepOrder();
+        if (order == null || order <= 1) return List.of();
+        StepInstance previous = stepInstanceRepository.findByWorkflowInstanceId(instance.getId()).stream()
+                .filter(s -> Integer.valueOf(order - 1).equals(s.getSnapStepOrder()))
+                .filter(s -> s.getStatus() == com.kashi.grc.workflow.enums.StepStatus.APPROVED)
+                .max(java.util.Comparator.comparing(StepInstance::getId))
+                .orElse(null);
+        if (previous == null) return List.of();
+        return taskInstanceRepository
+                .findByStepInstanceIdAndStatus(previous.getId(), com.kashi.grc.workflow.enums.TaskStatus.APPROVED)
+                .stream()
+                .filter(t -> t.getTaskRole() == null
+                        || t.getTaskRole() == com.kashi.grc.workflow.enums.TaskRole.ACTOR)
+                .map(com.kashi.grc.workflow.domain.TaskInstance::getAssignedUserId)
+                .filter(java.util.Objects::nonNull)
+                .distinct()
+                .toList();
     }
 
     /**

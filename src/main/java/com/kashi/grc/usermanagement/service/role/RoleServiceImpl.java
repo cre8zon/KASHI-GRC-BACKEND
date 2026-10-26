@@ -22,7 +22,7 @@ public class RoleServiceImpl implements RoleService {
     private final PermissionRepository permissionRepository;
     private final UserRepository       userRepository;
     private final MembershipRoleSync membershipRoleSync;
-    private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
+    private final UserTenantMembershipRepository membershipRepository;
     // SodRuleRepository is now guard.SodRuleRepository — unified entity in guard module.
     // ROLE_PAIR rules (role conflict at assignment time) and PERMISSION_PAIR rules
     // (permission conflict at access resolution time) both live in guard.SodRule / sod_rules table.
@@ -233,7 +233,7 @@ public class RoleServiceImpl implements RoleService {
         // must match.
         RoleSide committedSide = user.getRoles().stream()
                 .map(Role::getSide)
-                .filter(java.util.Objects::nonNull)
+                .filter(Objects::nonNull)
                 .findFirst()
                 .orElse(null);
 
@@ -265,6 +265,13 @@ public class RoleServiceImpl implements RoleService {
                         "Cannot assign a SYSTEM-side role to a user outside the Kashi System Tenant. "
                                 + "SYSTEM roles are reserved for platform administration and can only "
                                 + "be held by users of that one tenant.");
+            }
+
+            // The Org Owner role moves only with ownership (OrgOwnerService):
+            // granting it here would make a second owner.
+            if (com.kashi.grc.usermanagement.service.user.OrgOwnerService.isOwnerRole(role)) {
+                throw new ValidationException(
+                        "The Org Owner role can't be given directly. Use Transfer ownership on the new owner.");
             }
 
             // A suspended role is parked — it must not be newly assigned to
@@ -308,6 +315,15 @@ public class RoleServiceImpl implements RoleService {
         requireNotGuest(userId, tenantId, "changed");
         var user = userRepository.findByIdAndTenantIdAndIsDeletedFalse(userId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("User", userId));
+        // Removing ORG_OWNER would leave the organisation with no owner; it
+        // moves only by transfer, which takes it from the old owner itself.
+        boolean removingOwnerRole = user.getRoles().stream()
+                .anyMatch(r -> r.getId().equals(roleId)
+                        && com.kashi.grc.usermanagement.service.user.OrgOwnerService.isOwnerRole(r));
+        if (removingOwnerRole) {
+            throw new ValidationException(
+                    "The Org Owner role can't be removed. Transfer ownership to someone else instead.");
+        }
         user.getRoles().removeIf(r -> r.getId().equals(roleId));
         var saved = userRepository.save(user);
 

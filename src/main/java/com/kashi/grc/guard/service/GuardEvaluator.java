@@ -87,10 +87,16 @@ public class GuardEvaluator {
         log.debug("[KASHI-GUARD] {} rule(s) for tag='{}' instanceId={}",
                 rules.size(), ctx.questionTagSnapshot(), ctx.questionInstanceId());
 
+        boolean evidenceBacked = evidenceBacked(ctx);
+
         for (GuardRule rule : rules) {
             try {
-                if (evaluateCondition(rule, ctx)) handleMatch(rule, ctx, tenantId);
-                else                               handleNoMatch(rule, ctx.questionInstanceId(), tenantId);
+                if (evidenceBacked && evidenceSatisfies(rule)) {
+                    handleNoMatch(rule, ctx.questionInstanceId(), tenantId,
+                            "Auto-resolved: the answer is backed by attached evidence");
+                } else if (evaluateCondition(rule, ctx)) handleMatch(rule, ctx, tenantId);
+                else handleNoMatch(rule, ctx.questionInstanceId(), tenantId,
+                            "Auto-resolved: answer no longer triggers rule " + rule.getId());
             } catch (Exception e) {
                 log.warn("[KASHI-GUARD] Rule {} failed: {}", rule.getId(), e.getMessage());
             }
@@ -126,10 +132,35 @@ public class GuardEvaluator {
                          boolean fileUploaded,
                          Double score,
                          String navContext,
-                         java.util.List<String> selectedOptionValues,
+                         List<String> selectedOptionValues,
                          Long tenantId) {
         evaluate(new QuestionContext(questionTagSnapshot, questionInstanceId,
                 responseText, fileUploaded, score, navContext, selectedOptionValues), tenantId);
+    }
+
+    // ── Evidence answers the rule ─────────────────────────────────────────────
+    //
+    // A rule judges the ANSWER — "In draft", "No formal process", a score under
+    // threshold. When the vendor answered AND attached evidence, the evidence is
+    // what a reviewer weighs, and raising a finding over it duplicated work the
+    // reviewer still has to do anyway: open the file. So an answer that comes
+    // with evidence satisfies the rule, and any finding the rule raised earlier
+    // closes with a note saying why.
+    //
+    // Only when there IS an answer: a file with nothing selected or written is
+    // still an unanswered question. ANY_ANSWER fires on every answer by design,
+    // and FILE_NOT_UPLOADED is already false when a file exists, so neither is
+    // changed.
+
+    private static boolean evidenceBacked(QuestionContext ctx) {
+        if (!ctx.fileUploaded()) return false;
+        boolean text   = ctx.responseText() != null && !ctx.responseText().isBlank();
+        boolean option = ctx.selectedOptionValues() != null && !ctx.selectedOptionValues().isEmpty();
+        return text || option || ctx.score() != null;
+    }
+
+    private static boolean evidenceSatisfies(GuardRule rule) {
+        return rule.getConditionType() != GuardRule.ConditionType.ANY_ANSWER;
     }
 
     // ── Condition evaluation ──────────────────────────────────────────────────
@@ -324,7 +355,7 @@ public class GuardEvaluator {
 
     // ── No match → auto-resolve existing open item ───────────────────────────
 
-    private void handleNoMatch(GuardRule rule, Long questionInstanceId, Long tenantId) {
+    private void handleNoMatch(GuardRule rule, Long questionInstanceId, Long tenantId, String note) {
         actionItemRepository.findAll(
                 ActionItemSpecification.forTenant(tenantId)
                         .and(ActionItemSpecification.forEntity(
@@ -333,9 +364,12 @@ public class GuardEvaluator {
                                 ActionItem.SourceType.SYSTEM, rule.getId()))
                         .and(ActionItemSpecification.open())
         ).forEach(item -> {
+            // An escalated finding closes through its Issue — resolving it here
+            // would leave the Issue's workflow running for work already closed.
+            if (item.getLinkedIssueId() != null) return;
             item.setStatus(ActionItem.Status.RESOLVED);
             item.setResolvedBy(SYSTEM_USER_ID);
-            item.setResolutionNote("Auto-resolved: answer no longer triggers rule " + rule.getId());
+            item.setResolutionNote(note);
             actionItemRepository.save(item);
             log.info("[KASHI-GUARD] Rule {} NO MATCH → resolved item={} qi={}",
                     rule.getId(), item.getId(), questionInstanceId);

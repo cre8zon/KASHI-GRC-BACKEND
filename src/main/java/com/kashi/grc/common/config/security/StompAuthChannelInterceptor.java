@@ -39,6 +39,8 @@ public class StompAuthChannelInterceptor implements ChannelInterceptor {
     private static final String CHAT_TOPIC = "/topic/chat/";
 
     private final JwtTokenProvider tokens;
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
+    private final com.kashi.grc.common.security.LiveSessionRegistry liveSessions;
 
     @Override
     public Message<?> preSend(Message<?> message, MessageChannel channel) {
@@ -50,7 +52,17 @@ public class StompAuthChannelInterceptor implements ChannelInterceptor {
             String token = header != null && header.startsWith("Bearer ") ? header.substring(7).trim() : null;
             if (token != null && !token.isEmpty() && !"null".equals(token) && tokens.validateToken(token)) {
                 try {
-                    acc.setUser(new StompPrincipal(tokens.getUserId(token), tokens.getTenantId(token)));
+                    Long uid = tokens.getUserId(token), tid = tokens.getTenantId(token);
+                    // A suspended account connects without an identity, so every
+                    // personal topic below is refused. (Platform admins are never
+                    // suspended through the app, so no exemption is needed here.)
+                    if (accountAccess.check(uid, tid).blocked()) {
+                        log.debug("[WS] Connect without identity — account blocked | user={}", uid);
+                        return message;
+                    }
+                    acc.setUser(new StompPrincipal(uid, tid));
+                    // Known by user from now on, so suspending them disconnects this at once.
+                    liveSessions.bind(acc.getSessionId(), uid, tid);
                 } catch (RuntimeException e) {
                     log.debug("[WS] Could not read the token on connect: {}", e.getMessage());
                 }
@@ -62,6 +74,9 @@ public class StompAuthChannelInterceptor implements ChannelInterceptor {
             String dest = acc.getDestination();
             if (dest == null) return message;
             StompPrincipal me = acc.getUser() instanceof StompPrincipal p ? p : null;
+            // Re-checked on every subscribe: a socket opened before a suspension
+            // cannot subscribe to anything personal afterwards.
+            if (me != null && accountAccess.check(me.userId(), me.tenantId()).blocked()) return refuse(dest, me);
             if (dest.startsWith(USER_TOPIC)) {
                 if (me == null || !dest.equals(USER_TOPIC + me.userId())) return refuse(dest, me);
             } else if (dest.startsWith(CHAT_TOPIC)) {

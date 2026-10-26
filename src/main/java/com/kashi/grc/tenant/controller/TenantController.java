@@ -28,6 +28,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 
+@lombok.extern.slf4j.Slf4j
 @RestController
 @RequestMapping("/v1/tenants")
 @Tag(name = "Tenant Management", description = "Tenant provisioning and configuration")
@@ -45,6 +46,13 @@ public class TenantController {
     private final com.kashi.grc.uiconfig.repository.FeatureFlagRepository featureFlagRepository;
     private final com.kashi.grc.uiconfig.service.FeatureEntitlementService featureEntitlementService;
     private final com.kashi.grc.firmverification.service.AuditFirmVerificationService firmVerificationService;
+    private final com.kashi.grc.usermanagement.repository.AccountStatusChangeRepository statusChangeRepository;
+    private final com.kashi.grc.usermanagement.service.user.OrgOwnerService orgOwnerService;
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
+    private final com.kashi.grc.common.security.LiveSessionRegistry liveSessions;
+
+    /** The statuses a tenant can be put in by hand. CANCELLED is set by billing. */
+    private static final java.util.Set<String> TENANT_STATUSES = java.util.Set.of("ACTIVE", "TRIAL", "SUSPENDED");
 
     // ── CREATE ────────────────────────────────────────────────────
     @PostMapping
@@ -184,7 +192,7 @@ public class TenantController {
         if (req.getName()        != null) t.setName(req.getName());
         if (req.getDescription() != null) t.setDescription(req.getDescription());
         if (req.getPlan()        != null) t.setPlan(req.getPlan());
-        if (req.getStatus()      != null) t.setStatus(req.getStatus());
+        if (req.getStatus()      != null) changeStatus(t, req.getStatus(), req.getStatusReason());
         if (req.getMaxUsers()    != null) t.setMaxUsers(req.getMaxUsers());
         if (req.getMaxVendors()  != null) t.setMaxVendors(req.getMaxVendors());
         // Commercial profile and bill-to. An empty string clears a field.
@@ -220,8 +228,13 @@ public class TenantController {
             return ResponseEntity.ok(ApiResponse.success(Map.of()));
         }
 
-        // Owner = earliest ORGANIZATION-side user; fallback to earliest any user
-        var owner = users.stream()
+        // The recorded owner (tenants.owner_user_id) when there is one. Older
+        // tenants without it fall back to the earliest organisation-side user,
+        // as before, until the backfill has run.
+        Long ownerId = tenantRepository.findById(tenantId).map(Tenant::getOwnerUserId).orElse(null);
+        var recorded = ownerId == null ? null
+                : users.stream().filter(u -> u.getId().equals(ownerId)).findFirst().orElse(null);
+        var owner = recorded != null ? recorded : users.stream()
                 .filter(u -> u.getRoles().stream()
                         .anyMatch(r -> r.getSide() != null &&
                                 r.getSide().name().equals("ORGANIZATION")))
@@ -286,9 +299,78 @@ public class TenantController {
         )));
     }
 
+    // ── STATUS ────────────────────────────────────────────────────
+
+    /**
+     * Suspend or reactivate an organisation. Used to be a free-text field set
+     * through this update with no validation and no record of who did it.
+     *
+     * SUSPENDED needs a reason and starts the read-only grace period
+     * (AccountAccessService): the organisation's people can still sign in, view
+     * and export, but not change anything; after the grace period access is
+     * blocked. ACTIVE / TRIAL clear it. Takes effect on everyone's next request.
+     */
+    private void changeStatus(Tenant t, String raw, String reason) {
+        String to = raw == null ? "" : raw.trim().toUpperCase();
+        if (!TENANT_STATUSES.contains(to)) {
+            throw new BusinessException("INVALID_STATUS", "Status must be ACTIVE, TRIAL or SUSPENDED.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        String from = t.getStatus() == null ? "ACTIVE" : t.getStatus().toUpperCase();
+        if (to.equals(from)) return;
+        if (com.kashi.grc.common.util.Constants.SYSTEM_TENANT_ID.equals(t.getId()) && "SUSPENDED".equals(to)) {
+            throw new BusinessException("SYSTEM_TENANT", "The platform's own organisation can't be suspended.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        if ("SUSPENDED".equals(to) && (reason == null || reason.isBlank())) {
+            throw new BusinessException("REASON_REQUIRED", "A reason is required to suspend an organisation.",
+                    HttpStatus.UNPROCESSABLE_ENTITY);
+        }
+        t.setStatus(to);
+        t.setSuspendedAt("SUSPENDED".equals(to) ? LocalDateTime.now() : null);
+        statusChangeRepository.save(com.kashi.grc.usermanagement.domain.AccountStatusChange.builder()
+                .subjectType(com.kashi.grc.usermanagement.domain.AccountStatusChange.TENANT)
+                .subjectId(t.getId())
+                .tenantId(t.getId())
+                .fromStatus(from)
+                .toStatus(to)
+                .reason(reason == null || reason.isBlank() ? null : reason.trim())
+                .actorUserId(utilityService.getLoggedInDataContext().getId())
+                .detail("SUSPENDED".equals(to)
+                        ? "read-only for " + accountAccess.readOnlyDays() + " days, then blocked" : null)
+                .build());
+        com.kashi.grc.common.security.AccountAccessService.invalidateAll();
+        // Open connections of people this change blocks are closed once it is saved.
+        liveSessions.sweepAfterCommit();
+        log.info("[TENANT] Status {} → {} | tenantId={} | reason={}", from, to, t.getId(), reason);
+    }
+
+    @GetMapping("/{tenantId}/status-history")
+    @Operation(summary = "Who changed this organisation's status or owner, when and why")
+    public ResponseEntity<ApiResponse<List<com.kashi.grc.usermanagement.domain.AccountStatusChange>>> statusHistory(
+            @PathVariable Long tenantId) {
+        return ResponseEntity.ok(ApiResponse.success(statusChangeRepository
+                .findBySubjectTypeAndSubjectIdOrderByIdDesc(
+                        com.kashi.grc.usermanagement.domain.AccountStatusChange.TENANT, tenantId)));
+    }
+
+    @PostMapping("/{tenantId}/owner/transfer")
+    @Operation(summary = "Make another of the organisation's people its owner (platform)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> transferOwner(
+            @PathVariable Long tenantId, @RequestBody Map<String, Object> body) {
+        Object uid = body.get("userId");
+        if (uid == null) throw new BusinessException("USER_REQUIRED", "userId is required");
+        return ResponseEntity.ok(ApiResponse.success(orgOwnerService.transfer(
+                tenantId, Long.valueOf(uid.toString()),
+                body.get("reason") == null ? null : body.get("reason").toString())));
+    }
+
     // ── MAPPER ────────────────────────────────────────────────────
     private TenantResponse toResponse(Tenant t) {
         return TenantResponse.builder()
+                .ownerUserId(t.getOwnerUserId())
+                .suspendedAt(t.getSuspendedAt())
+                .readOnlyUntil("SUSPENDED".equalsIgnoreCase(t.getStatus()) ? accountAccess.graceEnd(t) : null)
                 .tenantId(t.getId()).name(t.getName()).code(t.getCode())
                 .description(t.getDescription()).status(t.getStatus())
                 .plan(t.getPlan()).maxUsers(t.getMaxUsers()).maxVendors(t.getMaxVendors())

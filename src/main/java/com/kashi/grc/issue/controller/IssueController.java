@@ -45,6 +45,11 @@ public class IssueController {
     private final IssueRepository                                            issueRepository;
     private final com.kashi.grc.audit.service.AuditScopeService              auditScope;
     private final AuditFindingRepository                                     findingRepository;
+    private final com.kashi.grc.actionitem.repository.ActionItemRepository                     actionItemRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentQuestionInstanceRepository     questionInstanceRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentSectionInstanceRepository      sectionInstanceRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentResponseRepository             responseRepository;
+    private final com.kashi.grc.assessment.repository.AssessmentOptionInstanceRepository       optionInstanceRepository;
     private final com.kashi.grc.workflow.service.WorkflowAccessService      workflowAccessService;
 
     @Value("${app.ingest.token:}")
@@ -162,8 +167,10 @@ public class IssueController {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
         Issue.Status newStatus = Issue.Status.valueOf(body.get("status").toUpperCase());
+        // Same completeness rules as the named endpoints: this is how "Send for
+        // validation" moves, and a generic PATCH must not be a way round them.
         return ResponseEntity.ok(ApiResponse.success(
-                issueService.updateStatus(id, newStatus, ctx.getId(), ctx.getTenantId())));
+                issueService.transition(id, newStatus, null, ctx.getId(), ctx.getTenantId())));
     }
 
     /** See IssueService.requireCanMoveStatus — the step holder, or an override holder. */
@@ -242,55 +249,70 @@ public class IssueController {
 
     @PostMapping("/{id}/triage")
     @Operation(summary = "Triage issue — OPEN → TRIAGED, sets acknowledgedAt")
-    public ResponseEntity<ApiResponse<IssueResponse>> triage(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<IssueResponse>> triage(
+            @PathVariable Long id,
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.TRIAGED, ctx.getId(), ctx.getTenantId());
+        // The step's own fields ride along — see IssueService.transition.
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.TRIAGED, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Triaged | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
 
     @PostMapping("/{id}/start")
     @Operation(summary = "Start work — TRIAGED → IN_PROGRESS")
-    public ResponseEntity<ApiResponse<IssueResponse>> start(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<IssueResponse>> start(
+            @PathVariable Long id,
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.IN_PROGRESS, ctx.getId(), ctx.getTenantId());
+        // The step's own fields ride along — see IssueService.transition.
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.IN_PROGRESS, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Started | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
 
     @PostMapping("/{id}/submit-for-review")
     @Operation(summary = "Submit for review — IN_PROGRESS → PENDING_REVIEW")
-    public ResponseEntity<ApiResponse<IssueResponse>> submitForReview(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<IssueResponse>> submitForReview(
+            @PathVariable Long id,
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.PENDING_REVIEW, ctx.getId(), ctx.getTenantId());
+        // The step's own fields ride along — see IssueService.transition.
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.PENDING_REVIEW, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Submitted for review | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
 
     @PostMapping("/{id}/resolve")
     @Operation(summary = "Resolve issue — PENDING_REVIEW → RESOLVED, sets remediatedAt")
-    public ResponseEntity<ApiResponse<IssueResponse>> resolve(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<IssueResponse>> resolve(
+            @PathVariable Long id,
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.RESOLVED, ctx.getId(), ctx.getTenantId());
+        // The step's own fields ride along — see IssueService.transition.
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.RESOLVED, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Resolved | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
 
     @PostMapping("/{id}/close")
     @Operation(summary = "Close issue — RESOLVED → CLOSED, sets closedAt + closedBy")
-    public ResponseEntity<ApiResponse<IssueResponse>> close(@PathVariable Long id) {
+    public ResponseEntity<ApiResponse<IssueResponse>> close(
+            @PathVariable Long id,
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
         requireCanMoveStatus(id, ctx);
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.CLOSED, ctx.getId(), ctx.getTenantId());
+        // The step's own fields ride along — see IssueService.transition.
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.CLOSED, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Closed | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
     }
@@ -299,14 +321,50 @@ public class IssueController {
     @Operation(summary = "Accept risk — sets acceptedRisk flag then OPEN/IN_PROGRESS → ACCEPTED_RISK")
     public ResponseEntity<ApiResponse<IssueResponse>> acceptRisk(
             @PathVariable Long id,
-            @RequestBody(required = false) Map<String, Object> body) {
+            @RequestBody(required = false) IssueRequest fields) {
         var ctx = utilityService.getLoggedInDataContext();
-        // Acceptance note — if IssueRequest gains acceptedRiskNote field in future,
-        // it can be stored here. For now the note is carried in description/remarks.
-        IssueResponse resp = issueService.updateStatus(
-                id, Issue.Status.ACCEPTED_RISK, ctx.getId(), ctx.getTenantId());
+        // Like every other status move this approves the current step's task,
+        // so it needs the same check — it was the one move anyone could make.
+        requireCanMoveStatus(id, ctx);
+        // acceptedRiskNote is required (IssueService.transition).
+        IssueResponse resp = issueService.transition(
+                id, Issue.Status.ACCEPTED_RISK, fields, ctx.getId(), ctx.getTenantId());
         log.info("[ISSUE] Risk accepted | id={} | by={}", id, ctx.getId());
         return ResponseEntity.ok(ApiResponse.success(resp));
+    }
+
+    /**
+     * The validator accepts or rejects one remediation evidence file.
+     * Body: { "decision": "ACCEPTED" | "REJECTED", "note": "…" } — a note is
+     * required to reject. Only the validation step's task holder.
+     */
+    @PostMapping("/{id}/evidence/{linkId}/review")
+    @Operation(summary = "Accept or reject a remediation evidence file — validation step only")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> reviewEvidence(
+            @PathVariable Long id,
+            @PathVariable Long linkId,
+            @RequestBody Map<String, String> body) {
+        var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
+        return ResponseEntity.ok(ApiResponse.success(issueService.reviewEvidence(
+                id, linkId, body.get("decision"), body.get("note"), ctx.getId(), ctx.getTenantId())));
+    }
+
+    /**
+     * Send the fix back to the owner with a reason. Body: { "note": "…" }.
+     * The workflow returns to the step that submits for review and the issue
+     * goes back to IN_PROGRESS. Only the current step's task holder.
+     */
+    @PostMapping("/{id}/request-changes")
+    @Operation(summary = "Validator sends the remediation back to the owner — IN_PROGRESS, back to the execute step")
+    public ResponseEntity<ApiResponse<IssueResponse>> requestChanges(
+            @PathVariable Long id,
+            @RequestBody(required = false) Map<String, String> body) {
+        var ctx = utilityService.getLoggedInDataContext();
+        requireCanMoveStatus(id, ctx);
+        String note = body != null ? body.getOrDefault("note", body.get("changesRequested")) : null;
+        return ResponseEntity.ok(ApiResponse.success(
+                issueService.requestChanges(id, note, ctx.getId(), ctx.getTenantId())));
     }
 
     @PostMapping("/{id}/reopen")
@@ -364,7 +422,7 @@ public class IssueController {
     // ── ADDED: linked-findings endpoints ─────────────────────────────────────
 
     @GetMapping("/{id}/linked-findings")
-    @Operation(summary = "Get all audit findings linked to this issue")
+    @Operation(summary = "What this issue was raised from — audit findings, or the vendor assessment question")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getLinkedFindings(
             @PathVariable Long id) {
 
@@ -374,15 +432,16 @@ public class IssueController {
         // link back to a finding on their own engagement narrows it.
         auditScope.requireIssueVisible(id);
         Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
-        issueRepository.findById(id)
+        Issue issue = issueRepository.findById(id)
                 .filter(i -> i.getTenantId().equals(tenantId))
                 .orElseThrow(() -> new ResourceNotFoundException("Issue", id));
 
-        List<Map<String, Object>> findings = findingRepository
+        List<Map<String, Object>> findings = new java.util.ArrayList<>(findingRepository
                 .findByLinkedIssueIdAndTenantId(id, tenantId)
                 .stream()
                 .map(f -> {
                     Map<String, Object> m = new LinkedHashMap<>();
+                    m.put("kind",               "AUDIT_FINDING");
                     m.put("findingId",          f.getId());
                     m.put("findingRef",          f.getFindingRef());
                     m.put("engagementId",        f.getEngagementId());
@@ -397,9 +456,78 @@ public class IssueController {
                     m.put("remediationPlan",     f.getRemediationPlan());
                     return m;
                 })
-                .toList();
+                .toList());
+
+        // A vendor issue's source is the remediation a reviewer raised on one
+        // assessment question. It has no audit_findings row, so this tab said
+        // "No linked findings yet" on every vendor issue.
+        Map<String, Object> vendorSource = vendorQuestionSource(issue, tenantId);
+        if (vendorSource != null) findings.add(0, vendorSource);
 
         return ResponseEntity.ok(ApiResponse.success(findings));
+    }
+
+    /**
+     * The assessment question a vendor issue came from: question, answer,
+     * reviewer verdict, the remediation that was asked for, and the assessment
+     * to link back to. Null when the issue did not come from an assessment.
+     */
+    private Map<String, Object> vendorQuestionSource(Issue issue, Long tenantId) {
+        if (!"ASSESSMENT_REMEDIATION".equals(issue.getSourceEntityType()) || issue.getSourceEntityId() == null)
+            return null;
+        com.kashi.grc.actionitem.domain.ActionItem item = actionItemRepository.findById(issue.getSourceEntityId())
+                .filter(a -> tenantId.equals(a.getTenantId()))
+                .orElse(null);
+        if (item == null) return null;
+
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("kind",              "VENDOR_QUESTION");
+        m.put("actionItemId",      item.getId());
+        m.put("title",             item.getTitle());
+        m.put("remediationAsked",  item.getDescription());
+        m.put("status",            item.getStatus());
+        m.put("severity",          item.getSeverity());
+        m.put("assessmentId",      item.getParentEntityId());
+
+        Long qiId = item.getEntityId();
+        questionInstanceRepository.findById(qiId).ifPresent(qi -> {
+            m.put("questionInstanceId", qi.getId());
+            m.put("questionText",       qi.getQuestionTextSnapshot());
+            if (qi.getSectionInstanceId() != null) {
+                sectionInstanceRepository.findById(qi.getSectionInstanceId())
+                        .ifPresent(s -> m.put("sectionName", s.getSectionNameSnapshot()));
+            }
+            if (item.getParentEntityId() != null) {
+                responseRepository.findFirstByAssessmentIdAndQuestionInstanceIdOrderByIdDesc(
+                                item.getParentEntityId(), qi.getId())
+                        .ifPresent(r -> {
+                            m.put("answer",         describeAnswer(r));
+                            m.put("reviewerStatus", r.getReviewerStatus());
+                        });
+            }
+        });
+        return m;
+    }
+
+    /** The answer as a person would read it: the chosen option(s), or the text. */
+    private String describeAnswer(com.kashi.grc.assessment.domain.AssessmentResponse r) {
+        if (r.getSelectedOptionInstanceId() != null) {
+            return optionInstanceRepository.findById(r.getSelectedOptionInstanceId())
+                    .map(o -> o.getOptionValue()).orElse(null);
+        }
+        String t = r.getResponseText();
+        if (t == null || t.isBlank()) return null;
+        if (t.startsWith("[FILE_UPLOADED")) return "File uploaded";
+        if (t.startsWith("[")) {
+            try {
+                Long[] ids = new com.fasterxml.jackson.databind.ObjectMapper().readValue(t, Long[].class);
+                return java.util.Arrays.stream(ids)
+                        .map(oid -> optionInstanceRepository.findById(oid).map(o -> o.getOptionValue()).orElse(null))
+                        .filter(java.util.Objects::nonNull)
+                        .collect(java.util.stream.Collectors.joining(", "));
+            } catch (Exception ignored) { return t; }
+        }
+        return t;
     }
 
     @PostMapping("/{id}/link-finding")

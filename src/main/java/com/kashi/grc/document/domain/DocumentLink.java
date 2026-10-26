@@ -87,4 +87,24 @@ public class DocumentLink {
     /** Optional reviewer note about why this evidence satisfies a requirement */
     @Column(name = "notes", columnDefinition = "TEXT")
     private String notes;
+
+    // ── Review — used where evidence is accepted or rejected file by file ────
+    // (issue remediation evidence today). Null on every link nobody reviews,
+    // which is every link in every other module, so nothing else changes.
+    // A non-null status also locks the link: reviewed evidence stays on the
+    // record (DocumentController.removeLink refuses it).
+
+    /** ACCEPTED or REJECTED once reviewed; null = not reviewed (yet). */
+    @Column(name = "review_status", length = 20)
+    private String reviewStatus;
+
+    @Column(name = "reviewed_by")
+    private Long reviewedBy;
+
+    @Column(name = "reviewed_at")
+    private LocalDateTime reviewedAt;
+
+    /** Why it was accepted or, required on rejection, what is wrong with it. */
+    @Column(name = "review_note", columnDefinition = "TEXT")
+    private String reviewNote;
 }

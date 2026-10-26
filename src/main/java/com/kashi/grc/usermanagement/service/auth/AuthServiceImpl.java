@@ -56,6 +56,7 @@ public class AuthServiceImpl implements AuthService {
     private final MailService         mailService;
     private final com.kashi.grc.common.security.PermissionGate permissionGate;
     private final com.kashi.grc.common.util.UtilityService      utilityService;
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     @Value("${kashi.app.base-url:https://app.kashigrc.com}")
     private String appBaseUrl;
@@ -92,10 +93,10 @@ public class AuthServiceImpl implements AuthService {
             }
         }
 
-        // 3. Check general status
-        if (!UserStatus.ACTIVE.equals(user.getStatus())) {
-            throw new ValidationException("Account is not active");
-        }
+        // 3. The account's status is checked AFTER the password (step 4b), so
+        //    that "this account is suspended" is only ever said to someone who
+        //    knows the password. Checked before it, the sign-in form told
+        //    anyone which addresses belonged to suspended accounts.
 
         // (The LOGIN DEBUG block that logged the stored bcrypt hash and the
         //  password length at INFO on every attempt has been removed — those
@@ -106,7 +107,11 @@ public class AuthServiceImpl implements AuthService {
             user.incrementFailedAttempts();
             log.warn("Invalid password for: {} (attempt {})", request.getEmail(), user.getFailedLoginAttempts());
 
-            if (user.getFailedLoginAttempts() >= Constants.MAX_FAILED_ATTEMPTS) {
+            // Only an ACTIVE account is locked. Locking a SUSPENDED one would
+            // overwrite the suspension, and the automatic unlock above would
+            // then hand it back as ACTIVE.
+            if (user.getFailedLoginAttempts() >= Constants.MAX_FAILED_ATTEMPTS
+                    && UserStatus.ACTIVE.equals(user.getStatus())) {
                 user.setStatus(UserStatus.LOCKED);
                 user.setLockoutUntil(DateTimeUtils.plusMinutes(Constants.LOCKOUT_MINUTES));
                 log.warn("Account locked: {} until {}", request.getEmail(), user.getLockoutUntil());
@@ -114,6 +119,11 @@ public class AuthServiceImpl implements AuthService {
             userRepository.save(user);
             throw new ValidationException("Invalid email or password");
         }
+
+        // 4b. Password is right — now may this account be used at all? The
+        //     user's own status, their organisation's, and (for a vendor-side
+        //     user) their vendor's. A read-only organisation may still sign in.
+        requireAccess(user, null);
 
         // 5. Reset failed attempts on success
         user.resetFailedAttempts();
@@ -166,6 +176,7 @@ public class AuthServiceImpl implements AuthService {
                 .orElse(null);
 
         Long activeTenantId = active != null ? active.getTenantId() : user.getTenantId();
+        if (!activeTenantId.equals(user.getTenantId())) requireAccess(user, activeTenantId);
 
         // Roles are per membership. Only re-resolve when the session is NOT the
         // home tenant — otherwise user.getRoles() is already correct and we
@@ -225,6 +236,7 @@ public class AuthServiceImpl implements AuthService {
         if (!target.isUsable()) {
             throw new ValidationException("Your access to that organization has ended");
         }
+        requireAccess(user, tenantId);
 
         TenantContext.setCurrentTenant(tenantId);
 
@@ -332,11 +344,19 @@ public class AuthServiceImpl implements AuthService {
                 .filter(u -> !u.isDeleted())
                 .orElseThrow(this::sessionExpired);
 
-        if (!UserStatus.ACTIVE.equals(user.getStatus())
-                || Boolean.TRUE.equals(user.getPasswordResetRequired())) {
-            log.info("[AUTH-REFRESH] refused for userId={} status={} resetRequired={}",
-                    userId, user.getStatus(), user.getPasswordResetRequired());
+        if (Boolean.TRUE.equals(user.getPasswordResetRequired())) {
+            log.info("[AUTH-REFRESH] refused for userId={} — password reset required", userId);
             throw sessionExpired();
+        }
+        // Suspended user, organisation or vendor: refused with the reason, so the
+        // app can sign the person out and say why rather than "session expired".
+        if (!isPlatformUser(user)) {
+            com.kashi.grc.common.security.AccountAccessService.Verdict v =
+                    accountAccess.check(user.getId(), tenantId != null ? tenantId : user.getTenantId());
+            if (v.blocked()) {
+                log.info("[AUTH-REFRESH] refused for userId={} code={}", userId, v.code());
+                throw new BusinessException(v.code(), v.message(), HttpStatus.UNAUTHORIZED);
+            }
         }
 
         // Rotation: the token just presented is spent. Whatever happens next,
@@ -403,6 +423,28 @@ public class AuthServiceImpl implements AuthService {
         revokedTokenRepository.save(com.kashi.grc.usermanagement.domain.RevokedToken.builder()
                 .jti(rc.jti()).userId(rc.userId()).expiresAt(rc.expiresAt())
                 .revokedAt(LocalDateTime.now()).reason(reason).build());
+    }
+
+    /**
+     * Refuse a sign-in (or tenant switch) for an account that may not be used:
+     * suspended or deactivated user, suspended or closed organisation, or a
+     * suspended vendor. 403 with a specific code — the sign-in page shows the
+     * message. Platform administrators are exempt: they suspend and reactivate.
+     *
+     * tenantId null = the user's home tenant.
+     */
+    private void requireAccess(User user, Long tenantId) {
+        if (isPlatformUser(user)) return;
+        com.kashi.grc.common.security.AccountAccessService.Verdict v = accountAccess.check(user.getId(), tenantId);
+        if (v.blocked()) {
+            log.info("[AUTH] Sign-in refused | userId={} | code={}", user.getId(), v.code());
+            throw new BusinessException(v.code(), v.message(), HttpStatus.FORBIDDEN);
+        }
+    }
+
+    private static boolean isPlatformUser(User user) {
+        return user.getRoles().stream()
+                .anyMatch(r -> r.getSide() == com.kashi.grc.usermanagement.domain.RoleSide.SYSTEM);
     }
 
     private BusinessException sessionExpired() {

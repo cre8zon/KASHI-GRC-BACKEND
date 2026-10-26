@@ -135,6 +135,13 @@ public class AssessmentTaskResetListener {
                 // exactly what the Submit control will reappear on.
                 List<AssessmentSectionInstance> mine = sectionInstanceRepository
                         .findByTemplateInstanceIdAndAssignedUserIdOrderBySectionOrderNo(ti.getId(), userId);
+                // No section was ever given to anyone: the responder worked them
+                // all, and submit treated them that way — so reset reopens them all.
+                if (mine.isEmpty()) {
+                    List<AssessmentSectionInstance> all = sectionInstanceRepository
+                            .findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+                    if (all.stream().allMatch(s -> s.getAssignedUserId() == null)) mine = all;
+                }
 
                 for (AssessmentSectionInstance sec : mine) {
                     if (sec.getSubmittedAt() != null) {
@@ -171,6 +178,28 @@ public class AssessmentTaskResetListener {
                 List<AssessmentSectionInstance> mine = sectionInstanceRepository
                         .findByTemplateInstanceIdAndReviewerAssignedUserIdOrderBySectionOrderNo(
                                 ti.getId(), userId);
+                // The same fallback reviewer-submit applies ("No explicit section
+                // assignments — falling back to all sections"): when no section
+                // has a reviewer, the reviewer signed them all off, so a reset
+                // must reopen them all. Without this it reopened none, and the
+                // reset task came back with every section still locked.
+                // Plus every section this reviewer signed off themselves. A
+                // section given to someone else (or reassigned after the
+                // sign-off) was missed by both rules above, so the reset came
+                // back with "sectionsUnlocked=0" and no Submit control anywhere.
+                List<AssessmentSectionInstance> all = sectionInstanceRepository
+                        .findByTemplateInstanceIdOrderBySectionOrderNo(ti.getId());
+                if (mine.isEmpty() && all.stream().allMatch(s -> s.getReviewerAssignedUserId() == null)) {
+                    mine = all;
+                } else {
+                    java.util.Set<Long> ids = new java.util.HashSet<>();
+                    List<AssessmentSectionInstance> merged = new java.util.ArrayList<>(mine);
+                    mine.forEach(s -> ids.add(s.getId()));
+                    for (AssessmentSectionInstance s : all) {
+                        if (userId.equals(s.getReviewerSubmittedBy()) && ids.add(s.getId())) merged.add(s);
+                    }
+                    mine = merged;
+                }
 
                 for (AssessmentSectionInstance sec : mine) {
                     if (sec.getReviewerSubmittedAt() != null) {

@@ -83,14 +83,46 @@ public class NotificationService {
      */
     private final ObjectProvider<SimpMessagingTemplate> messagingProvider;
 
+    /**
+     * Suspension. Nobody suspended — the person, their vendor, or their
+     * organisation (read-only grace included) — is notified: they cannot act
+     * on it, and a suspended customer must not keep receiving mail from us.
+     * One check here covers every module and every scheduled job, instead of
+     * each remembering to ask. ObjectProvider for the startup reason above.
+     */
+    private final ObjectProvider<com.kashi.grc.common.security.AccountAccessService> accountAccessProvider;
+
     public NotificationService(NotificationRepository notificationRepository,
                                ObjectProvider<KafkaEventPublisher> kafkaPublisherProvider,
                                ObjectProvider<NotificationRouteContributor> routeContributors,
-                               ObjectProvider<SimpMessagingTemplate> messagingProvider) {
+                               ObjectProvider<SimpMessagingTemplate> messagingProvider,
+                               ObjectProvider<com.kashi.grc.common.security.AccountAccessService> accountAccessProvider) {
         this.notificationRepository = notificationRepository;
         this.kafkaPublisher         = kafkaPublisherProvider.getIfAvailable();
         this.routeContributors      = routeContributors;
         this.messagingProvider      = messagingProvider;
+        this.accountAccessProvider  = accountAccessProvider;
+    }
+
+    /**
+     * Can this person be notified now? Judged in the tenant the notification is
+     * raised in (request threads), or their home tenant (scheduler threads,
+     * where there is no tenant context). Any failure → deliver: a broken check
+     * must never swallow notifications for everyone.
+     */
+    private boolean deliverable(Long userId) {
+        if (userId == null) return false;
+        try {
+            var access = accountAccessProvider.getIfAvailable();
+            if (access == null) return true;
+            boolean ok = access.check(userId, TenantContext.getCurrentTenant()).access()
+                    == com.kashi.grc.common.security.AccountAccessService.Access.FULL;
+            if (!ok) log.debug("[NOTIFY] Skipped — userId={} is suspended or in a suspended organisation", userId);
+            return ok;
+        } catch (Exception e) {
+            log.warn("[NOTIFY] Access check failed for userId={} — delivering | {}", userId, e.getMessage());
+            return true;
+        }
     }
 
     /**
@@ -215,6 +247,7 @@ public class NotificationService {
     @Transactional
     public void send(Long userId, String type, String message, String entityType, Long entityId,
                      Long actorUserId, Map<String, String> context) {
+        if (!deliverable(userId)) return;
         saveNotification(userId, type, message, entityType, entityId);
         publishEmailEvent(List.of(userId), type, message, entityType, entityId, actorUserId, context);
     }
@@ -227,7 +260,7 @@ public class NotificationService {
     @Transactional
     public void sendToUsers(List<Long> userIds, String type, String message, String entityType, Long entityId,
                             Long actorUserId, Map<String, String> context) {
-        List<Long> distinct = userIds.stream().distinct().toList();
+        List<Long> distinct = userIds.stream().distinct().filter(this::deliverable).toList();
         distinct.forEach(uid -> saveNotification(uid, type, message, entityType, entityId));
         // ONE event for all recipients — the consumer fans out to N emails
         publishEmailEvent(distinct, type, message, entityType, entityId, actorUserId, context);

@@ -90,6 +90,9 @@ public class ReviewController {
     private final com.kashi.grc.usermanagement.service.user.UserDisplayNameService userDisplayNameService;
     private final NotificationService                  notificationService;
     private final UtilityService                       utilityService;
+    private final com.kashi.grc.assessment.service.AssessmentAccessGuard accessGuard;
+    /** The same eligibility rule the picker lists — see assertSectionAssignable. */
+    private final com.kashi.grc.assessment.service.AssessmentAssignmentService assignmentService;
     /**
      * Publishes ActionItemCreatedEvent so a raised remediation can be escalated
      * to an Issue by AssessmentGuardFindingListener, the same way a KashiGuard
@@ -126,6 +129,7 @@ public class ReviewController {
         Long reviewerId = body.get("userId");
         if (reviewerId == null)
             throw new com.kashi.grc.common.exception.ValidationException("userId is required");
+        assertSectionAssignable(assessmentId, reviewerId);
 
         AssessmentTemplateInstance ti = templateInstanceRepository.findByAssessmentId(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance", assessmentId));
@@ -175,6 +179,7 @@ public class ReviewController {
         List<Number> rawIds = (List<Number>) body.get("sectionInstanceIds");
         if (rawIds == null || rawIds.isEmpty())
             throw new com.kashi.grc.common.exception.ValidationException("sectionInstanceIds is required");
+        assertSectionAssignable(assessmentId, reviewerId);
 
         AssessmentTemplateInstance ti = templateInstanceRepository.findByAssessmentId(assessmentId)
                 .orElseThrow(() -> new ResourceNotFoundException("TemplateInstance", assessmentId));
@@ -209,6 +214,25 @@ public class ReviewController {
         resp.put("assigned",                 targets.size());
         resp.put("message",                  targets.size() + " section(s) assigned to reviewer");
         return ResponseEntity.ok(ApiResponse.success(resp));
+    }
+
+    /**
+     * Section reviewers are chosen by the review lead on the reviewer-assignment
+     * step, and only from the people that step allows.
+     *
+     * Both section endpoints checked nothing but that the section belonged to the
+     * assessment — not the caller's organisation, not who was being assigned. They
+     * were unused while the Review tab assigned per question; now that it assigns
+     * per section they are the live path, so they get the checks the question
+     * endpoint already has: the assessment is in the caller's tenant, and the
+     * assignee passes AssessmentAssignmentService.assertAssignable — the same
+     * resolution the picker lists, so what is offered and what is accepted agree.
+     */
+    private void assertSectionAssignable(Long assessmentId, Long reviewerId) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        assessmentRepository.findByIdAndTenantId(assessmentId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        assignmentService.assertAssignable(reviewerId, assessmentId, StepAction.ASSIGN);
     }
 
     @GetMapping("/{assessmentId}/my-reviewer-sections")
@@ -749,17 +773,27 @@ public class ReviewController {
     @PostMapping("/{assessmentId}/sections/{sectionInstanceId}/reviewer-reopen")
     @Transactional
     @Operation(summary = "Org CISO reopens reviewer section (clears reviewerSubmittedAt)")
+    // The permission, not "any organisation user": every reviewer is an
+    // organisation user, so the side check let a reviewer reopen anyone's
+    // signed-off section. assessment.section.reviewer_reopen is the seeded
+    // permission that means this, and the Review tab's Reopen gates on it too.
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAuthority('assessment.section.reviewer_reopen')")
     public ResponseEntity<ApiResponse<Map<String, Object>>> reviewerReopenSection(
             @PathVariable Long assessmentId,
             @PathVariable Long sectionInstanceId) {
 
-        Long userId = utilityService.getLoggedInDataContext().getId();
-        User cu = utilityService.getLoggedInDataContext();
-        if (cu.getRoles().stream().noneMatch(r -> r.getSide() == RoleSide.ORGANIZATION || r.getSide() == RoleSide.SYSTEM))
-            throw new BusinessException("ACCESS_DENIED", "Only Org CISO/Admin can reopen.", HttpStatus.FORBIDDEN);
+        Long userId   = utilityService.getLoggedInDataContext().getId();
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        assessmentRepository.findByIdAndTenantId(assessmentId, tenantId)
+                .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
 
         AssessmentSectionInstance si = sectionInstanceRepository.findById(sectionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("SectionInstance", sectionInstanceId));
+        AssessmentTemplateInstance reopenTi = templateInstanceRepository.findByAssessmentId(assessmentId).orElse(null);
+        if (reopenTi == null || !reopenTi.getId().equals(si.getTemplateInstanceId()))
+            throw new com.kashi.grc.common.exception.ValidationException(
+                    "SectionInstance does not belong to assessment " + assessmentId);
         if (si.getReviewerSubmittedAt() == null)
             return ResponseEntity.ok(ApiResponse.success(Map.of("sectionInstanceId", sectionInstanceId, "status", "NOT_SUBMITTED")));
 
@@ -1027,6 +1061,9 @@ public class ReviewController {
                 .tenantId(tenantId).createdBy(userId).assignedTo(assistantId)
                 .sourceType(ActionItem.SourceType.COMMENT).sourceId(questionInstanceId)
                 .entityType(ActionItem.EntityType.QUESTION_RESPONSE).entityId(questionInstanceId)
+                // The assessment, so the inbox's nav row opens it and not
+                // /module/vendor_assessment/{questionId}.
+                .parentEntityType(ActionItem.EntityType.ASSESSMENT).parentEntityId(assessmentId)
                 .title("Clarification requested: " + qi.getQuestionTextSnapshot().substring(0, Math.min(80, qi.getQuestionTextSnapshot().length())))
                 .description(description).status(ActionItem.Status.OPEN).priority(ActionItem.Priority.MEDIUM)
                 .resolutionReservedFor(userId)
@@ -1075,8 +1112,12 @@ public class ReviewController {
 
         AssessmentQuestionInstance qi = questionInstanceRepository.findById(questionInstanceId)
                 .orElseThrow(() -> new ResourceNotFoundException("QuestionInstance", questionInstanceId));
-        VendorAssessment assessment = assessmentRepository.findById(assessmentId)
+        VendorAssessment assessment = assessmentRepository.findByIdAndTenantId(assessmentId, tenantId)
                 .orElseThrow(() -> new ResourceNotFoundException("VendorAssessment", assessmentId));
+        // The same rule as a verdict: whoever holds the step may raise a
+        // remediation on any question, a review assistant on the questions
+        // delegated to them and no others.
+        accessGuard.assertCanEvaluate(assessment, qi, userId);
 
         ActionItem.Priority priority = switch (severity) {
             case "CRITICAL" -> ActionItem.Priority.CRITICAL;
@@ -1188,6 +1229,12 @@ public class ReviewController {
 
     @PostMapping("/{assessmentId}/action-items/{actionItemId}/accept-risk")
     @Transactional
+    // Accepting a risk closes a finding without the vendor fixing it — a decision
+    // for whoever signs off the assessment's risk, not for every reviewer who can
+    // raise one. Its own permission, so the Findings tab and this endpoint agree,
+    // and a reviewer on the evaluate step escalates instead.
+    @org.springframework.security.access.prepost.PreAuthorize(
+            "hasAuthority('assessment.remediation.accept_risk')")
     @Operation(summary = "Reviewer accepts risk on remediation item — closes it without vendor fix")
     public ResponseEntity<ApiResponse<Map<String, Object>>> acceptRisk(
             @PathVariable Long assessmentId,

@@ -76,6 +76,8 @@ public class StepSlaMonitor {
     private final DbRepository                  dbRepository;
     private final NotificationService           notificationService;
     private final WorkflowEngineService         workflowEngineService;
+    /** Suspended organisations are not swept: nobody there can act, and both sweeps catch up after reactivation. */
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     // ── CONCERN 1: Re-attempt UNASSIGNED steps ────────────────────────────────
 
@@ -97,8 +99,16 @@ public class StepSlaMonitor {
 
         for (StepInstance si : unassigned) {
             try {
+                // A step emptied because its assignee was suspended waits for a
+                // person to choose the new assignee (the organisation's rule:
+                // "back to unassigned"). Re-running role resolution would hand
+                // it to every role holder at once.
+                if (historyRepository.existsByStepInstanceIdAndEventType(
+                        si.getId(), WorkflowEngineService.EVT_RETURNED_UNASSIGNED)) continue;
+
                 WorkflowInstance wi = instanceRepository.findById(si.getWorkflowInstanceId()).orElse(null);
                 if (wi == null) continue;
+                if (!accountAccess.tenantOperating(wi.getTenantId())) continue;
 
                 // Load the blueprint step for role join-table lookup
                 WorkflowStep step = si.getStepId() != null
@@ -183,6 +193,7 @@ public class StepSlaMonitor {
             try {
                 WorkflowInstance wi = instanceRepository.findById(si.getWorkflowInstanceId()).orElse(null);
                 if (wi == null) continue;
+                if (!accountAccess.tenantOperating(wi.getTenantId())) continue;
 
                 long pendingActorTasks = taskInstanceRepository
                         .countByStepInstanceIdAndTaskRoleAndStatus(si.getId(), TaskRole.ACTOR, TaskStatus.PENDING);

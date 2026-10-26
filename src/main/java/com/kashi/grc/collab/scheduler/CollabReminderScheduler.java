@@ -50,6 +50,8 @@ public class CollabReminderScheduler {
 
     private final NotificationService        notificationService;
     private final PlatformTransactionManager transactionManager;
+    /** Suspended organisations and people get no reminders — they cannot act on them. */
+    private final com.kashi.grc.common.security.AccountAccessService accountAccess;
 
     @PersistenceContext
     private EntityManager em;
@@ -74,6 +76,7 @@ public class CollabReminderScheduler {
             TransactionTemplate tx = new TransactionTemplate(transactionManager);
             int sent = 0;
             for (CollabMeeting m : due) {
+                if (!accountAccess.tenantOperating(m.getTenantId())) continue;
                 // Claim it first, in its own transaction: at most one reminder, even with
                 // several backend instances or a send that fails part-way.
                 Integer claimed = tx.execute(t -> em.createQuery(
@@ -86,7 +89,7 @@ public class CollabReminderScheduler {
                 String msg = "\"" + m.getTitle() + "\" starts at " + m.getStartsAt().format(TIME)
                         + ("EMBEDDED".equals(m.getProvider()) ? " — join the call from here" : "");
                 for (Long u : to) {
-                    if (send(u, "COLLAB_MEETING_STARTING", msg, "COLLAB_MEETING", m.getId())) sent++;
+                    if (send(u, m.getTenantId(), "COLLAB_MEETING_STARTING", msg, "COLLAB_MEETING", m.getId())) sent++;
                 }
             }
             log.info("[COLLAB-REMINDER] Meetings starting soon | meetings={} | notifications={}", due.size(), sent);
@@ -134,7 +137,7 @@ public class CollabReminderScheduler {
             String msg = tomorrow.equals(i.getPlannedEnd())
                     ? "\"" + i.getTitle() + "\" in " + ws + " is due tomorrow"
                     : "\"" + i.getTitle() + "\" in " + ws + " was due yesterday and is not done";
-            if (send(i.getOwnerUserId(), "COLLAB_PLAN_DUE", msg, "COLLAB_WORKSPACE", i.getWorkspaceId())) sent++;
+            if (send(i.getOwnerUserId(), i.getTenantId(), "COLLAB_PLAN_DUE", msg, "COLLAB_WORKSPACE", i.getWorkspaceId())) sent++;
         }
         log.info("[COLLAB-REMINDER] Plan due dates | items={} | notifications={}", rows.size(), sent);
     }
@@ -163,7 +166,7 @@ public class CollabReminderScheduler {
             String msg = tomorrow.equals(a.getDueAt().toLocalDate())
                     ? "Request \"" + a.getTitle() + "\" in " + ws + " is due tomorrow"
                     : "Request \"" + a.getTitle() + "\" in " + ws + " was due yesterday";
-            if (send(a.getAssignedTo(), "COLLAB_REQUEST_DUE", msg, "COLLAB_WORKSPACE", a.getEntityId())) sent++;
+            if (send(a.getAssignedTo(), a.getTenantId(), "COLLAB_REQUEST_DUE", msg, "COLLAB_WORKSPACE", a.getEntityId())) sent++;
         }
         log.info("[COLLAB-REMINDER] Request due dates | requests={} | notifications={}", rows.size(), sent);
     }
@@ -179,8 +182,10 @@ public class CollabReminderScheduler {
         return out;
     }
 
-    private boolean send(Long userId, String type, String message, String entityType, Long entityId) {
+    private boolean send(Long userId, Long tenantId, String type, String message, String entityType, Long entityId) {
         if (userId == null) return false;
+        // Suspended person, or an organisation that is suspended: skip.
+        if (!accountAccess.userOperating(userId, tenantId)) return false;
         try {
             notificationService.send(userId, type, message, entityType, entityId);
             return true;
@@ -189,4 +194,4 @@ public class CollabReminderScheduler {
             return false;
         }
     }
-}
+}

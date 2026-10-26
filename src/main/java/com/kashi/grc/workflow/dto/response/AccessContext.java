@@ -174,6 +174,12 @@ public class AccessContext {
      */
     private List<String> availableActions;
 
+    /**
+     * The status-flow buttons that complete the current step (step override
+     * "transitions"). Null = no restriction. See StepUiOverride.transitions.
+     */
+    private List<String> transitions;
+
     // ── New: resolved permission set ──────────────────────────────────────────
 
     /**

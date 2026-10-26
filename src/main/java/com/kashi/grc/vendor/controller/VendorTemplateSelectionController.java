@@ -124,7 +124,15 @@ public class VendorTemplateSelectionController {
                 })
                 .collect(java.util.stream.Collectors.toCollection(ArrayList::new));
 
-        boolean alreadySelected = sel.getSelectedTemplateId() != null;
+        // A template on the row is not the same as a decision. When the score
+        // maps to exactly one template, QUEUE_ASSESSMENT_CANDIDATES fills it in
+        // itself and completes — but the blueprint's "Select Assessment
+        // Template" step still comes next, with a task for a person. Treating
+        // the pre-fill as "already selected" hid this panel, so that task had
+        // nothing on screen to act on (first onboarding of a single-band
+        // vendor). Only a PERSON's choice (selectedByUserId) closes it; while
+        // the choice is still open, the pre-fill is offered as the default.
+        boolean alreadySelected = !awaitingChoice(sel, instanceId);
 
         // ── EVERY BAND, FOR THE OVERRIDE ─────────────────────────────────────
         //
@@ -182,6 +190,8 @@ public class VendorTemplateSelectionController {
         body.put("alreadySelected",     alreadySelected);
         if (alreadySelected) {
             body.put("selectedTemplateId", sel.getSelectedTemplateId());
+        } else if (sel.getSelectedTemplateId() != null) {
+            body.put("preselectedTemplateId", sel.getSelectedTemplateId());
         }
 
         log.debug("[TEMPLATE-SELECTION] GET | instanceId={} | candidates={} | alreadySelected={}",
@@ -210,8 +220,9 @@ public class VendorTemplateSelectionController {
                 .orElseThrow(() -> new ResourceNotFoundException(
                         "VendorTemplateSelection (workflowInstanceId)", instanceId));
 
-        // Guard: already selected — idempotent, just return success
-        if (sel.getSelectedTemplateId() != null) {
+        // Guard: already decided — idempotent, just return success. A template
+        // the QUEUE step pre-filled on its own does not count (see getPending).
+        if (!awaitingChoice(sel, instanceId)) {
             log.warn("[TEMPLATE-SELECTION] Already selected templateId={} for instanceId={} — skipping",
                     sel.getSelectedTemplateId(), instanceId);
             return ResponseEntity.ok(ApiResponse.success(Map.of(
@@ -277,7 +288,14 @@ public class VendorTemplateSelectionController {
 
         // Step 1: complete the paused QUEUE_ASSESSMENT_CANDIDATES step.
         // This auto-activates step 2 (Select Assessment Template).
-        if (sel.getStepInstanceId() != null) {
+        // Only while it is still waiting: with a single mapped template the
+        // QUEUE step already completed on its own, and completing it again would
+        // re-run the advance onto the step after it.
+        boolean queueLive = sel.getStepInstanceId() != null && stepInstanceRepository
+                .findById(sel.getStepInstanceId())
+                .map(s -> com.kashi.grc.workflow.enums.StepStatus.LIVE.contains(s.getStatus()))
+                .orElse(false);
+        if (queueLive) {
             log.info("[TEMPLATE-SELECTION] Completing QUEUE step | stepInstanceId={} | instanceId={}",
                     sel.getStepInstanceId(), instanceId);
             workflowEngineService.completeSystemStepAndAdvance(
@@ -286,8 +304,8 @@ public class VendorTemplateSelectionController {
                     "Template selected by admin: " + template.getName() + " (id=" + req.getTemplateId() + ")"
             );
         } else {
-            log.warn("[TEMPLATE-SELECTION] stepInstanceId is null on selection row id={} — " +
-                    "cannot auto-advance step 1; advancing step 2 directly", sel.getId());
+            log.info("[TEMPLATE-SELECTION] QUEUE step not waiting (already completed, or no step on row id={}) — "
+                    + "completing the Select step directly", sel.getId());
         }
 
         // Step 2: the 'Select Assessment Template' step is now IN_PROGRESS but has no
@@ -332,6 +350,23 @@ public class VendorTemplateSelectionController {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Is a person's choice still owed? Not once somebody has chosen
+     * (selectedByUserId). Otherwise only while the workflow is actually waiting
+     * for it — the QUEUE step paused, or a "Select Assessment Template" step
+     * live. A pre-filled row on a workflow that has moved past both (blueprints
+     * without a Select step, or older instances) is a decision already acted on.
+     */
+    private boolean awaitingChoice(VendorTemplateSelection sel, Long instanceId) {
+        if (sel.getSelectedByUserId() != null) return false;
+        if (sel.getSelectedTemplateId() == null) return true;
+        return stepInstanceRepository.findByWorkflowInstanceId(instanceId).stream()
+                .filter(s -> com.kashi.grc.workflow.enums.StepStatus.LIVE.contains(s.getStatus()))
+                .anyMatch(s -> s.getId().equals(sel.getStepInstanceId())
+                        || (s.getSnapName() != null
+                        && s.getSnapName().toLowerCase().contains("select assessment template")));
+    }
 
     private List<Long> parseCandidateIds(String json) {
         try {

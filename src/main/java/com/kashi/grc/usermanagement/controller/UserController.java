@@ -58,6 +58,8 @@ import java.util.Map;
 public class UserController {
 
     private final UserService userService;
+    private final com.kashi.grc.usermanagement.service.user.UserLifecycleService lifecycle;
+    private final com.kashi.grc.usermanagement.service.user.OrgOwnerService orgOwnerService;
     private final com.kashi.grc.usermanagement.repository.UserTenantMembershipRepository membershipRepository;
     private final UtilityService utilityService;
     private final com.kashi.grc.usermanagement.repository.UserRepository userRepository;
@@ -115,7 +117,7 @@ public class UserController {
                                                       .filter(java.util.Objects::nonNull).distinct().limit(200).toList();
         if (wanted.isEmpty()) return ResponseEntity.ok(ApiResponse.success(List.of()));
 
-        List<Map<String, Object>> out = new java.util.ArrayList<>();
+        List<Map<String, Object>> out = new ArrayList<>();
         for (var u : userRepository.findAllById(wanted)) {
             if (u.isDeleted()) continue;
             boolean visible = java.util.Objects.equals(u.getTenantId(), tenantId)
@@ -249,11 +251,41 @@ public class UserController {
 
     // ── SUSPEND ───────────────────────────────────────────────────
     @PatchMapping("/{userId}/suspend")
-    @Operation(summary = "Suspend a user account")
-    public ResponseEntity<ApiResponse<UserResponse>> suspendUser(
+    @Operation(summary = "Suspend a user account — { reason } optional; needs USER_EDIT")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> suspendUser(
+            @PathVariable Long userId,
+            @RequestBody(required = false) Map<String, String> body) {
+        var u = lifecycle.suspend(userId, body == null ? null : body.get("reason"));
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
+                "userId", u.getId(), "status", u.getStatus().name())));
+    }
+
+    @GetMapping("/{userId}/status-history")
+    @Operation(summary = "Who suspended / reactivated this account, when and why")
+    public ResponseEntity<ApiResponse<List<com.kashi.grc.usermanagement.domain.AccountStatusChange>>> statusHistory(
             @PathVariable Long userId) {
-        UserResponse user = userService.suspendUser(userId);
-        return ResponseEntity.ok(ApiResponse.success(user));
+        return ResponseEntity.ok(ApiResponse.success(lifecycle.history(userId)));
+    }
+
+    // ── ORG OWNER ─────────────────────────────────────────────────
+
+    @GetMapping("/owner")
+    @Operation(summary = "The caller's organisation's Org Owner (user id)")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> owner() {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        Map<String, Object> out = new java.util.HashMap<>();
+        out.put("ownerUserId", orgOwnerService.ownerOf(tenantId));
+        return ResponseEntity.ok(ApiResponse.success(out));
+    }
+
+    @PostMapping("/{userId}/make-owner")
+    @Operation(summary = "Transfer ownership of the organisation to this person — current owner only")
+    public ResponseEntity<ApiResponse<Map<String, Object>>> makeOwner(
+            @PathVariable Long userId,
+            @RequestBody(required = false) Map<String, String> body) {
+        Long tenantId = utilityService.getLoggedInDataContext().getTenantId();
+        return ResponseEntity.ok(ApiResponse.success(
+                orgOwnerService.transfer(tenantId, userId, body == null ? null : body.get("reason"))));
     }
 
     // ── ACTIVATE ──────────────────────────────────────────────────

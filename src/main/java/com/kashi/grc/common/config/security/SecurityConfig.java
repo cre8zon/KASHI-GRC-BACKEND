@@ -213,7 +213,9 @@ public class SecurityConfig {
         config.addAllowedOrigin("http://localhost:5174");
         config.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
-        config.setExposedHeaders(List.of("Authorization"));
+        // X-Account-Access(-Until): the organisation is read-only (suspended,
+        // in its grace period) — the app reads these to show its banner.
+        config.setExposedHeaders(List.of("Authorization", "X-Account-Access", "X-Account-Access-Until", "X-Auth-Status"));
         config.setAllowCredentials(true);
         config.setMaxAge(3600L);
 
