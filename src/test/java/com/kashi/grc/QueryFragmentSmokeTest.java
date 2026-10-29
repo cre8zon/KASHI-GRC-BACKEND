@@ -151,7 +151,7 @@ class QueryFragmentSmokeTest {
         check("AuditPolicyInstanceControlMappingRepository.findControlInstanceIdsByPolicyInstanceId", () -> auditPolicyInstanceControlMappingRepository.findControlInstanceIdsByPolicyInstanceId(-1L));
         check("AuditPolicyInstanceControlMappingRepository.findPolicyInstanceIdsByControlInstanceId", () -> auditPolicyInstanceControlMappingRepository.findPolicyInstanceIdsByControlInstanceId(-1L));
         check("AuditPolicyInstanceRepository.findByEngagementIdAndTenantId", () -> auditPolicyInstanceRepository.findByEngagementIdAndTenantId(-1L, -1L));
-        check("AuditPolicyRepository.countForTenant", () -> auditPolicyRepository.countForTenant(-1L));
+        check("AuditPolicyRepository.countForTenant", () -> auditPolicyRepository.countForTenant(-1L, false));
         check("AuditPolicyRepository.findByPolicyRefForTenant", () -> auditPolicyRepository.findByPolicyRefForTenant("smoke", -1L));
         check("AuditPolicyRepository.findByTenantIdAndStatus", () -> auditPolicyRepository.findByTenantIdAndStatus(-1L, AuditPolicy.PolicyStatus.APPROVED));
         check("AuditPolicyRepository.findByTenantIdOrderByTitleAsc", () -> auditPolicyRepository.findByTenantIdOrderByTitleAsc(-1L));
