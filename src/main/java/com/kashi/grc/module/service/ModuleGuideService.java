@@ -68,6 +68,9 @@ public class ModuleGuideService {
         out.put("summary", guide != null && guide.hasNonNull("summary") ? guide.get("summary").asText() : null);
         out.put("connections", guide != null && guide.has("connections") ? objectMapper.convertValue(guide.get("connections"), List.class) : List.of());
         out.put("chapters", guide != null && guide.has("chapters") ? objectMapper.convertValue(guide.get("chapters"), List.class) : List.of());
+        // Kinds of action items people receive inside this module's records
+        // ([{label, raisedWhen, goesTo, closesWhen}]), written on Guides & demos.
+        out.put("actionItems", guide != null && guide.has("actionItems") ? objectMapper.convertValue(guide.get("actionItems"), List.class) : List.of());
         out.put("hasDemo", notBlank(firstNonBlank(bp.getDemoVideoKey(), platform.getDemoVideoKey()))
                 || notBlank(firstNonBlank(bp.getDemoVideoUrl(), platform.getDemoVideoUrl())));
 

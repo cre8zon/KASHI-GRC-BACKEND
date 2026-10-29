@@ -48,6 +48,7 @@ public class WorkflowCatalogueService {
     private final StorageService             storageService;
     private final UtilityService             utilityService;
     private final ObjectMapper               objectMapper;
+    private final com.kashi.grc.module.repository.ModuleBlueprintRepository blueprintRepository;
 
     /** Side order used for the sides summary, so every card lists them the same way. */
     private static final List<String> SIDE_ORDER =
@@ -61,7 +62,17 @@ public class WorkflowCatalogueService {
         if (entityType == null || entityType.isBlank())
             throw new BusinessException("ENTITY_TYPE_REQUIRED", "entityType is required", HttpStatus.BAD_REQUEST);
         User user = utilityService.getLoggedInDataContext();
-        List<Workflow> workflows = visibleWorkflows(entityType.trim().toUpperCase(), user.getTenantId());
+        // A module runs its own workflows AND the ones its blueprint is eligible
+        // for: Vendor Assessment has none of its own — it runs the VENDOR
+        // workflow (workflow_eligibility = 'VENDOR'). Without this, vendor users
+        // (who reach Vendor Assessments, not Vendors) found no workflow, no
+        // steps and no video.
+        String et = entityType.trim().toUpperCase();
+        List<Workflow> workflows = new ArrayList<>();
+        Set<Long> seen = new HashSet<>();
+        for (String type : workflowTypesFor(et, user.getTenantId())) {
+            for (Workflow w : visibleWorkflows(type, user.getTenantId())) if (seen.add(w.getId())) workflows.add(w);
+        }
         return describe(workflows, user.getTenantId(), false);
     }
 
@@ -202,6 +213,19 @@ public class WorkflowCatalogueService {
         return latest.values().stream()
                 .sorted(Comparator.comparing(Workflow::getName, String.CASE_INSENSITIVE_ORDER))
                 .toList();
+    }
+
+    /** The module's own type first, then its blueprint's workflow_eligibility (tenant copy over platform). */
+    private List<String> workflowTypesFor(String entityType, Long tenantId) {
+        LinkedHashSet<String> types = new LinkedHashSet<>();
+        types.add(entityType);
+        Optional<com.kashi.grc.module.domain.ModuleBlueprint> bp = tenantId == null ? Optional.empty()
+                : blueprintRepository.findByEntityTypeIgnoreCaseAndTenantId(entityType, tenantId);
+        if (bp.isEmpty()) bp = blueprintRepository.findByEntityTypeIgnoreCaseAndTenantIdIsNull(entityType);
+        bp.map(com.kashi.grc.module.domain.ModuleBlueprint::getWorkflowEligibility).ifPresent(el -> {
+            for (String t : el.split(",")) if (!t.isBlank()) types.add(t.trim().toUpperCase());
+        });
+        return new ArrayList<>(types);
     }
 
     private Workflow requireVisible(Long workflowId, Long tenantId) {
