@@ -88,4 +88,37 @@ public class RoleRepositoryImpl implements RoleRepositoryCustom {
         Long r = em.createQuery(cq).getSingleResult();
         return r != null ? r : 0L;
     }
+
+    @Override
+    public List<Object[]> findRolesHoldingPermissions(Long tenantId, java.util.Collection<String> permissionCodes) {
+        if (permissionCodes == null || permissionCodes.isEmpty()) return List.of();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<Role> r = cq.from(Role.class);
+        Join<Object, Object> p = r.join("permissions");
+        List<Predicate> preds = new ArrayList<>();
+        preds.add(cb.or(cb.equal(r.get("tenantId"), tenantId), cb.isNull(r.get("tenantId"))));
+        preds.add(p.get("code").in(permissionCodes));
+        preds.add(cb.or(cb.isNull(r.get("status")), cb.equal(r.get("status"), "ACTIVE")));
+        if (!SYSTEM_TENANT_ID.equals(tenantId)) preds.add(cb.notEqual(r.get("side"), RoleSide.SYSTEM));
+        cq.multiselect(r.get("id"), r.get("name"), r.get("side"), p.get("code"))
+                .where(preds.toArray(new Predicate[0]))
+                .distinct(true);
+        return em.createQuery(cq).getResultList();
+    }
+
+    @Override
+    public List<Object[]> countActiveUsersByRoleInTenant(Long tenantId, java.util.Collection<Long> roleIds) {
+        if (tenantId == null || roleIds == null || roleIds.isEmpty()) return List.of();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<User> u = cq.from(User.class);
+        Join<Object, Object> roles = u.join("roles");
+        cq.multiselect(roles.get("id"), cb.countDistinct(u))
+                .where(cb.equal(u.get("tenantId"), tenantId),
+                        cb.equal(u.get("status"), com.kashi.grc.usermanagement.domain.UserStatus.ACTIVE),
+                        roles.get("id").in(roleIds))
+                .groupBy(roles.get("id"));
+        return em.createQuery(cq).getResultList();
+    }
 }

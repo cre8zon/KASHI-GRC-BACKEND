@@ -225,4 +225,20 @@ public class WorkflowStep extends BaseEntity {
     @Column(name = "auto_complete_actor_on_submit", nullable = false)
     @Builder.Default
     private boolean autoCompleteActorOnSubmit = false;
+
+    /**
+     * Where this step starts in the workflow's walkthrough video, in seconds.
+     * Null = no chapter for this step; the task bar's "How this step works"
+     * link only shows when it is set.
+     */
+    @Column(name = "demo_start_seconds")
+    private Integer demoStartSeconds;
+
+    /**
+     * "What to do" for whoever acts on this step — one or two sentences, shown
+     * in the task's action bar and in the workflow guide. Written by Platform
+     * Admin in Guides & demos. Null = no guidance line.
+     */
+    @Column(name = "guide_text", columnDefinition = "TEXT")
+    private String guideText;
 }

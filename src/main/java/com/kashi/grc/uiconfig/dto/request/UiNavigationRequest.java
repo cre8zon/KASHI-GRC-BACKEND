@@ -10,6 +10,8 @@ public class UiNavigationRequest {
     public String icon;
     @NotBlank public String route;
     public String parentKey;
+    /** navKey of the page this row is a tab of; blank clears it. */
+    public String tabParentKey;
     public Integer sortOrder;
     public String module;
     public String allowedSides;

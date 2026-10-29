@@ -234,4 +234,24 @@ public class ModuleBlueprint extends GlobalOrTenantEntity {
      */
     @Column(name = "nav_key", length = 100)
     private String navKey;
+
+    // ── Module guide ("How this module works") ───────────────────────────────
+    // Written by Platform Admin in Guides & demos; read by every list screen's
+    // guide band and the guide page. The blueprint update endpoint does not
+    // touch these, so saving the blueprint elsewhere never clears them.
+
+    /**
+     * {"summary": "...", "connections": [{"entityType","label","text"}],
+     *  "chapters": [{"label","seconds"}]}
+     */
+    @Column(name = "guide_json", columnDefinition = "TEXT")
+    private String guideJson;
+
+    /** Uploaded walkthrough (S3 key), played through a short-lived presigned URL. */
+    @Column(name = "demo_video_key", length = 512)
+    private String demoVideoKey;
+
+    /** Or an external link (https). The uploaded file wins when both are set. */
+    @Column(name = "demo_video_url", length = 1000)
+    private String demoVideoUrl;
 }

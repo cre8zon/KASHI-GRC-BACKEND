@@ -108,6 +108,7 @@ public class UiAdminController {
         UiNavigation nav = UiNavigation.builder()
                 .navKey(req.getNavKey()).label(req.getLabel()).icon(req.getIcon())
                 .route(req.getRoute()).parentKey(req.getParentKey())
+                .tabParentKey(req.getTabParentKey() == null || req.getTabParentKey().isBlank() ? null : req.getTabParentKey())
                 .sortOrder(req.getSortOrder()).module(req.getModule())
                 .allowedSides(req.getAllowedSides()).minLevel(req.getMinLevel())
                 .requiredPermission(req.getRequiredPermission())
@@ -141,6 +142,7 @@ public class UiAdminController {
                     m.put("route",                n.getRoute());
                     m.put("icon",                 n.getIcon()                != null ? n.getIcon()                : "");
                     m.put("parentKey",            n.getParentKey()           != null ? n.getParentKey()           : "");
+                    m.put("tabParentKey",         n.getTabParentKey()        != null ? n.getTabParentKey()        : "");
                     m.put("module",               n.getModule()              != null ? n.getModule()              : "");
                     m.put("sortOrder",            n.getSortOrder()           != null ? n.getSortOrder()           : 0);
                     m.put("isActive",             Boolean.TRUE.equals(n.isActive()));
@@ -162,6 +164,7 @@ public class UiAdminController {
         if (req.getIcon()                != null) nav.setIcon(req.getIcon());
         if (req.getRoute()               != null) nav.setRoute(req.getRoute());
         if (req.getParentKey()           != null) nav.setParentKey(req.getParentKey().isBlank()           ? null : req.getParentKey());
+        if (req.getTabParentKey()        != null) nav.setTabParentKey(req.getTabParentKey().isBlank()     ? null : req.getTabParentKey());
         if (req.getSortOrder()           != null) nav.setSortOrder(req.getSortOrder());
         if (req.getModule()              != null) nav.setModule(req.getModule());
         if (req.getAllowedSides()        != null) nav.setAllowedSides(req.getAllowedSides());

@@ -60,7 +60,8 @@ public class EnquiryService {
     public static final String PERM_MANAGE = "platform:enquiries:manage";
 
     public static final List<String> TYPES = List.of(
-            "DEMO", "TRIAL", "CONTACT_SALES", "AUDIT_FIRM", "PARTNERSHIP", "SUPPORT", "GENERAL");
+            "DEMO", "TRIAL", "CONTACT_SALES", "AUDIT_FIRM", "PARTNERSHIP", "SUPPORT", "GENERAL",
+            "WORKFLOW_REQUEST");
     public static final List<String> STATUSES = List.of("NEW", "IN_PROGRESS", "QUALIFIED", "CONVERTED", "CLOSED");
     public static final List<String> OPEN = List.of("NEW", "IN_PROGRESS", "QUALIFIED");
     public static final List<String> PRIORITIES = List.of("LOW", "NORMAL", "HIGH");
@@ -171,6 +172,58 @@ public class EnquiryService {
         events.publishEvent(new EnquiryEvents.Received(e.getId()));
         log.info("[ENQUIRY] received | ref={} type={} plan={} source={}", e.getReference(), type, e.getPlanCode(), e.getUtmSource());
         return accepted(e.getReference(), type);
+    }
+
+    // ══════════════════════ SIGNED-IN: CUSTOM WORKFLOW REQUEST ════════════════
+
+    /**
+     * A customer asking for a workflow the catalogue does not have.
+     *
+     * Lands in the same inbox as website enquiries, as WORKFLOW_REQUEST, already
+     * matched to the customer's tenant — so it is quoted and tracked like any
+     * other lead. Who asked comes from the session, never the payload.
+     */
+    @Transactional
+    public Map<String, Object> submitWorkflowRequest(User requester, String entityType, String moduleLabel,
+                                                     String startFrom, String neededBy, String message) {
+        if (requester == null) throw bad("requester", "Sign in to request a workflow.");
+        if (blank(message) || message.trim().length() < 10)
+            throw bad("message", "Describe what the workflow should do (at least a sentence).");
+
+        String company = requester.getTenantId() == null ? null
+                : tenantRepository.findById(requester.getTenantId()).map(Tenant::getName).orElse(null);
+        String module = blank(moduleLabel) ? humanise(blank(entityType) ? "GENERAL" : entityType.trim().toUpperCase()) : moduleLabel.trim();
+
+        StringBuilder body = new StringBuilder();
+        body.append("Module: ").append(module);
+        if (!blank(startFrom)) body.append("\nStart from: ").append(trim(startFrom, 255));
+        if (!blank(neededBy))  body.append("\nNeeded by: ").append(trim(neededBy, 40));
+        body.append("\n\n").append(message.trim());
+
+        Enquiry e = Enquiry.builder()
+                .reference(uniqueReference())
+                .enquiryType("WORKFLOW_REQUEST")
+                .priority("NORMAL")
+                .fullName(trim(blank(requester.getFullName()) ? requester.getEmail() : requester.getFullName(), 150))
+                .email(requester.getEmail() == null ? null : requester.getEmail().trim().toLowerCase())
+                .company(trim(company, 200))
+                .topic(trim(blank(entityType) ? null : entityType.trim().toUpperCase(), 60))
+                .subject(trim("Custom workflow for " + module, 200))
+                .message(trim(body.toString(), 5000))
+                .sourcePage("/workflows/catalogue")
+                .matchedTenantId(requester.getTenantId())
+                .lastActivityAt(LocalDateTime.now())
+                .build();
+        enquiryRepository.save(e);
+        activity(e, "RECEIVED", "Requested from the workflow catalogue", null, "NEW", requester.getId());
+        events.publishEvent(new EnquiryEvents.Received(e.getId()));
+        log.info("[ENQUIRY] workflow request | ref={} tenant={} module={}", e.getReference(), requester.getTenantId(), module);
+
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("reference", e.getReference());
+        m.put("message", "Thanks — we have your request as " + e.getReference()
+                + ". We'll reply by email with a scope and quote within two working days.");
+        return m;
     }
 
     private Map<String, Object> accepted(String reference, String type) {
@@ -599,6 +652,7 @@ public class EnquiryService {
             case "AUDIT_FIRM" -> "audit-firm application";
             case "PARTNERSHIP" -> "partnership enquiry";
             case "SUPPORT" -> "support request";
+            case "WORKFLOW_REQUEST" -> "custom workflow request";
             default -> "enquiry";
         };
     }

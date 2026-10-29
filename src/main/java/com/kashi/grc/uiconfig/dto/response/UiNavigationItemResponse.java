@@ -15,6 +15,8 @@ public class UiNavigationItemResponse {
     private String icon;
     private String route;
     private String parentKey;
+    /** Set when this row is a tab on another row's page, not a sidebar entry. */
+    private String tabParentKey;
     private Integer sortOrder;
     private String module;
     private String badgeCountEndpoint;

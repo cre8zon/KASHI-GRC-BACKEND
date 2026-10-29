@@ -30,4 +30,21 @@ public class WorkflowInstanceRepositoryImpl implements WorkflowInstanceRepositor
         List<WorkflowInstance> result = em.createQuery(cq).setMaxResults(1).getResultList();
         return result.isEmpty() ? Optional.empty() : Optional.of(result.get(0));
     }
+
+    @Override
+    public List<Object[]> countUsageByWorkflowForTenant(Long tenantId, java.util.Collection<Long> workflowIds) {
+        if (tenantId == null || workflowIds == null || workflowIds.isEmpty()) return List.of();
+        CriteriaBuilder cb = em.getCriteriaBuilder();
+        CriteriaQuery<Object[]> cq = cb.createQuery(Object[].class);
+        Root<WorkflowInstance> wi = cq.from(WorkflowInstance.class);
+        Expression<Integer> openFlag = cb.<Integer>selectCase()
+                .when(wi.get("status").in(WorkflowStatus.PENDING, WorkflowStatus.IN_PROGRESS,
+                        WorkflowStatus.ON_HOLD), 1)
+                .otherwise(0);
+        cq.multiselect(wi.get("workflowId"), cb.count(wi), cb.sum(openFlag))
+                .where(cb.equal(wi.get("tenantId"), tenantId),
+                        wi.get("workflowId").in(workflowIds))
+                .groupBy(wi.get("workflowId"));
+        return em.createQuery(cq).getResultList();
+    }
 }

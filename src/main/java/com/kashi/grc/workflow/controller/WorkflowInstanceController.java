@@ -256,7 +256,7 @@ public class WorkflowInstanceController {
     @Operation(summary = "Override-advance a step without a task (requires workflow:step:override permission)")
     public ResponseEntity<ApiResponse<WorkflowInstanceResponse>> overrideStep(
             @PathVariable Long stepInstanceId,
-            @RequestBody(required = false) java.util.Map<String, Object> body) {
+            @RequestBody(required = false) Map<String, Object> body) {
 
         Long performedBy = utilityService.getLoggedInDataContext().getId();
         String action  = body != null && body.get("action")  != null ? body.get("action").toString()  : "APPROVE";
@@ -308,7 +308,7 @@ public class WorkflowInstanceController {
 
     @GetMapping("/tasks/my-next")
     @Operation(summary = "After task completion — find current user's next pending task on the same entity or its parent project")
-    public ResponseEntity<ApiResponse<java.util.Map<String, Object>>> getMyNextTask(
+    public ResponseEntity<ApiResponse<Map<String, Object>>> getMyNextTask(
             @RequestParam String entityType,
             @RequestParam Long entityId) {
 
@@ -358,10 +358,10 @@ public class WorkflowInstanceController {
         }
 
         if (next == null) {
-            return ResponseEntity.ok(ApiResponse.success(java.util.Map.of()));
+            return ResponseEntity.ok(ApiResponse.success(Map.of()));
         }
 
-        return ResponseEntity.ok(ApiResponse.success(java.util.Map.of(
+        return ResponseEntity.ok(ApiResponse.success(Map.of(
                 "taskId",         next.getId(),
                 "stepInstanceId", next.getStepInstanceId(),
                 "stepName",       next.getStepName()   != null ? next.getStepName()   : "",
@@ -398,7 +398,7 @@ public class WorkflowInstanceController {
         // Same rule as manual-assign — this legacy path had no check either.
         com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
         if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
-        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
+        WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
             throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
@@ -454,7 +454,7 @@ public class WorkflowInstanceController {
         if (si == null || !si.getWorkflowInstanceId().equals(instanceId)) {
             throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
         }
-        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
+        WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         if (!permissionGate.isPlatform() && !service.canAssignStep(si, wi, assignedBy)) {
             throw new com.kashi.grc.common.exception.BusinessException("PERMISSION_DENIED",
@@ -491,7 +491,7 @@ public class WorkflowInstanceController {
         var caller = utilityService.getLoggedInDataContext();
         com.kashi.grc.workflow.domain.StepInstance si = service.getStepInstance(stepInstanceId);
         if (si == null) throw new com.kashi.grc.common.exception.ResourceNotFoundException("StepInstance", stepInstanceId);
-        com.kashi.grc.workflow.domain.WorkflowInstance wi = service.getInstanceOfStep(si);
+        WorkflowInstance wi = service.getInstanceOfStep(si);
         permissionGate.requireSameTenant(wi.getTenantId(), caller.getTenantId());
         boolean canAssign = permissionGate.isPlatform() || service.canAssignStep(si, wi, caller.getId());
         Map<String, Object> out = new java.util.LinkedHashMap<>();
@@ -578,7 +578,7 @@ public class WorkflowInstanceController {
     public ResponseEntity<ApiResponse<Map<String, Object>>> resetTask(
             @PathVariable Long id,
             @PathVariable Long taskId,
-            @RequestBody(required = false) java.util.Map<String, Object> body) {
+            @RequestBody(required = false) Map<String, Object> body) {
         Long userId = utilityService.getLoggedInDataContext().getId();
         boolean rollbackDownstream = body != null
                 && Boolean.TRUE.equals(body.get("rollbackDownstream"));
@@ -642,6 +642,12 @@ public class WorkflowInstanceController {
      * Per-step tracking summary — every blueprint step with runtime state,
      * assigned users by name, task history, SLA status, and duration.
      */
+    @GetMapping("/{id}/role-coverage")
+    @Operation(summary = "Steps still ahead whose actor roles nobody holds, and who the task falls back to")
+    public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getRoleCoverage(@PathVariable Long id) {
+        return ResponseEntity.ok(ApiResponse.success(service.roleCoverageGaps(id)));
+    }
+
     @GetMapping("/{id}/progress")
     @Operation(summary = "Per-step progress tracking — assignments, tasks, SLA, duration for each step")
     public ResponseEntity<ApiResponse<List<Map<String, Object>>>> getProgress(@PathVariable Long id) {
