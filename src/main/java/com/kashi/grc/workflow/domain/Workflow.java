@@ -42,4 +42,16 @@ public class Workflow extends GlobalOrTenantEntity {
     @Column(name = "is_active", nullable = false)
     @Builder.Default
     private boolean isActive = false;
+
+    /**
+     * Walkthrough video for the workflow catalogue. Either an S3 object
+     * uploaded by Platform Admin (played through a short-lived presigned URL)
+     * or an external link (an unlisted video page). When both are set the
+     * uploaded file wins. Chapters live on the steps (demoStartSeconds).
+     */
+    @Column(name = "demo_video_key", length = 512)
+    private String demoVideoKey;
+
+    @Column(name = "demo_video_url", length = 1000)
+    private String demoVideoUrl;
 }

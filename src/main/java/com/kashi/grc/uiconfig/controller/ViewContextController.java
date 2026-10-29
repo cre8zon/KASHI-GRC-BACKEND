@@ -70,6 +70,14 @@ public class ViewContextController {
                 ? workflowAccessService.resolve(currentUser, stepInstanceId, taskId)
                 : workflowAccessService.resolveForModule(currentUser, entityType, entityId);
 
+        // Display only — never fails the access answer.
+        try {
+            context.setWorkflowInstanceId(
+                    workflowAccessService.resolveWorkflowInstanceId(entityType, entityId, stepInstanceId));
+        } catch (RuntimeException e) {
+            log.debug("[VIEW-CONTEXT] workflowInstanceId not resolved: {}", e.getMessage());
+        }
+
         return ResponseEntity.ok(ApiResponse.success(context));
     }
 }

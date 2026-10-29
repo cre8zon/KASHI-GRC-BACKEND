@@ -159,12 +159,16 @@ public class WorkflowAccessService {
         // always carries a taskId — produced no override affordance at all, even
         // for a lead holding the permission, because this path never considered
         // override.
-        return mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
+        AccessContext ctx = mergeContext(base, override, resolvedPermissions, availableActions, sodViolations,
                 resolveCanOverride(user, si, resolvedPermissions),
                 si.getSnapName(),
                 si.getSnapStepAction() != null ? si.getSnapStepAction().name() : null,
                 Boolean.TRUE.equals(si.getSnapAutoCompleteActorOnSubmit()),
                 taskId);
+        // The step this answer is about — the module path returns it, the task
+        // path did not, and pages checking it read every live task as view-only.
+        ctx.setStepInstanceId(si.getId());
+        return ctx;
     }
 
     /**
@@ -176,6 +180,35 @@ public class WorkflowAccessService {
      * @param entityType e.g. "RISK", "AUDIT"
      * @param entityId   The specific record (for SoD check); null for list pages
      */
+    /**
+     * The workflow instance a record runs on, for display (Workflow tile/tab).
+     * The step's instance when a step is given; otherwise the record's active
+     * instance, then the same indirect lookups resolveForModule uses: an
+     * engagement through its project, a vendor assessment through its cycle
+     * (by id, so a finished assessment still shows its completed workflow).
+     * Null when there is none.
+     */
+    public Long resolveWorkflowInstanceId(String entityType, Long entityId, Long stepInstanceId) {
+        if (stepInstanceId != null) {
+            return stepInstanceRepository.findById(stepInstanceId).map(StepInstance::getWorkflowInstanceId).orElse(null);
+        }
+        if (entityId == null || entityType == null) return null;
+        Optional<WorkflowInstance> inst = instanceRepository.findActiveByEntityTypeAndEntityId(entityType, entityId);
+        if (inst.isEmpty() && "AUDIT_ENGAGEMENT".equals(entityType)) {
+            inst = auditEngagementRepository.findById(entityId)
+                    .filter(e -> e.getProjectInstanceId() != null)
+                    .flatMap(e -> instanceRepository.findActiveByEntityTypeAndEntityId("AUDIT_PROJECT", e.getProjectInstanceId()));
+        }
+        if (inst.isEmpty() && "VENDOR_ASSESSMENT".equals(entityType)) {
+            inst = vendorAssessmentRepository.findById(entityId)
+                    .map(com.kashi.grc.assessment.domain.VendorAssessment::getCycleId)
+                    .flatMap(vendorAssessmentCycleRepository::findById)
+                    .map(com.kashi.grc.assessment.domain.VendorAssessmentCycle::getWorkflowInstanceId)
+                    .flatMap(instanceRepository::findById);
+        }
+        return inst.map(WorkflowInstance::getId).orElse(null);
+    }
+
     public AccessContext resolveForModule(User user, String entityType, Long entityId) {
         List<String> resolvedPermissions = resolvePermissions(user);
 

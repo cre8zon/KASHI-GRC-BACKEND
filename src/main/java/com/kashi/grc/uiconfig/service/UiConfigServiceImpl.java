@@ -522,9 +522,15 @@ public class UiConfigServiceImpl implements UiConfigService {
 
         // Feature entitlement first — cheapest, tenant-wide exclusion. A row with
         // a required_feature the tenant lacks is neither shown nor route-resolved.
-        if (item.getRequiredFeature() != null && !item.getRequiredFeature().isBlank()
-                && !features.contains(item.getRequiredFeature())) {
-            return false;
+        // required_feature may list several keys, comma-separated: the row shows
+        // when the tenant has ANY of them (an "Engagements" page that covers
+        // SOC 2 and ISO 27001). A single key behaves exactly as before.
+        if (item.getRequiredFeature() != null && !item.getRequiredFeature().isBlank()) {
+            boolean anyFeature = Arrays.stream(item.getRequiredFeature().split(","))
+                    .map(String::trim)
+                    .filter(f -> !f.isEmpty())
+                    .anyMatch(features::contains);
+            if (!anyFeature) return false;
         }
 
         // required_permission supports comma-separated OR logic (same pattern as allowed_sides).
@@ -587,6 +593,7 @@ public class UiConfigServiceImpl implements UiConfigService {
                 .map(i -> UiNavigationItemResponse.builder()
                         .id(i.getId()).navKey(i.getNavKey()).label(i.getLabel())
                         .icon(i.getIcon()).route(i.getRoute()).parentKey(i.getParentKey())
+                        .tabParentKey(i.getTabParentKey())
                         .sortOrder(i.getSortOrder()).module(i.getModule())
                         .badgeCountEndpoint(i.getBadgeCountEndpoint())
                         .requiredFeature(i.getRequiredFeature())

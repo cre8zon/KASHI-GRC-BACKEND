@@ -22,4 +22,19 @@ public interface RoleRepositoryCustom {
 
     /** Number of users holding a role (join through User.roles). */
     long countUsersWithRole(Long roleId);
+
+    /**
+     * Active users of one tenant holding each of the given roles: rows of
+     * {roleId, userCount}. Roles nobody holds are absent. Used by the workflow
+     * catalogue to say whether a tenant can staff every step.
+     */
+    List<Object[]> countActiveUsersByRoleInTenant(Long tenantId, java.util.Collection<Long> roleIds);
+
+    /**
+     * Active roles visible to a tenant that hold any of the given permission
+     * codes (through role_permissions): rows of {roleId, roleName, side, code}.
+     * SYSTEM roles are left out for a non-system tenant, as everywhere else.
+     * Used by the module guide's "who can do what".
+     */
+    List<Object[]> findRolesHoldingPermissions(Long tenantId, java.util.Collection<String> permissionCodes);
 }

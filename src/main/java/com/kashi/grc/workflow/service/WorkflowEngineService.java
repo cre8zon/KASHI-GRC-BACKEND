@@ -321,6 +321,8 @@ public class WorkflowEngineService {
                 .description(original.getDescription())
                 .version(newVersion)
                 .isActive(false)
+                .demoVideoKey(original.getDemoVideoKey())
+                .demoVideoUrl(original.getDemoVideoUrl())
                 .build();
         workflowRepository.save(newWorkflow);
 
@@ -340,6 +342,21 @@ public class WorkflowEngineService {
                     .stepAction(step.getStepAction())
                     .navKey(step.getNavKey())
                     .assignerNavKey(step.getAssignerNavKey())
+                    // Everything else a step carries. These were not copied, so a
+                    // new version lost its side (tasks went to nobody on the
+                    // vendor/auditor side), its per-step button list
+                    // (stepUiOverrideJson.transitions), its SoD rules and its
+                    // auto-complete flags (step 1 stopped completing on create).
+                    .side(step.getSide())
+                    .actorResolution(step.getActorResolution())
+                    .assignableSide(step.getAssignableSide())
+                    .assignableRoleId(step.getAssignableRoleId())
+                    .stepUiOverrideJson(step.getStepUiOverrideJson())
+                    .sodRulesJson(step.getSodRulesJson())
+                    .autoApproveAssignerOnFill(step.isAutoApproveAssignerOnFill())
+                    .autoCompleteActorOnSubmit(step.isAutoCompleteActorOnSubmit())
+                    .demoStartSeconds(step.getDemoStartSeconds())
+                    .guideText(step.getGuideText())
                     .build();
             stepRepository.save(cloned);
 
@@ -359,6 +376,14 @@ public class WorkflowEngineService {
                             .label(sec.getLabel()).description(sec.getDescription())
                             .required(sec.isRequired()).completionEvent(sec.getCompletionEvent())
                             .requiresAssignment(sec.isRequiresAssignment()).tracksItems(sec.isTracksItems())
+                            // Screen keys and UI json drive how the section renders;
+                            // without them a new version's sections fall back to
+                            // the generic view.
+                            .sectionScreenKey(sec.getSectionScreenKey())
+                            .itemScreenKey(sec.getItemScreenKey())
+                            .itemRefType(sec.getItemRefType())
+                            .sectionUiJson(sec.getSectionUiJson())
+                            .itemUiJson(sec.getItemUiJson())
                             .build()));
         });
 
@@ -2414,7 +2439,7 @@ public class WorkflowEngineService {
                                 boolean hasLiveTask = taskInstanceRepository
                                         .findByStepInstanceId(existing.getId()).stream()
                                         .anyMatch(t -> t.getStatus() == TaskStatus.PENDING
-                                                || t.getStatus() == TaskStatus.IN_PROGRESS);
+                                                    || t.getStatus() == TaskStatus.IN_PROGRESS);
                                 if (!hasLiveTask) {
                                     log.info("[WORKFLOW] Adopted step has no live task — re-arming assignment | "
                                                     + "stepInstanceId={} | status={}",
@@ -3247,8 +3272,8 @@ public class WorkflowEngineService {
 
                 case POOL -> {
                     if (isAssignable(instance.getInitiatedBy(), tenantId)) {
-                        TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
-                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
+                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     }
                     log.info("[WORKFLOW] Step '{}' POOL — ASSIGNER task for initiator (placeholder)", si.getSnapName());
                 }
@@ -3316,8 +3341,8 @@ public class WorkflowEngineService {
 
                 case INITIATOR -> {
                     if (isAssignable(instance.getInitiatedBy(), tenantId)) {
-                        TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
-                        sectionCompletionService.snapshotSectionsForTask(t, si, instance);
+                    TaskInstance t = createTask(si, instance.getInitiatedBy(), true, TaskRole.ASSIGNER, "ORGANIZATION", tenantId);
+                    sectionCompletionService.snapshotSectionsForTask(t, si, instance);
                     }
                     log.info("[WORKFLOW] Step '{}' INITIATOR — ASSIGNER task for initiator userId={}",
                             si.getSnapName(), instance.getInitiatedBy());
@@ -3743,7 +3768,7 @@ public class WorkflowEngineService {
             String who = userRepository.findById(userId).map(u -> u.getFullName().trim()).orElse("This user");
             throw new BusinessException("ASSIGNEE_INACTIVE",
                     who + " is suspended or deactivated and cannot be given tasks. Choose someone else.",
-                    org.springframework.http.HttpStatus.UNPROCESSABLE_ENTITY);
+                    HttpStatus.UNPROCESSABLE_ENTITY);
         }
         TaskInstance task = TaskInstance.builder()
                 .stepInstanceId(si.getId())
@@ -4663,6 +4688,99 @@ public class WorkflowEngineService {
      * organisation or their vendor is suspended (AccountAccessService). A user
      * locked out after failed sign-ins still is — that is not a suspension.
      */
+    /**
+     * Role coverage of a running workflow: the steps still ahead (the current
+     * one included) whose actor roles nobody can take, and who the task will
+     * go to instead.
+     *
+     * Uses EXACTLY the lookups activateStep uses when it creates actor tasks —
+     * side-filtered role holders, vendor-scoped on VENDOR steps, the HOME /
+     * GUEST membership scope on an engagement's AUDITOR steps, suspended users
+     * skipped — and the same fallback: VENDOR side → the vendor's VRM, else
+     * the workflow initiator. So the warning says what the engine will do.
+     *
+     * Steps that name a person rather than a role (ENTITY_CREATOR /
+     * ENTITY_OWNER), steps without actor roles and SYSTEM steps are left out.
+     * An ASSIGNMENT_SCOPED step is included: with nobody holding its roles the
+     * engine's role filter empties it and it falls back the same way.
+     *
+     * Read-only. Returns [] for a finished workflow or when every step is covered.
+     */
+    @Transactional(readOnly = true)
+    public List<Map<String, Object>> roleCoverageGaps(Long instanceId) {
+        WorkflowInstance inst = instanceRepository.findById(instanceId)
+                .orElseThrow(() -> new ResourceNotFoundException("WorkflowInstance", instanceId));
+        if (inst.getStatus() == WorkflowStatus.COMPLETED || inst.getStatus() == WorkflowStatus.CANCELLED
+                || inst.getStatus() == WorkflowStatus.REJECTED) return List.of();
+        Long tenantId = inst.getTenantId();
+
+        List<WorkflowStep> steps = stepRepository.findByWorkflowIdOrderByStepOrderAsc(inst.getWorkflowId());
+        int fromOrder = steps.stream()
+                .filter(s -> Objects.equals(s.getId(), inst.getCurrentStepId()))
+                .map(WorkflowStep::getStepOrder).findFirst().orElse(0);
+        Map<Long, List<WorkflowStepRole>> rolesByStep = stepRoleRepository
+                .findByStepIdIn(steps.stream().map(WorkflowStep::getId).toList())
+                .stream().collect(Collectors.groupingBy(WorkflowStepRole::getStepId));
+
+        List<Map<String, Object>> gaps = new ArrayList<>();
+        for (WorkflowStep step : steps) {
+            if (step.getStepOrder() == null || step.getStepOrder() < fromOrder) continue;
+            String side = step.getSide();
+            if ("SYSTEM".equalsIgnoreCase(side) || (step.getAutomatedAction() != null && !step.getAutomatedAction().isBlank())) continue;
+            ActorResolution res = step.getActorResolution() != null ? step.getActorResolution() : ActorResolution.ROLE_BASED;
+            if (res == ActorResolution.ENTITY_CREATOR || res == ActorResolution.ENTITY_OWNER) continue;
+            List<WorkflowStepRole> actorRoles = rolesByStep.getOrDefault(step.getId(), List.of());
+            if (actorRoles.isEmpty()) continue;
+
+            List<String> roleNames = new ArrayList<>();
+            boolean anyone = false;
+            for (WorkflowStepRole ar : actorRoles) {
+                roleRepository.findById(ar.getRoleId()).map(com.kashi.grc.usermanagement.domain.Role::getName).ifPresent(roleNames::add);
+                List<Long> uids;
+                if ("VENDOR".equalsIgnoreCase(side)) {
+                    uids = dbRepository.findUserIdsByRoleAndVendor(ar.getRoleId(), tenantId, inst.getEntityId());
+                } else if (side != null) {
+                    String membershipType = resolveMembershipScope(inst, side);
+                    uids = membershipType != null
+                            ? dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId, side, membershipType)
+                            : dbRepository.findUserIdsByRoleAndTenantAndSide(ar.getRoleId(), tenantId, side);
+                } else {
+                    uids = dbRepository.findUserIdsByRoleAndTenant(ar.getRoleId(), tenantId);
+                }
+                if (uids.stream().anyMatch(u -> isAssignable(u, tenantId))) { anyone = true; break; }
+            }
+            if (anyone) continue;
+
+            // Who the engine would hand the task to instead.
+            Long fallbackUserId = null;
+            String fallbackKind = "INITIATOR";
+            if ("VENDOR".equalsIgnoreCase(side)) {
+                fallbackUserId = java.util.stream.Stream.of("VENDOR_VRM", "VRM")
+                        .map(name -> roleRepository.findByNameAndSide(name, com.kashi.grc.usermanagement.domain.RoleSide.VENDOR))
+                        .filter(Optional::isPresent).map(Optional::get)
+                        .flatMap(r -> dbRepository.findUserIdsByRoleAndVendor(r.getId(), tenantId, inst.getEntityId()).stream())
+                        .findFirst().orElse(null);
+                if (fallbackUserId != null) fallbackKind = "VENDOR_VRM";
+            }
+            if (fallbackUserId == null) fallbackUserId = inst.getInitiatedBy();
+            if (!isAssignable(fallbackUserId, tenantId)) { fallbackUserId = null; fallbackKind = "NOBODY"; }
+            String fallbackName = fallbackUserId == null ? null
+                    : userRepository.findById(fallbackUserId).map(com.kashi.grc.usermanagement.domain.User::getFullName).orElse(null);
+
+            Map<String, Object> g = new LinkedHashMap<>();
+            g.put("stepId", step.getId());
+            g.put("stepOrder", step.getStepOrder());
+            g.put("stepName", step.getName());
+            g.put("side", side);
+            g.put("current", Objects.equals(step.getId(), inst.getCurrentStepId()));
+            g.put("roles", roleNames);
+            g.put("fallbackKind", fallbackKind);          // VENDOR_VRM | INITIATOR | NOBODY
+            g.put("fallbackUserName", fallbackName);
+            gaps.add(g);
+        }
+        return gaps;
+    }
+
     public boolean isAssignable(Long userId, Long tenantId) {
         return userId != null && !accountAccess.check(userId, tenantId).blocked();
     }
@@ -4747,7 +4865,7 @@ public class WorkflowEngineService {
     /** Open tasks a user holds right now (for the suspend dialog's "what this affects"). */
     public long countOpenTasks(Long userId) {
         return taskInstanceRepository.findByAssignedUserIdAndStatusIn(
-                        userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)).stream()
+                userId, List.of(TaskStatus.PENDING, TaskStatus.IN_PROGRESS)).stream()
                 .map(t -> stepInstanceRepository.findById(t.getStepInstanceId()).orElse(null))
                 .filter(si -> si != null && StepStatus.LIVE.contains(si.getStatus()))
                 .count();

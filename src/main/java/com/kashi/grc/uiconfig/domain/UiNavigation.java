@@ -36,6 +36,17 @@ public class UiNavigation extends GlobalOrTenantEntity {
     @Column(name = "parent_key", length = 100)
     private String parentKey;
 
+    /**
+     * Show this row as a TAB on another row's page instead of in the sidebar.
+     * Holds that row's navKey: a "Vendor dashboard" row with
+     * tab_parent_key = 'module_vendor' appears as a tab beside "Vendors" on the
+     * Vendors page, and not as its own sidebar entry. NULL = an ordinary
+     * sidebar row (the default — nothing changes until a row is set).
+     * Managed from the Navigation admin page.
+     */
+    @Column(name = "tab_parent_key", length = 100)
+    private String tabParentKey;
+
     @Column(name = "sort_order")
     private Integer sortOrder;
 

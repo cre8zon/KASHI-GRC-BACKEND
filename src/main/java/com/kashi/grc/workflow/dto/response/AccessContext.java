@@ -90,6 +90,12 @@ public class AccessContext {
     private Long     taskId;
     private Long     stepInstanceId;
 
+    /** The workflow instance this record runs on, as resolved here — including
+     *  the indirect cases (an engagement's project, a vendor assessment's cycle
+     *  filed under the VENDOR). Lets the detail page's Workflow tile and tab
+     *  find the instance a lookup by (entityType, entityId) would miss. */
+    private Long     workflowInstanceId;
+
     private boolean  canView;
     private boolean  canEdit;
     private boolean  canAct;

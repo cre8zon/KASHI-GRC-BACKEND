@@ -136,7 +136,7 @@ public class StorageService {
      * a valid place to upload a 500MB video, which is a storage bill and an
      * evidence-review problem nobody asked for.
      */
-    private static final Set<String> VIDEO_DOCUMENT_TYPES = Set.of("TRAINING_VIDEO");
+    private static final Set<String> VIDEO_DOCUMENT_TYPES = Set.of("TRAINING_VIDEO", "WORKFLOW_DEMO_VIDEO");
 
     private static final Set<String> VIDEO_MIME_TYPES = Set.of(
             "video/mp4", "video/webm", "video/quicktime"
@@ -917,8 +917,8 @@ public class StorageService {
      */
     public byte[] streamFileBytes(String s3Key) {
         try {
-            software.amazon.awssdk.services.s3.model.GetObjectRequest req =
-                    software.amazon.awssdk.services.s3.model.GetObjectRequest.builder()
+            GetObjectRequest req =
+                    GetObjectRequest.builder()
                             .bucket(bucket)
                             .key(s3Key)
                             .build();

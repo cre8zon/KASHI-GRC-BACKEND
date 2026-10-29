@@ -363,7 +363,15 @@ public class IssueService {
                 if (oldVal == null && newVal != null) {
                     log.info("[ISSUE-WF] advanceOnFieldSet '{}' transitioned null -> {} | issueId={}",
                             advanceField, newVal, issue.getId());
-                    advanceWorkflowTask(issue, userId, advanceField + " set");
+                    // Only the step's own holder completes it by filling the
+                    // field. Anyone else editing the issue (Edit details) just
+                    // saves the value; the step stays with its holder.
+                    if (holdsCurrentStep(issue, userId)) {
+                        advanceWorkflowTask(issue, userId, advanceField + " set");
+                    } else {
+                        log.info("[ISSUE-WF] {} set by user {} who does not hold the current step — saved, step not advanced",
+                                advanceField, userId);
+                    }
                 }
             }
         }
@@ -1139,7 +1147,7 @@ public class IssueService {
             log.warn("[ISSUE-WF] workflowInstanceId is NULL — workflow was never started for issueId={}", issue.getId());
             return;
         }
-        try {
+        {
             com.kashi.grc.workflow.domain.WorkflowInstance wfInst =
                     instanceRepository.findById(issue.getWorkflowInstanceId()).orElse(null);
             if (wfInst == null) {
@@ -1160,34 +1168,69 @@ public class IssueService {
                     allTasks.stream().map(t -> t.getId() + ":" + t.getStatus() + ":" + t.getTaskRole())
                             .collect(java.util.stream.Collectors.joining(", ")));
 
-            java.util.Optional<com.kashi.grc.workflow.domain.TaskInstance> pendingTask =
-                    allTasks.stream()
-                            .filter(t -> t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING)
-                            .findFirst();
+            java.util.List<com.kashi.grc.workflow.domain.TaskInstance> openTasks = allTasks.stream()
+                    .filter(t -> t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
+                            || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS)
+                    .filter(t -> t.getTaskRole() == null
+                            || t.getTaskRole() == com.kashi.grc.workflow.enums.TaskRole.ACTOR)
+                    .toList();
 
-            if (pendingTask.isEmpty()) {
-                log.warn("[ISSUE-WF] No PENDING task found on currentStep={} — cannot advance",
+            if (openTasks.isEmpty()) {
+                log.warn("[ISSUE-WF] No open task on currentStep={} — nothing to advance",
                         wfInst.getCurrentStepId());
                 return;
             }
 
-            com.kashi.grc.workflow.domain.TaskInstance task = pendingTask.get();
-            log.info("[ISSUE-WF] Approving taskId={} | assignedTo={}", task.getId(), task.getAssignedUserId());
-            com.kashi.grc.workflow.dto.request.TaskActionRequest req =
-                    new com.kashi.grc.workflow.dto.request.TaskActionRequest();
-            req.setTaskInstanceId(task.getId());
-            req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
-            req.setRemarks(remarks);
-            try {
+            // ── WHOSE TASK ────────────────────────────────────────────────
+            // The CALLER's. This used to approve the first pending task on the
+            // step, whoever it belonged to. On a step with two holders
+            // (Organisation Validation: Arjun and Priyanka) Priyanka's
+            // "Validate & Resolve" tried to approve Arjun's task, the engine
+            // refused (not your task), and that refusal — raised inside the
+            // engine's transaction — marked the whole save rollback-only:
+            // nothing saved, ERR-… on screen. With ANY_ONE approval the
+            // caller's approval completes the step and the engine closes the
+            // other holder's task.
+            //
+            // A caller with no task here reached this through override
+            // (requireCanMoveStatus lets an override holder through), so the
+            // step moves by override and is recorded as one.
+            //
+            // Failures are NOT swallowed any more: a status move whose step
+            // could not complete must fail as a whole, with its real reason,
+            // rather than leave the status moved and the workflow behind it.
+            java.util.Optional<com.kashi.grc.workflow.domain.TaskInstance> mine = openTasks.stream()
+                    .filter(t -> userId != null && userId.equals(t.getAssignedUserId()))
+                    .findFirst();
+
+            if (mine.isPresent()) {
+                com.kashi.grc.workflow.domain.TaskInstance task = mine.get();
+                log.info("[ISSUE-WF] Approving the caller's taskId={} | user={}", task.getId(), userId);
+                com.kashi.grc.workflow.dto.request.TaskActionRequest req =
+                        new com.kashi.grc.workflow.dto.request.TaskActionRequest();
+                req.setTaskInstanceId(task.getId());
+                req.setActionType(com.kashi.grc.workflow.enums.ActionType.APPROVE);
+                req.setRemarks(remarks);
                 workflowEngineService.performAction(req, userId);
                 log.info("[ISSUE-WF] performAction succeeded | taskId={}", task.getId());
-            } catch (Exception e) {
-                log.warn("[ISSUE-WF] performAction failed | issueId={} | taskId={} | {}",
-                        issue.getId(), task.getId(), e.getMessage(), e);
+            } else {
+                log.info("[ISSUE-WF] Caller {} holds no task on step {} — advancing by override",
+                        userId, wfInst.getCurrentStepId());
+                workflowEngineService.overrideAdvanceStep(wfInst.getCurrentStepId(), "APPROVE", remarks, userId);
             }
-        } catch (Exception e) {
-            log.warn("[ISSUE-WF] advanceWorkflowTask error | issueId={} | {}", issue.getId(), e.getMessage(), e);
         }
+    }
+
+    /** Whether the user holds an open task on the issue's current step. */
+    private boolean holdsCurrentStep(Issue issue, Long userId) {
+        if (issue.getWorkflowInstanceId() == null || userId == null) return false;
+        return instanceRepository.findById(issue.getWorkflowInstanceId())
+                .map(com.kashi.grc.workflow.domain.WorkflowInstance::getCurrentStepId)
+                .map(stepId -> taskInstanceRepository.findByStepInstanceId(stepId).stream()
+                        .anyMatch(t -> userId.equals(t.getAssignedUserId())
+                                && (t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.PENDING
+                                || t.getStatus() == com.kashi.grc.workflow.enums.TaskStatus.IN_PROGRESS)))
+                .orElse(false);
     }
 
     private void startWorkflowIfConfigured(Issue issue, Long overrideWorkflowId,
