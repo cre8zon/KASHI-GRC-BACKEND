@@ -1,3 +1,4 @@
+/*
 package com.kashi.grc.common.kafka.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -34,6 +35,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+*/
 /**
  * Kafka foundation for KashiGRC.
  *
@@ -58,7 +60,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *    processed/failed counters and KafkaEventPublisher for producer-side
  *    send counters — together these three are what make it possible to
  *    actually SEE whether Kafka is healthy in production, not just assume it.
- */
+ *//*
+
 @Slf4j
 @EnableKafka
 @Configuration
@@ -319,7 +322,8 @@ public class KafkaConfig {
                 .build();
     }
 
-    /**
+    */
+/**
      * Bulk policy adoption.
      *
      * Keyed by TENANT, so one tenant's adoption run stays on one partition and
@@ -330,7 +334,8 @@ public class KafkaConfig {
      *
      * The engagement topic keys by engagementId for the opposite reason: each
      * engagement is independent and round-robin is fine.
-     */
+     *//*
+
     @Bean
     public NewTopic auditPolicyBulkAdoptTopic() {
         return TopicBuilder.name(KafkaTopics.AUDIT_POLICY_BULK_ADOPT_REQUESTED)
@@ -346,4 +351,4 @@ public class KafkaConfig {
                 .replicas(1)
                 .build();
     }
-}
+}*/
