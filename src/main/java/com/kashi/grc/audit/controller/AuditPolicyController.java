@@ -43,6 +43,7 @@ public class AuditPolicyController {
     /** Optional: KafkaEventPublisher is @ConditionalOnProperty. */
     private final org.springframework.beans.factory.ObjectProvider<com.kashi.grc.common.kafka.KafkaEventPublisher> kafkaPublisher;
     private final AuditPolicyControlMappingRepository         policyControlMappingRepository;
+    private final com.kashi.grc.ucf.repository.CommonControlMappingRepository commonControlMappingRepository;
     private final com.kashi.grc.audit.repository.AuditControlRepository controlRepository;
     private final AuditPolicyInstanceRepository               policyInstanceRepository;
     private final AuditPolicyInstanceControlMappingRepository policyInstanceControlMappingRepository;
@@ -948,6 +949,141 @@ public class AuditPolicyController {
 
         return ResponseEntity.ok(ApiResponse.success(
                 Map.of("mappingId", mapping.getId(), "policyId", policyId, "controlId", controlId)));
+    }
+
+    /**
+     * Link library controls to a policy by UCF code — the control list a person
+     * has just confirmed (the AI "create policy" review step, or an accepted
+     * suggestion in the editor's mapping panel).
+     *
+     * The AI proposes UCF codes (common_controls.code); the Linked Controls tab
+     * shows library controls (audit_controls). The bridge is the UCF crosswalk
+     * (common_control_mappings: UCF code -> framework citation), the same source
+     * the policy's own "Framework References" section is built from, so the
+     * links and the text agree. A library control is linked when its framework
+     * and code match a crosswalk citation of a confirmed UCF code. A SOC 2
+     * point of focus ("CC8.1-C1") under a matched criterion ("CC8.1") is
+     * linked only if its own UCF tag is confirmed too, or it has no tag.
+     *
+     * audit_controls.common_control_code is used only as a fallback, for a UCF
+     * code the crosswalk says nothing about in that framework (a tenant's own
+     * controls, say). Where the crosswalk does speak, it wins: a library row
+     * tagged with the wrong UCF code is not linked on the strength of the tag.
+     *
+     * Limited to the policy's frameworks when given. Existing links are left as
+     * they are. Codes that link nothing are returned as unmatched. Nothing is
+     * linked that a person did not confirm.
+     */
+    @PostMapping("/v1/audit/library/policies/{id}/controls/link-common")
+    @Operation(summary = "Link library controls to a policy by confirmed UCF codes")
+    @Transactional
+    public ResponseEntity<ApiResponse<Map<String, Object>>> linkByCommonCodes(
+            @PathVariable Long id, @RequestBody Map<String, Object> body) {
+        AuditPolicy policy = policyRepository.findById(id)
+                .orElseThrow(() -> new ResourceNotFoundException("AuditPolicy", id));
+        requireOwnedPolicy(policy);
+        var ctx = utilityService.getLoggedInDataContext();
+        Long tenantId = ctx.getTenantId();
+        Long userId   = ctx.getId();
+
+        List<String> codes = stringList(body == null ? null : body.get("codes"));
+        Set<String> fws = stringList(body == null ? null : body.get("frameworks")).stream()
+                .map(AuditPolicyController::normFramework).filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
+        if (codes.isEmpty()) {
+            return ResponseEntity.ok(ApiResponse.success(Map.of("linked", List.of(), "unmatched", List.of())));
+        }
+
+        // Crosswalk: "fw|citation" -> UCF code, and which (UCF code, fw) pairs it covers.
+        Map<String, String> citationToCode = new HashMap<>();
+        Set<String> covered = new HashSet<>();
+        for (var m : commonControlMappingRepository.findByCommonControlCodeInAndActiveTrue(codes)) {
+            if (m.getTenantId() != null && !Objects.equals(m.getTenantId(), tenantId)) continue;
+            String fw = normFramework(m.getFrameworkRef());
+            if (!fws.isEmpty() && !fws.contains(fw)) continue;
+            citationToCode.putIfAbsent(fw + "|" + normCitation(m.getCitation()), m.getCommonControlCode());
+            covered.add(m.getCommonControlCode() + "|" + fw);
+        }
+
+        Set<String> codeSet = new HashSet<>(codes);
+        Map<Long, String> chosen = new LinkedHashMap<>();       // controlId -> UCF code it came from
+        Map<Long, AuditControl> byId = new HashMap<>();
+        for (AuditControl c : controlRepository.findByTenantIdIsNullOrTenantId(tenantId)) {
+            String fw = normFramework(c.getFrameworkRef());
+            if (!fws.isEmpty() && !fws.contains(fw)) continue;
+            String cc = normCitation(c.getControlCode());
+            String via = citationToCode.get(fw + "|" + cc);
+            // A SOC 2 point of focus ("CC6.1-C2") under a mapped criterion
+            // ("CC6.1") is linked only when its own UCF tag is one of the
+            // confirmed codes, or it has none. A criterion is broad: CC6.1 covers
+            // MFA, unique accounts and least privilege, and confirming "secret
+            // scanning" must not link all three.
+            if (via == null && cc.contains("-")) {
+                String parent = citationToCode.get(fw + "|" + cc.substring(0, cc.indexOf('-')));
+                String tag = c.getCommonControlCode();
+                if (parent != null && (tag == null || tag.isBlank())) via = parent;
+                else if (parent != null && codeSet.contains(tag)) via = tag;
+            }
+            if (via == null && c.getCommonControlCode() != null && codeSet.contains(c.getCommonControlCode())
+                    && !covered.contains(c.getCommonControlCode() + "|" + fw)) {
+                via = c.getCommonControlCode();
+            }
+            if (via != null) { chosen.put(c.getId(), via); byId.put(c.getId(), c); }
+        }
+
+        List<Map<String, Object>> linked = new ArrayList<>();
+        boolean added = false;
+        for (var e : chosen.entrySet()) {
+            AuditControl c = byId.get(e.getKey());
+            boolean existed = policyControlMappingRepository.findByPolicyIdAndControlId(id, c.getId()).isPresent();
+            if (!existed) {
+                policyControlMappingRepository.save(AuditPolicyControlMapping.builder()
+                        .policyId(id).controlId(c.getId())
+                        .tenantId(tenantId).createdBy(userId)
+                        .mappingType(AuditPolicyControlMapping.MappingType.DIRECT)
+                        .mappingNote("Confirmed from AI suggestion (" + e.getValue() + ")")
+                        .build());
+                added = true;
+            }
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("controlId", c.getId());
+            m.put("controlCode", c.getControlCode());
+            m.put("frameworkRef", c.getFrameworkRef());
+            m.put("commonControlCode", e.getValue());
+            m.put("alreadyLinked", existed);
+            linked.add(m);
+        }
+        Set<String> matched = new HashSet<>(chosen.values());
+        List<String> unmatched = codes.stream().filter(c -> !matched.contains(c)).toList();
+
+        if (added) {
+            policyWorkflow.onControlLinked(policy, userId);
+            libraryCache.evictLibraryLists();
+        }
+        log.info("[AUDIT-POLICY] link-common | policy={} codes={} linked={} unmatched={}",
+                id, codes.size(), linked.size(), unmatched);
+        return ResponseEntity.ok(ApiResponse.success(Map.of("linked", linked, "unmatched", unmatched)));
+    }
+
+    /** "A.8.25", "a.8.25 ", "CL.5.3", "Clause 5.3" -> comparable form. */
+    private static String normCitation(String c) {
+        if (c == null) return "";
+        String s = c.toUpperCase(Locale.ROOT).replaceAll("\\s+", "");
+        if (s.startsWith("CLAUSE")) s = s.substring(6);
+        if (s.startsWith("CL.")) s = s.substring(3);
+        return s;
+    }
+
+    private static List<String> stringList(Object v) {
+        if (v == null) return List.of();
+        Collection<?> raw = v instanceof Collection<?> c ? c : Arrays.asList(String.valueOf(v).split(","));
+        return raw.stream().filter(Objects::nonNull).map(o -> String.valueOf(o).trim())
+                .filter(s -> !s.isEmpty()).distinct().toList();
+    }
+
+    /** "ISO 27001", "ISO27001", "iso-27001" -> "ISO27001"; "SOC 2" -> "SOC2". */
+    private static String normFramework(String f) {
+        return f == null ? "" : f.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9]", "");
     }
 
     /**

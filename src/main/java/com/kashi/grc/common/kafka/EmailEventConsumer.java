@@ -33,7 +33,7 @@ import java.util.Map;
  *   History — every outcome (SENT / FAILED + error) is recorded in email_log.
  *   Retry/DLT — sendMailSync THROWS on SMTP failure; the exception propagates
  *       to the container error handler → 3 retries with backoff → the record
- *       lands on kashigrc.email.requested.DLT. Never swallow exceptions here.
+ *       lands on kashigrc.email.requested-dlt. Never swallow exceptions here.
  *   Tenant isolation — TenantContext is set from the envelope FIRST and
  *       cleared in finally (listener threads are pooled and reused).
  *
@@ -69,7 +69,7 @@ public class EmailEventConsumer {
                 return;
             }
 
-            Map<String, Object> p = envelope.getPayload();
+            Map<String, Object> p = envelope.getPayload() != null ? envelope.getPayload() : Map.of();
 
             switch (envelope.getEventType()) {
                 case "EMAIL_TEMPLATE_REQUESTED" -> handleTemplate(envelope, p);
@@ -80,9 +80,10 @@ public class EmailEventConsumer {
 
         } catch (Exception e) {
             // Record the failure, then RE-THROW so retries + DLT engage.
-            recordOutcome(envelope, str(envelope.getPayload().get("to")),
-                    str(envelope.getPayload().get("templateName")),
-                    str(envelope.getPayload().get("subject")),
+            // A payload-less envelope must not turn this into a NullPointerException
+            // that hides the real error from the retry log.
+            Map<String, Object> p = envelope.getPayload() != null ? envelope.getPayload() : Map.of();
+            recordOutcome(envelope, str(p.get("to")), str(p.get("templateName")), str(p.get("subject")),
                     EmailLog.Status.FAILED, e.getMessage());
             throw e;
         } finally {

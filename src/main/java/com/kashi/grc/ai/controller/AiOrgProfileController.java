@@ -1,8 +1,10 @@
 package com.kashi.grc.ai.controller;
 
 import com.kashi.grc.ai.domain.AiOrgProfile;
+import com.kashi.grc.ai.policy.PolicyRoleRegister;
 import com.kashi.grc.ai.repository.AiOrgProfileRepository;
 import com.kashi.grc.common.dto.ApiResponse;
+import com.kashi.grc.common.security.PermissionGate;
 import com.kashi.grc.common.util.UtilityService;
 import com.kashi.grc.usermanagement.domain.User;
 import lombok.RequiredArgsConstructor;
@@ -32,6 +34,8 @@ public class AiOrgProfileController {
 
     private final AiOrgProfileRepository repository;
     private final UtilityService         utilityService;
+    private final PermissionGate         permissionGate;
+    private final PolicyRoleRegister     roleRegister;
 
     @GetMapping("/v1/ai/org-profile")
     @Transactional(readOnly = true)
@@ -44,6 +48,13 @@ public class AiOrgProfileController {
     @PutMapping("/v1/ai/org-profile")
     @Transactional
     public ApiResponse<AiOrgProfile> save(@RequestBody AiOrgProfile incoming) {
+        // Writing is gated; reading is not. Every value here is quoted verbatim
+        // into generated policies, and the row also holds prohibited_claims, the
+        // preferred provider and the ai_enabled switch — so only people who can
+        // create policies may change it (the same AUDIT_CREATE that shows the
+        // sidebar entry). GET and /completeness stay open to signed-in users:
+        // the AI drafting dialogs read them for everyone who drafts.
+        permissionGate.require("AUDIT_CREATE");
         User user = utilityService.getLoggedInDataContext();
 
         AiOrgProfile profile = repository.findByTenantId(user.getTenantId())
@@ -91,6 +102,8 @@ public class AiOrgProfileController {
         profile.setAiEnabled(incoming.getAiEnabled());
         profile.setAllowExampleMining(incoming.getAllowExampleMining());
         profile.setUpdatedBy(user.getId());
+        // Holder names follow the policy role register, whatever the client sent.
+        roleRegister.applyTo(profile);
 
         return ApiResponse.success(repository.save(profile));
     }
@@ -151,6 +164,6 @@ public class AiOrgProfileController {
                 "missing", missing,
                 "message", score >= 80 ? "Generation is well grounded"
                         : score >= 50 ? "Add the missing fields for noticeably more specific output"
-                        : "Output will be generic until this profile is completed"));
+                          : "Output will be generic until this profile is completed"));
     }
 }

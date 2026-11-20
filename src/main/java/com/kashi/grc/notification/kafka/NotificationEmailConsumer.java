@@ -51,7 +51,7 @@ import java.util.Objects;
  * FAILURE CLASSIFICATION:
  *   Non-retryable (log + record SKIPPED + return, offset commits):
  *     no recipients / no resolvable emails / suppressed by rule.
- *   Retryable (record FAILED + RETHROW → 3 backoff retries → .DLT):
+ *   Retryable (record FAILED + RETHROW → 3 backoff retries → -dlt):
  *     DB unavailable, unexpected exceptions. Publishing to the email topic
  *     is async fire-and-log (KafkaEventPublisher), matching MailService.
  */
@@ -219,7 +219,7 @@ public class NotificationEmailConsumer {
                 }
             }
 
-            dispatchLogRepository.save(NotificationDispatchLog.builder()
+            writeLog(NotificationDispatchLog.builder()
                     .eventId(envelope.getEventId())
                     .tenantId(tenantId)
                     .eventKey(eventKey)
@@ -236,7 +236,7 @@ public class NotificationEmailConsumer {
 
         } catch (Exception e) {
             recordFailed(envelope, e);   // best-effort, never masks the real error
-            throw e;                     // → DefaultErrorHandler retries → .DLT
+            throw e;                     // → DefaultErrorHandler retries → -dlt
         } finally {
             TenantContext.clear();       // listener threads are pooled — always clear
         }
@@ -328,7 +328,7 @@ public class NotificationEmailConsumer {
                                Long entityId, int recipientCount, String reason) {
         log.info("Notification fanout SKIPPED | eventId={} | eventKey={} | reason={}",
                 env.getEventId(), eventKey, reason);
-        dispatchLogRepository.save(NotificationDispatchLog.builder()
+        writeLog(NotificationDispatchLog.builder()
                 .eventId(env.getEventId())
                 .tenantId(env.getTenantId())
                 .eventKey(eventKey != null ? eventKey : "UNKNOWN")
@@ -347,7 +347,7 @@ public class NotificationEmailConsumer {
             String detail = e.getMessage() != null && e.getMessage().length() > 500
                     ? e.getMessage().substring(0, 500) : e.getMessage();
             String eventKey = env.getPayload() != null ? str(env.getPayload().get("eventKey")) : null;
-            dispatchLogRepository.save(NotificationDispatchLog.builder()
+            writeLog(NotificationDispatchLog.builder()
                     .eventId(env.getEventId())
                     .tenantId(env.getTenantId())
                     .eventKey(eventKey != null ? eventKey : "UNKNOWN")
@@ -364,6 +364,20 @@ public class NotificationEmailConsumer {
     }
 
     // ── Payload coercion (JSON numbers arrive as Integer/Long/String) ─────
+
+    /**
+     * One row per event, always. event_id is unique: a FAILED attempt wrote the
+     * row, so the retry's DISPATCHED (or SKIPPED) must UPDATE it. Inserting a
+     * second row threw a duplicate-key error AFTER the emails had been handed
+     * to the email topic, which made the container retry the whole fanout —
+     * every recipient got the email again on each retry — and finally sent a
+     * successful notification to the dead-letter topic.
+     */
+    private void writeLog(NotificationDispatchLog row) {
+        dispatchLogRepository.findByEventId(row.getEventId())
+                .ifPresent(existing -> row.setId(existing.getId()));
+        dispatchLogRepository.save(row);
+    }
 
     private static String str(Object o) { return o != null ? o.toString() : null; }
 

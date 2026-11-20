@@ -315,6 +315,9 @@ public class PolicyTemplatePlaceholders {
             // report it if the catalogue does not recognise it as workflow-filled.
             PolicyVariableCatalog.Variable def = PolicyVariableCatalog.get(key);
             if (def != null && def.isWorkflow()) continue;
+            // {{role_<key>}} is the policy role register's holder, filled in
+            // when the policy is read (PolicyVariableResolver). Not a gap.
+            if (key.startsWith("role_")) continue;
             found.add(key);
         }
         return new ArrayList<>(found);

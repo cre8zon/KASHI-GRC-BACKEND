@@ -5,7 +5,9 @@ import lombok.Setter;
 import org.springframework.boot.context.properties.ConfigurationProperties;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -81,6 +83,14 @@ public class AiProperties {
         private String  chatModel;
         /** Cheaper model for mechanical steps: critique, extraction, classification. */
         private String  fastModel;
+
+        /**
+         * Same-vendor models to try, in order, when the chosen model is busy or
+         * down (e.g. Gemini's "model is experiencing high demand" 503). Comma
+         * separated. Same vendor, so it keeps a tenant's provider pin intact and
+         * needs no second API key.
+         */
+        private List<String> fallbackModels = new ArrayList<>();
 
         private int     connectTimeoutSeconds = 10;
         private int     readTimeoutSeconds    = 120;

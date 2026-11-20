@@ -35,10 +35,19 @@ import java.util.function.Consumer;
  * data and whether they can choose. Being able to answer yes closes that thread
  * in one line.
  *
- * ── FAILOVER IS DELIBERATELY NOT AUTOMATIC ───────────────────────────────────
+ * ── FAILOVER RESPECTS THE PIN ────────────────────────────────────────────────
  * If a tenant pinned a provider, silently falling back to a different vendor on
- * error would violate the exact commitment the pin represents. Failover only
- * happens for tenants that expressed no preference.
+ * error would violate the exact commitment the pin represents. So failover
+ * (completeWithFailover / streamWithFailover) walks a chain built by chain():
+ *   1. the chosen provider and model
+ *   2. that provider's fallback-models, then its other configured model —
+ *      same vendor, so allowed even for a pinned tenant
+ *   3. other configured providers — ONLY when nothing pinned the provider
+ * A call that pinned the model itself (an eval run) gets no failover at all.
+ *
+ * Every candidate but the last gets a single attempt: Gemini can take ~10 s to
+ * answer "high demand", and three of those before trying the next model is
+ * 30 s of spinner. The last candidate gets the provider's full retry budget.
  */
 @Slf4j
 @Component
@@ -102,7 +111,13 @@ public class LlmProviderRegistry {
      * together. Random spread turns a thundering herd back into traffic.
      */
     public LlmResponse completeWithRetry(LlmProvider provider, LlmRequest request) {
-        int max = provider instanceof GenericLlmProvider g ? g.config().getMaxRetries() : 2;
+        return completeWithRetry(provider, request, null);
+    }
+
+    /** @param maxRetriesOverride null = the provider's configured budget */
+    public LlmResponse completeWithRetry(LlmProvider provider, LlmRequest request, Integer maxRetriesOverride) {
+        int max = maxRetriesOverride != null ? maxRetriesOverride
+                : provider instanceof GenericLlmProvider g ? g.config().getMaxRetries() : 2;
         AiProviderException last = null;
 
         for (int attempt = 0; attempt <= max; attempt++) {
@@ -121,6 +136,106 @@ public class LlmProviderRegistry {
             }
         }
         throw last != null ? last : AiProviderException.unavailable(provider.key(), "exhausted retries");
+    }
+
+    // ── Failover ──────────────────────────────────────────────────────────────
+
+    /** One provider + model to try. */
+    public record Candidate(LlmProvider provider, String model) {}
+
+    /** What actually answered, so the caller records the right vendor and model. */
+    public record Served(LlmProvider provider, String model, LlmResponse response) {}
+
+    /**
+     * The ordered list of provider/model pairs to try for one call.
+     *
+     * @param providerPinned the caller or the tenant chose this vendor — never leave it
+     * @param modelPinned    the caller fixed the exact model — try nothing else
+     * @param preferFast     the template asks for the fast model on other vendors too
+     */
+    public List<Candidate> chain(LlmProvider primary, String model,
+                                 boolean providerPinned, boolean modelPinned, boolean preferFast) {
+        List<Candidate> out = new ArrayList<>();
+        out.add(new Candidate(primary, model));
+        if (modelPinned) return out;
+
+        // Same vendor: configured fallbacks, then its other model.
+        if (primary instanceof GenericLlmProvider g) {
+            for (String m : g.config().getFallbackModels()) addIfNew(out, primary, m);
+            addIfNew(out, primary, preferFast ? g.defaultChatModel() : g.defaultFastModel());
+        }
+
+        // Other vendors, only for tenants that expressed no preference.
+        if (!providerPinned) {
+            List<GenericLlmProvider> others = new ArrayList<>();
+            GenericLlmProvider def = byKey.get(props.getDefaultProvider().toLowerCase());
+            if (def != null) others.add(def);
+            byKey.values().forEach(p -> { if (!others.contains(p)) others.add(p); });
+            for (GenericLlmProvider p : others) {
+                if (!p.isConfigured() || p.key().equals(primary.key())) continue;
+                addIfNew(out, p, preferFast ? p.defaultFastModel() : p.defaultChatModel());
+            }
+        }
+        return out;
+    }
+
+    private static void addIfNew(List<Candidate> out, LlmProvider p, String model) {
+        if (model == null || model.isBlank()) return;
+        boolean seen = out.stream().anyMatch(c -> c.provider().key().equals(p.key()) && model.equals(c.model()));
+        if (!seen) out.add(new Candidate(p, model.trim()));
+    }
+
+    /** Blocking completion down the chain. Bad requests stop it: every vendor would refuse them. */
+    public Served completeWithFailover(List<Candidate> chain, LlmRequest request) {
+        AiProviderException last = null;
+        for (int i = 0; i < chain.size(); i++) {
+            Candidate c = chain.get(i);
+            boolean lastCandidate = i == chain.size() - 1;
+            request.model(c.model());
+            try {
+                LlmResponse r = completeWithRetry(c.provider(), request, lastCandidate ? null : 0);
+                if (i > 0) log.warn("[AI-REGISTRY] served by fallback {}/{} after {} failed", c.provider().key(),
+                        c.model(), chain.get(0).provider().key() + "/" + chain.get(0).model());
+                return new Served(c.provider(), c.model(), r);
+            } catch (AiProviderException e) {
+                last = e;
+                if (lastCandidate || !worthFailingOver(e)) throw e;
+                log.warn("[AI-REGISTRY] {}/{} failed ({}: {}) — trying {}/{}", c.provider().key(), c.model(),
+                        e.getErrorCode(), e.getDetail(), chain.get(i + 1).provider().key(), chain.get(i + 1).model());
+            }
+        }
+        throw last != null ? last : AiProviderException.unavailable("ai", "empty provider chain");
+    }
+
+    /**
+     * Streaming down the chain — but only until the first token reaches the
+     * browser. After that, switching model would splice two answers together,
+     * so a mid-stream failure is final.
+     */
+    public Served streamWithFailover(List<Candidate> chain, LlmRequest request, Consumer<String> onToken) {
+        java.util.concurrent.atomic.AtomicBoolean emitted = new java.util.concurrent.atomic.AtomicBoolean(false);
+        Consumer<String> tracking = t -> { emitted.set(true); onToken.accept(t); };
+        AiProviderException last = null;
+        for (int i = 0; i < chain.size(); i++) {
+            Candidate c = chain.get(i);
+            boolean lastCandidate = i == chain.size() - 1;
+            request.model(c.model());
+            try {
+                return new Served(c.provider(), c.model(), streamOrFallback(c.provider(), request, tracking));
+            } catch (AiProviderException e) {
+                last = e;
+                if (lastCandidate || emitted.get() || !worthFailingOver(e)) throw e;
+                log.warn("[AI-REGISTRY] {}/{} stream failed ({}: {}) — trying {}/{}", c.provider().key(), c.model(),
+                        e.getErrorCode(), e.getDetail(), chain.get(i + 1).provider().key(), chain.get(i + 1).model());
+            }
+        }
+        throw last != null ? last : AiProviderException.unavailable("ai", "empty provider chain");
+    }
+
+    /** Busy, rate-limited, down, or refusing our key: another model may well answer. */
+    private static boolean worthFailingOver(AiProviderException e) {
+        return e.isRetryable() || "AI_PROVIDER_AUTH".equals(e.getErrorCode())
+                || "AI_PROVIDER_NOT_CONFIGURED".equals(e.getErrorCode());
     }
 
     /**

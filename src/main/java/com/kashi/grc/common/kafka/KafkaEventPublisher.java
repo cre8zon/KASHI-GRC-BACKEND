@@ -91,13 +91,38 @@ public class KafkaEventPublisher {
         //
         // Outside a transaction (schedulers, consumers republishing) there is
         // nothing to wait for, so it sends immediately as before.
+        //
+        // NESTED CASE — publish() called from INSIDE another afterCommit hook
+        // (NotificationService.publishEmailEvent, the welcome and password-reset
+        // emails in UserServiceImpl / AuthServiceImpl, any after-commit lambda
+        // that sends mail). Synchronization is still active at that point, so
+        // we register — but Spring runs afterCommit over a SNAPSHOT taken
+        // before the hooks started (AbstractPlatformTransactionManager
+        // .triggerAfterCommit → getSynchronizations()), so a synchronization
+        // registered during afterCommit never gets its afterCommit call. The
+        // event was silently dropped: no error, no log, no email.
+        //
+        // afterCompletion IS called for it — triggerAfterCompletion takes a
+        // fresh snapshot after the afterCommit round. So the hook sends on
+        // afterCommit in the normal case and on afterCompletion(COMMITTED) in
+        // the nested case, exactly once either way, and never on rollback.
         if (org.springframework.transaction.support.TransactionSynchronizationManager
                 .isSynchronizationActive()) {
             org.springframework.transaction.support.TransactionSynchronizationManager
                     .registerSynchronization(
                             new org.springframework.transaction.support.TransactionSynchronization() {
+                                private boolean sent;
+
                                 @Override public void afterCommit() {
+                                    sent = true;
                                     doSend(topic, eventType, key, envelope, tenantId);
+                                }
+
+                                @Override public void afterCompletion(int status) {
+                                    if (!sent && status == STATUS_COMMITTED) {
+                                        sent = true;
+                                        doSend(topic, eventType, key, envelope, tenantId);
+                                    }
                                 }
                             });
             return;

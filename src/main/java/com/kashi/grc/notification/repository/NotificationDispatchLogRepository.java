@@ -12,4 +12,11 @@ public interface NotificationDispatchLogRepository extends JpaRepository<Notific
      */
     boolean existsByEventIdAndStatusIn(String eventId,
                                        java.util.Collection<NotificationDispatchLog.Status> statuses);
+
+    /**
+     * The row for an event, if any. event_id is unique, so every write for an
+     * event updates this one row: a FAILED attempt followed by a successful
+     * retry becomes DISPATCHED instead of colliding on uk_notif_dispatch_event_id.
+     */
+    java.util.Optional<NotificationDispatchLog> findByEventId(String eventId);
 }

@@ -1,4 +1,3 @@
-/*
 package com.kashi.grc.common.kafka.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,10 +13,11 @@ import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.annotation.EnableKafka;
@@ -35,7 +35,6 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
-*/
 /**
  * Kafka foundation for KashiGRC.
  *
@@ -50,7 +49,8 @@ import java.util.concurrent.ConcurrentHashMap;
  *    to the error handler instead of crash-looping the container.
  *  - DefaultErrorHandler: 3 retries with exponential backoff, then the record
  *    is published to "<topic>-dlt" and the partition moves on. A poison
- *    message can never block a partition.
+ *    message can never block a partition — see the recoverer below for the
+ *    one thing that has to be true for that to hold.
  *  - Every message deserialises to KafkaEventEnvelope — one target type for
  *    all topics, no type-mapping headers needed.
  *  - Observability: KafkaClientMetrics bound to every producer/consumer the
@@ -60,13 +60,15 @@ import java.util.concurrent.ConcurrentHashMap;
  *    processed/failed counters and KafkaEventPublisher for producer-side
  *    send counters — together these three are what make it possible to
  *    actually SEE whether Kafka is healthy in production, not just assume it.
- *//*
-
+ */
 @Slf4j
 @EnableKafka
 @Configuration
 @RequiredArgsConstructor
-@ConditionalOnProperty(name = "kashi.kafka.enabled", havingValue = "true")
+// Local / self-hosted broker (no SASL). For Confluent Cloud set
+// kashi.kafka.provider=confluent and KafkaConfigConfluent loads instead —
+// only one of the two may load, as both define the same beans.
+@ConditionalOnExpression("${kashi.kafka.enabled:false} and '${kashi.kafka.provider:local}' != 'confluent'")
 public class KafkaConfig {
 
     private final ObjectMapper objectMapper;
@@ -85,6 +87,23 @@ public class KafkaConfig {
 
     @Value("${kashi.kafka.consumer.concurrency:3}")
     private int concurrency;
+
+    /**
+     * This class talks plain text. Pointed at Confluent Cloud (TLS + SASL) the
+     * client reads the TLS handshake bytes as a message length, allocates a
+     * buffer that size and dies with "OutOfMemoryError: Java heap space", which
+     * stops every listener container. Refuse to start instead, with the fix.
+     */
+    @jakarta.annotation.PostConstruct
+    void refuseConfluentWithoutSasl() {
+        if (bootstrapServers != null && bootstrapServers.contains("confluent.cloud")) {
+            throw new IllegalStateException(
+                    "spring.kafka.bootstrap-servers points at Confluent Cloud (" + bootstrapServers
+                            + ") but kashi.kafka.provider is not 'confluent', so the plain-text KafkaConfig loaded. "
+                            + "Set kashi.kafka.provider=confluent and spring.kafka.properties.sasl.jaas.config "
+                            + "so KafkaConfigConfluent loads instead.");
+        }
+    }
 
     // ── Producer ─────────────────────────────────────────────────────
 
@@ -198,10 +217,33 @@ public class KafkaConfig {
     public ConcurrentKafkaListenerContainerFactory<String, KafkaEventEnvelope>
     kafkaListenerContainerFactory(KafkaTemplate<String, KafkaEventEnvelope> template) {
 
-        // Failed records -> "<originalTopic>-dlt", same partition (Spring Kafka's
-        // actual default suffix — NOT ".DLT" despite what older comments in this
-        // file assumed; verified against real runtime behavior, not docs)
-        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(template);
+        // Failed records -> "<originalTopic>-dlt" (Spring Kafka's actual default
+        // suffix — NOT ".DLT" despite what older comments in this file assumed;
+        // verified against real runtime behavior, not docs), at a partition the
+        // PRODUCER picks.
+        //
+        // The -1 is the important part, and it is what makes the "a poison
+        // message can never block a partition" promise above actually true.
+        //
+        // Spring Kafka's default resolver targets THE SAME PARTITION NUMBER in
+        // the DLT, which silently requires every DLT to be at least as wide as
+        // its source. Nothing enforces that, and partitions can be added to a
+        // topic by anyone at any time and never removed, so the two drift.
+        //
+        // When they drifted on the Confluent side (source 6 partitions, DLT 3)
+        // the result was not a lost message but a wedged partition: the publish
+        // to the missing partition timed out, sendOrThrow threw, the record was
+        // never recovered, the handler seeked back, and the same offset was
+        // reprocessed every ~23 seconds indefinitely. Three partitions of
+        // kashigrc.email.requested sat at offset 0 and never advanced.
+        //
+        // -1 hands the choice to the producer's partitioner, which places the
+        // record by key among whatever partitions the DLT actually has. Keys are
+        // preserved, so related messages still land together; they just no
+        // longer depend on a partition index existing on both sides.
+        DeadLetterPublishingRecoverer recoverer = new DeadLetterPublishingRecoverer(
+                template,
+                (rec, ex) -> new TopicPartition(rec.topic() + "-dlt", -1));
 
         // Counts every time a record actually gets dead-lettered (retries
         // exhausted). This is the metric worth alerting on — a rising DLT
@@ -322,8 +364,7 @@ public class KafkaConfig {
                 .build();
     }
 
-    */
-/**
+    /**
      * Bulk policy adoption.
      *
      * Keyed by TENANT, so one tenant's adoption run stays on one partition and
@@ -334,8 +375,7 @@ public class KafkaConfig {
      *
      * The engagement topic keys by engagementId for the opposite reason: each
      * engagement is independent and round-robin is fine.
-     *//*
-
+     */
     @Bean
     public NewTopic auditPolicyBulkAdoptTopic() {
         return TopicBuilder.name(KafkaTopics.AUDIT_POLICY_BULK_ADOPT_REQUESTED)
@@ -351,4 +391,4 @@ public class KafkaConfig {
                 .replicas(1)
                 .build();
     }
-}*/
+}

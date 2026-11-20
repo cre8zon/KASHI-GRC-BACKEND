@@ -80,8 +80,12 @@ public class OpenAiEmbeddingProvider implements EmbeddingProvider {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("model", embedCfg.getModel());
         body.put("input", batch);
-        // Only send when the model supports it; ada-002 rejects the parameter outright.
-        if (embedCfg.getModel() != null && embedCfg.getModel().startsWith("text-embedding-3")) {
+        // Ask for the configured size from every model that takes the parameter:
+        // OpenAI text-embedding-3-* and Gemini gemini-embedding-001 (via its
+        // OpenAI-compatible endpoint) both do. Only ada-002 rejects it outright.
+        // Gemini without it returns its full 3072 dimensions, which a collection
+        // created at the configured size refuses on every upsert.
+        if (embedCfg.getModel() != null && !embedCfg.getModel().contains("ada-002") && !dimensionsRefused) {
             body.put("dimensions", embedCfg.getDimensions());
         }
 
@@ -104,7 +108,7 @@ public class OpenAiEmbeddingProvider implements EmbeddingProvider {
                 JsonNode arr = n.path("embedding");
                 float[] v = new float[arr.size()];
                 for (int i = 0; i < arr.size(); i++) v[i] = (float) arr.get(i).asDouble();
-                vectors.add(v);
+                vectors.add(fitToConfiguredDimensions(v));
             }
 
             if (vectors.size() != batch.size()) {
@@ -115,6 +119,14 @@ public class OpenAiEmbeddingProvider implements EmbeddingProvider {
 
         } catch (org.springframework.web.client.HttpStatusCodeException e) {
             int code = e.getStatusCode().value();
+            // A provider that refuses the `dimensions` parameter: ask again
+            // without it; fitToConfiguredDimensions trims the full-size answer.
+            if (code == 400 && body.containsKey("dimensions") && !dimensionsRefused) {
+                dimensionsRefused = true;
+                log.warn("[AI-EMBED] {} refused the dimensions parameter — retrying without it | {}",
+                        embedCfg.getModel(), e.getResponseBodyAsString());
+                return embedBatch(batch);
+            }
             log.warn("[AI-EMBED] HTTP {} | {}", code, e.getResponseBodyAsString());
             if (code == 429) throw AiProviderException.rateLimited(key());
             throw AiProviderException.unavailable(key(), "embeddings HTTP " + code);
@@ -124,4 +136,44 @@ public class OpenAiEmbeddingProvider implements EmbeddingProvider {
             throw AiProviderException.unavailable(key(), e.getMessage());
         }
     }
+
+    /**
+     * The vector store's collection is created at the configured size and
+     * rejects anything else, so every vector must leave here at that size.
+     *
+     * Longer than configured (a provider that ignored the `dimensions`
+     * parameter): both supported families are Matryoshka-trained, so the
+     * leading components are a valid smaller embedding — keep them and
+     * re-normalise to unit length, as Google recommends for reduced Gemini
+     * sizes, so cosine scores stay comparable.
+     *
+     * Shorter than configured: there is nothing correct to pad with. Fail with
+     * a message naming the mismatch rather than letting Qdrant reject it later
+     * with "Vector dimension error".
+     */
+    private float[] fitToConfiguredDimensions(float[] v) {
+        int want = embedCfg.getDimensions();
+        if (v.length == want) return v;
+        if (v.length < want) {
+            throw new IllegalStateException("Embedding model " + embedCfg.getModel() + " returned "
+                    + v.length + " dimensions but app.ai.embedding.dimensions=" + want
+                    + ". Lower the setting to " + v.length + " or below, then recreate the collection.");
+        }
+        if (!warnedTruncation) {
+            warnedTruncation = true;
+            log.warn("[AI-EMBED] {} returned {} dimensions; truncating to the configured {} and re-normalising",
+                    embedCfg.getModel(), v.length, want);
+        }
+        float[] out = java.util.Arrays.copyOf(v, want);
+        double norm = 0;
+        for (float x : out) norm += (double) x * x;
+        norm = Math.sqrt(norm);
+        if (norm > 0) for (int i = 0; i < out.length; i++) out[i] = (float) (out[i] / norm);
+        return out;
+    }
+
+    private volatile boolean warnedTruncation;
+
+    /** Set once a provider rejects `dimensions`; later batches stop sending it. */
+    private volatile boolean dimensionsRefused;
 }

@@ -108,7 +108,7 @@ public class RbacAdminController {
                     if (!module.isBlank()) p.add(cb.equal(root.get("module"), module));
                     return p;
                 },
-                (cb, root) -> Map.of("code", root.get("code")),
+                (cb, root) -> Map.of("code", root.get("code"), "name", root.get("name")),
                 perm -> {
                     Map<String, Object> m = new LinkedHashMap<>();
                     m.put("id",           perm.getId());

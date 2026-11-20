@@ -31,11 +31,11 @@ import java.util.UUID;
 /**
  * Operator surface: prompts, corpus, usage, evals, health.
  *
- * ── SECURE THIS PROPERLY ─────────────────────────────────────────────────────
- * Prompt editing is behaviour editing for every generation in the system. These
- * routes belong behind a platform-admin permission in your existing RBAC — add
- * @PreAuthorize with the right authority once you have picked the permission
- * code, rather than relying on the path prefix.
+ * ── ACCESS ───────────────────────────────────────────────────────────────────
+ * Prompt editing is behaviour editing for every generation in the system.
+ * SecurityConfig restricts /v1/ai/admin/** to platform operators (SIDE_SYSTEM or
+ * system:write), except GET policy-variables, which the policy editor reads for
+ * every author. The @PreAuthorize on the write routes stays as a second check.
  */
 @Slf4j
 @RestController

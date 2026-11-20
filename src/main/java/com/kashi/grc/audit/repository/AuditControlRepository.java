@@ -9,6 +9,9 @@ import java.util.Optional;
 public interface AuditControlRepository extends JpaRepository<AuditControl, Long> {
     List<AuditControl> findByTenantIdIsNullOrTenantId(Long tenantId);
 
+    /** Library controls carrying any of these UCF codes. Callers filter by tenant visibility. */
+    List<AuditControl> findByCommonControlCodeIn(java.util.Collection<String> commonControlCodes);
+
     /** Indexed lookups for CSV library import upsert — were full findAll()+filter per row,
      *  reused across upsertControl, upsertControlTestMapping, upsertPolicyControlMapping. */
     Optional<AuditControl> findByNameAndTenantId(String name, Long tenantId);

@@ -13,6 +13,9 @@ public interface AuditEngagementRepository extends JpaRepository<AuditEngagement
     List<AuditEngagement> findByProjectInstanceId(Long projectInstanceId);
     boolean existsByTenantIdAndNameAndTemplateIdAndCreatedAtAfter(Long tenantId, String name, Long templateId, java.time.LocalDateTime after);
     List<AuditEngagement> findByTenantId(Long tenantId);
+
+    /** Engagements whose template snapshot never ran (recovery sweep, all tenants). */
+    List<AuditEngagement> findBySnapshotStatusAndCreatedAtBefore(String snapshotStatus, java.time.LocalDateTime before);
     Optional<AuditEngagement> findByTenantIdAndWorkflowInstanceId(Long tenantId, Long workflowInstanceId);
 
     // nextEngagementRefSequence(tenantId) is declared in

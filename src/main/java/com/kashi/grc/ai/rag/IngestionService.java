@@ -218,8 +218,13 @@ public class IngestionService {
      * Re-embed everything built with a stale model or dimension. Run after
      * changing app.ai.embedding.* — the reason those two columns are on the
      * chunk row in the first place.
+     *
+     * Deliberately NOT one transaction: each batch is upserted to the vector
+     * store and then saved, so a failure part-way keeps the batches already
+     * done instead of rolling MySQL back while their points sit in Qdrant.
+     * A rate-limited batch waits and retries (free-tier Gemini allows 100
+     * embedding requests a minute, and each text in a batch counts as one).
      */
-    @Transactional
     public void reindexStale() {
         List<AiDocumentChunk> stale = chunkRepository.findStaleVectors(
                 embeddingProvider.model(), embeddingProvider.dimensions());
@@ -231,7 +236,7 @@ public class IngestionService {
         int batch = props.getEmbedding().getBatchSize();
         for (int i = 0; i < stale.size(); i += batch) {
             List<AiDocumentChunk> slice = stale.subList(i, Math.min(stale.size(), i + batch));
-            List<float[]> vectors = embeddingProvider.embed(slice.stream().map(AiDocumentChunk::getContent).toList());
+            List<float[]> vectors = embedWithBackoff(slice.stream().map(AiDocumentChunk::getContent).toList());
 
             List<VectorStore.VectorPoint> points = new ArrayList<>();
             for (int j = 0; j < slice.size(); j++) {
@@ -244,7 +249,7 @@ public class IngestionService {
                         c.getVectorId(), vectors.get(j), c.getTenantScope(),
                         c.getSourceType().name(), c.getSourceId(), c.getId(),
                         Map.of("sourceRef", String.valueOf(c.getSourceRef()),
-                               "sectionPath", String.valueOf(c.getSectionPath()))));
+                                "sectionPath", String.valueOf(c.getSectionPath()))));
             }
             vectorStore.upsert(points);
             chunkRepository.saveAll(slice);
@@ -253,6 +258,28 @@ public class IngestionService {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static final int  RATE_LIMIT_ATTEMPTS = 6;
+    private static final long RATE_LIMIT_WAIT_MS  = 35_000L;   // provider asks for ~30 s
+
+    /** Embed, waiting out rate limits instead of abandoning the whole run. */
+    private List<float[]> embedWithBackoff(List<String> texts) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return embeddingProvider.embed(texts);
+            } catch (com.kashi.grc.ai.provider.AiProviderException e) {
+                if (!"AI_RATE_LIMITED".equals(e.getErrorCode()) || attempt >= RATE_LIMIT_ATTEMPTS) throw e;
+                log.info("[AI-INGEST] embedding rate-limited — waiting {}s (attempt {}/{})",
+                        RATE_LIMIT_WAIT_MS / 1000, attempt, RATE_LIMIT_ATTEMPTS);
+                try {
+                    Thread.sleep(RATE_LIMIT_WAIT_MS);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
 
     /**
      * Quarantined content is stored but never indexed. Keeping it is not

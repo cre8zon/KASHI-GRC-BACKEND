@@ -35,6 +35,9 @@ public final class AiEnums {
         ASSESSMENT_ANSWER_SUGGEST,
         ISSUE_REMEDIATION_PLAN,
 
+        // ── KashiGuard AI (the in-app agent) ────────────────────────────────
+        AGENT_ANSWER,            // read-only question over the tenant's own records, cited
+
         // ── Content platform ────────────────────────────────────────
         // Its own block, not appended to the policy group, because the risk
         // profile differs: policy output goes to one customer's reviewer,

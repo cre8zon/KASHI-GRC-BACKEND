@@ -64,6 +64,7 @@ public class PolicyContextAssembler {
     private final RetrievalService        retrievalService;
     private final PolicyTemplatePlaceholders placeholders;
     private final ObjectMapper            mapper;
+    private final PolicyRoleRegister      roleRegister;
 
     @PersistenceContext
     private EntityManager em;
@@ -143,7 +144,7 @@ public class PolicyContextAssembler {
         }
 
         return new PolicyContext(
-                buildOrgBlock(profile, frameworks),
+                buildOrgBlock(profile, frameworks, roleRegister.currentRoleKeysByTitle(tenantId).keySet()),
                 buildControlBlock(controls),
                 retrievedBlock, chunkIds, allowed, titles, profile, grounded);
     }
@@ -159,7 +160,7 @@ public class PolicyContextAssembler {
      * holds cardholder data when it does not is a false compliance statement in
      * the customer's own document set.
      */
-    private String buildOrgBlock(AiOrgProfile p, List<String> frameworks) {
+    private String buildOrgBlock(AiOrgProfile p, List<String> frameworks, java.util.Collection<String> registerRoles) {
         if (p == null) {
             return """
                    ORGANISATION CONTEXT
@@ -199,9 +200,28 @@ public class PolicyContextAssembler {
         line(sb, "Ticketing", p.getTicketingSystem());
         if (Boolean.TRUE.equals(p.getHasOnPremise())) line(sb, "Also operates", "on-premise infrastructure");
 
-        sb.append("\nACCOUNTABLE ROLES (name these where the policy assigns responsibility)\n");
-        line(sb, "Security owner", join(p.getSecurityOwnerName(), p.getSecurityOwnerTitle()));
-        line(sb, "Privacy officer", p.getPrivacyOfficerName());
+        /*
+         * Roles, never names. A policy that says "Priyanka Paridhi reviews…" is
+         * wrong the day she changes job and needs re-approval to fix; "the CISO
+         * reviews…" stays true. The holder's name is added when the policy is
+         * read ({{role_<key>}}, PolicyRoleRegister), and the approval record
+         * keeps its own names. So the model is given titles only.
+         */
+        LinkedHashSet<String> titles = new LinkedHashSet<>(registerRoles);
+        String ownerTitle = notBlankOr(p.getSecurityOwnerTitle(),
+                p.getSecurityOwnerName() != null && !p.getSecurityOwnerName().isBlank() ? "Security Owner" : null);
+        if (ownerTitle != null && titles.stream().noneMatch(t -> t.equalsIgnoreCase(ownerTitle))) titles.add(ownerTitle);
+        if (p.getPrivacyOfficerName() != null && !p.getPrivacyOfficerName().isBlank()
+                && titles.stream().noneMatch(t -> t.toLowerCase().contains("privacy"))) titles.add("Privacy Officer");
+        if (!titles.isEmpty()) {
+            sb.append("\nACCOUNTABLE ROLES\n")
+              .append("Assign every responsibility to one of these role titles, written exactly as given. ")
+              .append("Refer to people by role title only and never write a personal name — the current ")
+              .append("holder's name is added automatically when the policy is read. Use as few roles as ")
+              .append("the policy needs; developers and all personnel may be referred to generically.\n");
+            titles.forEach(t -> sb.append("- ").append(t).append('\n'));
+            if (ownerTitle != null) line(sb, "Owns information security", ownerTitle);
+        }
         line(sb, "Security contact", p.getSecurityContactEmail());
         line(sb, "Incident reporting", p.getIncidentContactEmail());
 
@@ -211,17 +231,31 @@ public class PolicyContextAssembler {
 
         // Customer-authored facts. In practice the most-used field on the profile.
         if (p.getCustomFactsJson() != null && !p.getCustomFactsJson().isBlank()) {
-            try {
-                JsonNode facts = mapper.readTree(p.getCustomFactsJson());
-                if (facts.isArray() && facts.size() > 0) {
-                    sb.append("\nADDITIONAL ORGANISATION FACTS\n");
-                    for (JsonNode f : facts) {
-                        sb.append("- ").append(f.path("label").asText("")).append(": ")
-                                .append(f.path("value").asText("")).append('\n');
+            // Stored as JSON [{label,value}] by older clients, but the profile
+            // screen collects plain sentences. Parsing only the JSON form
+            // silently dropped every fact typed on that screen.
+            String raw = p.getCustomFactsJson().trim();
+            boolean added = false;
+            if (raw.startsWith("[")) {
+                try {
+                    JsonNode facts = mapper.readTree(raw);
+                    if (facts.isArray() && facts.size() > 0) {
+                        sb.append("\nADDITIONAL ORGANISATION FACTS\n");
+                        for (JsonNode f : facts) {
+                            sb.append("- ").append(f.path("label").asText("")).append(": ")
+                                    .append(f.path("value").asText("")).append('\n');
+                        }
+                        added = true;
                     }
+                } catch (Exception e) {
+                    log.debug("[AI-POLICY-CTX] custom facts not JSON, using as text");
                 }
-            } catch (Exception e) {
-                log.debug("[AI-POLICY-CTX] custom facts JSON unparseable, skipped");
+            }
+            if (!added) {
+                sb.append("\nADDITIONAL ORGANISATION FACTS (true of this organisation; state them where relevant)\n");
+                for (String line : raw.split("\\r?\\n")) {
+                    if (!line.isBlank()) sb.append("- ").append(line.trim()).append('\n');
+                }
             }
         }
 
@@ -368,6 +402,47 @@ public class PolicyContextAssembler {
      * never ISO or AICPA requirement text, which is copyrighted.
      */
     @Transactional(readOnly = true)
+    /**
+     * Framework clauses the given controls satisfy, grouped by framework and
+     * sorted: {"ISO27001": [A.8.25, A.8.28], "SOC2": [CC8.1]}. Feeds the
+     * "Framework references" section of a generated policy, which auditors read
+     * first to see what a document is meant to evidence.
+     */
+    public Map<String, java.util.SortedSet<String>> frameworkReferences(List<String> controlCodes,
+                                                                     List<String> frameworks) {
+        Map<String, java.util.SortedSet<String>> out = new java.util.TreeMap<>();
+        if (controlCodes == null || controlCodes.isEmpty()) return out;
+        List<Object[]> rows = em.createQuery("""
+                select m.frameworkRef, m.citation
+                from CommonControlMapping m
+                where m.commonControlCode in :codes and m.active = true
+                  and (:noFw = true or m.frameworkRef in :frameworks)
+                """, Object[].class)
+                .setParameter("codes", controlCodes)
+                .setParameter("noFw", frameworks == null || frameworks.isEmpty())
+                .setParameter("frameworks", frameworks == null || frameworks.isEmpty() ? List.of("") : frameworks)
+                .getResultList();
+        for (Object[] r : rows) {
+            if (r[0] == null || r[1] == null) continue;
+            out.computeIfAbsent(String.valueOf(r[0]), k -> new java.util.TreeSet<>(NATURAL))
+               .add(String.valueOf(r[1]));
+        }
+        return out;
+    }
+
+    /** A.5.9 before A.5.10: compare digit runs as numbers. */
+    private static final java.util.Comparator<String> NATURAL = (a, b) -> {
+        String[] x = a.split("(?<=\\D)(?=\\d)|(?<=\\d)(?=\\D)");
+        String[] y = b.split("(?<=\\D)(?=\\d)|(?<=\\d)(?=\\D)");
+        for (int i = 0; i < Math.min(x.length, y.length); i++) {
+            int c = (x[i].matches("\\d+") && y[i].matches("\\d+"))
+                    ? Long.compare(Long.parseLong(x[i]), Long.parseLong(y[i]))
+                    : x[i].compareTo(y[i]);
+            if (c != 0) return c;
+        }
+        return Integer.compare(x.length, y.length);
+    };
+
     public Map<String, String> citationsFor(List<String> controlCodes, List<String> frameworks) {
         Map<String, String> out = new LinkedHashMap<>();
         if (controlCodes == null || controlCodes.isEmpty()) return out;
@@ -529,6 +604,10 @@ public class PolicyContextAssembler {
 
     private void line(StringBuilder sb, String label, String value) {
         if (value != null && !value.isBlank()) sb.append("- ").append(label).append(": ").append(value).append('\n');
+    }
+
+    private static String notBlankOr(String a, String fallback) {
+        return a != null && !a.isBlank() ? a.trim() : fallback;
     }
 
     private String join(String a, String b) {

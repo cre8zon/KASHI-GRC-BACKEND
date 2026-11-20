@@ -86,7 +86,8 @@ public class ModuleBlueprintController {
                     }
                     return p;
                 },
-                (cb, root) -> Map.of("sortorder", root.get("sortOrder"), "displayname", root.get("displayName")),
+                (cb, root) -> Map.of("sortorder", root.get("sortOrder"), "displayname", root.get("displayName"),
+                        "entitytype", root.get("entityType")),
                 this::toDetailMap)));
     }
 

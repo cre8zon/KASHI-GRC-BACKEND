@@ -7,4 +7,7 @@ import java.util.Optional;
 @Repository
 public interface AuditEngagementTemplateInstanceRepository extends JpaRepository<AuditEngagementTemplateInstance, Long> {
     Optional<AuditEngagementTemplateInstance> findByEngagementId(Long engagementId);
+
+    /** Whether the engagement's template has already been snapshotted (retry guard). */
+    boolean existsByEngagementId(Long engagementId);
 }

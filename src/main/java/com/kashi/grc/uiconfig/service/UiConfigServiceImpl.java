@@ -550,6 +550,49 @@ public class UiConfigServiceImpl implements UiConfigService {
         return true;
     }
 
+    @Override
+    @Transactional(readOnly = true)
+    public Boolean callerMayInvokeActionEndpoint(String httpMethod, String path) {
+        User user = utilityService.getLoggedInDataContext();
+        List<UiAction> bound = actionRepository.findAllByTenant(user.getTenantId()).stream()
+                .filter(a -> Boolean.TRUE.equals(a.getIsActive()))
+                .filter(a -> httpMethod.equalsIgnoreCase(
+                        a.getHttpMethod() == null || a.getHttpMethod().isBlank() ? "POST" : a.getHttpMethod().trim()))
+                .filter(a -> endpointMatches(a.getApiEndpoint(), path))
+                .toList();
+        if (bound.isEmpty()) return null;
+
+        Set<String> sides = extractSides(user);
+        Set<String> perms = extractPermissions(user);
+        // Any one row is enough: the same action is sometimes inserted once per
+        // role or per screen, and the button shows if any of them is visible.
+        // Status is left to the service, which refuses an illegal transition.
+        return bound.stream().anyMatch(a -> isActionVisible(a, sides, perms, null));
+    }
+
+    /**
+     * '/v1/risks/{id}/accept' against '/v1/risks/42/accept'. A placeholder
+     * matches exactly one segment; any query string on the template is ignored.
+     */
+    private static boolean endpointMatches(String template, String path) {
+        if (template == null || template.isBlank() || path == null) return false;
+        String t = template.trim();
+        int q = t.indexOf('?');
+        if (q >= 0) t = t.substring(0, q);
+        String[] ts = trimSlash(t).split("/");
+        String[] ps = trimSlash(path).split("/");
+        if (ts.length != ps.length) return false;
+        for (int i = 0; i < ts.length; i++) {
+            boolean placeholder = ts[i].startsWith("{") && ts[i].endsWith("}");
+            if (placeholder ? ps[i].isEmpty() : !ts[i].equals(ps[i])) return false;
+        }
+        return true;
+    }
+
+    private static String trimSlash(String s) {
+        return s.endsWith("/") && s.length() > 1 ? s.substring(0, s.length() - 1) : s;
+    }
+
     private boolean isActionVisible(UiAction a, Set<String> sides,
                                     Set<String> perms, String entityStatus) {
         if (a.getRequiredPermission() != null && !a.getRequiredPermission().isBlank()) {
