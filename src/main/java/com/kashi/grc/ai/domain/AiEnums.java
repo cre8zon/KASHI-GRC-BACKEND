@@ -38,6 +38,12 @@ public final class AiEnums {
         // ── KashiGuard AI (the in-app agent) ────────────────────────────────
         AGENT_ANSWER,            // read-only question over the tenant's own records, cited
 
+        // ── Website assistant (www.kashiguard.com chat) ─────────────────────
+        // Public and anonymous: answers only from the website's own pages and
+        // published posts, never from any tenant's data.
+        SITE_ASSISTANT_ANSWER,   // a visitor's question -> cited answer + handover hint
+        SITE_ASSISTANT_SUMMARY,  // a chat being handed to a person -> summary, topic, type
+
         // ── Content platform ────────────────────────────────────────
         // Its own block, not appended to the policy group, because the risk
         // profile differs: policy output goes to one customer's reviewer,
@@ -96,7 +102,12 @@ public final class AiEnums {
         VENDOR_DOCUMENT,     // vendor SOC 2 / questionnaire response
         ASSESSMENT_RESPONSE,
         UPLOADED_LEGACY_POLICY,
-        KNOWLEDGE_NOTE       // free-text org knowledge captured by the customer
+        KNOWLEDGE_NOTE,      // free-text org knowledge captured by the customer
+        // Public website content for the website assistant. Platform-wide
+        // (no tenant). Every in-app caller names the types it wants, so these
+        // never reach a tenant's answers.
+        WEBSITE_PAGE,        // a page of www.kashiguard.com (SiteChatSourcePage.id)
+        WEBSITE_POST         // a published blog/glossary/resource post (Post.id)
     }
 
     /**
