@@ -1,4 +1,3 @@
-
 package com.kashi.grc.common.kafka.config;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -14,10 +13,11 @@ import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnExpression;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.kafka.annotation.EnableKafka;
@@ -35,11 +35,38 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Kafka wiring for Confluent Cloud (SASL_SSL), the twin of KafkaConfig.
+ *
+ * Same beans, same names, same topics; it adds the SASL/TLS client settings
+ * Confluent needs to every client (producer, consumer, admin) and declares
+ * topics with replication factor 3, which Confluent Cloud requires.
+ *
+ * ── WHICH ONE LOADS ────────────────────────────────────────────────────────
+ * Both classes define producerFactory, kafkaTemplate, consumerFactory and so
+ * on, so exactly one may load, or startup fails on duplicate bean names:
+ *
+ *   kashi.kafka.enabled=true + kashi.kafka.provider=confluent → this class
+ *   kashi.kafka.enabled=true + provider unset or local         → KafkaConfig
+ *   kashi.kafka.enabled=false                                  → neither
+ *
+ * ── PROPERTIES ─────────────────────────────────────────────────────────────
+ *   spring.kafka.bootstrap-servers                 pkc-xxxx.<region>.aws.confluent.cloud:9092
+ *   spring.kafka.properties.sasl.jaas.config       org.apache.kafka.common.security.plain.PlainLoginModule required username='<API_KEY>' password='<API_SECRET>';
+ *   spring.kafka.properties.security.protocol      SASL_SSL (default)
+ *   spring.kafka.properties.sasl.mechanism         PLAIN (default)
+ * Put the API key and secret in the environment, never in the properties file.
+ *
+ * A topic missing from the cluster is created at startup only if the API key
+ * may create topics. If it may not, create the topics below (and their -dlt
+ * twins) in the Confluent console first: a listener on a missing topic gets
+ * no messages.
+ */
 @Slf4j
 @EnableKafka
 @Configuration
 @RequiredArgsConstructor
-@ConditionalOnProperty(name = "kashi.kafka.enabled", havingValue = "true")
+@ConditionalOnExpression("${kashi.kafka.enabled:false} and '${kashi.kafka.provider:local}' == 'confluent'")
 public class KafkaConfigConfluent {
 
     private final ObjectMapper objectMapper;
@@ -229,8 +256,45 @@ public class KafkaConfigConfluent {
     kafkaListenerContainerFactory(
             KafkaTemplate<String, KafkaEventEnvelope> template) {
 
+        // ── DLT PARTITION: -1, NOT THE SOURCE PARTITION ────────────────────
+        //
+        // Spring Kafka's default destination resolver sends a failed record to
+        // "<topic>-dlt" AT THE SAME PARTITION NUMBER. That silently requires
+        // every DLT to have at least as many partitions as its source topic,
+        // and nothing enforces it.
+        //
+        // On 17 Nov that assumption broke. kashigrc.email.requested had SIX
+        // partitions on the cluster while its -dlt had three, and the result
+        // was not a lost message but a wedged partition:
+        //
+        //   TimeoutException: Partition 5 of topic kashigrc.email.requested-dlt
+        //   with partition count 3 is not present in metadata after 3000 ms
+        //
+        //   SES send fails → recoverer publishes to -dlt partition 5 → there is
+        //   no partition 5 → sendOrThrow throws → the record is NOT recovered →
+        //   DefaultErrorHandler seeks back → the same offset is consumed again,
+        //   every ~23 seconds, forever.
+        //
+        // Both stuck records sat at OFFSET 0 (email.requested-3@0 and -5@0), so
+        // partitions 3, 4 and 5 had never advanced. Every event that hashed to
+        // them was queued behind a record that could never be processed — the
+        // exact failure the class javadoc on KafkaConfig promises cannot happen
+        // ("a poison message can never block a partition").
+        //
+        // Passing -1 as the partition hands the choice to the producer's
+        // partitioner, which places the record by key within whatever
+        // partitions the DLT actually has. Records keep their keys, so related
+        // messages still land together; they simply no longer need a partition
+        // index that may not exist.
+        //
+        // This is deliberately a code fix rather than widening the DLT to six
+        // partitions. Matching counts works until the next time they drift, and
+        // nothing in the build would notice — partitions can be added to a topic
+        // by anyone, at any time, and never removed.
         DeadLetterPublishingRecoverer recoverer =
-                new DeadLetterPublishingRecoverer(template);
+                new DeadLetterPublishingRecoverer(
+                        template,
+                        (rec, ex) -> new TopicPartition(rec.topic() + "-dlt", -1));
 
         org.springframework.kafka.listener.ConsumerRecordRecoverer countingRecoverer =
                 (record, exception) -> {
@@ -271,6 +335,12 @@ public class KafkaConfigConfluent {
         factory.setCommonErrorHandler(errorHandler);
         factory.setConcurrency(concurrency);
 
+        // Without this, one SASL failure (a key still propagating, a rotated
+        // secret, a brief Confluent auth outage) stops every listener for good
+        // and only a restart brings them back. With it, they keep retrying
+        // every 30 s and resume on their own once authentication succeeds.
+        factory.getContainerProperties().setAuthExceptionRetryInterval(java.time.Duration.ofSeconds(30));
+
         return factory;
     }
 
@@ -286,6 +356,14 @@ public class KafkaConfigConfluent {
     // ─────────────────────────────────────────────
     // Topic Declarations
     // Replication factor 3 for Confluent Cloud
+    //
+    // These numbers are a FLOOR, not a fact. KafkaAdmin will create a missing
+    // topic with the partition count below and will ADD partitions to one that
+    // has fewer, but it can never reduce a topic that already has more — which
+    // is why kashigrc.email.requested sits at six on the cluster while this
+    // file says three, and logs "exists but has a different partition count"
+    // at every startup. Harmless in itself; see the DLT note above for what it
+    // cost when the recoverer depended on the two matching.
     // ─────────────────────────────────────────────
 
     @Bean

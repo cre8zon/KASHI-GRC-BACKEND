@@ -174,6 +174,124 @@ public class EnquiryService {
         return accepted(e.getReference(), type);
     }
 
+    // ══════════════════════ WEBSITE ASSISTANT HANDOVER ════════════════════════
+
+    /** Enquiry channel for chats handed over by the website assistant. */
+    public static final String CHANNEL_CHAT = "CHAT";
+
+    /**
+     * A website chat being handed to a person. Same rules as the form: the
+     * same validation, the same duplicate folding (the same person and type
+     * within the hour is added to the open enquiry), the same acknowledgement
+     * email. The chat's own rate limits and honeypot run in
+     * SiteAssistantService before this is called.
+     *
+     * {@code r.message} carries the AI's summary; the transcript itself stays
+     * in the chat tables and is shown beside the enquiry in the inbox.
+     *
+     * @return id, reference and the message to show the visitor
+     */
+    @Transactional
+    public Map<String, Object> submitFromChat(EnquirySubmitRequest r, String priority, String ipHash, String userAgent) {
+        String type = r.getType() == null ? "GENERAL" : r.getType().trim().toUpperCase();
+        if (!TYPES.contains(type) || "WORKFLOW_REQUEST".equals(type)) type = "GENERAL";
+
+        Map<String, String> errors = validate(r, type);
+        if (!errors.isEmpty()) {
+            Map<String, Object> details = new LinkedHashMap<>();
+            details.put("fieldErrors", errors);
+            throw new BusinessException("ENQUIRY_INVALID",
+                    errors.size() == 1 ? errors.values().iterator().next() : "Please check the highlighted fields.",
+                    HttpStatus.UNPROCESSABLE_ENTITY, details);
+        }
+
+        String email = r.getEmail().trim().toLowerCase();
+        Optional<Enquiry> open = enquiryRepository.findFirstByEmailAndStatusInOrderByIdDesc(email, OPEN);
+        if (open.isPresent() && open.get().getEnquiryType().equals(type)
+                && open.get().getCreatedAt() != null
+                && open.get().getCreatedAt().isAfter(LocalDateTime.now().minusHours(1))) {
+            Enquiry e = open.get();
+            activity(e, "NOTE", "Asked again from the website chat"
+                    + (blank(r.getMessage()) ? "." : ":\n" + trim(r.getMessage(), 5000)), null, null, null);
+            touch(e);
+            enquiryRepository.save(e);
+            return chatAccepted(e, type);
+        }
+
+        String prio = PRIORITIES.contains(up(priority)) ? up(priority) : "NORMAL";
+        Enquiry e = Enquiry.builder()
+                .reference(uniqueReference())
+                .enquiryType(type)
+                .channel(CHANNEL_CHAT)
+                .priority(prio)
+                .fullName(trim(r.getFullName(), 150))
+                .email(email)
+                .company(trim(r.getCompany(), 200))
+                .topic(trim(r.getTopic(), 60))
+                .subject(trim(r.getSubject(), 200))
+                .message(trim(r.getMessage(), 5000))
+                .sourcePage(trim(r.getSourcePage(), 512))
+                .landingPage(trim(r.getLandingPage(), 512))
+                .referrer(trim(r.getReferrer(), 512))
+                .utmSource(trim(r.getUtmSource(), 100))
+                .utmMedium(trim(r.getUtmMedium(), 100))
+                .utmCampaign(trim(r.getUtmCampaign(), 150))
+                .utmTerm(trim(r.getUtmTerm(), 150))
+                .utmContent(trim(r.getUtmContent(), 150))
+                .marketingConsent(Boolean.TRUE.equals(r.getMarketingConsent()))
+                .consentAt(Boolean.TRUE.equals(r.getMarketingConsent()) ? LocalDateTime.now() : null)
+                .ipHash(ipHash)
+                .userAgent(trim(userAgent, 255))
+                .duplicateOfId(open.map(Enquiry::getId).orElse(null))
+                .lastActivityAt(LocalDateTime.now())
+                .build();
+        userRepository.findByEmail(email).map(User::getTenantId).ifPresent(e::setMatchedTenantId);
+
+        enquiryRepository.save(e);
+        activity(e, "RECEIVED", "Handed over from the website chat"
+                + (e.getSourcePage() == null ? "" : " on " + e.getSourcePage()), null, "NEW", null);
+        events.publishEvent(new EnquiryEvents.Received(e.getId()));
+        log.info("[ENQUIRY] received from chat | ref={} type={} priority={}", e.getReference(), type, prio);
+        return chatAccepted(e, type);
+    }
+
+    private Map<String, Object> chatAccepted(Enquiry e, String type) {
+        Map<String, Object> m = accepted(e.getReference(), type);
+        m.put("id", e.getId());
+        return m;
+    }
+
+    /**
+     * The team replied to a chat visitor (in the chat and by email). Recorded
+     * on the timeline like any reply: the first one starts the response clock
+     * and moves a New enquiry to In progress.
+     */
+    @Transactional
+    public void recordChatReply(Long enquiryId, String body, Long actorId) {
+        Enquiry e = require(enquiryId);
+        activity(e, "EMAIL", "Replied to the visitor in the chat and by email:\n" + trim(body, 10_000), null, null, actorId);
+        firstResponse(e);
+        if ("NEW".equals(e.getStatus())) {
+            activity(e, "STATUS", null, "NEW", "IN_PROGRESS", actorId);
+            e.setStatus("IN_PROGRESS");
+        }
+        touch(e);
+        enquiryRepository.save(e);
+    }
+
+    /** The visitor wrote again in the chat after it was handed over. */
+    @Transactional
+    public void recordChatFollowUp(Long enquiryId, String body) {
+        Enquiry e = enquiryRepository.findById(enquiryId).orElse(null);
+        if (e == null) return;
+        activity(e, "NOTE", "The visitor wrote in the website chat:\n" + trim(body, 5000), null, null, null);
+        touch(e);
+        enquiryRepository.save(e);
+    }
+
+    /** The same salted hash the form stores, for the chat's own rate limits. */
+    public String hashIp(String ip) { return hash(ip); }
+
     // ══════════════════════ SIGNED-IN: CUSTOM WORKFLOW REQUEST ════════════════
 
     /**
@@ -522,6 +640,7 @@ public class EnquiryService {
         m.put("id", e.getId());
         m.put("reference", e.getReference());
         m.put("type", e.getEnquiryType());
+        m.put("channel", e.getChannel());
         m.put("status", e.getStatus());
         m.put("priority", e.getPriority());
         m.put("fullName", e.getFullName());

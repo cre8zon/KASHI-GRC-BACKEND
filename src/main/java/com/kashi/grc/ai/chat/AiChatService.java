@@ -257,11 +257,24 @@ public class AiChatService {
         }
         request.addMessage(LlmMessage.user(redUser.redactedText()));
 
+        // Failover: same-vendor fallback models always; other vendors only when
+        // neither the caller nor the tenant pinned one; nothing when the caller
+        // pinned the exact model (eval runs).
+        boolean providerPinned = !isBlank(call.providerOverride)
+                || (profile != null && !isBlank(profile.getPreferredProvider())
+                && providerRegistry.configuredKeys().contains(profile.getPreferredProvider().toLowerCase()));
+        boolean modelPinned = !isBlank(call.modelOverride);
+        var chain = providerRegistry.chain(provider, model, providerPinned, modelPinned,
+                Boolean.TRUE.equals(template.getPreferFastModel()));
+
         LlmResponse response;
         try {
-            response = onToken == null
-                    ? providerRegistry.completeWithRetry(provider, request)
-                    : providerRegistry.streamOrFallback(provider, request, onToken);
+            var served = onToken == null
+                    ? providerRegistry.completeWithFailover(chain, request)
+                    : providerRegistry.streamWithFailover(chain, request, onToken);
+            response = served.response();
+            provider = served.provider();     // record and bill what actually answered
+            model    = served.model();
         } catch (RuntimeException e) {
             Long id = recorder.recordFailure(new AiInteractionRecorder.FailureRecord(
                     call.taskType, call.pipelineName, call.stepIndex, call.stepName,
@@ -270,7 +283,8 @@ public class AiChatService {
                     call.entityType, call.entityId, correlationId, call.parentInteractionId,
                     call.userId, call.tenantId, call.evalRun,
                     System.currentTimeMillis() - started), e);
-            log.error("[AI-CHAT] {} failed | interaction={} | {}", call.templateKey, id, e.getMessage());
+            log.error("[AI-CHAT] {} failed | interaction={} | {}", call.templateKey, id,
+                    e instanceof com.kashi.grc.ai.provider.AiProviderException pe ? pe.getDetail() : e.getMessage());
             throw e;
         }
 
@@ -394,6 +408,8 @@ public class AiChatService {
     }
 
     private static int nz(Integer i) { return i == null ? 0 : i; }
+
+    private static boolean isBlank(String s) { return s == null || s.isBlank(); }
 
     private static String firstNonBlank(String... vals) {
         for (String v : vals) if (v != null && !v.isBlank()) return v;

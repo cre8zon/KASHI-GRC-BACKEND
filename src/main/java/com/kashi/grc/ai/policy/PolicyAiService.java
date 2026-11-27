@@ -22,8 +22,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -61,6 +65,17 @@ public class PolicyAiService {
     private final PolicyTemplatePlaceholders placeholders;
     private final AiProperties             props;
     private final ObjectMapper             mapper;
+    private final com.kashi.grc.ai.repository.AiOrgProfileRepository orgProfileRepository;
+    private final PolicyRoleRegister       roleRegister;
+
+    /**
+     * How many candidate controls the metadata step shows the model. The
+     * framework scope can return 200; at ~190 tokens each that was a ~38k-token
+     * prompt for a title-and-tags suggestion, and the main cause of 30 s+
+     * responses. The shortlist is ranked against the user's own words first.
+     */
+    @org.springframework.beans.factory.annotation.Value("${app.ai.policy.metadata-max-controls:40}")
+    private int metadataMaxControls;
 
     // ══════════════════════════════════════════════════════════════════════════
     // METADATA — the CREATE path, before any policy row exists
@@ -99,14 +114,16 @@ public class PolicyAiService {
                         .var("intent", req.getIntent())
                         .var("frameworks", req.getFrameworks() == null || req.getFrameworks().isEmpty()
                                 ? "not specified" : String.join(", ", req.getFrameworks()))
-                        .var("availableControls", contextAssembler.buildCandidateBlock(candidates)));
+                        .var("availableControls", contextAssembler.buildCandidateBlock(
+                                shortlist(candidates, req.getIntent(), metadataMaxControls))));
 
         JsonNode json = r.json();
+        boolean uk = british(tenantId);
         MetadataResponse out = new MetadataResponse();
-        out.setTitle(json.path("title").asText(null));
-        out.setDescription(json.path("description").asText(null));
-        out.setOwnerTeam(json.path("ownerTeam").asText(null));
-        out.setRationale(json.path("rationale").asText(null));
+        out.setTitle(spell(json.path("title").asText(null), uk));
+        out.setDescription(spell(json.path("description").asText(null), uk));
+        out.setOwnerTeam(ownerAsRole(tenantId, json.path("ownerTeam").asText(null)));
+        out.setRationale(spell(json.path("rationale").asText(null), uk));
         out.setReviewFrequencyMonths(json.path("reviewFrequencyMonths").asInt(12));
         out.setInteractionId(r.interactionId());
 
@@ -329,7 +346,7 @@ public class PolicyAiService {
 
         RewriteResponse out = new RewriteResponse();
         out.setOriginalText(req.getSelectedText());
-        out.setRewrittenText(r.content() == null ? null : r.content().trim());
+        out.setRewrittenText(r.content() == null ? null : spell(r.content().trim(), british(tenantId)));
         out.setInteractionId(r.interactionId());
         return out;
     }
@@ -551,7 +568,20 @@ public class PolicyAiService {
                 mappings.add(ms);
             }
             out.setSuggestedControls(mappings);
-            out.setContentHtml(htmlRenderer.render(out));
+            // Framework references come from the catalogue's mappings for the
+            // controls this draft addresses — never from model text.
+            List<String> addressed = mappings.stream().map(MappingSuggestion::getControlCode).toList();
+            List<String> fws = req.getFrameworks() == null || req.getFrameworks().isEmpty() ? null : req.getFrameworks();
+            out.setContentHtml(htmlRenderer.render(out, contextAssembler.frameworkReferences(addressed, fws),
+                    roleRegister.currentRoleKeysByTitle(ctx.getTenantId())));
+
+            // The profile's spelling setting, enforced rather than requested —
+            // see BritishSpelling. No profile means the product default, British.
+            PolicyContextAssembler.PolicyContext spc =
+                    (PolicyContextAssembler.PolicyContext) ctx.get("policyContext");
+            if (spc == null || isBritish(spc.profile())) {
+                out.setContentHtml(BritishSpelling.html(out.getContentHtml()));
+            }
 
             /*
              * Placeholders that survived into the finished draft. The prompt
@@ -625,5 +655,107 @@ public class PolicyAiService {
     private static String truncate(String s, int n) {
         if (s == null) return "";
         return s.length() <= n ? s : s.substring(0, n) + "\n[...truncated]";
+    }
+
+    // ── Metadata shortlist ────────────────────────────────────────────────────
+
+    private static final Set<String> STOP = Set.of(
+            "the", "and", "for", "with", "that", "this", "from", "are", "our", "how", "who", "what",
+            "when", "all", "any", "has", "have", "will", "must", "should", "into", "out", "its",
+            "policy", "policies", "procedure", "process", "ensure", "within", "before", "after");
+
+    /**
+     * Ranks candidates by overlap with the user's description and keeps the top
+     * `max`. Words are compared on their first four letters, so "secure",
+     * "security" and "securely" meet, as do "test" and "testing". Title hits
+     * weigh three times a description hit. Controls with no overlap keep their
+     * original (framework) order behind the matches, so a vague description
+     * still gets a spread of controls rather than nothing.
+     *
+     * Deliberately lexical: no extra model or embedding call, so it adds
+     * microseconds, not seconds. The model still chooses; this only decides
+     * what it reads. Validation still checks citations against the FULL
+     * candidate list, so nothing real is ever rejected because of the cut.
+     */
+    static List<CommonControl> shortlist(List<CommonControl> candidates, String intent, int max) {
+        if (candidates.size() <= max || max <= 0) return candidates;
+        Set<String> terms = stems(intent);
+        if (terms.isEmpty()) return candidates.subList(0, max);
+
+        record Scored(CommonControl c, int score, int order) {}
+        List<Scored> scored = new ArrayList<>(candidates.size());
+        for (int i = 0; i < candidates.size(); i++) {
+            CommonControl c = candidates.get(i);
+            Set<String> title = stems(c.getTitle());
+            Set<String> desc  = stems(c.getDescription());
+            int score = 0;
+            for (String t : terms) {
+                if (title.contains(t)) score += 3;
+                else if (desc.contains(t)) score += 1;
+            }
+            scored.add(new Scored(c, score, i));
+        }
+        scored.sort((a, b) -> a.score() != b.score()
+                ? Integer.compare(b.score(), a.score())
+                : Integer.compare(a.order(), b.order()));
+        return scored.subList(0, max).stream().map(Scored::c).toList();
+    }
+
+    private static Set<String> stems(String text) {
+        Set<String> out = new java.util.HashSet<>();
+        if (text == null) return out;
+        for (String w : text.toLowerCase().split("[^a-z0-9]+")) {
+            if (w.length() < 3 || STOP.contains(w)) continue;
+            out.add(w.length() > 4 ? w.substring(0, 4) : w);
+        }
+        return out;
+    }
+
+    // ── Spelling ──────────────────────────────────────────────────────────────
+
+    /** The tenant's spelling setting; no profile row means the product default, British. */
+    /**
+     * The metadata prompt asks for a function ("Engineering", "IT Security").
+     * Where the tenant has a policy role for that function, the owner becomes
+     * the role, so the policy has an accountable owner whose name follows the
+     * register. Matching is deterministic: same title, then a role sharing the
+     * function's word ("Engineering" -> "Engineering Lead"), then security
+     * functions -> the role that owns information security. No match keeps the
+     * suggestion as it was; the user picks from the dropdown either way.
+     */
+    private String ownerAsRole(Long tenantId, String suggested) {
+        if (suggested == null || suggested.isBlank() || tenantId == null) return suggested;
+        Map<String, String> roles = roleRegister.currentRoleKeysByTitle(tenantId);   // title -> key
+        if (roles.isEmpty()) return suggested;
+        String s = suggested.trim().toLowerCase(Locale.ROOT);
+        for (String t : roles.keySet()) if (t.equalsIgnoreCase(s)) return t;
+
+        Set<String> generic = Set.of("team", "department", "function", "lead", "manager", "head",
+                "officer", "and", "of", "the", "it");
+        List<String> words = Arrays.stream(s.split("[^a-z0-9]+"))
+                .filter(w -> w.length() >= 2 && !generic.contains(w)).toList();
+        for (String t : roles.keySet()) {
+            Set<String> tw = new HashSet<>(Arrays.asList(t.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")));
+            if (!words.isEmpty() && words.stream().allMatch(tw::contains)) return t;
+        }
+        if (s.contains("security") || s.contains("infosec") || s.contains("ciso")) {
+            String owner = orgProfileRepository.findByTenantId(tenantId)
+                    .map(p -> p.getSecurityOwnerTitle()).orElse(null);
+            if (owner != null) for (String t : roles.keySet()) if (t.equalsIgnoreCase(owner.trim())) return t;
+        }
+        return suggested;
+    }
+
+    private boolean british(Long tenantId) {
+        if (tenantId == null) return true;
+        return isBritish(orgProfileRepository.findByTenantId(tenantId).orElse(null));
+    }
+
+    private static boolean isBritish(com.kashi.grc.ai.domain.AiOrgProfile p) {
+        return p == null || p.getSpellingVariant() == null || !"AMERICAN".equalsIgnoreCase(p.getSpellingVariant());
+    }
+
+    private static String spell(String text, boolean british) {
+        return british && text != null ? BritishSpelling.text(text) : text;
     }
 }

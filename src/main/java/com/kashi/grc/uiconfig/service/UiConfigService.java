@@ -20,6 +20,20 @@ public interface UiConfigService {
     /** Action buttons available on a screen for the current user */
     List<UiActionResponse> getActions(String screenKey, String entityStatus);
 
+    /**
+     * Server-side check behind the action buttons, for ModuleActionGuard.
+     *
+     * Finds the active ui_actions bound to this endpoint (http_method plus
+     * api_endpoint, with {placeholders} matching one path segment) and answers
+     * whether the caller would be shown at least one of them, by exactly the
+     * rule getActions uses: required_permission (any of, including
+     * permission_grants and their revokes) and allowed_sides.
+     *
+     * @return null when no active ui_action is bound to the endpoint, so the
+     *         caller can leave that request to the service's own checks
+     */
+    Boolean callerMayInvokeActionEndpoint(String httpMethod, String path);
+
     /** Dashboard widgets filtered by role side */
     List<DashboardWidgetResponse> getDashboardWidgets();
 

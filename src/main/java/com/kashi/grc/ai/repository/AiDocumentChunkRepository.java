@@ -17,6 +17,9 @@ public interface AiDocumentChunkRepository extends JpaRepository<AiDocumentChunk
 
     List<AiDocumentChunk> findByVectorIdIn(List<String> vectorIds);
 
+    /** Chunks MySQL believes are in the vector store (VectorIndexReconciler, lost-collection check). */
+    List<AiDocumentChunk> findByQuarantinedFalseAndIndexedAtIsNotNull();
+
     /**
      * Hash check that makes re-ingestion free. The editor autosaves every thirty
      * seconds; without this the same policy would be re-embedded all day.

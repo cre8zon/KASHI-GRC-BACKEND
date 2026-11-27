@@ -48,6 +48,14 @@ public class Enquiry extends BaseEntity {
     @Column(name = "enquiry_type", nullable = false, length = 20)
     private String enquiryType;
 
+    /**
+     * How it reached us. NULL = a website form (every enquiry before this
+     * column existed); CHAT = handed over from the website assistant, whose
+     * transcript is in site_chat_messages (SiteChatSession.enquiryId).
+     */
+    @Column(name = "channel", length = 10)
+    private String channel;
+
     /** NEW | IN_PROGRESS | QUALIFIED | CONVERTED | CLOSED */
     @Column(name = "status", nullable = false, length = 20)
     @Builder.Default

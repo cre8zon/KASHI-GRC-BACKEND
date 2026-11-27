@@ -47,6 +47,7 @@ public class PolicyVariableResolver {
 
     private final TenantRepository tenantRepository;
     private final UserRepository   userRepository;
+    private final com.kashi.grc.ai.policy.PolicyRoleRegister roleRegister;
 
     /**
      * @param body     raw content_body, may be null
@@ -95,6 +96,11 @@ public class PolicyVariableResolver {
         Map<String, String> v = new HashMap<>();
 
         if (tenantId != null) {
+            // Policy roles: {{role_engineering_lead}} -> the CURRENT holder. Only
+            // forward-looking accountability comes from here; who approved a
+            // version is read from the version itself below and never changes.
+            roleRegister.currentHolderNames(tenantId).forEach((k, name) -> v.put("role_" + k, name));
+
             tenantRepository.findById(tenantId).ifPresent(t -> {
                 v.put("company_name", t.getName());
                 v.put("organisation_name", t.getName());
@@ -105,7 +111,11 @@ public class PolicyVariableResolver {
         if (policy == null) return v;
 
         if (policy.getOwnerTeam() != null && !policy.getOwnerTeam().isBlank()) {
-            v.put("policy_owner", policy.getOwnerTeam());
+            // An owner that names a policy role reads "Role (Current holder)",
+            // so it follows the register when the role changes hands. Any
+            // other owner text (a team name) is shown as written.
+            String asRole = roleRegister.ownerDisplay(tenantId, policy.getOwnerTeam());
+            v.put("policy_owner", asRole != null ? asRole : policy.getOwnerTeam());
         } else if (policy.getOwnerId() != null) {
             userRepository.findById(policy.getOwnerId())
                     .ifPresent(u -> v.put("policy_owner", u.getFullName()));

@@ -62,7 +62,8 @@ public class AiInteractionRecorder {
                     .renderedPrompt(r.prompt()).inputVariables(r.inputVariables()).inputHash(r.inputHash())
                     .status(e instanceof GuardrailException ? InteractionStatus.BLOCKED : InteractionStatus.FAILED)
                     .errorCode(e instanceof BusinessException be ? be.getErrorCode() : "AI_ERROR")
-                    .errorMessage(truncate(e.getMessage(), 2000))
+                    .errorMessage(truncate(e instanceof com.kashi.grc.ai.provider.AiProviderException pe
+                            ? pe.getDetail() : e.getMessage(), 2000))
                     .latencyMs(r.latencyMs())
                     .entityType(r.entityType()).entityId(r.entityId())
                     .correlationId(r.correlationId()).parentInteractionId(r.parentInteractionId())

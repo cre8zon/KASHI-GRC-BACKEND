@@ -83,6 +83,9 @@ public class AiPipeline {
             } catch (RuntimeException e) {
                 if (step.isCritical()) {
                     log.error("[AI-PIPELINE] {} | critical step '{}' failed", name, step.name(), e);
+                    // Provider trouble keeps its own user-facing message and status
+                    // ("busy, try again") instead of becoming a step-name error.
+                    if (e instanceof com.kashi.grc.ai.provider.AiProviderException) throw e;
                     throw new com.kashi.grc.common.exception.BusinessException(
                             "AI_PIPELINE_FAILED",
                             "Generation failed at step '" + step.name() + "': " + e.getMessage(),

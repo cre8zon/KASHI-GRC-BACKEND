@@ -310,8 +310,9 @@ public class GenericLlmProvider implements LlmProvider {
         return switch (code) {
             case 429 -> AiProviderException.rateLimited(key);
             case 401, 403 -> new AiProviderException("AI_PROVIDER_AUTH",
-                    displayName() + " rejected the credentials",
-                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, false);
+                    "The AI assistant isn't available right now. Please contact your administrator.",
+                    org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE, false,
+                    displayName() + " rejected the credentials (HTTP " + code + ")");
             case 400, 404, 422 -> AiProviderException.badRequest(key, detail);
             case 529 -> AiProviderException.unavailable(key, "overloaded");
             default -> AiProviderException.unavailable(key, "HTTP " + code + " " + detail);

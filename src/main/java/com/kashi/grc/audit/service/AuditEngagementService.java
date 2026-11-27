@@ -373,8 +373,22 @@ public class AuditEngagementService {
     public void completeEngagementProvisioning(AuditEngagement engagement, Long templateId, Long tenantId,
                                                boolean startWorkflow, Long overrideWorkflowId, Long createdBy) {
         try {
-            self.snapshotTemplate(engagement, templateId, tenantId);
-            if (startWorkflow) {
+            // Retry guard. snapshotTemplate commits on its own; if the workflow
+            // start after it throws, the consumer rethrows and Kafka redelivers
+            // with snapshotStatus still PROVISIONING. Snapshotting again would
+            // build a second copy of every section, control, test and policy.
+            // The template instance row is the first thing a snapshot writes,
+            // so its presence means the tree is already there.
+            if (templateInstanceRepository.existsByEngagementId(engagement.getId())) {
+                log.warn("[AUDIT] Template already snapshotted for engagementId={} — retry skips the snapshot",
+                        engagement.getId());
+            } else {
+                self.snapshotTemplate(engagement, templateId, tenantId);
+            }
+            if (startWorkflow && engagement.getWorkflowInstanceId() != null) {
+                log.warn("[AUDIT] Workflow already started for engagementId={} (instance {}) — retry skips it",
+                        engagement.getId(), engagement.getWorkflowInstanceId());
+            } else if (startWorkflow) {
                 startWorkflowIfConfigured(engagement, overrideWorkflowId, createdBy, tenantId);
             } else {
                 log.info("[AUDIT] Skipping per-engagement workflow start (project-governed) | engagementId={}",

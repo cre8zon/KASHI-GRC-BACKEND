@@ -104,13 +104,32 @@ public class UtilityService {
                     pageDetails.setFilterBy(parseSemiColonSeparatedList(p.getValue()));
                     break;
                 case "search":
-                    pageDetails.setSearch(parseSemiColonSeparatedList(p.getValue()));
+                    // Two shapes arrive here. Admin pages send field pairs
+                    // ("name=cloud"); the module lists send the box's plain text
+                    // ("phish"). Plain text has no '=', so the pair parser
+                    // dropped it and the search box did nothing. It is now kept
+                    // as a free-text term (name "*"), which DbRepository matches
+                    // against every text field the list declares.
+                    if (p.getValue() != null && !p.getValue().contains("=")) {
+                        if (!p.getValue().isBlank())
+                            pageDetails.setSearch(new ArrayList<>(List.of(
+                                    pair(FREE_TEXT, p.getValue().replace("\"", "")))));
+                    } else {
+                        pageDetails.setSearch(parseSemiColonSeparatedList(p.getValue()));
+                    }
                     break;
                 case "sortby":
-                    pageDetails.setSortBy(parseSemiColonSeparatedList(p.getValue()));
+                    // Same two shapes: "name=asc" (admin pages) or a bare field
+                    // ("title", module lists). A bare field was dropped, so
+                    // clicking a column header never changed the order.
+                    pageDetails.setSortBy(p.getValue() != null && !p.getValue().contains("=")
+                            ? bareList(p.getValue())
+                            : parseSemiColonSeparatedList(p.getValue()));
                     break;
                 case "sortdirection":
-                    pageDetails.setSortDirection(parseSemiColonSeparatedList(p.getValue()));
+                    pageDetails.setSortDirection(p.getValue() != null && !p.getValue().contains("=")
+                            ? bareList(p.getValue())
+                            : parseSemiColonSeparatedList(p.getValue()));
                     break;
             }
         });
@@ -121,6 +140,28 @@ public class UtilityService {
      * Parses "key1=value1;key2=value2" into a list of NameValue pairs.
      * Fixed: each semicolon-separated segment is split on its own '=', not the whole string.
      */
+    /** Search-term name for free text: match it against every text field. */
+    public static final String FREE_TEXT = "*";
+
+    private static NameValue pair(String name, String value) {
+        NameValue nv = new NameValue();
+        nv.setName(name);
+        nv.setValue(value.toLowerCase().trim());
+        return nv;
+    }
+
+    /** "title;status" → [{title,title},{status,status}] — the value carries the
+     *  field (or the direction), which is where DbRepository reads it from. */
+    private ArrayList<NameValue> bareList(String raw) {
+        ArrayList<NameValue> list = new ArrayList<>();
+        if (raw == null) return list;
+        for (String seg : raw.replace("\"", "").split(";")) {
+            String v = seg.trim();
+            if (!v.isEmpty()) list.add(pair(v.toLowerCase(), v));
+        }
+        return list;
+    }
+
     private ArrayList<NameValue> parseSemiColonSeparatedList(String keyValue) {
         ArrayList<NameValue> pairList = new ArrayList<>();
         String strKeyValue = keyValue.replace("\"", "");

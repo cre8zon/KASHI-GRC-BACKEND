@@ -3,6 +3,7 @@ package com.kashi.grc.common.repository;
 import com.kashi.grc.common.dto.NameValue;
 import com.kashi.grc.common.dto.PageDetails;
 import com.kashi.grc.common.dto.PaginatedResponse;
+import com.kashi.grc.common.util.UtilityService;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import jakarta.persistence.criteria.*;
@@ -347,6 +348,19 @@ public class DbRepository {
         if (pd.getSearch() != null && !pd.getSearch().isEmpty()) {
             List<Predicate> searchPreds = new ArrayList<>();
             for (NameValue nv : pd.getSearch()) {
+                // Free text from a list's search box: any declared text field
+                // may match. Only String paths — LIKE on an enum or a number
+                // column either fails or matches nonsense.
+                if (UtilityService.FREE_TEXT.equals(nv.getName())) {
+                    if (nv.getValue() == null || nv.getValue().isBlank()) continue;
+                    String like = "%" + escapeLike(nv.getValue().toLowerCase()) + "%";
+                    for (Path<?> p : fields.values()) {
+                        if (p != null && String.class.isAssignableFrom(p.getJavaType())) {
+                            searchPreds.add(cb.like(cb.lower(p.as(String.class)), like, '!'));
+                        }
+                    }
+                    continue;
+                }
                 Path<?> path = fields.get(nv.getName());
                 if (path != null && nv.getValue() != null) {
                     searchPreds.add(cb.like(
@@ -378,12 +392,20 @@ public class DbRepository {
 
             for (int i = 0; i < sortByList.size(); i++) {
                 NameValue sortEntry = sortByList.get(i);
-                // Field name is in the value (e.g. NameValue{name="name", value="email"})
+                // Two shapes reach here:
+                //   sortBy=title&sortDirection=desc → {title,title} + {desc}
+                //   sortBy=name=desc               → {name,desc}
+                // The second put the DIRECTION in the value, which was then
+                // looked up as a field, so those tables never sorted either.
                 String fieldName = sortEntry.getValue() != null ? sortEntry.getValue() : sortEntry.getName();
                 String dir = sortDirList.size() > i
                         ? sortDirList.get(i).getValue()
                         : "asc";
-                Path<?> path = fields.get(fieldName);
+                if ("asc".equalsIgnoreCase(fieldName) || "desc".equalsIgnoreCase(fieldName)) {
+                    dir = fieldName;
+                    fieldName = sortEntry.getName();
+                }
+                Path<?> path = resolveField(fields, fieldName);
                 if (path != null) {
                     orders.add("desc".equalsIgnoreCase(dir) ? cb.desc(path) : cb.asc(path));
                 }
@@ -398,6 +420,30 @@ public class DbRepository {
         }
 
         if (!orders.isEmpty()) cq.orderBy(orders);
+    }
+
+    /**
+     * Sort keys arrive lowercased (the parser lowercases everything), while the
+     * field maps mix "incidentref", "incident_ref" and "nextReviewDate". Exact
+     * key first, then ignoring case and underscores, so a column key the table
+     * sends finds its path however the controller spelled it.
+     */
+    private static Path<?> resolveField(Map<String, Path<?>> fields, String key) {
+        if (key == null) return null;
+        Path<?> exact = fields.get(key);
+        if (exact != null) return exact;
+        String want = key.replace("_", "").toLowerCase();
+        for (Map.Entry<String, Path<?>> e : fields.entrySet()) {
+            if (e.getKey() != null && e.getKey().replace("_", "").toLowerCase().equals(want)) return e.getValue();
+        }
+        return null;
+    }
+
+    /** A typed % or _ is a character to find, not a wildcard. '!' is the
+     *  escape character rather than '\\', which MySQL's default string mode
+     *  would itself treat as an escape inside the ESCAPE literal. */
+    private static String escapeLike(String v) {
+        return v.replace("!", "!!").replace("%", "!%").replace("_", "!_");
     }
 
     /**

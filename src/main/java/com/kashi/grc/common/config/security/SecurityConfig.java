@@ -177,6 +177,33 @@ public class SecurityConfig {
                         .requestMatchers("/v1/billing/public/**").denyAll()
                         .requestMatchers(HttpMethod.POST, "/v1/enquiries/public").permitAll()
                         .requestMatchers("/v1/enquiries/public/**").denyAll()
+                        // ── WEBSITE ASSISTANT ──────────────────────────────────
+                        // The chat on www.kashiguard.com. Anonymous visitors: the
+                        // conversation is named by a 256-bit token the browser
+                        // holds (X-Chat-Session), stored only as a hash. Rate-
+                        // limited and capped in SiteAssistantService; it reads the
+                        // public website only, never a tenant. The page sync is
+                        // the website's deploy, proved by a shared key. Each
+                        // endpoint listed, rest of both prefixes denied.
+                        .requestMatchers(HttpMethod.POST, "/v1/site-assistant/public/messages").permitAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/site-assistant/public/handover").permitAll()
+                        .requestMatchers(HttpMethod.GET,  "/v1/site-assistant/public/session").permitAll()
+                        .requestMatchers("/v1/site-assistant/public/**").denyAll()
+                        .requestMatchers(HttpMethod.POST, "/v1/site-assistant/sync/pages").permitAll()
+                        .requestMatchers("/v1/site-assistant/sync/**").denyAll()
+                        // ── AI OPERATOR CONSOLE ────────────────────────────────
+                        // Prompts, corpus, reindex, evals, usage and traces are
+                        // platform operations: a prompt edit changes every
+                        // generation for every tenant. Only the write routes had a
+                        // @PreAuthorize; the reads (prompt text, provider list,
+                        // corpus stats) were open to any signed-in user. Locked at
+                        // the URL layer so a new admin route is covered without
+                        // anyone remembering an annotation. SIDE_SYSTEM or
+                        // system:write, the same test as PermissionGate.isPlatform.
+                        // policy-variables is the one exception: the policy editor
+                        // reads it for every author, and it is a static catalogue.
+                        .requestMatchers(HttpMethod.GET, "/v1/ai/admin/policy-variables").authenticated()
+                        .requestMatchers("/v1/ai/admin/**").hasAnyAuthority("SIDE_SYSTEM", "system:write")
                         .requestMatchers(
                                 "/v1/admin/**",
                                 "/v1/tenants/**"

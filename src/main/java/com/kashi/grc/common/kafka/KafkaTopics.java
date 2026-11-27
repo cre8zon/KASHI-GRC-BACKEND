@@ -7,8 +7,10 @@ package com.kashi.grc.common.kafka;
  * Every topic used anywhere in the codebase MUST be declared here —
  * never inline topic strings in producers or listeners.
  *
- * Dead-letter topics are derived automatically as "<topic>.DLT"
- * by the DeadLetterPublishingRecoverer in KafkaConfig.
+ * Dead-letter topics are "<topic>-dlt" (Spring Kafka 3.3+ default for
+ * DeadLetterPublishingRecoverer) and are declared with the same partition
+ * count as their topic in KafkaConfig, because a failed record is sent to the
+ * SAME partition number on the dead-letter topic.
  */
 public final class KafkaTopics {
 
